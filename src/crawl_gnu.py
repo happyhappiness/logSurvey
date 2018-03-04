@@ -12,7 +12,7 @@ MAIN_URL = 'http://git.savannah.gnu.org'
 
 def store_patch_file(patch, counter, record, writer):
     """
-    @ param patch and counter\n
+    @ param patch, counter, record and writer\n
     @ return new counter\n
     @ involve check patch for log modification and store patch file if success\n
     """
@@ -29,7 +29,7 @@ def store_patch_file(patch, counter, record, writer):
 
 def generate_record(url, commit_info, counter, writer):
     """
-    @ param commit info\n
+    @ param commit info, counter and writer\n
     @ return nothing\n
     @ involve parse commit info and generate commit record\n
     """
@@ -82,7 +82,7 @@ def generate_record(url, commit_info, counter, writer):
             
 def analyze_commit(commit_page, counter, writer):
     """
-    @ param commit page\n
+    @ param commit page, counter and writer\n
     @ return nothing\n
     @ involve analyze commit page and store commit record[call generate code]\n
     """
@@ -96,7 +96,7 @@ def analyze_commit(commit_page, counter, writer):
 
 def analyze_commit_list(commit_list_page, total_counter, counter, writer):
     """
-    @ param commit list page\n
+    @ param commit list page, counter and file writer\n
     @ return nothing\n
     @ involve fetch and analyze commit list[call analyze commit]\n
     """
@@ -115,7 +115,7 @@ def analyze_commit_list(commit_list_page, total_counter, counter, writer):
             break
         is_commit = re.search(commit_page_pattern, line, re.I)
         if is_commit:
-            analyze_commit(is_commit.group(1), counter)
+            analyze_commit(is_commit.group(1), counter, writer)
             commit_count += 1
             total_counter += 1
             if total_counter % 10 == 0:
@@ -134,5 +134,7 @@ if __name__ == "__main__":
     record_file = file('data/analyze/' + REPOS_NAME + '_log_commit.csv', 'wb')
     writer = csv.writer(record_file)
     writer.writerow(['url', 'date', 'title', 'changes', 'file_name'])
+    # analyze commit list
     analyze_commit_list('/cgit/' + REPOS_NAME + '.git/log/?ofs=50', 0, 0, writer)
+
     record_file.close()

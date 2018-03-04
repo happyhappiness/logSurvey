@@ -16,13 +16,15 @@ def store_patch_file(patch, counter, record, writer):
     @ return new counter\n
     @ involve check patch for log modification and store patch file if success\n
     """
+    if patch is None:
+        print record
     for line in patch:
         if line.startswith('-') or line.startswith('+'):
             is_log = re.search(LOG_PATTERN, line, re.I)
             if is_log:
                 file_name = 'data/crawl/' + REPOS_NAME + '/patch_' + str(counter) + '.diff'
                 my_util.store_file(file_name, patch)
-                writer.writerow(record.append(file_name))
+                writer.writerow(record + [file_name])
                 return counter + 1
     
     return counter
@@ -30,13 +32,13 @@ def store_patch_file(patch, counter, record, writer):
 def generate_record(url, commit_info, counter, writer):
     """
     @ param commit info, counter and writer\n
-    @ return nothing\n
+    @ return counter\n
     @ involve parse commit info and generate commit record\n
     """
     # regex parser for store [url, date, title, changes, patch_file]
     date_pattern = r'Date: \w*, (\d* \w* \d*) \d*:\d*:.*'
     title_pattern = r'Subject: (.*)'
-    patch_pattern = r'\* .*'
+    patch_pattern = r'\d* \w* changed, (\d*)\D*(\d*)\D*'
     title = None
     date = None
     patch = None
@@ -62,28 +64,36 @@ def generate_record(url, commit_info, counter, writer):
                     break
                 else:
                    title += '\n' + line 
+    if patch is None:
+        print 'can not retrieve patch for given url: %s' %url
+        return counter
     # retrieve modify and diff
     changes = 0
-    modify_pattern = r'\d* \w* changed, (\d*) \w*\(.\), (\d*) \w*\(.\)'
     diff_pattern = r'diff --git .*'
     for line in patch:
         # find changes(just one time)
         if changes == 0:
-            is_modify = re.search(modify_pattern, line, re.I)
+            is_modify = is_patch
             if is_modify:
                 for i in range(1, is_modify.lastindex + 1):
-                    changes += int(is_modify.group(i))
+                    num_str = is_modify.group(i)
+                    if num_str == '':
+                        num_str = '0'
+                    else:
+                        changes += int(num_str)
         else:
             # find first diff file
             is_diff = re.search(diff_pattern, line, re.I)
             if is_diff:
-                counter = store_patch_file(patch[patch.index(line):], counter, [url, date, title, changes], writer)
-                break
+                return store_patch_file(patch[patch.index(line):], counter, [url, date, title, changes], writer)
+
+    print 'can not retrieve diff for given url: %s' %url
+    return counter
             
 def analyze_commit(commit_page, counter, writer):
     """
     @ param commit page, counter and writer\n
-    @ return nothing\n
+    @ return counter\n
     @ involve analyze commit page and store commit record[call generate code]\n
     """
     url = MAIN_URL + commit_page
@@ -92,7 +102,7 @@ def analyze_commit(commit_page, counter, writer):
     commit_info = response.read()
     commit_info = commit_info.split("\n")
     # regex parser for store [url, time, title, explain, patch_file]
-    generate_record(url, commit_info, counter, writer)
+    return generate_record(url, commit_info, counter, writer)
 
 def analyze_commit_list(commit_list_page, total_counter, counter, writer):
     """
@@ -113,9 +123,12 @@ def analyze_commit_list(commit_list_page, total_counter, counter, writer):
         # one page has at most 50 commits
         if commit_count >= 50:
             break
+        # retrieve commit address
         is_commit = re.search(commit_page_pattern, line, re.I)
         if is_commit:
-            analyze_commit(is_commit.group(1), counter, writer)
+            # analyze commit and counter
+            counter = analyze_commit(is_commit.group(1), counter, writer)
+            # update commit counter and total counter
             commit_count += 1
             total_counter += 1
             if total_counter % 10 == 0:

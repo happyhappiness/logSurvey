@@ -1,0 +1,590 @@
+diff --git a/README.checkout b/README.checkout
+index 3265c81..c8a111e 100644
+--- a/README.checkout
++++ b/README.checkout
+@@ -99,6 +99,9 @@ Compiling From Repository Sources
+ 
+      * [47]GnuPG with GPGME is used to verify GPG-signed Metalink resources.
+ 
++     * [48]libcares is needed to bind DNS resolving to a given IP address.
++       The command line options --dns-servers and --bind-dns-address are
++       only available when configured with --with-cares.
+ 
+    For those who might be confused as to what to do once they check out
+    the source code, considering configure and Makefile do not yet exist at
+@@ -207,3 +210,4 @@ References
+   45. https://www.python.org/
+   46. https://launchpad.net/libmetalink
+   47. https://www.gnupg.org
++  48. http://c-ares.haxx.se/
+diff --git a/configure.ac b/configure.ac
+index d7bba63..eb303f0 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -72,7 +72,6 @@ dnl SSL: Configure SSL backend to use
+ AC_ARG_WITH([ssl],
+   [AS_HELP_STRING([--with-ssl={gnutls,openssl}], [specify SSL backend. GNU TLS is the default.])])
+ 
+-
+ dnl Zlib: Configure use of zlib for compression
+ AC_ARG_WITH([zlib],
+   [AS_HELP_STRING([--without-zlib], [disable zlib.])])
+@@ -81,6 +80,9 @@ dnl Metalink: Configure use of the Metalink library
+ AC_ARG_WITH([metalink],
+   [AS_HELP_STRING([--with-metalink], [enable support for metalinks.])])
+ 
++dnl C-Ares: Configure use of the c-ares library for DNS lookup
++AC_ARG_WITH(cares, AS_HELP_STRING([--with-cares], [enable support for C-Ares DNS lookup.]), with_cares=$withval, with_cares=no)
++
+ dnl
+ dnl Process features
+ dnl
+@@ -744,6 +746,31 @@ AS_IF([test "X$enable_pcre" != "Xno"],[
+   ])
+ ])
+ 
++dnl
++dnl Check for libcares (resolver library)
++dnl
++
++AS_IF([test "X$with_cares" == "Xyes"],[
++  PKG_CHECK_MODULES([CARES], libcares, [
++    CFLAGS="$CARES_CFLAGS $CFLAGS"
++    AC_CHECK_HEADER(ares.h, [
++      LIBS="$CARES_LIBS $LIBS"
++      AC_DEFINE([HAVE_LIBCARES], [1], [Define if libcares is available.])
++      RESOLVER_INFO="libcares, --bind-dns-address and --dns-servers available"
++    ])
++  ], [
++    AC_CHECK_HEADER(ares.h, [
++      AC_CHECK_LIB(cares, ares_set_local_ip4, [
++        LIBS="-lcares ${LIBS}"
++        AC_DEFINE([HAVE_LIBCARES], 1, [Define if libcares is available.])
++        RESOLVER_INFO="libcares, --bind-dns-address and --dns-servers available"
++      ])
++    ])
++  ])
++], [
++  RESOLVER_INFO="libc, --bind-dns-address and --dns-servers not available"
++])
++
+ 
+ dnl Needed by src/Makefile.am
+ AM_CONDITIONAL([IRI_IS_ENABLED], [test "X$iri" != "Xno"])
+@@ -778,5 +805,6 @@ AC_MSG_NOTICE([Summary of build options:
+   Assertions:        $ENABLE_ASSERTION
+   Valgrind:          $VALGRIND_INFO
+   Metalink:          $with_metalink
++  Resolver:          $RESOLVER_INFO
+   GPGME:             $have_gpg
+ ])
+diff --git a/doc/wget.texi b/doc/wget.texi
+index efebc49..594a702 100644
+--- a/doc/wget.texi
++++ b/doc/wget.texi
+@@ -571,6 +571,27 @@ the local machine.  @var{ADDRESS} may be specified as a hostname or IP
+ address.  This option can be useful if your machine is bound to multiple
+ IPs.
+ 
++@cindex bind DNS address
++@cindex client DNS address
++@cindex DNS IP address, client, DNS
++@item --bind-dns-address=@var{ADDRESS}
++[libcares only]
++This address overrides the route for DNS requests. If you ever need to
++circumvent the standard settings from /etc/resolv.conf, this option together
++with @samp{--dns-servers} is your friend.
++@var{ADDRESS} must be specified either as IPv4 or IPv6 address.
++Wget needs to be built with libcares for this option to be available.
++
++@cindex DNS server
++@cindex DNS IP address, client, DNS
++@item --dns-servers=@var{ADDRESSES}
++[libcares only]
++The given address(es) override the standard nameserver
++addresses,  e.g. as configured in /etc/resolv.conf.
++@var{ADDRESSES} may be specified either as IPv4 or IPv6 addresses,
++comma-separated.
++Wget needs to be built with libcares for this option to be available.
++
+ @cindex retries
+ @cindex tries
+ @cindex number of tries
+diff --git a/src/build_info.c.in b/src/build_info.c.in
+index 83b7664..c7493e9 100644
+--- a/src/build_info.c.in
++++ b/src/build_info.c.in
+@@ -8,6 +8,7 @@ nls             defined ENABLE_NLS
+ ntlm            defined ENABLE_NTLM
+ opie            defined ENABLE_OPIE
+ psl             defined HAVE_LIBPSL
++cares            defined HAVE_LIBCARES
+ 
+ metalink        defined HAVE_METALINK
+ gpgme           defined HAVE_GPGME
+diff --git a/src/host.c b/src/host.c
+index 219f89c..d654fee 100644
+--- a/src/host.c
++++ b/src/host.c
+@@ -65,6 +65,7 @@ as that of the covered work.  */
+ #include "host.h"
+ #include "url.h"
+ #include "hash.h"
++#include "ptimer.h"
+ 
+ #ifndef NO_ADDRESS
+ # define NO_ADDRESS NO_DATA
+@@ -649,6 +650,104 @@ cache_remove (const char *host)
+     }
+ }
+ 
++#ifdef HAVE_LIBCARES
++#include <ares.h>
++extern ares_channel ares;
++
++static struct address_list *
++merge_address_lists (struct address_list *al1, struct address_list *al2)
++{
++  int count = al1->count + al2->count;
++
++  /* merge al2 into al1 */
++  al1->addresses = xrealloc (al1->addresses, sizeof (ip_address) * count);
++  memcpy (al1->addresses + al1->count, al2->addresses, sizeof (ip_address) * al2->count);
++  al1->count = count;
++
++  address_list_delete (al2);
++
++  return al1;
++}
++
++static struct address_list *
++address_list_from_hostent (struct hostent *host)
++{
++  int count, i;
++  struct address_list *al = xnew0 (struct address_list);
++
++  for (count = 0; host->h_addr_list[count]; count++)
++    ;
++
++  assert (count > 0);
++
++  al->addresses = xnew_array (ip_address, count);
++  al->count     = count;
++  al->refcount  = 1;
++
++  for (i = 0; i < count; i++)
++    {
++      ip_address *ip = &al->addresses[i];
++      ip->family = host->h_addrtype;
++      memcpy (IP_INADDR_DATA (ip), host->h_addr_list[i], ip->family == AF_INET ? 4 : 16);
++    }
++
++  return al;
++}
++
++static void
++wait_ares (ares_channel channel)
++{
++  struct ptimer *timer = NULL;
++
++  if (opt.dns_timeout)
++    timer = ptimer_new ();
++
++  for (;;)
++    {
++      struct timeval *tvp, tv;
++      fd_set read_fds, write_fds;
++      int nfds, rc;
++
++      FD_ZERO (&read_fds);
++      FD_ZERO (&write_fds);
++      nfds = ares_fds (channel, &read_fds, &write_fds);
++      if (nfds == 0)
++        break;
++
++      if (timer)
++        {
++          double max = opt.dns_timeout - ptimer_measure (timer);
++
++          tv.tv_sec = (long) max;
++          tv.tv_usec = 1000000 * (max - (long) max);
++          tvp = ares_timeout (channel, &tv, &tv);
++        }
++      else
++        tvp = ares_timeout (channel, NULL, &tv);
++
++      rc = select (nfds, &read_fds, &write_fds, NULL, tvp);
++      if (rc == 0 && timer && ptimer_measure (timer) >= opt.dns_timeout)
++        ares_cancel (channel);
++      else
++        ares_process (channel, &read_fds, &write_fds);
++    }
++}
++
++static void
++callback (void *arg, int status, int timeouts _GL_UNUSED, struct hostent *host)
++{
++  struct address_list **al = (struct address_list **) arg;
++
++  if (!host || status != ARES_SUCCESS)
++    {
++      *al = NULL;
++      return;
++    }
++
++  *al = address_list_from_hostent (host);
++}
++#endif
++
+ /* Look up HOST in DNS and return a list of IP addresses.
+ 
+    This function caches its result so that, if the same host is passed
+@@ -755,80 +854,112 @@ lookup_host (const char *host, int flags)
+     }
+ 
+ #ifdef ENABLE_IPV6
+-  {
+-    int err;
+-    struct addrinfo hints, *res;
+-
+-    xzero (hints);
+-    hints.ai_socktype = SOCK_STREAM;
+-    if (opt.ipv4_only)
+-      hints.ai_family = AF_INET;
+-    else if (opt.ipv6_only)
+-      hints.ai_family = AF_INET6;
+-    else
+-      /* We tried using AI_ADDRCONFIG, but removed it because: it
+-         misinterprets IPv6 loopbacks, it is broken on AIX 5.1, and
+-         it's unneeded since we sort the addresses anyway.  */
++#ifdef HAVE_LIBCARES
++  if (ares)
++    {
++      struct address_list *al4;
++      struct address_list *al6;
++
++      if (opt.ipv4_only || !opt.ipv6_only)
++        ares_gethostbyname (ares, host, AF_INET, callback, &al4);
++      if (opt.ipv6_only || !opt.ipv4_only)
++        ares_gethostbyname (ares, host, AF_INET6, callback, &al6);
++
++      wait_ares (ares);
++
++      if (al4 && al6)
++        al = merge_address_lists (al4, al6);
++      else if (al4)
++        al = al4;
++      else
++        al = al6;
++    }
++  else
++#endif
++    {
++      int err;
++      struct addrinfo hints, *res;
++
++      xzero (hints);
++      hints.ai_socktype = SOCK_STREAM;
++      if (opt.ipv4_only)
++        hints.ai_family = AF_INET;
++      else if (opt.ipv6_only)
++        hints.ai_family = AF_INET6;
++      else
++        /* We tried using AI_ADDRCONFIG, but removed it because: it
++           misinterprets IPv6 loopbacks, it is broken on AIX 5.1, and
++           it's unneeded since we sort the addresses anyway.  */
+         hints.ai_family = AF_UNSPEC;
+ 
+-    if (flags & LH_BIND)
+-      hints.ai_flags |= AI_PASSIVE;
++      if (flags & LH_BIND)
++        hints.ai_flags |= AI_PASSIVE;
+ 
+ #ifdef AI_NUMERICHOST
+-    if (numeric_address)
+-      {
+-        /* Where available, the AI_NUMERICHOST hint can prevent costly
+-           access to DNS servers.  */
+-        hints.ai_flags |= AI_NUMERICHOST;
+-        timeout = 0;            /* no timeout needed when "resolving"
++      if (numeric_address)
++        {
++          /* Where available, the AI_NUMERICHOST hint can prevent costly
++             access to DNS servers.  */
++          hints.ai_flags |= AI_NUMERICHOST;
++          timeout = 0; /* no timeout needed when "resolving"
+                                    numeric hosts -- avoid setting up
+                                    signal handlers and such. */
+-      }
++        }
+ #endif
+ 
+-    err = getaddrinfo_with_timeout (host, NULL, &hints, &res, timeout);
+-    if (err != 0 || res == NULL)
+-      {
+-        if (!silent)
+-          logprintf (LOG_VERBOSE, _("failed: %s.\n"),
+-                     err != EAI_SYSTEM ? gai_strerror (err) : strerror (errno));
+-        return NULL;
+-      }
+-    al = address_list_from_addrinfo (res);
+-    freeaddrinfo (res);
+-    if (!al)
+-      {
+-        logprintf (LOG_VERBOSE,
+-                   _("failed: No IPv4/IPv6 addresses for host.\n"));
+-        return NULL;
+-      }
++      err = getaddrinfo_with_timeout (host, NULL, &hints, &res, timeout);
+ 
+-    /* Reorder addresses so that IPv4 ones (or IPv6 ones, as per
+-       --prefer-family) come first.  Sorting is stable so the order of
+-       the addresses with the same family is undisturbed.  */
+-    if (al->count > 1 && opt.prefer_family != prefer_none)
+-      stable_sort (al->addresses, al->count, sizeof (ip_address),
+-                   opt.prefer_family == prefer_ipv4
+-                   ? cmp_prefer_ipv4 : cmp_prefer_ipv6);
+-  }
++      if (err != 0 || res == NULL)
++        {
++          if (!silent)
++            logprintf (LOG_VERBOSE, _ ("failed: %s.\n"),
++                       err != EAI_SYSTEM ? gai_strerror (err) : strerror (errno));
++          return NULL;
++        }
++      al = address_list_from_addrinfo (res);
++      freeaddrinfo (res);
++    }
++
++  if (!al)
++    {
++      logprintf (LOG_VERBOSE,
++                 _ ("failed: No IPv4/IPv6 addresses for host.\n"));
++      return NULL;
++    }
++
++  /* Reorder addresses so that IPv4 ones (or IPv6 ones, as per
++     --prefer-family) come first.  Sorting is stable so the order of
++     the addresses with the same family is undisturbed.  */
++  if (al->count > 1 && opt.prefer_family != prefer_none)
++    stable_sort (al->addresses, al->count, sizeof (ip_address),
++                 opt.prefer_family == prefer_ipv4
++                 ? cmp_prefer_ipv4 : cmp_prefer_ipv6);
+ #else  /* not ENABLE_IPV6 */
+-  {
+-    struct hostent *hptr = gethostbyname_with_timeout (host, timeout);
+-    if (!hptr)
+-      {
+-        if (!silent)
+-          {
+-            if (errno != ETIMEDOUT)
+-              logprintf (LOG_VERBOSE, _("failed: %s.\n"),
+-                         host_errstr (h_errno));
+-            else
+-              logputs (LOG_VERBOSE, _("failed: timed out.\n"));
+-          }
+-        return NULL;
+-      }
+-    /* Do older systems have h_addr_list?  */
+-    al = address_list_from_ipv4_addresses (hptr->h_addr_list);
+-  }
++#ifdef HAVE_LIBCARES
++  if (ares)
++    {
++      ares_gethostbyname (ares, host, AF_INET, callback, &al);
++      wait_ares (ares);
++    }
++  else
++#endif
++    {
++      struct hostent *hptr = gethostbyname_with_timeout (host, timeout);
++      if (!hptr)
++        {
++          if (!silent)
++            {
++              if (errno != ETIMEDOUT)
++                logprintf (LOG_VERBOSE, _ ("failed: %s.\n"),
++                           host_errstr (h_errno));
++              else
++                logputs (LOG_VERBOSE, _ ("failed: timed out.\n"));
++            }
++          return NULL;
++        }
++      /* Do older systems have h_addr_list?  */
++      al = address_list_from_ipv4_addresses (hptr->h_addr_list);
++    }
+ #endif /* not ENABLE_IPV6 */
+ 
+   /* Print the addresses determined by DNS lookup, but no more than
+diff --git a/src/init.c b/src/init.c
+index 48859aa..c6ee9ce 100644
+--- a/src/init.c
++++ b/src/init.c
+@@ -143,6 +143,9 @@ static const struct {
+   { "backups",          &opt.backups,           cmd_number },
+   { "base",             &opt.base_href,         cmd_string },
+   { "bindaddress",      &opt.bind_address,      cmd_string },
++#ifdef HAVE_LIBCARES
++  { "binddnsaddress",   &opt.bind_dns_address,  cmd_string },
++#endif
+   { "bodydata",         &opt.body_data,         cmd_string },
+   { "bodyfile",         &opt.body_file,         cmd_string },
+ #ifdef HAVE_SSL
+@@ -173,6 +176,9 @@ static const struct {
+   { "dirprefix",        &opt.dir_prefix,        cmd_directory },
+   { "dirstruct",        NULL,                   cmd_spec_dirstruct },
+   { "dnscache",         &opt.dns_cache,         cmd_boolean },
++#ifdef HAVE_LIBCARES
++  { "dnsservers",       &opt.dns_servers,       cmd_string },
++#endif
+   { "dnstimeout",       &opt.dns_timeout,       cmd_time },
+   { "domains",          &opt.domains,           cmd_vector },
+   { "dotbytes",         &opt.dot_bytes,         cmd_bytes },
+@@ -1922,6 +1928,18 @@ cleanup (void)
+   xfree (opt.body_file);
+   xfree (opt.rejected_log);
+ 
++#ifdef HAVE_LIBCARES
++#include <ares.h>
++  {
++    extern ares_channel ares;
++
++    xfree (opt.bind_dns_address);
++    xfree (opt.dns_servers);
++    ares_destroy (ares);
++    ares_library_cleanup ();
++  }
++#endif
++
+ #endif /* DEBUG_MALLOC */
+ }
+ 
+diff --git a/src/main.c b/src/main.c
+index 4641008..15b46ee 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -86,6 +86,13 @@ as that of the covered work.  */
+ struct iri dummy_iri;
+ #endif
+ 
++#ifdef HAVE_LIBCARES
++#include <ares.h>
++ares_channel ares;
++#else
++void *ares;
++#endif
++
+ struct options opt;
+ 
+ /* defined in version.c */
+@@ -252,6 +259,9 @@ static struct cmdline_option option_data[] =
+     { "backups", 0, OPT_BOOLEAN, "backups", -1 },
+     { "base", 'B', OPT_VALUE, "base", -1 },
+     { "bind-address", 0, OPT_VALUE, "bindaddress", -1 },
++#ifdef HAVE_LIBCARES
++    { "bind-dns-address", 0, OPT_VALUE, "binddnsaddress", -1 },
++#endif
+     { "body-data", 0, OPT_VALUE, "bodydata", -1 },
+     { "body-file", 0, OPT_VALUE, "bodyfile", -1 },
+     { IF_SSL ("ca-certificate"), 0, OPT_VALUE, "cacertificate", -1 },
+@@ -277,6 +287,9 @@ static struct cmdline_option option_data[] =
+     { "directories", 0, OPT_BOOLEAN, "dirstruct", -1 },
+     { "directory-prefix", 'P', OPT_VALUE, "dirprefix", -1 },
+     { "dns-cache", 0, OPT_BOOLEAN, "dnscache", -1 },
++#ifdef HAVE_LIBCARES
++    { "dns-servers", 0, OPT_VALUE, "dnsservers", -1 },
++#endif
+     { "dns-timeout", 0, OPT_VALUE, "dnstimeout", -1 },
+     { "domains", 'D', OPT_VALUE, "domains", -1 },
+     { "dont-remove-listing", 0, OPT__DONT_REMOVE_LISTING, NULL, no_argument },
+@@ -627,6 +640,12 @@ Download:\n"),
+        --spider                    don't download anything\n"),
+     N_("\
+   -T,  --timeout=SECONDS           set all timeout values to SECONDS\n"),
++#ifdef HAVE_LIBCARES
++    N_("\
++       --dns-servers=ADDRESSES     list of DNS servers to query (comma separated)\n"),
++    N_("\
++       --bind-dns-address=ADDRESS  bind DNS resolver to ADDRESS (hostname or IP) on local host\n"),
++#endif
+     N_("\
+        --dns-timeout=SECS          set the DNS lookup timeout to SECS\n"),
+     N_("\
+@@ -1774,6 +1793,58 @@ only if outputting to a regular file.\n"));
+         }
+     }
+ 
++#ifdef HAVE_LIBCARES
++  if (opt.bind_dns_address || opt.dns_servers)
++    {
++      if (ares_library_init (ARES_LIB_INIT_ALL))
++        {
++          fprintf (stderr, _("Failed to init libcares\n"));
++          exit (WGET_EXIT_GENERIC_ERROR);
++        }
++
++      if (ares_init (&ares) != ARES_SUCCESS)
++        {
++          fprintf (stderr, _("Failed to init c-ares channel\n"));
++          exit (WGET_EXIT_GENERIC_ERROR);
++        }
++
++      if (opt.bind_dns_address)
++        {
++          struct in_addr a4;
++#ifdef ENABLE_IPV6
++          struct in6_addr a6;
++#endif
++
++          if (inet_pton (AF_INET, opt.bind_dns_address, &a4) == 1)
++            {
++              ares_set_local_ip4 (ares, ntohl (a4.s_addr));
++            }
++#ifdef ENABLE_IPV6
++          else if (inet_pton (AF_INET6, opt.bind_dns_address, &a6) == 1)
++            {
++              ares_set_local_ip6 (ares, (unsigned char *) &a6);
++            }
++#endif
++          else
++            {
++              fprintf (stderr, _("Failed to parse IP address '%s'\n"), opt.bind_dns_address);
++              exit (WGET_EXIT_GENERIC_ERROR);
++            }
++        }
++
++      if (opt.dns_servers)
++        {
++          int result;
++
++          if ((result = ares_set_servers_csv (ares, opt.dns_servers)) != ARES_SUCCESS)
++            {
++              fprintf (stderr, _("Failed to set DNS server(s) '%s' (%d)\n"), opt.dns_servers, result);
++              exit (WGET_EXIT_GENERIC_ERROR);
++            }
++        }
++    }
++#endif
++
+ #ifdef __VMS
+   /* Set global ODS5 flag according to the specified destination (if
+      any), otherwise according to the current default device.
+diff --git a/src/options.h b/src/options.h
+index 5cd5fb1..b936f51 100644
+--- a/src/options.h
++++ b/src/options.h
+@@ -99,6 +99,11 @@ struct options
+   void *(*regex_compile_fun)(const char *);             /* Function to compile a regex. */
+   bool (*regex_match_fun)(const void *, const char *);  /* Function to match a string to a regex. */
+ 
++#ifdef HAVE_LIBCARES
++  char *bind_dns_address;
++  char *dns_servers;
++#endif
++
+   char **domains;               /* See host.c */
+   char **exclude_domains;
+   bool dns_cache;               /* whether we cache DNS lookups. */
+-- 
+cgit v1.0-41-gc330
+

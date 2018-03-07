@@ -1,0 +1,814 @@
+diff --git a/TODO b/TODO
+index 7b54483..0f2ea12 100644
+--- a/TODO
++++ b/TODO
+@@ -15,16 +15,6 @@ represent user-visible changes.
+   file name.  If possible, try not to break `-nc' and friends when
+   doing that.
+ 
+-* Should allow retries with multiple downloads when using -O on
+-  regular files.  As the source comment says: "A possible solution to
+-  [rewind not working with multiple downloads] would be to remember
+-  the file position in the output document and to seek to that
+-  position, instead of rewinding."
+-
+-  But the above won't work for -O/dev/stdout, when stdout is a pipe.
+-  An even better solution would be to simply keep writing to the same
+-  file descriptor each time, instead of reopening it in append mode.
+-
+ * Wget shouldn't delete rejected files that were not downloaded, but
+   just found on disk because of `-nc'.  For example, `wget -r -nc
+   -A.gif URL' should allow the user to get all the GIFs without
+diff --git a/src/ChangeLog b/src/ChangeLog
+index 57e27d7..d5b86c0 100644
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,5 +1,25 @@
+ 2003-11-30  Hrvoje Niksic  <hniksic@xemacs.org>
+ 
++	* retr.c (fd_read_body): Report the amount of data *written* as
++	amount_read.  This is not entirely logical, but that's what the
++	callers expect, and it's not easy to change.
++
++	* ftp.c (ftp_loop_internal): Ditto.
++
++	* http.c (http_loop): Be smarter about assigning restval; if we're
++	in the nth pass of a download, simply use the information we have
++	about how much data has been retrieved as restval.
++
++	* ftp.c (getftp): Ditto for FTP "REST" command.
++
++	* http.c (gethttp): When the server doesn't respect range, skip
++	the first RESTVAL bytes of the read body.  Never truncate the
++	output file.
++
++	* retr.c (fd_read_body): Support skipping initial STARTPOS octets.
++
++2003-11-30  Hrvoje Niksic  <hniksic@xemacs.org>
++
+ 	* http.c (skip_short_body): Renamed skip_body to skip_short_body;
+ 	don't bother calling fd_read_body.
+ 
+diff --git a/src/ftp-ls.c b/src/ftp-ls.c
+index d1172de..5c85322 100644
+--- a/src/ftp-ls.c
++++ b/src/ftp-ls.c
+@@ -48,6 +48,8 @@ so, delete this exception statement from your version.  */
+ #include "ftp.h"
+ #include "url.h"
+ 
++extern FILE *output_stream;
++
+ /* Converts symbolic permissions to number-style ones, e.g. string
+    rwxr-xr-x to 755.  For now, it knows nothing of
+    setuid/setgid/sticky.  ACLs are ignored.  */
+@@ -827,7 +829,7 @@ ftp_index (const char *file, struct url *u, struct fileinfo *f)
+   char *upwd;
+   char *htclfile;		/* HTML-clean file name */
+ 
+-  if (!opt.dfp)
++  if (!output_stream)
+     {
+       fp = fopen (file, "wb");
+       if (!fp)
+@@ -837,7 +839,7 @@ ftp_index (const char *file, struct url *u, struct fileinfo *f)
+ 	}
+     }
+   else
+-    fp = opt.dfp;
++    fp = output_stream;
+   if (u->user)
+     {
+       char *tmpu, *tmpp;        /* temporary, clean user and passwd */
+@@ -919,7 +921,7 @@ ftp_index (const char *file, struct url *u, struct fileinfo *f)
+     }
+   fprintf (fp, "</pre>\n</body>\n</html>\n");
+   xfree (upwd);
+-  if (!opt.dfp)
++  if (!output_stream)
+     fclose (fp);
+   else
+     fflush (fp);
+diff --git a/src/ftp.c b/src/ftp.c
+index 1dd381b..436a8f5 100644
+--- a/src/ftp.c
++++ b/src/ftp.c
+@@ -66,6 +66,9 @@ extern LARGE_INT total_downloaded_bytes;
+ 
+ extern char ftp_last_respline[];
+ 
++extern FILE *output_stream;
++extern int output_stream_regular;
++
+ typedef struct
+ {
+   int st;			/* connection status */
+@@ -241,6 +244,8 @@ getftp (struct url *u, long *len, long restval, ccon *con)
+   int cmd = con->cmd;
+   int pasv_mode_open = 0;
+   long expected_bytes = 0L;
++  int rest_failed = 0;
++  int flags;
+ 
+   assert (con != NULL);
+   assert (con->target != NULL);
+@@ -791,22 +796,8 @@ Error in server response, closing control connection.\n"));
+ 	  return err;
+ 	  break;
+ 	case FTPRESTFAIL:
+-	  /* If `-c' is specified and the file already existed when
+-	     Wget was started, it would be a bad idea for us to start
+-	     downloading it from scratch, effectively truncating it.  */
+-	  if (opt.always_rest && (cmd & NO_TRUNCATE))
+-	    {
+-	      logprintf (LOG_NOTQUIET,
+-			 _("\nREST failed; will not truncate `%s'.\n"),
+-			 con->target);
+-	      fd_close (csock);
+-	      con->csock = -1;
+-	      fd_close (dtsock);
+-	      fd_close (local_sock);
+-	      return CONTNOTSUPPORTED;
+-	    }
+ 	  logputs (LOG_VERBOSE, _("\nREST failed, starting from scratch.\n"));
+-	  restval = 0L;
++	  rest_failed = 1;
+ 	  break;
+ 	case FTPOK:
+ 	  /* fine and dandy */
+@@ -965,8 +956,8 @@ Error in server response, closing control connection.\n"));
+ 	}
+     }
+ 
+-  /* Open the file -- if opt.dfp is set, use it instead.  */
+-  if (!opt.dfp || con->cmd & DO_LIST)
++  /* Open the file -- if output_stream is set, use it instead.  */
++  if (!output_stream || con->cmd & DO_LIST)
+     {
+       mkalldirs (con->target);
+       if (opt.backups)
+@@ -986,24 +977,7 @@ Error in server response, closing control connection.\n"));
+ 	}
+     }
+   else
+-    {
+-      extern int global_download_count;
+-      fp = opt.dfp;
+-
+-      /* Rewind the output document if the download starts over and if
+-	 this is the first download.  See gethttp() for a longer
+-	 explanation.  */
+-      if (!restval && global_download_count == 0 && opt.dfp != stdout)
+-	{
+-	  /* This will silently fail for streams that don't correspond
+-	     to regular files, but that's OK.  */
+-	  rewind (fp);
+-	  /* ftruncate is needed because opt.dfp is opened in append
+-	     mode if opt.always_rest is set.  */
+-	  ftruncate (fileno (fp), 0);
+-	  clearerr (fp);
+-	}
+-    }
++    fp = output_stream;
+ 
+   if (*len)
+     {
+@@ -1023,9 +997,12 @@ Error in server response, closing control connection.\n"));
+     }
+ 
+   /* Get the contents of the document.  */
++  flags = 0;
++  if (restval && rest_failed)
++    flags |= rb_skip_startpos;
+   res = fd_read_body (dtsock, fp,
+ 		      expected_bytes ? expected_bytes - restval : 0,
+-		      0, restval, len, &con->dltime);
++		      restval, len, &con->dltime, flags);
+   *len += restval;
+ 
+   tms = time_str (NULL);
+@@ -1039,7 +1016,7 @@ Error in server response, closing control connection.\n"));
+        error here.  Checking the result of fwrite() is not enough --
+        errors could go unnoticed!  */
+     int flush_res;
+-    if (!opt.dfp || con->cmd & DO_LIST)
++    if (!output_stream || con->cmd & DO_LIST)
+       flush_res = fclose (fp);
+     else
+       flush_res = fflush (fp);
+@@ -1105,8 +1082,8 @@ Error in server response, closing control connection.\n"));
+ 
+   if (!(cmd & LEAVE_PENDING))
+     {
+-      /* I should probably send 'QUIT' and check for a reply, but this
+-	 is faster.  #### Is it OK, though?  */
++      /* Closing the socket is faster than sending 'QUIT' and the
++	 effect is the same.  */
+       fd_close (csock);
+       con->csock = -1;
+     }
+@@ -1144,7 +1121,7 @@ static uerr_t
+ ftp_loop_internal (struct url *u, struct fileinfo *f, ccon *con)
+ {
+   int count, orig_lp;
+-  long restval, len;
++  long restval, len = 0;
+   char *tms, *locf;
+   char *tmrate = NULL;
+   uerr_t err;
+@@ -1202,20 +1179,14 @@ ftp_loop_internal (struct url *u, struct fileinfo *f, ccon *con)
+ 	    con->cmd |= DO_CWD;
+ 	}
+ 
+-      /* Assume no restarting.  */
+-      restval = 0L;
+-      if ((count > 1 || opt.always_rest)
+-	  && !(con->cmd & DO_LIST)
+-	  && file_exists_p (locf))
+-	if (stat (locf, &st) == 0 && S_ISREG (st.st_mode))
+-	  restval = st.st_size;
+-
+-      /* In `-c' is used, check whether the file we're writing to
+-	 exists and is of non-zero length.  If so, we'll refuse to
+-	 truncate it if the server doesn't support continued
+-	 downloads.  */
+-      if (opt.always_rest && restval > 0)
+-	con->cmd |= NO_TRUNCATE;
++      /* Decide whether or not to restart.  */
++      restval = 0;
++      if (count > 1)
++	restval = len;		/* start where the previous run left off */
++      else if (opt.always_rest
++	       && stat (locf, &st) == 0
++	       && S_ISREG (st.st_mode))
++	restval = st.st_size;
+ 
+       /* Get the current time string.  */
+       tms = time_str (NULL);
+@@ -1601,7 +1572,7 @@ Already have correct symlink %s -> %s\n\n"),
+ 	  const char *fl = NULL;
+ 	  if (opt.output_document)
+ 	    {
+-	      if (opt.od_known_regular)
++	      if (output_stream_regular)
+ 		fl = opt.output_document;
+ 	    }
+ 	  else
+diff --git a/src/ftp.h b/src/ftp.h
+index aaaff47..5de9c5f 100644
+--- a/src/ftp.h
++++ b/src/ftp.h
+@@ -104,9 +104,7 @@ enum wget_ftp_command
+   DO_CWD        = 0x0002,	/* Change current directory.  */
+   DO_RETR       = 0x0004,	/* Retrieve the file.  */
+   DO_LIST       = 0x0008,	/* Retrieve the directory list.  */
+-  LEAVE_PENDING = 0x0010,	/* Do not close the socket.  */
+-  NO_TRUNCATE	= 0x0020	/* Don't truncate the file if REST
+-				   malfunctions. */
++  LEAVE_PENDING = 0x0010	/* Do not close the socket.  */
+ };
+ 
+ enum wget_ftp_fstatus
+diff --git a/src/http.c b/src/http.c
+index 169cebe..a305cbe 100644
+--- a/src/http.c
++++ b/src/http.c
+@@ -1,6 +1,5 @@
+ /* HTTP support.
+-   Copyright (C) 1995, 1996, 1997, 1998, 2000, 2001, 2002
+-   Free Software Foundation, Inc.
++   Copyright (C) 2003 Free Software Foundation, Inc.
+ 
+ This file is part of GNU Wget.
+ 
+@@ -76,6 +75,9 @@ extern int errno;
+ extern char *version_string;
+ extern LARGE_INT total_downloaded_bytes;
+ 
++extern FILE *output_stream;
++extern int output_stream_regular;
++
+ #ifndef MIN
+ # define MIN(x, y) ((x) > (y) ? (y) : (x))
+ #endif
+@@ -114,6 +116,7 @@ struct cookie_jar *wget_cookie_jar;
+ #define HTTP_STATUS_UNAUTHORIZED	401
+ #define HTTP_STATUS_FORBIDDEN		403
+ #define HTTP_STATUS_NOT_FOUND		404
++#define HTTP_STATUS_RANGE_NOT_SATISFIABLE 416
+ 
+ /* Server errors 5xx.  */
+ #define HTTP_STATUS_INTERNAL		500
+@@ -978,8 +981,6 @@ struct http_stat
+   char *error;			/* textual HTTP error */
+   int statcode;			/* status code */
+   double dltime;		/* time of the download in msecs */
+-  int no_truncate;		/* whether truncating the file is
+-				   forbidden. */
+   const char *referer;		/* value of the referer header. */
+   char **local_file;		/* local file. */
+ };
+@@ -1035,6 +1036,7 @@ gethttp (struct url *u, struct http_stat *hs, int *dt, struct url *proxy)
+   FILE *fp;
+ 
+   int sock = -1;
++  int flags;
+ 
+   /* Whether authorization has been already tried. */
+   int auth_tried_already = 0;
+@@ -1617,68 +1619,28 @@ gethttp (struct url *u, struct http_stat *hs, int *dt, struct url *proxy)
+ 	}
+     }
+ 
+-  if (contrange == 0 && hs->restval > 0)
++  if (statcode == HTTP_STATUS_RANGE_NOT_SATISFIABLE)
+     {
+-      /* The download starts from the beginning, presumably because
+-	 the server did not honor our `Range' request.  Normally we'd
+-	 just reset hs->restval and start the download from
+-	 scratch.  */
+-
+-      /* However, if `-c' is used, we need to be a bit more careful:
+-
+-         1. If `-c' is specified and the file already existed when
+-         Wget was started, it would be a bad idea to start downloading
+-         it from scratch, effectively truncating the file.
+-
+-	 2. If `-c' is used on a file that is already fully
+-	 downloaded, we're requesting bytes after the end of file,
+-	 which can result in the server not honoring `Range'.  If this
+-	 is the case, `Content-Length' will be equal to the length of
+-	 the file.  */
+-      if (opt.always_rest)
+-	{
+-	  /* Check for condition #2. */
+-	  if (contlen != -1              /* we got content-length. */
+-	      && hs->restval >= contlen  /* file fully downloaded
+-					    or has shrunk.  */
+-	      )
+-	    {
+-	      logputs (LOG_VERBOSE, _("\
++      /* If `-c' is in use and the file has been fully downloaded (or
++	 the remote file has shrunk), Wget effectively requests bytes
++	 after the end of file and the server response with 416.  */
++      logputs (LOG_VERBOSE, _("\
+ \n    The file is already fully retrieved; nothing to do.\n\n"));
+-	      /* In case the caller inspects. */
+-	      hs->len = contlen;
+-	      hs->res = 0;
+-	      /* Mark as successfully retrieved. */
+-	      *dt |= RETROKF;
+-	      xfree_null (type);
+-	      CLOSE_INVALIDATE (sock);	/* would be CLOSE_FINISH, but there
+-					   might be more bytes in the body. */
+-	      return RETRUNNEEDED;
+-	    }
+-
+-	  /* Check for condition #1. */
+-	  if (hs->no_truncate)
+-	    {
+-	      logprintf (LOG_NOTQUIET,
+-			 _("\
+-\n\
+-Continued download failed on this file, which conflicts with `-c'.\n\
+-Refusing to truncate existing file `%s'.\n\n"), *hs->local_file);
+-	      xfree_null (type);
+-	      CLOSE_INVALIDATE (sock); /* see above */
+-	      return CONTNOTSUPPORTED;
+-	    }
+-
+-	  /* Fallthrough */
+-	}
+-
+-      hs->restval = 0;
++      /* In case the caller inspects. */
++      hs->len = contlen;
++      hs->res = 0;
++      /* Mark as successfully retrieved. */
++      *dt |= RETROKF;
++      xfree_null (type);
++      CLOSE_INVALIDATE (sock);	/* would be CLOSE_FINISH, but there
++				   might be more bytes in the body. */
++      return RETRUNNEEDED;
+     }
+-  else if (contrange != hs->restval ||
+-	   (H_PARTIAL (statcode) && contrange == -1))
++  if ((contrange != 0 && contrange != hs->restval)
++      || (H_PARTIAL (statcode) && !contrange))
+     {
+-      /* This means the whole request was somehow misunderstood by the
+-	 server.  Bail out.  */
++      /* The Range request was somehow misunderstood by the server.
++	 Bail out.  */
+       xfree_null (type);
+       CLOSE_INVALIDATE (sock);
+       return RANGEERR;
+@@ -1727,7 +1689,7 @@ Refusing to truncate existing file `%s'.\n\n"), *hs->local_file);
+     }
+ 
+   /* Open the local file.  */
+-  if (!opt.dfp)
++  if (!output_stream)
+     {
+       mkalldirs (*hs->local_file);
+       if (opt.backups)
+@@ -1736,53 +1698,27 @@ Refusing to truncate existing file `%s'.\n\n"), *hs->local_file);
+       if (!fp)
+ 	{
+ 	  logprintf (LOG_NOTQUIET, "%s: %s\n", *hs->local_file, strerror (errno));
+-	  CLOSE_INVALIDATE (sock); /* would be CLOSE_FINISH, but there
+-				      might be more bytes in the body. */
++	  CLOSE_INVALIDATE (sock);
+ 	  return FOPENERR;
+ 	}
+     }
+-  else				/* opt.dfp */
+-    {
+-      extern int global_download_count;
+-      fp = opt.dfp;
+-      /* To ensure that repeated "from scratch" downloads work for -O
+-	 files, we rewind the file pointer, unless restval is
+-	 non-zero.  (This works only when -O is used on regular files,
+-	 but it's still a valuable feature.)
+-
+-	 However, this loses when more than one URL is specified on
+-	 the command line the second rewinds eradicates the contents
+-	 of the first download.  Thus we disable the above trick for
+-	 all the downloads except the very first one.
+-
+-         #### A possible solution to this would be to remember the
+-	 file position in the output document and to seek to that
+-	 position, instead of rewinding.
+-
+-         We don't truncate stdout, since that breaks
+-	 "wget -O - [...] >> foo".
+-      */
+-      if (!hs->restval && global_download_count == 0 && opt.dfp != stdout)
+-	{
+-	  /* This will silently fail for streams that don't correspond
+-	     to regular files, but that's OK.  */
+-	  rewind (fp);
+-	  /* ftruncate is needed because opt.dfp is opened in append
+-	     mode if opt.always_rest is set.  */
+-	  ftruncate (fileno (fp), 0);
+-	  clearerr (fp);
+-	}
+-    }
++  else
++    fp = output_stream;
+ 
+-  /* #### This confuses the code that checks for file size.  There
+-     should be some overhead information.  */
++  /* #### This confuses the timestamping code that checks for file
++     size.  Maybe we should save some additional information?  */
+   if (opt.save_headers)
+     fwrite (head, 1, strlen (head), fp);
+ 
+   /* Download the request body.  */
+-  hs->res = fd_read_body (sock, fp, contlen != -1 ? contlen : 0, keep_alive,
+-			  hs->restval, &hs->len, &hs->dltime);
+-  hs->len += contrange;
++  flags = 0;
++  if (keep_alive)
++    flags |= rb_read_exactly;
++  if (hs->restval > 0 && contrange == 0)
++    flags |= rb_skip_startpos;
++  hs->res = fd_read_body (sock, fp, contlen != -1 ? contlen : 0,
++			  hs->restval, &hs->len, &hs->dltime, flags);
++  hs->len += hs->restval;
+ 
+   if (hs->res >= 0)
+     CLOSE_FINISH (sock);
+@@ -1794,7 +1730,7 @@ Refusing to truncate existing file `%s'.\n\n"), *hs->local_file);
+        error here.  Checking the result of fwrite() is not enough --
+        errors could go unnoticed!  */
+     int flush_res;
+-    if (!opt.dfp)
++    if (!output_stream)
+       flush_res = fclose (fp);
+     else
+       flush_res = fflush (fp);
+@@ -1847,6 +1783,8 @@ http_loop (struct url *u, char **newloc, char **local_file, const char *referer,
+   if (strchr (u->url, '*'))
+     logputs (LOG_VERBOSE, _("Warning: wildcards not supported in HTTP.\n"));
+ 
++  xzero (hstat);
++
+   /* Determine the local filename.  */
+   if (local_file && *local_file)
+     hstat.local_file = local_file;
+@@ -1947,7 +1885,7 @@ File `%s' already there, will not retrieve.\n"), *hstat.local_file);
+     }
+   /* Reset the counter.  */
+   count = 0;
+-  *dt = 0 | ACCEPTRANGES;
++  *dt = 0;
+   /* THE loop */
+   do
+     {
+@@ -1979,21 +1917,15 @@ File `%s' already there, will not retrieve.\n"), *hstat.local_file);
+ 	*dt |= HEAD_ONLY;
+       else
+ 	*dt &= ~HEAD_ONLY;
+-      /* Assume no restarting.  */
+-      hstat.restval = 0L;
++
+       /* Decide whether or not to restart.  */
+-      if (((count > 1 && (*dt & ACCEPTRANGES)) || opt.always_rest)
+-	  /* #### this calls access() and then stat(); could be optimized. */
+-	  && file_exists_p (locf))
+-	if (stat (locf, &st) == 0 && S_ISREG (st.st_mode))
+-	  hstat.restval = st.st_size;
+-
+-      /* In `-c' is used and the file is existing and non-empty,
+-	 refuse to truncate it if the server doesn't support continued
+-	 downloads.  */
+-      hstat.no_truncate = 0;
+-      if (opt.always_rest && hstat.restval)
+-	hstat.no_truncate = 1;
++      hstat.restval = 0;
++      if (count > 1)
++	hstat.restval = hstat.len; /* continue where we left off */
++      else if (opt.always_rest
++	       && stat (locf, &st) == 0
++	       && S_ISREG (st.st_mode))
++	hstat.restval = st.st_size;
+ 
+       /* Decide whether to send the no-cache directive.  We send it in
+ 	 two cases:
+@@ -2171,7 +2103,7 @@ The sizes do not match (local %ld) -- retrieving.\n"), local_size);
+ 	  const char *fl = NULL;
+ 	  if (opt.output_document)
+ 	    {
+-	      if (opt.od_known_regular)
++	      if (output_stream_regular)
+ 		fl = opt.output_document;
+ 	    }
+ 	  else
+diff --git a/src/init.c b/src/init.c
+index b48a57c..8624f12 100644
+--- a/src/init.c
++++ b/src/init.c
+@@ -1284,8 +1284,13 @@ cleanup (void)
+ {
+   /* Free external resources, close files, etc. */
+ 
+-  if (opt.dfp)
+-    fclose (opt.dfp);
++  {
++    extern FILE *output_stream;
++    if (output_stream)
++      fclose (output_stream);
++    /* No need to check for error because Wget flushes its output (and
++       checks for errors) after any data arrives.  */
++  }
+ 
+   /* We're exiting anyway so there's no real need to call free()
+      hundreds of times.  Skipping the frees will make Wget exit
+diff --git a/src/main.c b/src/main.c
+index f76380b..29eb99d 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -864,19 +864,23 @@ Can't timestamp and not clobber old files at the same time.\n"));
+   /* Open the output filename if necessary.  */
+   if (opt.output_document)
+     {
++      extern FILE *output_stream;
++      extern int output_stream_regular;
++
+       if (HYPHENP (opt.output_document))
+-	opt.dfp = stdout;
++	output_stream = stdout;
+       else
+ 	{
+ 	  struct stat st;
+-	  opt.dfp = fopen (opt.output_document, opt.always_rest ? "ab" : "wb");
+-	  if (opt.dfp == NULL)
++	  output_stream = fopen (opt.output_document,
++				 opt.always_rest ? "ab" : "wb");
++	  if (output_stream == NULL)
+ 	    {
+ 	      perror (opt.output_document);
+ 	      exit (1);
+ 	    }
+-	  if (fstat (fileno (opt.dfp), &st) == 0 && S_ISREG (st.st_mode))
+-	    opt.od_known_regular = 1;
++	  if (fstat (fileno (output_stream), &st) == 0 && S_ISREG (st.st_mode))
++	    output_stream_regular = 1;
+ 	}
+     }
+ 
+diff --git a/src/options.h b/src/options.h
+index e643489..f547486 100644
+--- a/src/options.h
++++ b/src/options.h
+@@ -81,11 +81,6 @@ struct options
+ 				   FTP. */
+   char *output_document;	/* The output file to which the
+ 				   documents will be printed.  */
+-  int od_known_regular;		/* whether output_document is a
+-                                   regular file we can manipulate,
+-                                   i.e. not `-' or a device file. */
+-  FILE *dfp;			/* The file pointer to the output
+-				   document. */
+ 
+   int always_rest;		/* Always use REST. */
+   char *ftp_acc;		/* FTP username */
+diff --git a/src/retr.c b/src/retr.c
+index c395939..73425cb 100644
+--- a/src/retr.c
++++ b/src/retr.c
+@@ -63,12 +63,16 @@ so, delete this exception statement from your version.  */
+ extern int errno;
+ #endif
+ 
+-/* See the comment in gethttp() why this is needed. */
+-int global_download_count;
+-
+ /* Total size of downloaded files.  Used to enforce quota.  */
+ LARGE_INT total_downloaded_bytes;
+ 
++/* If non-NULL, the stream to which output should be written.  This
++   stream is initialized when `-O' is used.  */
++FILE *output_stream;
++
++/* Whether output_document is a regular file we can manipulate,
++   i.e. not `-' or a device file. */
++int output_stream_regular;
+ 
+ static struct {
+   long chunk_bytes;
+@@ -133,18 +137,51 @@ limit_bandwidth (long bytes, struct wget_timer *timer)
+ # define MIN(i, j) ((i) <= (j) ? (i) : (j))
+ #endif
+ 
++/* Write data in BUF to OUT.  However, if *SKIP is non-zero, skip that
++   amount of data and decrease SKIP.  Increment *TOTAL by the amount
++   of data written.  */
++
++static int
++write_data (FILE *out, const char *buf, int bufsize, long *skip,
++	    long *transferred)
++{
++  if (!out)
++    return 1;
++  if (*skip > bufsize)
++    {
++      *skip -= bufsize;
++      return 1;
++    }
++  if (*skip)
++    {
++      buf += *skip;
++      bufsize -= *skip;
++      *skip = 0;
++      if (bufsize == 0)
++	return 1;
++    }
++  *transferred += bufsize;
++  fwrite (buf, 1, bufsize, out);
++
++  /* Immediately flush the downloaded data.  This should not hinder
++     performance: fast downloads will arrive in large 16K chunks
++     (which stdio would write out immediately anyway), and slow
++     downloads wouldn't be limited by disk speed.  */
++  fflush (out);
++  return !ferror (out);
++}
++
+ /* Read the contents of file descriptor FD until it the connection
+    terminates or a read error occurs.  The data is read in portions of
+    up to 16K and written to OUT as it arrives.  If opt.verbose is set,
+    the progress is shown.
+ 
+    TOREAD is the amount of data expected to arrive, normally only used
+-   by the progress gauge.  However, if EXACT is set, no more than
+-   TOREAD octets will be read.
++   by the progress gauge.
+ 
+    STARTPOS is the position from which the download starts, used by
+    the progress gauge.  The amount of data read gets stored to
+-   *AMOUNT_READ.  The time it took to download the data (in
++   *TRANSFERRED.  The time it took to download the data (in
+    milliseconds) is stored to *ELAPSED.
+ 
+    The function exits and returns the amount of data read.  In case of
+@@ -152,8 +189,8 @@ limit_bandwidth (long bytes, struct wget_timer *timer)
+    writing data, -2 is returned.  */
+ 
+ int
+-fd_read_body (int fd, FILE *out, long toread, int exact, long startpos,
+-	      long *amount_read, double *elapsed)
++fd_read_body (int fd, FILE *out, long toread, long startpos,
++	      long *transferred, double *elapsed, int flags)
+ {
+   int ret = 0;
+ 
+@@ -172,11 +209,22 @@ fd_read_body (int fd, FILE *out, long toread, int exact, long startpos,
+      data arrives slowly. */
+   int progress_interactive = 0;
+ 
+-  *amount_read = 0;
++  int exact = flags & rb_read_exactly;
++  long skip = 0;
++
++  /* How much data we've read.  This is used internally and is
++     unaffected by skipping STARTPOS.  */
++  long total_read = 0;
++
++  *transferred = 0;
++  if (flags & rb_skip_startpos)
++    skip = startpos;
+ 
+   if (opt.verbose)
+     {
+-      progress = progress_create (startpos, toread);
++      /* If we're skipping STARTPOS bytes, hide it from
++	 progress_create because the indicator can't deal with it.  */
++      progress = progress_create (skip ? 0 : startpos, toread);
+       progress_interactive = progress_interactive_p (progress);
+     }
+ 
+@@ -203,9 +251,9 @@ fd_read_body (int fd, FILE *out, long toread, int exact, long startpos,
+      means that it is unknown how much data is to arrive.  However, if
+      EXACT is set, then toread==0 means what it says: that no data
+      should be read.  */
+-  while (!exact || (*amount_read < toread))
++  while (!exact || (total_read < toread))
+     {
+-      int rdsize = exact ? MIN (toread - *amount_read, dlbufsize) : dlbufsize;
++      int rdsize = exact ? MIN (toread - total_read, dlbufsize) : dlbufsize;
+       double tmout = opt.read_timeout;
+       if (progress_interactive)
+ 	{
+@@ -241,15 +289,10 @@ fd_read_body (int fd, FILE *out, long toread, int exact, long startpos,
+ 	    last_successful_read_tm = wtimer_read (timer);
+ 	}
+ 
+-      if (ret > 0 && out != NULL)
++      if (ret > 0)
+ 	{
+-	  fwrite (dlbuf, 1, ret, out);
+-	  /* Immediately flush the downloaded data.  This should not
+-	     hinder performance: fast downloads will arrive in large
+-	     16K chunks (which stdio would write out anyway), and slow
+-	     downloads wouldn't be limited by disk speed.  */
+-	  fflush (out);
+-	  if (ferror (out))
++	  total_read += ret;
++	  if (!write_data (out, dlbuf, ret, &skip, transferred))
+ 	    {
+ 	      ret = -2;
+ 	      goto out;
+@@ -259,13 +302,12 @@ fd_read_body (int fd, FILE *out, long toread, int exact, long startpos,
+       if (opt.limit_rate)
+ 	limit_bandwidth (ret, timer);
+ 
+-      *amount_read += ret;
+       if (progress)
+ 	progress_update (progress, ret, wtimer_read (timer));
+ #ifdef WINDOWS
+       if (toread > 0)
+ 	ws_percenttitle (100.0 *
+-			 (startpos + *amount_read) / (startpos + toread));
++			 (startpos + total_read) / (startpos + toread));
+ #endif
+     }
+   if (ret < -1)
+@@ -713,7 +755,6 @@ retrieve_url (const char *origurl, char **file, char **newloc,
+       xfree (url);
+     }
+ 
+-  ++global_download_count;
+   RESTORE_POST_DATA;
+ 
+   return result;
+diff --git a/src/retr.h b/src/retr.h
+index 047b4f9..da93734 100644
+--- a/src/retr.h
++++ b/src/retr.h
+@@ -30,13 +30,19 @@ so, delete this exception statement from your version.  */
+ #ifndef RETR_H
+ #define RETR_H
+ 
++/* Flags for fd_read_body. */
++enum {
++  rb_read_exactly  = 1,
++  rb_skip_startpos = 2
++};
++
++int fd_read_body PARAMS ((int, FILE *, long, long, long *, double *, int));
++
+ typedef const char *(*hunk_terminator_t) PARAMS ((const char *, int, int));
+ 
+ char *fd_read_hunk PARAMS ((int, hunk_terminator_t, int));
+ char *fd_read_line PARAMS ((int));
+ 
+-int fd_read_body PARAMS ((int, FILE *, long, int, long, long *, double *));
+-
+ uerr_t retrieve_url PARAMS ((const char *, char **, char **,
+ 			     const char *, int *));
+ uerr_t retrieve_from_file PARAMS ((const char *, int, int *));
+-- 
+cgit v1.0-41-gc330
+

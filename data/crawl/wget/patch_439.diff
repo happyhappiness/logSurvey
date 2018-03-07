@@ -1,0 +1,514 @@
+diff --git a/src/ChangeLog b/src/ChangeLog
+index 7e4088f..984a344 100644
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,5 +1,21 @@
+ 2005-07-03  Hrvoje Niksic  <hniksic@xemacs.org>
+ 
++	* ftp.c (getftp): Ditto.
++
++	* http.c (gethttp): Use fd_errstr.
++
++	* connect.c (fd_register_transport): Restructure parameters to
++	include only a single structure that describes transport
++	implementation.
++
++	* openssl.c (openssl_errstr): New function: dump SSL error strings
++	into a static buffer and return a pointer to the buffer.
++
++	* connect.c (fd_errstr): New function; returns transport-specific
++	error message, or strerror(errno) if transport doesn't supply one.
++
++2005-07-03  Hrvoje Niksic  <hniksic@xemacs.org>
++
+ 	* mswindows.h: Also wrap accept() and listen().
+ 
+ 2005-07-03  Hrvoje Niksic  <hniksic@xemacs.org>
+diff --git a/src/connect.c b/src/connect.c
+index 295aeb8..35f50cc 100644
+--- a/src/connect.c
++++ b/src/connect.c
+@@ -732,14 +732,10 @@ sock_close (int fd)
+    or SSL_read or whatever is necessary.  */
+ 
+ static struct hash_table *transport_map;
+-static int transport_map_modified_tick;
++static unsigned int transport_map_modified_tick;
+ 
+ struct transport_info {
+-  fd_reader_t reader;
+-  fd_writer_t writer;
+-  fd_poller_t poller;
+-  fd_peeker_t peeker;
+-  fd_closer_t closer;
++  struct transport_implementation *imp;
+   void *ctx;
+ };
+ 
+@@ -751,9 +747,7 @@ struct transport_info {
+    call getpeername, etc.  */
+ 
+ void
+-fd_register_transport (int fd, fd_reader_t reader, fd_writer_t writer,
+-		       fd_poller_t poller, fd_peeker_t peeker,
+-		       fd_closer_t closer, void *ctx)
++fd_register_transport (int fd, struct transport_implementation *imp, void *ctx)
+ {
+   struct transport_info *info;
+ 
+@@ -763,11 +757,7 @@ fd_register_transport (int fd, fd_reader_t reader, fd_writer_t writer,
+   assert (fd >= 0);
+ 
+   info = xnew (struct transport_info);
+-  info->reader = reader;
+-  info->writer = writer;
+-  info->poller = poller;
+-  info->peeker = peeker;
+-  info->closer = closer;
++  info->imp = imp;
+   info->ctx = ctx;
+   if (!transport_map)
+     transport_map = hash_table_new (0, NULL, NULL);
+@@ -819,8 +809,8 @@ poll_internal (int fd, struct transport_info *info, int wf, double timeout)
+   if (timeout)
+     {
+       int test;
+-      if (info && info->poller)
+-	test = info->poller (fd, timeout, wf, info->ctx);
++      if (info && info->imp->poller)
++	test = info->imp->poller (fd, timeout, wf, info->ctx);
+       else
+ 	test = sock_poll (fd, timeout, wf);
+       if (test == 0)
+@@ -843,8 +833,8 @@ fd_read (int fd, char *buf, int bufsize, double timeout)
+   LAZY_RETRIEVE_INFO (info);
+   if (!poll_internal (fd, info, WAIT_FOR_READ, timeout))
+     return -1;
+-  if (info && info->reader)
+-    return info->reader (fd, buf, bufsize, info->ctx);
++  if (info && info->imp->reader)
++    return info->imp->reader (fd, buf, bufsize, info->ctx);
+   else
+     return sock_read (fd, buf, bufsize);
+ }
+@@ -868,8 +858,8 @@ fd_peek (int fd, char *buf, int bufsize, double timeout)
+   LAZY_RETRIEVE_INFO (info);
+   if (!poll_internal (fd, info, WAIT_FOR_READ, timeout))
+     return -1;
+-  if (info && info->peeker)
+-    return info->peeker (fd, buf, bufsize, info->ctx);
++  if (info && info->imp->peeker)
++    return info->imp->peeker (fd, buf, bufsize, info->ctx);
+   else
+     return sock_peek (fd, buf, bufsize);
+ }
+@@ -893,8 +883,8 @@ fd_write (int fd, char *buf, int bufsize, double timeout)
+     {
+       if (!poll_internal (fd, info, WAIT_FOR_WRITE, timeout))
+ 	return -1;
+-      if (info && info->writer)
+-	res = info->writer (fd, buf, bufsize, info->ctx);
++      if (info && info->imp->writer)
++	res = info->imp->writer (fd, buf, bufsize, info->ctx);
+       else
+ 	res = sock_write (fd, buf, bufsize);
+       if (res <= 0)
+@@ -905,6 +895,34 @@ fd_write (int fd, char *buf, int bufsize, double timeout)
+   return res;
+ }
+ 
++/* Report the most recent error(s) on FD.  This should only be called
++   after fd_* functions, such as fd_read and fd_write, and only if
++   they return a negative result.  For errors coming from other calls
++   such as setsockopt or fopen, strerror should continue to be
++   used.
++
++   If the transport doesn't support error messages or doesn't supply
++   one, strerror(errno) is returned.  */
++
++const char *
++fd_errstr (int fd)
++{
++  /* Don't bother with LAZY_RETRIEVE_INFO, as this will only be called
++     in case of error, never in a tight loop.  */
++  struct transport_info *info = NULL;
++  if (transport_map)
++    info = hash_table_get (transport_map, (void *) fd);
++
++  if (info && info->imp->errstr)
++    {
++      const char *err = info->imp->errstr (fd, info->ctx);
++      if (err)
++	return err;
++      /* else, fall through and print the system error. */
++    }
++  return strerror (errno);
++}
++
+ /* Close the file descriptor FD.  */
+ 
+ void
+@@ -920,8 +938,8 @@ fd_close (int fd)
+   if (transport_map)
+     info = hash_table_get (transport_map, (void *) fd);
+ 
+-  if (info && info->closer)
+-    info->closer (fd, info->ctx);
++  if (info && info->imp->closer)
++    info->imp->closer (fd, info->ctx);
+   else
+     sock_close (fd);
+ 
+diff --git a/src/connect.h b/src/connect.h
+index 18ee75a..643c72f 100644
+--- a/src/connect.h
++++ b/src/connect.h
+@@ -60,17 +60,21 @@ enum {
+ int select_fd (int, double, int);
+ bool test_socket_open (int);
+ 
+-typedef int (*fd_reader_t) (int, char *, int, void *);
+-typedef int (*fd_writer_t) (int, char *, int, void *);
+-typedef int (*fd_poller_t) (int, double, int, void *);
+-typedef int (*fd_peeker_t) (int, char *, int, void *);
+-typedef void (*fd_closer_t) (int, void *);
+-void fd_register_transport (int, fd_reader_t, fd_writer_t,
+-			    fd_poller_t, fd_peeker_t, fd_closer_t, void *);
+-void *fd_transport_context (int);
++struct transport_implementation {
++  int (*reader) (int, char *, int, void *);
++  int (*writer) (int, char *, int, void *);
++  int (*poller) (int, double, int, void *);
++  int (*peeker) (int, char *, int, void *);
++  const char *(*errstr) (int, void *);
++  void (*closer) (int, void *);
++};
+ 
++void fd_register_transport (int, struct transport_implementation *, void *);
++void *fd_transport_context (int);
+ int fd_read (int, char *, int, double);
+ int fd_write (int, char *, int, double);
+ int fd_peek (int, char *, int, double);
++const char *fd_errstr (int);
+ void fd_close (int);
++
+ #endif /* CONNECT_H */
+diff --git a/src/ftp.c b/src/ftp.c
+index 3c97862..60d9b4a 100644
+--- a/src/ftp.c
++++ b/src/ftp.c
+@@ -952,7 +952,7 @@ Error in server response, closing control connection.\n"));
+   if (*len)
+     {
+       print_length (*len, restval, true);
+-      expected_bytes = *len;	/* for get_contents/show_progress */
++      expected_bytes = *len;	/* for fd_read_body's progress bar */
+     }
+   else if (expected_bytes)
+     print_length (expected_bytes, restval, false);
+@@ -971,39 +971,29 @@ Error in server response, closing control connection.\n"));
+   tmrate = retr_rate (rd_size, con->dltime);
+   total_download_time += con->dltime;
+ 
+-  /* Close data connection socket.  */
+-  fd_close (dtsock);
+   fd_close (local_sock);
+   /* Close the local file.  */
+-  {
+-    /* Close or flush the file.  We have to be careful to check for
+-       error here.  Checking the result of fwrite() is not enough --
+-       errors could go unnoticed!  */
+-    int flush_res;
+-    if (!output_stream || con->cmd & DO_LIST)
+-      flush_res = fclose (fp);
+-    else
+-      flush_res = fflush (fp);
+-    if (flush_res == EOF)
+-      res = -2;
+-  }
+-
+-  /* If get_contents couldn't write to fp, bail out.  */
++  if (!output_stream || con->cmd & DO_LIST)
++    fclose (fp);
++
++  /* If fd_read_body couldn't write to fp, bail out.  */
+   if (res == -2)
+     {
+       logprintf (LOG_NOTQUIET, _("%s: %s, closing control connection.\n"),
+ 		 con->target, strerror (errno));
+       fd_close (csock);
+       con->csock = -1;
++      fd_close (dtsock);
+       return FWRITEERR;
+     }
+   else if (res == -1)
+     {
+       logprintf (LOG_NOTQUIET, _("%s (%s) - Data connection: %s; "),
+-		 tms, tmrate, strerror (errno));
++		 tms, tmrate, fd_errstr (dtsock));
+       if (opt.server_response)
+ 	logputs (LOG_ALWAYS, "\n");
+     }
++  fd_close (dtsock);
+ 
+   /* Get the server to tell us if everything is retrieved.  */
+   err = ftp_response (csock, &respline);
+diff --git a/src/http.c b/src/http.c
+index b188971..9b02e37 100644
+--- a/src/http.c
++++ b/src/http.c
+@@ -352,7 +352,7 @@ request_send (const struct request *req, int fd)
+   write_error = fd_write (fd, request_string, size - 1, -1);
+   if (write_error < 0)
+     logprintf (LOG_VERBOSE, _("Failed writing HTTP request: %s.\n"),
+-	       strerror (errno));
++	       fd_errstr (fd));
+   return write_error;
+ }
+ 
+@@ -838,7 +838,7 @@ skip_short_body (int fd, wgint contlen)
+ 	  /* Don't normally report the error since this is an
+ 	     optimization that should be invisible to the user.  */
+ 	  DEBUGP (("] aborting (%s).\n",
+-		   ret < 0 ? strerror (errno) : "EOF received"));
++		   ret < 0 ? fd_errstr (fd) : "EOF received"));
+ 	  return false;
+ 	}
+       contlen -= ret;
+@@ -1075,6 +1075,7 @@ struct http_stat
+   wgint contlen;		/* expected length */
+   wgint restval;		/* the restart value */
+   int res;			/* the result of last read */
++  const char *errstr;		/* error message from read error */
+   char *newloc;			/* new location (redirection) */
+   char *remote_time;		/* remote time-stamp string */
+   char *error;			/* textual HTTP error */
+@@ -1212,6 +1213,7 @@ gethttp (struct url *u, struct http_stat *hs, int *dt, struct url *proxy)
+   hs->len = 0;
+   hs->contlen = -1;
+   hs->res = -1;
++  hs->errstr = "";
+   hs->newloc = NULL;
+   hs->remote_time = NULL;
+   hs->error = NULL;
+@@ -1484,7 +1486,7 @@ gethttp (struct url *u, struct http_stat *hs, int *dt, struct url *proxy)
+ 	  if (write_error < 0)
+ 	    {
+ 	      logprintf (LOG_VERBOSE, _("Failed writing to proxy: %s.\n"),
+-			 strerror (errno));
++			 fd_errstr (sock));
+ 	      CLOSE_INVALIDATE (sock);
+ 	      return WRITEFAILED;
+ 	    }
+@@ -1493,7 +1495,7 @@ gethttp (struct url *u, struct http_stat *hs, int *dt, struct url *proxy)
+ 	  if (!head)
+ 	    {
+ 	      logprintf (LOG_VERBOSE, _("Failed reading proxy response: %s\n"),
+-			 strerror (errno));
++			 fd_errstr (sock));
+ 	      CLOSE_INVALIDATE (sock);
+ 	      return HERR;
+ 	    }
+@@ -1554,7 +1556,7 @@ gethttp (struct url *u, struct http_stat *hs, int *dt, struct url *proxy)
+   if (write_error < 0)
+     {
+       logprintf (LOG_VERBOSE, _("Failed writing HTTP request: %s.\n"),
+-		 strerror (errno));
++		 fd_errstr (sock));
+       CLOSE_INVALIDATE (sock);
+       request_free (req);
+       return WRITEFAILED;
+@@ -1578,7 +1580,7 @@ gethttp (struct url *u, struct http_stat *hs, int *dt, struct url *proxy)
+       else
+ 	{
+ 	  logprintf (LOG_NOTQUIET, _("Read error (%s) in headers.\n"),
+-		     strerror (errno));
++		     fd_errstr (sock));
+ 	  CLOSE_INVALIDATE (sock);
+ 	  request_free (req);
+ 	  return HERR;
+@@ -1966,20 +1968,14 @@ gethttp (struct url *u, struct http_stat *hs, int *dt, struct url *proxy)
+   if (hs->res >= 0)
+     CLOSE_FINISH (sock);
+   else
+-    CLOSE_INVALIDATE (sock);
++    {
++      if (hs->res < 0)
++	hs->errstr = fd_errstr (sock);
++      CLOSE_INVALIDATE (sock);
++    }
+ 
+-  {
+-    /* Close or flush the file.  We have to be careful to check for
+-       error here.  Checking the result of fwrite() is not enough --
+-       errors could go unnoticed!  */
+-    int flush_res;
+-    if (!output_stream)
+-      flush_res = fclose (fp);
+-    else
+-      flush_res = fflush (fp);
+-    if (flush_res == EOF)
+-      hs->res = -2;
+-  }
++  if (!output_stream)
++    fclose (fp);
+   if (hs->res == -2)
+     return FWRITEERR;
+   return RETRFINISHED;
+@@ -2502,7 +2498,7 @@ The sizes do not match (local %s) -- retrieving.\n"),
+ 	      logprintf (LOG_VERBOSE,
+ 			 _("%s (%s) - Read error at byte %s (%s)."),
+ 			 tms, tmrate, number_to_static_string (hstat.len),
+-			 strerror (errno));
++			 hstat.errstr);
+ 	      printwhat (count, opt.ntry);
+ 	      free_hstat (&hstat);
+ 	      continue;
+@@ -2514,7 +2510,7 @@ The sizes do not match (local %s) -- retrieving.\n"),
+ 			 tms, tmrate,
+ 			 number_to_static_string (hstat.len),
+ 			 number_to_static_string (hstat.contlen),
+-			 strerror (errno));
++			 hstat.errstr);
+ 	      printwhat (count, opt.ntry);
+ 	      free_hstat (&hstat);
+ 	      continue;
+diff --git a/src/mswindows.c b/src/mswindows.c
+index 93eb71d..d994234 100644
+--- a/src/mswindows.c
++++ b/src/mswindows.c
+@@ -709,7 +709,7 @@ run_with_timeout (double seconds, void (*fun) (void *), void *arg)
+ 			     &thread_arg, 0, &thread_id);
+   if (!thread_hnd)
+     {
+-      DEBUGP (("CreateThread() failed; %s\n", strerror (GetLastError ())));
++      DEBUGP (("CreateThread() failed; [0x%x]\n", GetLastError ()));
+       goto blocking_fallback;
+     }
+ 
+diff --git a/src/openssl.c b/src/openssl.c
+index a34649e..1f96706 100644
+--- a/src/openssl.c
++++ b/src/openssl.c
+@@ -126,9 +126,9 @@ init_prng (void)
+ static void
+ print_errors (void) 
+ {
+-  unsigned long curerr = 0;
+-  while ((curerr = ERR_get_error ()) != 0)
+-    logprintf (LOG_NOTQUIET, "OpenSSL: %s\n", ERR_error_string (curerr, NULL));
++  unsigned long err;
++  while ((err = ERR_get_error ()) != 0)
++    logprintf (LOG_NOTQUIET, "OpenSSL: %s\n", ERR_error_string (err, NULL));
+ }
+ 
+ /* Convert keyfile type as used by options.h to a type as accepted by
+@@ -238,7 +238,7 @@ static int
+ openssl_read (int fd, char *buf, int bufsize, void *ctx)
+ {
+   int ret;
+-  SSL *ssl = (SSL *) ctx;
++  SSL *ssl = ctx;
+   do
+     ret = SSL_read (ssl, buf, bufsize);
+   while (ret == -1
+@@ -251,7 +251,7 @@ static int
+ openssl_write (int fd, char *buf, int bufsize, void *ctx)
+ {
+   int ret = 0;
+-  SSL *ssl = (SSL *) ctx;
++  SSL *ssl = ctx;
+   do
+     ret = SSL_write (ssl, buf, bufsize);
+   while (ret == -1
+@@ -263,7 +263,7 @@ openssl_write (int fd, char *buf, int bufsize, void *ctx)
+ static int
+ openssl_poll (int fd, double timeout, int wait_for, void *ctx)
+ {
+-  SSL *ssl = (SSL *) ctx;
++  SSL *ssl = ctx;
+   if (timeout == 0)
+     return 1;
+   if (SSL_pending (ssl))
+@@ -275,7 +275,7 @@ static int
+ openssl_peek (int fd, char *buf, int bufsize, void *ctx)
+ {
+   int ret;
+-  SSL *ssl = (SSL *) ctx;
++  SSL *ssl = ctx;
+   do
+     ret = SSL_peek (ssl, buf, bufsize);
+   while (ret == -1
+@@ -284,10 +284,43 @@ openssl_peek (int fd, char *buf, int bufsize, void *ctx)
+   return ret;
+ }
+ 
++static const char *
++openssl_errstr (int fd, void *ctx)
++{
++  /* Unfortunately we cannot use ERR_error_string's internal buf
++     because we must be prepared to printing more than one error in
++     succession.  */
++  static char errbuf[512];
++  char *p = errbuf, *end = errbuf + sizeof errbuf;
++  unsigned long err;
++
++  if ((err = ERR_get_error ()) == 0)
++    /* Inform the caller that there have been no errors */
++    return NULL;
++
++  /* Iterate over OpenSSL's error stack and print errors to ERRBUF,
++     each followed by '\n', while being careful not to overrun
++     ERRBUF.  */
++  do
++    {
++      ERR_error_string_n (err, p, end - p);
++      p = strchr (p, '\0');
++      if (p < end)
++       *p++ = '\n';
++    }
++  while ((err = ERR_get_error ()) != 0);
++
++  if (p < end)
++    *p++ = '\0';
++  else
++    end[-1] = '\0';
++  return errbuf;
++}
++
+ static void
+ openssl_close (int fd, void *ctx)
+ {
+-  SSL *ssl = (SSL *) ctx;
++  SSL *ssl = ctx;
+   SSL_shutdown (ssl);
+   SSL_free (ssl);
+ 
+@@ -300,6 +333,14 @@ openssl_close (int fd, void *ctx)
+   DEBUGP (("Closed %d/SSL 0x%0lx\n", fd, (unsigned long) ssl));
+ }
+ 
++/* openssl_transport is the singleton that describes the SSL transport
++   methods provided by this file.  */
++
++static struct transport_implementation openssl_transport = {
++  openssl_read, openssl_write, openssl_poll,
++  openssl_peek, openssl_errstr, openssl_close
++};
++
+ /* Perform the SSL handshake on file descriptor FD, which is assumed
+    to be connected to an SSL server.  The SSL handle provided by
+    OpenSSL is registered with the file descriptor FD using
+@@ -327,8 +368,7 @@ ssl_connect (int fd)
+ 
+   /* Register FD with Wget's transport layer, i.e. arrange that our
+      functions are used for reading, writing, and polling.  */
+-  fd_register_transport (fd, openssl_read, openssl_write, openssl_poll,
+-			 openssl_peek, openssl_close, ssl);
++  fd_register_transport (fd, &openssl_transport, ssl);
+   DEBUGP (("Handshake successful; connected socket %d to SSL handle 0x%0*lx\n",
+ 	   fd, PTR_FORMAT (ssl)));
+   return true;
+-- 
+cgit v1.0-41-gc330
+

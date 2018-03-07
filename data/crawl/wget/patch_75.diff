@@ -1,0 +1,1246 @@
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 449a27f..050f58e 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -48,12 +48,12 @@ EXTRA_DIST = css.l css.c css_.c build_info.c.in
+ bin_PROGRAMS = wget
+ wget_SOURCES = connect.c convert.c cookies.c ftp.c	\
+ 		css_.c css-url.c	\
+-		ftp-basic.c ftp-ls.c hash.c host.c html-parse.c html-url.c	\
++		ftp-basic.c ftp-ls.c hash.c host.c hsts.c html-parse.c html-url.c	\
+ 		http.c init.c log.c main.c netrc.c progress.c ptimer.c	\
+ 		recur.c res.c retr.c spider.c url.c warc.c	\
+ 		utils.c exits.c build_info.c $(IRI_OBJ) $(METALINK_OBJ)	\
+ 		css-url.h css-tokens.h connect.h convert.h cookies.h	\
+-		ftp.h hash.h host.h html-parse.h html-url.h	\
++		ftp.h hash.h host.h hsts.h  html-parse.h html-url.h	\
+ 		http.h http-ntlm.h init.h log.h mswindows.h netrc.h	\
+ 		options.h progress.h ptimer.h recur.h res.h retr.h	\
+ 		spider.h ssl.h sysdep.h url.h warc.h utils.h wget.h iri.h	\
+diff --git a/src/hsts.c b/src/hsts.c
+new file mode 100644
+index 0000000..873707a
+--- /dev/null
++++ b/src/hsts.c
+@@ -0,0 +1,744 @@
++/* HTTP Strict Transport Security (HSTS) support.
++   Copyright (C) 1996, 1997, 1998, 1999, 2000, 2001, 2002, 2003, 2004,
++   2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2015 Free Software
++   Foundation, Inc.
++
++This file is part of GNU Wget.
++
++GNU Wget is free software; you can redistribute it and/or modify
++it under the terms of the GNU General Public License as published by
++the Free Software Foundation; either version 3 of the License, or
++ (at your option) any later version.
++
++GNU Wget is distributed in the hope that it will be useful,
++but WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++GNU General Public License for more details.
++
++You should have received a copy of the GNU General Public License
++along with Wget.  If not, see <http://www.gnu.org/licenses/>.
++
++Additional permission under GNU GPL version 3 section 7
++
++If you modify this program, or any covered work, by linking or
++combining it with the OpenSSL project's OpenSSL library (or a
++modified version of that library), containing parts covered by the
++terms of the OpenSSL or SSLeay licenses, the Free Software Foundation
++grants you additional permission to convey the resulting work.
++Corresponding Source for a non-source form of such a combination
++shall include the source code for the parts of OpenSSL used as well
++as that of the covered work.  */
++#include "wget.h"
++
++#ifdef HAVE_HSTS
++#include "hsts.h"
++#include "host.h" /* for is_valid_ip_address() */
++#include "init.h" /* for home_dir() */
++#include "utils.h"
++#include "hash.h"
++#include "c-ctype.h"
++#ifdef TESTING
++#include "test.h"
++#include <unistd.h> /* for unlink(), used only in tests */
++#endif
++
++#include <stdlib.h>
++#include <time.h>
++#include <sys/stat.h>
++#include <string.h>
++
++struct hsts_store {
++  struct hash_table *table;
++  time_t last_mtime;
++};
++
++struct hsts_kh {
++  char *host;
++  int explicit_port;
++};
++
++struct hsts_kh_info {
++  time_t created;
++  time_t max_age;
++  bool include_subdomains;
++};
++
++enum hsts_kh_match {
++  NO_MATCH,
++  SUPERDOMAIN_MATCH,
++  CONGRUENT_MATCH
++};
++
++#define hsts_is_host_name_valid(host) (!is_valid_ip_address (host))
++#define hsts_is_scheme_valid(scheme) (scheme == SCHEME_HTTPS)
++#define hsts_is_host_eligible(scheme, host) \
++    (hsts_is_scheme_valid (scheme) && hsts_is_host_name_valid (host))
++
++#define DEFAULT_HTTP_PORT 80
++#define DEFAULT_SSL_PORT  443
++#define CHECK_EXPLICIT_PORT(p1, p2) (p1 == 0 || p1 == p2)
++#define MAKE_EXPLICIT_PORT(s, p) (s == SCHEME_HTTPS ? (p == DEFAULT_SSL_PORT ? 0 : p) \
++    : (p == DEFAULT_HTTP_PORT ? 0 : p))
++
++/* Hashing and comparison functions for the hash table */
++
++static unsigned long
++hsts_hash_func (const void *key)
++{
++  struct hsts_kh *k = (struct hsts_kh *) key;
++  const char *h = NULL;
++  unsigned int hash = k->explicit_port;
++
++  for (h = k->host; *h; h++)
++    hash = hash * 31 + *h;
++
++  return hash;
++}
++
++static int
++hsts_cmp_func (const void *h1, const void *h2)
++{
++  struct hsts_kh *kh1 = (struct hsts_kh *) h1,
++      *kh2 = (struct hsts_kh *) h2;
++
++  return (!strcmp (kh1->host, kh2->host)) && (kh1->explicit_port == kh2->explicit_port);
++}
++
++/* Private functions. Feel free to make some of these public when needed. */
++
++static struct hsts_kh_info *
++hsts_find_entry (hsts_store_t store,
++                 const char *host, int explicit_port,
++                 enum hsts_kh_match *match_type,
++                 struct hsts_kh *kh)
++{
++  struct hsts_kh *k = NULL;
++  struct hsts_kh_info *khi = NULL;
++  enum hsts_kh_match match = NO_MATCH;
++  char *pos = NULL;
++  char *org_ptr = NULL;
++
++  k = (struct hsts_kh *) xnew (struct hsts_kh);
++  k->host = xstrdup_lower (host);
++  k->explicit_port = explicit_port;
++
++  /* save pointer so that we don't get into trouble later when freeing */
++  org_ptr = k->host;
++
++  khi = (struct hsts_kh_info *) hash_table_get (store->table, k);
++  if (khi)
++    {
++      match = CONGRUENT_MATCH;
++      goto end;
++    }
++
++  while (match == NO_MATCH &&
++      (pos = strchr (k->host, '.')) && pos - k->host > 0 &&
++      strchr (pos + 1, '.'))
++    {
++      k->host += (pos - k->host + 1);
++      khi = (struct hsts_kh_info *) hash_table_get (store->table, k);
++      if (khi)
++        match = SUPERDOMAIN_MATCH;
++    }
++
++end:
++  /* restore pointer or we'll get a SEGV */
++  k->host = org_ptr;
++  xfree (k->host);
++
++  /* copy parameters to previous frame */
++  if (match_type)
++    *match_type = match;
++  if (kh)
++    memcpy (kh, k, sizeof (struct hsts_kh));
++
++  xfree (k);
++  return khi;
++}
++
++static bool
++hsts_new_entry_internal (hsts_store_t store,
++                         const char *host, int port,
++                         time_t created, time_t max_age,
++                         bool include_subdomains,
++                         bool check_validity,
++                         bool check_expired,
++                         bool check_duplicates)
++{
++  struct hsts_kh *kh = xnew (struct hsts_kh);
++  struct hsts_kh_info *khi = xnew0 (struct hsts_kh_info);
++  bool success = false;
++
++  kh->host = xstrdup_lower (host);
++  kh->explicit_port = MAKE_EXPLICIT_PORT (SCHEME_HTTPS, port);
++
++  khi->created = created;
++  khi->max_age = max_age;
++  khi->include_subdomains = include_subdomains;
++
++  /* Check validity */
++  if (check_validity && !hsts_is_host_name_valid (host))
++    goto bail;
++
++  if (check_expired && ((khi->created + khi->max_age) < khi->created))
++    goto bail;
++
++  if (check_duplicates && hash_table_contains (store->table, kh))
++    goto bail;
++
++  /* Now store the new entry */
++  hash_table_put (store->table, kh, khi);
++  success = true;
++
++bail:
++  if (!success)
++    {
++      /* abort! */
++      xfree (kh->host);
++      xfree (kh);
++      xfree (khi);
++    }
++
++  return success;
++}
++
++/*
++   Creates a new entry, but does not check whether that entry already exists.
++   This function assumes that check has already been done by the caller.
++ */
++static bool
++hsts_add_entry (hsts_store_t store,
++                const char *host, int port,
++                time_t max_age, bool include_subdomains)
++{
++  time_t t = time (NULL);
++
++  /* It might happen time() returned -1 */
++  return (t < 0 ?
++      false :
++      hsts_new_entry_internal (store, host, port, t, max_age, include_subdomains, false, true, false));
++}
++
++/* Creates a new entry, unless an identical one already exists. */
++static bool
++hsts_new_entry (hsts_store_t store,
++                const char *host, int port,
++                time_t created, time_t max_age,
++                bool include_subdomains)
++{
++  return hsts_new_entry_internal (store, host, port, created, max_age, include_subdomains, true, true, true);
++}
++
++static void
++hsts_remove_entry (hsts_store_t store, struct hsts_kh *kh)
++{
++  if (hash_table_remove (store->table, kh))
++    xfree (kh->host);
++}
++
++static bool
++hsts_store_merge (hsts_store_t store,
++                  const char *host, int port,
++                  time_t created, time_t max_age,
++                  bool include_subdomains)
++{
++  enum hsts_kh_match match_type = NO_MATCH;
++  struct hsts_kh_info *khi = NULL;
++  bool success = false;
++
++  port = MAKE_EXPLICIT_PORT (SCHEME_HTTPS, port);
++  khi = hsts_find_entry (store, host, port, &match_type, NULL);
++  if (khi && match_type == CONGRUENT_MATCH && created > khi->created)
++    {
++      /* update the entry with the new info */
++      khi->created = created;
++      khi->max_age = max_age;
++      khi->include_subdomains = include_subdomains;
++
++      success = true;
++    }
++
++  return success;
++}
++
++static bool
++hsts_read_database (hsts_store_t store, const char *file, bool merge_with_existing_entries)
++{
++  FILE *fp = NULL;
++  char *line = NULL, *p;
++  size_t len = 0;
++  int items_read;
++  bool result = false;
++  bool (*func)(hsts_store_t, const char *, int, time_t, time_t, bool);
++
++  char host[256];
++  int port;
++  time_t created, max_age;
++  int include_subdomains;
++
++  func = (merge_with_existing_entries ? hsts_store_merge : hsts_new_entry);
++
++  fp = fopen (file, "r");
++  if (fp)
++    {
++      while (getline (&line, &len, fp) > 0)
++        {
++          for (p = line; c_isspace (*p); p++)
++            ;
++
++          if (*p == '#')
++            continue;
++
++          items_read = sscanf (p, "%255s %d %d %lu %lu",
++                               host,
++                               &port,
++                               &include_subdomains,
++                               (unsigned long *) &created,
++                               (unsigned long *) &max_age);
++
++          if (items_read == 5)
++            func (store, host, port, created, max_age, !!include_subdomains);
++        }
++
++      xfree (line);
++      fclose (fp);
++
++      result = true;
++    }
++
++  return result;
++}
++
++static void
++hsts_store_dump (hsts_store_t store, const char *filename)
++{
++  FILE *fp = NULL;
++  hash_table_iterator it;
++
++  fp = fopen (filename, "w");
++  if (fp)
++    {
++      /* Print preliminary comments. We don't care if any of these fail. */
++      fputs ("# HSTS 1.0 Known Hosts database for GNU Wget.\n", fp);
++      fputs ("# Edit at your own risk.\n", fp);
++      fputs ("# <hostname>[:<port>]\t<incl. subdomains>\t<created>\t<max-age>\n", fp);
++
++      /* Now cycle through the HSTS store in memory and dump the entries */
++      for (hash_table_iterate (store->table, &it); hash_table_iter_next (&it);)
++        {
++          struct hsts_kh *kh = (struct hsts_kh *) it.key;
++          struct hsts_kh_info *khi = (struct hsts_kh_info *) it.value;
++
++          if (fprintf (fp, "%s\t%d\t%d\t%lu\t%lu\n",
++                       kh->host, kh->explicit_port, khi->include_subdomains,
++                       khi->created, khi->max_age) < 0)
++            {
++              logprintf (LOG_ALWAYS, "Could not write the HSTS database correctly.\n");
++              break;
++            }
++        }
++
++      fclose (fp);
++    }
++}
++
++/* HSTS API */
++
++/*
++   Changes the given URLs according to the HSTS policy.
++
++   If there's no host in the store that either congruently
++   or not, matches the given URL, no changes are made.
++   Returns true if the URL was changed, or false
++   if it was left intact.
++ */
++bool
++hsts_match (hsts_store_t store, struct url *u)
++{
++  bool url_changed = false;
++  struct hsts_kh_info *entry = NULL;
++  struct hsts_kh *kh = xnew(struct hsts_kh);
++  enum hsts_kh_match match = NO_MATCH;
++  int port = MAKE_EXPLICIT_PORT (u->scheme, u->port);
++
++  /* avoid doing any computation if we're already in HTTPS */
++  if (!hsts_is_scheme_valid (u->scheme))
++    {
++      entry = hsts_find_entry (store, u->host, port, &match, kh);
++      if (entry)
++        {
++          if ((entry->created + entry->max_age) >= time(NULL))
++            {
++              if ((match == CONGRUENT_MATCH) ||
++                  (match == SUPERDOMAIN_MATCH && entry->include_subdomains))
++                {
++                  /* we found a matching Known HSTS Host
++                     rewrite the URL */
++                  u->scheme = SCHEME_HTTPS;
++                  if (u->port == 80)
++                    u->port = 443;
++                  url_changed = true;
++                }
++            }
++          else
++            hsts_remove_entry (store, kh);
++        }
++    }
++
++  xfree(kh);
++
++  return url_changed;
++}
++
++/*
++   Add a new HSTS Known Host to the HSTS store.
++
++   If the host already exists, its information is updated,
++   or it'll be removed from the store if max_age is zero.
++
++   Bear in mind that the store is kept in memory, and will not
++   be written to disk until hsts_store_save is called.
++   This function regrows the in-memory HSTS store if necessary.
++
++   Currently, for a host to be taken into consideration,
++   two conditions have to be met:
++     - Connection must be through a secure channel (HTTPS).
++     - The host must not be an IPv4 or IPv6 address.
++
++   The RFC 6797 states that hosts that match IPv4 or IPv6 format
++   should be discarded at URI rewrite time. But we short-circuit
++   that check here, since there's no point in storing a host that
++   will never be matched.
++
++   Returns true if a new entry was actually created, or false
++   if an existing entry was updated/deleted. */
++bool
++hsts_store_entry (hsts_store_t store,
++                  enum url_scheme scheme, const char *host, int port,
++                  time_t max_age, bool include_subdomains)
++{
++  bool result = false;
++  enum hsts_kh_match match = NO_MATCH;
++  struct hsts_kh *kh = xnew(struct hsts_kh);
++  struct hsts_kh_info *entry = NULL;
++  time_t t = 0;
++
++  if (hsts_is_host_eligible (scheme, host))
++    {
++      port = MAKE_EXPLICIT_PORT (scheme, port);
++      entry = hsts_find_entry (store, host, port, &match, kh);
++      if (entry && match == CONGRUENT_MATCH)
++        {
++          if (max_age == 0)
++            hsts_remove_entry (store, kh);
++          else if (max_age > 0)
++            {
++              entry->include_subdomains = include_subdomains;
++
++              if (entry->max_age != max_age)
++                {
++                  /* RFC 6797 states that 'max_age' is a TTL relative to the reception of the STS header
++                     so we have to update the 'created' field too */
++                  t = time (NULL);
++                  if (t != -1)
++                    entry->created = t;
++                  entry->max_age = max_age;
++                }
++            }
++          /* we ignore negative max_ages */
++        }
++      else if (entry == NULL || match == SUPERDOMAIN_MATCH)
++        {
++          /* Either we didn't find a matching host,
++             or we got a superdomain match.
++             In either case, we create a new entry.
++
++             We have to perform an explicit check because it might
++             happen we got a non-existent entry with max_age == 0.
++          */
++          result = hsts_add_entry (store, host, port, max_age, include_subdomains);
++        }
++      /* we ignore new entries with max_age == 0 */
++    }
++
++  xfree(kh);
++
++  return result;
++}
++
++hsts_store_t
++hsts_store_open (const char *filename)
++{
++  hsts_store_t store = NULL;
++  struct stat st;
++
++  store = xnew0 (struct hsts_store);
++  store->table = hash_table_new (0, hsts_hash_func, hsts_cmp_func);
++  store->last_mtime = 0;
++
++  if (file_exists_p (filename))
++    {
++      if (stat (filename, &st) == 0)
++        store->last_mtime = st.st_mtime;
++
++      if (!hsts_read_database (store, filename, false))
++        {
++          /* abort! */
++          hsts_store_close (store);
++          xfree (store);
++          store = NULL;
++        }
++    }
++
++  return store;
++}
++
++void
++hsts_store_save (hsts_store_t store, const char *filename)
++{
++  struct stat st;
++
++  if (filename && hash_table_count (store->table) > 0)
++    {
++      /* If the file has changed, merge the changes with our in-memory data
++         before dumping them to the file.
++         Otherwise we could potentially overwrite the data stored by other Wget processes.
++       */
++      if (store->last_mtime && stat (filename, &st) == 0 && st.st_mtime > store->last_mtime)
++        hsts_read_database (store, filename, true);
++
++      /* now dump to the file */
++      hsts_store_dump (store, filename);
++    }
++}
++
++void
++hsts_store_close (hsts_store_t store)
++{
++  hash_table_iterator it;
++
++  /* free all the host fields */
++  for (hash_table_iterate (store->table, &it); hash_table_iter_next (&it);)
++    {
++      xfree (((struct hsts_kh *) it.key)->host);
++      xfree (it.key);
++      xfree (it.value);
++    }
++
++  hash_table_destroy (store->table);
++}
++
++#ifdef TESTING
++/* I know I'm really evil because I'm writing macros
++   that change control flow. But we're testing, who will tell? :D
++ */
++#define TEST_URL_RW(s, u, p) do { \
++    if (test_url_rewrite (s, u, p, true)) \
++      return test_url_rewrite (s, u, p, true); \
++  } while (0)
++
++#define TEST_URL_NORW(s, u, p) do { \
++    if (test_url_rewrite (s, u, p, false)) \
++      return test_url_rewrite (s, u, p, false); \
++  } while (0)
++
++static char *
++get_hsts_store_filename (void)
++{
++  char *home = NULL, *filename = NULL;
++  FILE *fp = NULL;
++
++  home = home_dir ();
++  if (home)
++    {
++      filename = aprintf ("%s/.wget-hsts-test", home);
++      fp = fopen (filename, "w");
++      if (fp)
++        fclose (fp);
++    }
++
++  return filename;
++}
++
++static hsts_store_t
++open_hsts_test_store (void)
++{
++  char *filename = NULL;
++  hsts_store_t table = NULL;
++
++  filename = get_hsts_store_filename ();
++  table = hsts_store_open (filename);
++  xfree (filename);
++
++  return table;
++}
++
++static void
++close_hsts_test_store (void)
++{
++  char *filename = NULL;
++
++  filename = get_hsts_store_filename ();
++  unlink (filename);
++  xfree (filename);
++}
++
++static const char*
++test_url_rewrite (hsts_store_t s, const char *url, int port, bool rewrite)
++{
++  bool result;
++  struct url u;
++
++  u.host = xstrdup (url);
++  u.port = port;
++  u.scheme = SCHEME_HTTP;
++
++  result = hsts_match (s, &u);
++
++  if (rewrite)
++    {
++      if (port == 80)
++       mu_assert("URL: port should've been rewritten to 443", u.port == 443);
++      else
++        mu_assert("URL: port should've been left intact", u.port == port);
++      mu_assert("URL: scheme should've been rewritten to HTTPS", u.scheme == SCHEME_HTTPS);
++      mu_assert("result should've been true", result == true);
++    }
++  else
++    {
++      mu_assert("URL: port should've been left intact", u.port == port);
++      mu_assert("URL: scheme should've been left intact", u.scheme == SCHEME_HTTP);
++      mu_assert("result should've been false", result == false);
++    }
++
++  xfree (u.host);
++  return NULL;
++}
++
++const char *
++test_hsts_new_entry (void)
++{
++  enum hsts_kh_match match = NO_MATCH;
++  struct hsts_kh_info *khi = NULL;
++
++  hsts_store_t s = open_hsts_test_store ();
++  mu_assert("Could not open the HSTS store. This could be due to lack of memory.", s != NULL);
++
++  bool created = hsts_store_entry (s, SCHEME_HTTP, "www.foo.com", 80, 1234, true);
++  mu_assert("No entry should have been created.", created == false);
++
++  created = hsts_store_entry (s, SCHEME_HTTPS, "www.foo.com", 443, 1234, true);
++  mu_assert("A new entry should have been created", created == true);
++
++  khi = hsts_find_entry (s, "www.foo.com", MAKE_EXPLICIT_PORT (SCHEME_HTTPS, 443), &match, NULL);
++  mu_assert("Should've been a congruent match", match == CONGRUENT_MATCH);
++  mu_assert("No valid HSTS info was returned", khi != NULL);
++  mu_assert("Variable 'max_age' should be 1234", khi->max_age == 1234);
++  mu_assert("Variable 'include_subdomains' should be asserted", khi->include_subdomains == true);
++
++  khi = hsts_find_entry (s, "b.www.foo.com", MAKE_EXPLICIT_PORT (SCHEME_HTTPS, 443), &match, NULL);
++  mu_assert("Should've been a superdomain match", match == SUPERDOMAIN_MATCH);
++  mu_assert("No valid HSTS info was returned", khi != NULL);
++  mu_assert("Variable 'max_age' should be 1234", khi->max_age == 1234);
++  mu_assert("Variable 'include_subdomains' should be asserted", khi->include_subdomains == true);
++
++  khi = hsts_find_entry (s, "ww.foo.com", MAKE_EXPLICIT_PORT (SCHEME_HTTPS, 443), &match, NULL);
++  mu_assert("Should've been no match", match == NO_MATCH);
++
++  khi = hsts_find_entry (s, "foo.com", MAKE_EXPLICIT_PORT (SCHEME_HTTPS, 443), &match, NULL);
++  mu_assert("Should've been no match", match == NO_MATCH);
++
++  khi = hsts_find_entry (s, ".foo.com", MAKE_EXPLICIT_PORT (SCHEME_HTTPS, 443), &match, NULL);
++  mu_assert("Should've been no match", match == NO_MATCH);
++
++  khi = hsts_find_entry (s, ".www.foo.com", MAKE_EXPLICIT_PORT (SCHEME_HTTPS, 443), &match, NULL);
++  mu_assert("Should've been no match", match == NO_MATCH);
++
++  hsts_store_close (s);
++  close_hsts_test_store ();
++
++  return NULL;
++}
++
++const char*
++test_hsts_url_rewrite_superdomain (void)
++{
++  hsts_store_t s;
++  bool created;
++
++  s = open_hsts_test_store ();
++  mu_assert("Could not open the HSTS store", s != NULL);
++
++  created = hsts_store_entry (s, SCHEME_HTTPS, "www.foo.com", 443, time(NULL) + 1234, true);
++  mu_assert("A new entry should've been created", created == true);
++
++  TEST_URL_RW (s, "www.foo.com", 80);
++  TEST_URL_RW (s, "bar.www.foo.com", 80);
++
++  hsts_store_close (s);
++  close_hsts_test_store ();
++
++  return NULL;
++}
++
++const char*
++test_hsts_url_rewrite_congruent (void)
++{
++  hsts_store_t s;
++  bool created;
++
++  s = open_hsts_test_store ();
++  mu_assert("Could not open the HSTS store", s != NULL);
++
++  created = hsts_store_entry (s, SCHEME_HTTPS, "foo.com", 443, time(NULL) + 1234, false);
++  mu_assert("A new entry should've been created", created == true);
++
++  TEST_URL_RW (s, "foo.com", 80);
++  TEST_URL_NORW (s, "www.foo.com", 80);
++
++  hsts_store_close (s);
++  close_hsts_test_store ();
++
++  return NULL;
++}
++
++const char*
++test_hsts_read_database (void)
++{
++  hsts_store_t table;
++  char *home = home_dir();
++  char *file = NULL;
++  FILE *fp = NULL;
++
++  if (home)
++    {
++      file = aprintf ("%s/.wget-hsts-testing", home);
++      fp = fopen (file, "w");
++      if (fp)
++        {
++          fputs ("# dummy comment\n", fp);
++          fputs ("foo.example.com\t0\t1\t1434224817\t123123123\n", fp);
++          fputs ("bar.example.com\t0\t0\t1434224817\t456456456\n", fp);
++          fputs ("test.example.com\t8080\t0\t1434224817\t789789789\n", fp);
++          fclose (fp);
++
++          table = hsts_store_open (file);
++
++          TEST_URL_RW (table, "foo.example.com", 80);
++          TEST_URL_RW (table, "www.foo.example.com", 80);
++          TEST_URL_RW (table, "bar.example.com", 80);
++
++          TEST_URL_NORW(table, "www.bar.example.com", 80);
++
++          TEST_URL_RW (table, "test.example.com", 8080);
++
++          hsts_store_close (table);
++          unlink (file);
++        }
++    }
++
++  return NULL;
++}
++#endif /* TESTING */
++#endif /* HAVE_HSTS */
+diff --git a/src/hsts.h b/src/hsts.h
+new file mode 100644
+index 0000000..9a7043d
+--- /dev/null
++++ b/src/hsts.h
+@@ -0,0 +1,53 @@
++/* Declarations for hsts.c
++   Copyright (C) 1996, 1997, 1998, 1999, 2000, 2001, 2002, 2003, 2004,
++   2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2015 Free Software
++   Foundation, Inc.
++
++This file is part of GNU Wget.
++
++GNU Wget is free software; you can redistribute it and/or modify
++it under the terms of the GNU General Public License as published by
++the Free Software Foundation; either version 3 of the License, or
++ (at your option) any later version.
++
++GNU Wget is distributed in the hope that it will be useful,
++but WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++GNU General Public License for more details.
++
++You should have received a copy of the GNU General Public License
++along with Wget.  If not, see <http://www.gnu.org/licenses/>.
++
++Additional permission under GNU GPL version 3 section 7
++
++If you modify this program, or any covered work, by linking or
++combining it with the OpenSSL project's OpenSSL library (or a
++modified version of that library), containing parts covered by the
++terms of the OpenSSL or SSLeay licenses, the Free Software Foundation
++grants you additional permission to convey the resulting work.
++Corresponding Source for a non-source form of such a combination
++shall include the source code for the parts of OpenSSL used as well
++as that of the covered work.  */
++#include "wget.h"
++
++#ifdef HAVE_HSTS
++
++#ifndef HSTS_H
++#define HSTS_H
++
++#include "url.h"
++
++typedef struct hsts_store *hsts_store_t;
++
++hsts_store_t hsts_store_open (const char *);
++
++void hsts_store_save (hsts_store_t, const char *);
++void hsts_store_close (hsts_store_t);
++
++bool hsts_store_entry (hsts_store_t,
++                       enum url_scheme, const char *, int,
++                       time_t, bool);
++bool hsts_match (hsts_store_t, struct url *);
++
++#endif /* HSTS_H */
++#endif /* HAVE_HSTS */
+diff --git a/src/http.c b/src/http.c
+index fe0aebd..1e6f800 100644
+--- a/src/http.c
++++ b/src/http.c
+@@ -42,6 +42,7 @@ as that of the covered work.  */
+ 
+ #include "hash.h"
+ #include "http.h"
++#include "hsts.h"
+ #include "utils.h"
+ #include "url.h"
+ #include "host.h"
+@@ -1257,6 +1258,55 @@ parse_content_disposition (const char *hdr, char **filename)
+     return false;
+ }
+ 
++#ifdef HAVE_HSTS
++static bool
++parse_strict_transport_security (const char *header, time_t *max_age, bool *include_subdomains)
++{
++  param_token name, value;
++  const char *c_max_age = NULL;
++  bool is = false; /* includeSubDomains */
++  bool is_url_encoded = false;
++  bool success = false;
++
++  if (header)
++    {
++      /* Process the STS header. Keys should be matched case-insensitively. */
++      for (; extract_param (&header, &name, &value, ';', &is_url_encoded); is_url_encoded = false)
++      {
++	if (BOUNDED_EQUAL_NO_CASE(name.b, name.e, "max-age"))
++	  c_max_age = strdupdelim (value.b, value.e);
++	else if (BOUNDED_EQUAL_NO_CASE(name.b, name.e, "includeSubDomains"))
++	  is = true;
++      }
++
++      /* pass the parsed values over */
++      if (c_max_age)
++	{
++	  /* If the string value goes out of a long's bounds, strtol() will return LONG_MIN or LONG_MAX.
++	   * In theory, the HSTS engine should be able to handle it.
++	   * Also, time_t is normally defined as a long, so this should not break.
++	   */
++	  if (max_age)
++	    *max_age = (time_t) strtol (c_max_age, NULL, 10);
++	  if (include_subdomains)
++	    *include_subdomains = is;
++
++	  DEBUGP(("Parsed Strict-Transport-Security max-age = %s, includeSubDomains = %s\n",
++		     c_max_age, (is ? "true" : "false")));
++
++	  success = true;
++	}
++      else
++	{
++	  /* something weird happened */
++	  logprintf (LOG_VERBOSE, "Could not parse String-Transport-Security header\n");
++	  success = false;
++	}
++    }
++
++  return success;
++}
++#endif
+ 
+ /* Persistent connections.  Currently, we cache the most recently used
+    connection as persistent, provided that the HTTP server agrees to
+@@ -2842,6 +2892,17 @@ gethttp (struct url *u, struct http_stat *hs, int *dt, struct url *proxy,
+   FILE *fp;
+   int err;
+   uerr_t retval;
++#ifdef HAVE_HSTS
++#ifdef TESTING
++  /* we don't link against main.o when we're testing */
++  hsts_store_t hsts_store = NULL;
++#else
++  extern hsts_store_t hsts_store;
++#endif
++  const char *hsts_params;
++  time_t max_age;
++  bool include_subdomains;
++#endif
+ 
+   int sock = -1;
+ 
+@@ -3319,6 +3380,29 @@ gethttp (struct url *u, struct http_stat *hs, int *dt, struct url *proxy,
+   else
+     hs->error = xstrdup (message);
+ 
++#ifdef HAVE_HSTS
++  if (opt.hsts && hsts_store)
++    {
++      hsts_params = resp_header_strdup (resp, "Strict-Transport-Security");
++      if (parse_strict_transport_security (hsts_params, &max_age, &include_subdomains))
++	{
++	  /* process strict transport security */
++	  if (hsts_store_entry (hsts_store, u->scheme, u->host, u->port, max_age, include_subdomains))
++	    DEBUGP(("Added new HSTS host: %s:%u (max-age: %u, includeSubdomains: %s)\n",
++		u->host,
++		u->port,
++		(unsigned int) max_age,
++		(include_subdomains ? "true" : "false")));
++	  else
++	    DEBUGP(("Updated HSTS host: %s:%u (max-age: %u, includeSubdomains: %s)\n",
++		u->host,
++		u->port,
++		(unsigned int) max_age,
++		(include_subdomains ? "true" : "false")));
++	}
++    }
++#endif
++
+   type = resp_header_strdup (resp, "Content-Type");
+   if (type)
+     {
+diff --git a/src/http.h b/src/http.h
+index 05cdda4..71cb0f0 100644
+--- a/src/http.h
++++ b/src/http.h
+@@ -31,6 +31,8 @@ as that of the covered work.  */
+ #ifndef HTTP_H
+ #define HTTP_H
+ 
++#include "hsts.h"
++
+ struct url;
+ 
+ uerr_t http_loop (struct url *, struct url *, char **, char **, const char *,
+diff --git a/src/init.c b/src/init.c
+index ed4171e..da17614 100644
+--- a/src/init.c
++++ b/src/init.c
+@@ -194,6 +194,10 @@ static const struct {
+   { "ftpuser",          &opt.ftp_user,          cmd_string },
+   { "glob",             &opt.ftp_glob,          cmd_boolean },
+   { "header",           NULL,                   cmd_spec_header },
++#ifdef HAVE_HSTS
++  { "hsts",             &opt.hsts,              cmd_boolean },
++  { "hsts-file",        &opt.hsts_file,         cmd_file },
++#endif
+   { "htmlextension",    &opt.adjust_extension,  cmd_boolean }, /* deprecated */
+   { "htmlify",          NULL,                   cmd_spec_htmlify },
+   { "httpkeepalive",    &opt.http_keep_alive,   cmd_boolean },
+@@ -450,6 +454,11 @@ defaults (void)
+   opt.start_pos = -1;
+   opt.show_progress = -1;
+   opt.noscroll = false;
++
++#ifdef HAVE_HSTS
++  /* HSTS is enabled by default */
++  opt.hsts = true;
++#endif
+ }
+ 
+ /* Return the user's home directory (strdup-ed), or NULL if none is
+diff --git a/src/main.c b/src/main.c
+index 79a37b5..6490711 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -54,6 +54,7 @@ as that of the covered work.  */
+ #include "convert.h"
+ #include "spider.h"
+ #include "http.h"               /* for save_cookies */
++#include "hsts.h"               /* for initializing hsts_store to NULL */
+ #include "ptimer.h"
+ #include "warc.h"
+ #include "version.h"
+@@ -141,6 +142,63 @@ i18n_initialize (void)
+ #endif /* ENABLE_NLS */
+ }
+ 
++#ifdef HAVE_HSTS
++/* make the HSTS store global */
++hsts_store_t hsts_store;
++
++static char*
++get_hsts_database (void)
++{
++  char *home;
++
++  if (opt.hsts_file)
++    return xstrdup (opt.hsts_file);
++
++  home = home_dir ();
++  if (home)
++    return aprintf ("%s/.wget-hsts", home);
++
++  return NULL;
++}
++
++static void
++load_hsts (void)
++{
++  if (!hsts_store)
++    {
++      char *filename = get_hsts_database ();
++
++      if (filename)
++        {
++          hsts_store = hsts_store_open (filename);
++
++          if (!hsts_store)
++            logprintf (LOG_NOTQUIET, "ERROR: could not open HSTS store at '%s'. "
++                       "HSTS will be disabled.\n",
++                       filename);
++        }
++      else
++        logprintf (LOG_NOTQUIET, "ERROR: could not open HSTS store. HSTS will be disabled.\n");
++
++      xfree (filename);
++    }
++}
++
++static void
++save_hsts (void)
++{
++  if (hsts_store)
++    {
++      char *filename = get_hsts_database ();
++
++      hsts_store_save (hsts_store, filename);
++      hsts_store_close (hsts_store);
++
++      xfree (filename);
++    }
++}
++#endif
++
+ /* Definition of command-line options. */
+ 
+ static void _Noreturn print_help (void);
+@@ -230,6 +288,10 @@ static struct cmdline_option option_data[] =
+     { "header", 0, OPT_VALUE, "header", -1 },
+     { "help", 'h', OPT_FUNCALL, (void *)print_help, no_argument },
+     { "host-directories", 0, OPT_BOOLEAN, "addhostdir", -1 },
++#ifdef HAVE_HSTS
++    { "hsts", 0, OPT_BOOLEAN, "hsts", -1},
++    { "hsts-file", 0, OPT_VALUE, "hsts-file", -1 },
++#endif
+     { "html-extension", 'E', OPT_BOOLEAN, "adjustextension", -1 }, /* deprecated */
+     { "htmlify", 0, OPT_BOOLEAN, "htmlify", -1 },
+     { "http-keep-alive", 0, OPT_BOOLEAN, "httpkeepalive", -1 },
+@@ -714,6 +776,16 @@ HTTPS (SSL/TLS) options:\n"),
+     "\n",
+ #endif /* HAVE_SSL */
+ 
++#ifdef HAVE_HSTS
++    N_("\
++HSTS options:\n"),
++    N_("\
++       --no-hsts                   disable HSTS\n"),
++    N_("\
++       --hsts-file                 path of HSTS database (will override default)\n"),
++    "\n",
++#endif
++
+     N_("\
+ FTP options:\n"),
+ #ifdef __VMS
+@@ -1690,6 +1762,18 @@ outputting to a regular file.\n"));
+   signal (SIGWINCH, progress_handle_sigwinch);
+ #endif
+ 
++#ifdef HAVE_HSTS
++  hsts_store = NULL;
++
++  /* Load the HSTS database.
++     Maybe all the URLs are FTP(S), in which case HSTS would not be needed,
++     but this is the best place to do it, and it shouldn't be a critical
++     performance hit.
++   */
++  if (opt.hsts)
++    load_hsts ();
++#endif
++
+   /* Retrieve the URLs from argument list.  */
+   for (t = url; *t; t++)
+     {
+@@ -1727,10 +1811,10 @@ outputting to a regular file.\n"));
+               opt.follow_ftp = old_follow_ftp;
+             }
+           else
+-          {
+-            retrieve_url (url_parsed, *t, &filename, &redirected_URL, NULL,
+-                          &dt, opt.recursive, iri, true);
+-          }
++            {
++              retrieve_url (url_parsed, *t, &filename, &redirected_URL, NULL,
++                            &dt, opt.recursive, iri, true);
++            }
+ 
+           if (opt.delete_after && filename != NULL && file_exists_p (filename))
+             {
+@@ -1848,6 +1932,11 @@ outputting to a regular file.\n"));
+   if (opt.cookies_output)
+     save_cookies ();
+ 
++#ifdef HAVE_HSTS
++  if (opt.hsts && hsts_store)
++    save_hsts ();
++#endif
++
+   if (opt.convert_links && !opt.delete_after)
+     convert_all_links ();
+ 
+diff --git a/src/options.h b/src/options.h
+index 1ede7b3..f8244ea 100644
+--- a/src/options.h
++++ b/src/options.h
+@@ -295,6 +295,11 @@ struct options
+   bool show_all_dns_entries;    /* Show all the DNS entries when resolving a
+                                    name. */
+   bool report_bps;              /*Output bandwidth in bits format*/
++
++#ifdef HAVE_HSTS
++  bool hsts;
++  char *hsts_file;
++#endif
+ };
+ 
+ extern struct options opt;
+diff --git a/src/retr.c b/src/retr.c
+index f60da6e..896b58f 100644
+--- a/src/retr.c
++++ b/src/retr.c
+@@ -56,6 +56,7 @@ as that of the covered work.  */
+ #include "ptimer.h"
+ #include "html-url.h"
+ #include "iri.h"
++#include "hsts.h"
+ 
+ /* Total size of downloaded files.  Used to enforce quota.  */
+ SUM_SIZE_INT total_downloaded_bytes;
+@@ -799,6 +800,20 @@ retrieve_url (struct url * orig_parsed, const char *origurl, char **file,
+ #endif
+       || (proxy_url && proxy_url->scheme == SCHEME_HTTP))
+     {
++#ifdef HAVE_HSTS
++#ifdef TESTING
++      /* we don't link against main.o when we're testing */
++      hsts_store_t hsts_store = NULL;
++#else
++      extern hsts_store_t hsts_store;
++#endif
++
++      if (opt.hsts && hsts_store)
++	{
++	  if (hsts_match (hsts_store, u))
++	    logprintf (LOG_VERBOSE, "URL transformed to HTTPS due to an HSTS policy\n");
++	}
++#endif
+       result = http_loop (u, orig_parsed, &mynewloc, &local_file, refurl, dt,
+                           proxy_url, iri);
+     }
+@@ -988,6 +1003,7 @@ retrieve_url (struct url * orig_parsed, const char *origurl, char **file,
+ bail:
+   if (register_status)
+     inform_exit_status (result);
++
+   return result;
+ }
+ 
+diff --git a/src/test.c b/src/test.c
+index 9599ac4..5278925 100644
+--- a/src/test.c
++++ b/src/test.c
+@@ -62,6 +62,12 @@ all_tests(void)
+   mu_run_test (test_append_uri_pathel);
+   mu_run_test (test_are_urls_equal);
+   mu_run_test (test_is_robots_txt_url);
++#ifdef HAVE_HSTS
++  mu_run_test (test_hsts_new_entry);
++  mu_run_test (test_hsts_url_rewrite_superdomain);
++  mu_run_test (test_hsts_url_rewrite_congruent);
++  mu_run_test (test_hsts_read_database);
++#endif
+ 
+   return NULL;
+ }
+@@ -73,6 +79,7 @@ main (int argc _GL_UNUSED, const char *argv[])
+ {
+   const char *result;
+ 
++  printf ("[DEBUG] Testing...\n\n");
+ #ifdef ENABLE_NLS
+   /* Set the current locale.  */
+   setlocale (LC_ALL, "");
+diff --git a/src/test.h b/src/test.h
+index 6d5cbbe..f74c162 100644
+--- a/src/test.h
++++ b/src/test.h
+@@ -56,6 +56,10 @@ const char *test_append_uri_pathel(void);
+ const char *test_are_urls_equal(void);
+ const char *test_subdir_p(void);
+ const char *test_dir_matches_p(void);
++const char *test_hsts_new_entry(void);
++const char *test_hsts_url_rewrite_superdomain(void);
++const char *test_hsts_url_rewrite_congruent(void);
++const char *test_hsts_read_database(void);
+ 
+ #endif /* TEST_H */
+ 
+diff --git a/src/wget.h b/src/wget.h
+index 2caa03e..e2c6b30 100644
+--- a/src/wget.h
++++ b/src/wget.h
+@@ -54,6 +54,7 @@ as that of the covered work.  */
+ /* Is OpenSSL or GNUTLS available? */
+ #if defined HAVE_LIBSSL || defined HAVE_LIBSSL32 || defined HAVE_LIBGNUTLS
+ # define HAVE_SSL
++# define HAVE_HSTS /* There's no sense in enabling HSTS without SSL */
+ #endif
+ 
+ /* `gettext (FOO)' is long to write, so we use `_(FOO)'.  If NLS is
+-- 
+cgit v1.0-41-gc330
+

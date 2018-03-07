@@ -1,0 +1,240 @@
+diff --git a/src/ChangeLog b/src/ChangeLog
+index bd1edd9..2991a9e 100644
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,3 +1,16 @@
++2005-05-10  Hrvoje Niksic  <hniksic@xemacs.org>
++
++	* http.c (gethttp): Call ssl_check_server_identity.
++
++	* openssl.c (ssl_check_server_identity): New function, verifies
++	that the host name in the certificate matches the actual host
++	name.
++	(verify_cert_callback): Removed, since it didn't do anything
++	except returning the preverify_ok argument.
++
++	* connect.c (fd_transport_context): Allow retrieval of the context
++	pointer registered with fd_register_transport.
++
+ 2005-05-09  Hrvoje Niksic  <hniksic@xemacs.org>
+ 
+ 	* openssl.c (verify_cert_callback): Renamed from verify_callback.
+diff --git a/src/connect.c b/src/connect.c
+index c3a3d77..d6626f9 100644
+--- a/src/connect.c
++++ b/src/connect.c
+@@ -827,6 +827,17 @@ fd_register_transport (int fd, fd_reader_t reader, fd_writer_t writer,
+   ++transport_map_modified_tick;
+ }
+ 
++/* Return context of the transport registered with
++   fd_register_transport.  This assumes fd_register_transport was
++   previously called on FD.  */
++
++void *
++fd_transport_context (int fd)
++{
++  struct transport_info *info = hash_table_get (transport_map, (void *) fd);
++  return info->ctx;
++}
++
+ /* When fd_read/fd_write are called multiple times in a loop, they should
+    remember the INFO pointer instead of fetching it every time.  It is
+    not enough to compare FD to LAST_FD because FD might have been
+diff --git a/src/connect.h b/src/connect.h
+index 33cc7ab..8524226 100644
+--- a/src/connect.h
++++ b/src/connect.h
+@@ -69,6 +69,7 @@ typedef void (*fd_closer_t) PARAMS ((int, void *));
+ void fd_register_transport PARAMS ((int, fd_reader_t, fd_writer_t,
+ 				    fd_poller_t, fd_peeker_t, fd_closer_t,
+ 				    void *));
++void *fd_transport_context PARAMS ((int));
+ 
+ int fd_read PARAMS ((int, char *, int, double));
+ int fd_write PARAMS ((int, char *, int, double));
+diff --git a/src/http.c b/src/http.c
+index d3fc1c3..b32c3ee 100644
+--- a/src/http.c
++++ b/src/http.c
+@@ -1516,7 +1516,7 @@ gethttp (struct url *u, struct http_stat *hs, int *dt, struct url *proxy)
+ 
+       if (conn->scheme == SCHEME_HTTPS)
+ 	{
+-	  if (!ssl_connect (sock))
++	  if (!ssl_connect (sock) || !ssl_check_server_identity (sock, u->host))
+ 	    {
+ 	      fd_close (sock);
+ 	      return CONSSLERR;
+@@ -2233,7 +2233,6 @@ File `%s' already there, will not retrieve.\n"), *hstat.local_file);
+ 	  return err;
+ 	case CONSSLERR:
+ 	  /* Another fatal error.  */
+-	  logputs (LOG_VERBOSE, "\n");
+ 	  logprintf (LOG_NOTQUIET, _("Unable to establish SSL connection.\n"));
+ 	  free_hstat (&hstat);
+ 	  xfree_null (dummy);
+diff --git a/src/openssl.c b/src/openssl.c
+index 4486a16..023f79c 100644
+--- a/src/openssl.c
++++ b/src/openssl.c
+@@ -132,25 +132,6 @@ init_prng (void)
+ #endif
+ }
+ 
+-/* This function is called for additional (app-specific) verification
+-   of the server certificate.  We basically confirm the validity as
+-   determined by OpenSSL.
+-
+-   #### Someone should audit this for correctness and document it
+-   better.  */
+-
+-static int
+-verify_cert_callback (int ok, X509_STORE_CTX *ctx)
+-{
+-  char buf[256];
+-  X509 *cert = X509_STORE_CTX_get_current_cert (ctx);
+-  X509_NAME_oneline (X509_get_subject_name (cert), buf, sizeof (buf));
+-  /* #### Why are we not using the result of the above call?  Are we
+-     supposed to print it?  */
+-  DEBUGP (("verify_cert_callback: %s\n", buf));
+-  return ok;
+-}
+-
+ /* Print errors in the OpenSSL error stack. */
+ 
+ static void
+@@ -184,7 +165,7 @@ key_type_to_ssl_type (enum keyfile_type type)
+ /* Create an SSL Context and set default paths etc.  Called the first
+    time an HTTP download is attempted.
+ 
+-   Returns 0 on success, non-zero otherwise.  */
++   Returns 1 on success, 0 otherwise.  */
+ 
+ int
+ ssl_init ()
+@@ -237,8 +218,7 @@ ssl_init ()
+   /* Specify whether the connect should fail if the verification of
+      the peer fails or if it should go ahead.  */
+   SSL_CTX_set_verify (ssl_ctx,
+-		      opt.check_cert ? SSL_VERIFY_PEER : SSL_VERIFY_NONE,
+-		      verify_cert_callback);
++		      opt.check_cert ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, NULL);
+ 
+   if (opt.cert_file)
+     if (SSL_CTX_use_certificate_file (ssl_ctx, opt.cert_file,
+@@ -345,12 +325,12 @@ ssl_connect (int fd)
+   assert (ssl_ctx != NULL);
+   ssl = SSL_new (ssl_ctx);
+   if (!ssl)
+-    goto err;
++    goto error;
+   if (!SSL_set_fd (ssl, fd))
+-    goto err;
++    goto error;
+   SSL_set_connect_state (ssl);
+   if (SSL_connect (ssl) <= 0 || ssl->state != SSL_ST_OK)
+-    goto err;
++    goto error;
+ 
+   /* Register FD with Wget's transport layer, i.e. arrange that
+      SSL-enabled functions are used for reading, writing, and polling.
+@@ -362,9 +342,83 @@ ssl_connect (int fd)
+ 	   (unsigned long) ssl));
+   return 1;
+ 
+- err:
++ error:
+   print_errors ();
+   if (ssl)
+     SSL_free (ssl);
+   return 0;
+ }
++
++/* Check that the identity of the remote host, as presented by its
++   server certificate, corresponds to HOST, which is the host name the
++   user thinks he's connecting to.  This assumes that FD has been
++   connected to an SSL context using ssl_connect.  Return 1 if the
++   identity checks out, 0 otherwise.
++
++   If opt.check_cert is 0, this always returns 1, but still warns the
++   user about the mismatches, if any.  */
++
++int
++ssl_check_server_identity (int fd, const char *host)
++{
++  X509 *peer = NULL;
++  char peer_CN[256];
++  long vresult;
++  int retval;
++
++  /* If the user has specified --no-check-cert, we still want to warn
++     him about problems with the server's certificate.  */
++  const char *severity = opt.check_cert ? _("ERROR") : _("WARNING");
++
++  SSL *ssl = (SSL *) fd_transport_context (fd);
++  assert (ssl != NULL);
++
++  peer = SSL_get_peer_certificate (ssl);
++  if (!peer)
++    {
++      logprintf (LOG_NOTQUIET, _("%s: No certificate presented by %s.\n"),
++		 severity, escnonprint (host));
++      retval = 0;
++      goto out;
++    }
++
++  vresult = SSL_get_verify_result (ssl);
++  if (vresult != X509_V_OK)
++    {
++      logprintf (LOG_NOTQUIET,
++		 _("%s: Certificate verification error for %s: %s\n"),
++		 severity, escnonprint (host),
++		 X509_verify_cert_error_string (vresult));
++      retval = 0;
++      goto out;
++    }
++
++  /* Check that the common name matches HOST.
++
++     #### This should use dNSName if available; according to rfc2818:
++     "If a subjectAltName extension of type dNSName is present, that
++     MUST be used as the identity."  */
++
++  peer_CN[0] = '\0';
++  X509_NAME_get_text_by_NID (X509_get_subject_name (peer),
++			     NID_commonName, peer_CN, sizeof (peer_CN));
++  if (0 != strcasecmp (peer_CN, host))
++    {
++      logprintf (LOG_NOTQUIET, _("\
++%s: certificate common name `%s' doesn't match requested host name `%s'.\n"),
++		 severity, escnonprint (peer_CN), escnonprint (host));
++      retval = 0;
++      goto out;
++    }
++
++  /* The certificate was found, verified, and matched HOST. */
++  retval = 1;
++
++ out:
++  if (peer)
++    X509_free (peer);
++
++  /* Allow --no-check-cert to disable certificate checking. */
++  return opt.check_cert ? retval : 1;
++}
++
+diff --git a/src/ssl.h b/src/ssl.h
+index f6299e7..aa0a588 100644
+--- a/src/ssl.h
++++ b/src/ssl.h
+@@ -33,5 +33,6 @@ so, delete this exception statement from your version.  */
+ 
+ int ssl_init PARAMS ((void));
+ int ssl_connect PARAMS ((int));
++int ssl_check_server_identity PARAMS ((int, const char *));
+ 
+ #endif /* GEN_SSLFUNC_H */
+-- 
+cgit v1.0-41-gc330
+

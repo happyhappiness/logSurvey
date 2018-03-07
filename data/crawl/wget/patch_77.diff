@@ -1,0 +1,1530 @@
+diff --git a/bootstrap.conf b/bootstrap.conf
+index 4fff711..ce52d99 100644
+--- a/bootstrap.conf
++++ b/bootstrap.conf
+@@ -64,6 +64,7 @@ mkstemp
+ mkostemp
+ crypto/md5
+ crypto/sha1
++crypto/sha256
+ quote
+ quotearg
+ recv
+diff --git a/configure.ac b/configure.ac
+index 5450455..f701e2a 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -475,6 +475,29 @@ else
+   fi
+ fi
+ 
++dnl
++dnl Check for libmetalink
++dnl
++AS_IF([test x"$with_metalink" != xno], [
++  PKG_CHECK_MODULES([METALINK], libmetalink, [
++      LIBS="$METALINK_LIBS $LIBS"
++      CFLAGS="$METALINK_CFLAGS $CFLAGS"
++      AC_DEFINE([HAVE_METALINK], [1], [Define if using metalink.])
++      have_metalink=yes
++    ], [
++      have_metalink=no
++    ])
++])
++
++dnl
++dnl Check for GPGME
++dnl
++AM_PATH_GPGME([], [
++    LIBS="$GPGME_LIBS $LIBS"
++    CFLAGS="$GPGME_CFLAGS $CFLAGS"
++    AC_DEFINE([HAVE_GPGME], [1], [Define if GPGME is available.])
++    have_gpg=yes
++  ], [have_gpg=no])
+ 
+ dnl **********************************************************************
+ dnl Checks for IPv6
+@@ -715,6 +738,7 @@ AS_IF([test "X$enable_pcre" != "Xno"],[
+ dnl Needed by src/Makefile.am
+ AM_CONDITIONAL([IRI_IS_ENABLED], [test "X$iri" != "Xno"])
+ AM_CONDITIONAL([WITH_SSL], [test "X$with_ssl" != "Xno"])
++AM_CONDITIONAL([METALINK_IS_ENABLED], [test "X$have_metalink" != "Xno"])
+ 
+ dnl
+ dnl Create output
+@@ -743,4 +767,6 @@ AC_MSG_NOTICE([Summary of build options:
+   Debugging:         $ENABLE_DEBUG
+   Assertions:        $ENABLE_ASSERTION
+   Valgrind:          $VALGRIND_INFO
++  Metalink:          $have_metalink
++  GPGME:             $have_gpg
+ ])
+diff --git a/doc/wget.texi b/doc/wget.texi
+index 16cc5db..a9a0f6b 100644
+--- a/doc/wget.texi
++++ b/doc/wget.texi
+@@ -507,6 +507,18 @@ treated as @samp{html} if the Content-Type matches @samp{text/html}.
+ Furthermore, the @var{file}'s location will be implicitly used as base
+ href if none was specified.
+ 
++@cindex input-metalink
++@item --input-metalink=@var{file}
++Downloads files covered in local Metalink @var{file}. Metalink version 3
++and 4 are supported.
++
++@cindex metalink-over-http
++@item --metalink-over-http
++Issues HTTP HEAD request instead of GET and extracts Metalink metadata
++from response headers. Then it switches to Metalink download.
++If no valid Metalink metadata is found, it falls back to ordinary HTTP download.
++
++
+ @cindex force html
+ @item -F
+ @itemx --force-html
+diff --git a/po/POTFILES.in b/po/POTFILES.in
+index 5406e0f..0af89dc 100644
+--- a/po/POTFILES.in
++++ b/po/POTFILES.in
+@@ -26,6 +26,7 @@ src/init.c
+ src/iri.c
+ src/log.c
+ src/main.c
++src/metalink.c
+ src/mswindows.c
+ src/netrc.c
+ src/openssl.c
+diff --git a/src/Makefile.am b/src/Makefile.am
+index e8e9373..449a27f 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -35,6 +35,10 @@ if IRI_IS_ENABLED
+ IRI_OBJ = iri.c
+ endif
+ 
++if METALINK_IS_ENABLED
++METALINK_OBJ = metalink.c
++endif
++
+ # The following line is losing on some versions of make!
+ DEFS     = @DEFS@ -DSYSTEM_WGETRC=\"$(sysconfdir)/wgetrc\" -DLOCALEDIR=\"$(localedir)\"
+ LIBS     = @LIBICONV@ @LIBINTL@ @LIBS@ $(LIB_CLOCK_GETTIME)
+@@ -47,13 +51,13 @@ wget_SOURCES = connect.c convert.c cookies.c ftp.c	\
+ 		ftp-basic.c ftp-ls.c hash.c host.c html-parse.c html-url.c	\
+ 		http.c init.c log.c main.c netrc.c progress.c ptimer.c	\
+ 		recur.c res.c retr.c spider.c url.c warc.c	\
+-		utils.c exits.c build_info.c $(IRI_OBJ)	\
++		utils.c exits.c build_info.c $(IRI_OBJ) $(METALINK_OBJ)	\
+ 		css-url.h css-tokens.h connect.h convert.h cookies.h	\
+ 		ftp.h hash.h host.h html-parse.h html-url.h	\
+ 		http.h http-ntlm.h init.h log.h mswindows.h netrc.h	\
+ 		options.h progress.h ptimer.h recur.h res.h retr.h	\
+ 		spider.h ssl.h sysdep.h url.h warc.h utils.h wget.h iri.h	\
+-		exits.h version.h
++		exits.h version.h metalink.h
+ nodist_wget_SOURCES = version.c
+ EXTRA_wget_SOURCES = iri.c
+ LDADD = $(LIBOBJS) ../lib/libgnu.a
+diff --git a/src/http.c b/src/http.c
+index 777903b..afbc254 100644
+--- a/src/http.c
++++ b/src/http.c
+@@ -61,6 +61,10 @@ as that of the covered work.  */
+ #include "warc.h"
+ #include "c-strcase.h"
+ #include "version.h"
++#ifdef HAVE_METALINK
++# include "metalink.h"
++# include "xstrndup.h"
++#endif
+ 
+ #ifdef TESTING
+ #include "test.h"
+@@ -1497,6 +1501,9 @@ struct http_stat
+   wgint orig_file_size;         /* size of file to compare for time-stamping */
+   time_t orig_file_tstamp;      /* time-stamp of file to compare for
+                                  * time-stamping */
++#ifdef HAVE_METALINK
++  metalink_t *metalink;
++#endif
+ };
+ 
+ static void
+@@ -1509,6 +1516,10 @@ free_hstat (struct http_stat *hs)
+   xfree (hs->local_file);
+   xfree (hs->orig_file_name);
+   xfree (hs->message);
++#ifdef HAVE_METALINK
++  metalink_delete (hs->metalink);
++  hs->metalink = NULL;
++#endif
+ }
+ 
+ static void
+@@ -2450,6 +2461,553 @@ set_content_type (int *dt, const char *type)
+     *dt &= ~TEXTCSS;
+ }
+ 
++#ifdef HAVE_METALINK
++
++/*
++  Find value of given key. This is intended for Link header, but will
++  work with any header that uses ';' as field separator and '=' as key-value
++  separator.
++
++  Link           = "Link" ":" #link-value
++  link-value     = "<" URI-Reference ">" *( ";" link-param )
++  link-param     = ( ( "rel" "=" relation-types )
++                 | ( "anchor" "=" <"> URI-Reference <"> )
++                 | ( "rev" "=" relation-types )
++                 | ( "hreflang" "=" Language-Tag )
++                 | ( "media" "=" ( MediaDesc | ( <"> MediaDesc <"> ) ) )
++                 | ( "title" "=" quoted-string )
++                 | ( "title*" "=" ext-value )
++                 | ( "type" "=" ( media-type | quoted-mt ) )
++                 | ( link-extension ) )
++  link-extension = ( parmname [ "=" ( ptoken | quoted-string ) ] )
++                 | ( ext-name-star "=" ext-value )
++  ext-name-star  = parmname "*" ; reserved for RFC2231-profiled
++                                ; extensions.  Whitespace NOT
++                                ; allowed in between.
++  ptoken         = 1*ptokenchar
++  ptokenchar     = "!" | "#" | "$" | "%" | "&" | "'" | "("
++                 | ")" | "*" | "+" | "-" | "." | "/" | DIGIT
++                 | ":" | "<" | "=" | ">" | "?" | "@" | ALPHA
++                 | "[" | "]" | "^" | "_" | "`" | "{" | "|"
++                 | "}" | "~"
++  media-type     = type-name "/" subtype-name
++  quoted-mt      = <"> media-type <">
++  relation-types = relation-type
++                 | <"> relation-type *( 1*SP relation-type ) <">
++  relation-type  = reg-rel-type | ext-rel-type
++  reg-rel-type   = LOALPHA *( LOALPHA | DIGIT | "." | "-" )
++  ext-rel-type   = URI
++
++ See more: rfc5988
++*/
++static bool
++find_key_value (const char *start, const char *end, const char *key, char **value)
++{
++  const char *eq;
++  size_t key_len = strlen (key);
++  const char *val_beg, *val_end;
++  const char *key_beg;
++
++  key_beg = start;
++
++  while (key_beg + key_len + 1 < end)
++    {
++      /* Skip whitespaces.  */
++      while (key_beg + key_len + 1 < end && c_isspace (*key_beg))
++        key_beg++;
++      if (strncmp (key_beg, key, key_len))
++        {
++          /* Find next token.  */
++          while (key_beg + key_len + 1 < end && *key_beg != ';')
++            key_beg++;
++          key_beg++;
++          continue;
++        }
++      else
++        {
++          /* Find equals sign.  */
++          eq = key_beg + key_len;
++          while (eq < end && c_isspace (*eq))
++            eq++;
++          if (eq == end)
++            return false;
++          if (*eq != '=')
++            {
++              key_beg++;
++              continue;
++            }
++
++          val_beg = eq + 1;
++          while (val_beg < end && c_isspace (*val_beg))
++            val_beg++;
++          if (val_beg == end)
++            return false;
++          val_end = val_beg + 1;
++          while (val_end < end && *val_end != ';' && !c_isspace (*val_end))
++            val_end++;
++          *value = xstrndup (val_beg, val_end - val_beg);
++          return true;
++        }
++    }
++  *value = NULL;
++  return false;
++}
++
++/* This is to check if given token exists in HTTP header. Tokens are
++   separated by ';'. */
++static bool
++has_key (const char *start, const char *end, const char *key)
++{
++  const char *pos; /* Here would the token start.  */
++  size_t key_len = strlen (key);
++
++  pos = start;
++  while (pos + key_len <= end)
++    {
++      /* Skip whitespaces at beginning.  */
++      while (pos + key_len <= end && c_isspace (*pos))
++        pos++;
++
++      /* Does the prefix of pos match our key?  */
++      if (strncmp (key, pos, key_len))
++        {
++          /* This was not a match.
++             Skip all characters until beginning of next token.  */
++          while (pos + key_len <= end && *pos != ';')
++            pos++;
++          pos++;
++          continue;
++        }
++
++      /* key is prefix of pos. Is it the exact token or just a prefix?  */
++      pos += key_len;
++      while (pos < end && c_isspace (*pos))
++        pos++;
++      if (pos == end || *pos == ';')
++        return true;
++
++      /* This was not a match (just a prefix).
++         Skip all characters until beginning of next token.  */
++      while (pos + key_len <= end && *pos != ';')
++        pos++;
++      pos++;
++    }
++  return false;
++}
++
++/* Find all key=value pairs delimited with ';' or ','. This is intended for
++   Digest header parsing.
++   The usage is:
++
++   const char *pos;
++   for (pos = header_beg; pos = find_key_values (pos, header_end, &key, &val); pos++)
++   {
++     ...
++   }
++
++ */
++static const char *
++find_key_values (const char *start, const char *end, char **key, char **value)
++{
++  const char *key_start, *key_end;
++  const char *eq;
++  const char *val_start, *val_end;
++
++  eq = start;
++  while (eq < end && *eq != '=')
++    {
++      /* Skip tokens without =value part.  */
++      if (*eq == ';' || *eq == ',')
++        start = eq + 1;
++      eq++;
++    }
++
++  if (eq >= end)
++    return NULL;
++
++  key_start = start;
++  while (key_start < eq && c_isspace (*key_start))
++    key_start++;
++
++  key_end = eq - 1;
++  while (key_end > key_start && c_isspace (*key_end))
++    key_end--;
++  key_end++;
++
++  val_start = eq + 1;
++  while (val_start < end && c_isspace (*val_start))
++    val_start++;
++
++  val_end = val_start;
++
++  while (val_end < end && *val_end != ';' &&
++         *val_end != ',' && !c_isspace (*val_end))
++    val_end++;
++
++  *key = xstrndup (key_start, key_end - key_start);
++  *value = xstrndup (val_start, val_end - val_start);
++
++  /* Skip trailing whitespaces.  */
++  while (val_end < end && c_isspace (*val_end))
++    val_end++;
++
++  return val_end;
++}
++
++/* Will return proper metalink_t structure if enough data was found in
++   http response resp. Otherwise returns NULL.
++   Two exit points: one for success and one for failure.  */
++static metalink_t *
++metalink_from_http (const struct response *resp, const struct http_stat *hs,
++                    const struct url *u)
++{
++  metalink_t *metalink = NULL;
++  metalink_file_t *mfile = xnew0 (metalink_file_t);
++  const char *val_beg, *val_end;
++  int res_count = 0, hash_count = 0, sig_count = 0, i;
++
++  DEBUGP (("Checking for Metalink in HTTP response\n"));
++
++  /* Initialize metalink file for our simple use case.  */
++  if (hs->local_file)
++    mfile->name = xstrdup (hs->local_file);
++  else
++    mfile->name = url_file_name (u, NULL);
++
++  /* Begin with 1-element array (for 0-termination). */
++  mfile->checksums = xnew0 (metalink_checksum_t *);
++  mfile->resources = xnew0 (metalink_resource_t *);
++
++  /* Find all Link headers.  */
++  for (i = 0;
++       (i = resp_header_locate (resp, "Link", i, &val_beg, &val_end)) != -1;
++       i++)
++    {
++      char *rel = NULL, *reltype = NULL;
++      char *urlstr = NULL;
++      const char *url_beg, *url_end, *attrs_beg;
++      size_t url_len;
++
++      /* Sample Metalink Link headers:
++
++           Link: <http://www2.example.com/dir1/dir2/dir3/dir4/dir5/example.ext>;
++           rel=duplicate; pri=1; pref; geo=gb; depth=4
++
++           Link: <http://example.com/example.ext.asc>; rel=describedby;
++           type="application/pgp-signature"
++       */
++
++      /* Find beginning of URL.  */
++      url_beg = val_beg;
++      while (url_beg < val_end - 1 && c_isspace (*url_beg))
++        url_beg++;
++
++      /* Find end of URL.  */
++      /* The convention here is that end ptr points to one element after
++         end of string. In this case, it should be pointing to the '>', which
++         is one element after end of actual URL. Therefore, it should never point
++         to val_end, which is one element after entire header value string.  */
++      url_end = url_beg + 1;
++      while (url_end < val_end - 1 && *url_end != '>')
++        url_end++;
++
++      if (url_beg >= val_end || url_end >= val_end ||
++          *url_beg != '<' || *url_end != '>')
++        {
++          DEBUGP (("This is not a valid Link header. Ignoring.\n"));
++          continue;
++        }
++
++      /* Skip <.  */
++      url_beg++;
++      url_len = url_end - url_beg;
++
++      /* URL found. Now handle the attributes.  */
++      attrs_beg = url_end + 1;
++
++      /* First we need to find out what type of link it is. Currently, we
++         support rel=duplicate and rel=describedby.  */
++      if (!find_key_value (attrs_beg, val_end, "rel", &rel))
++        {
++          DEBUGP (("No rel value in Link header, skipping.\n"));
++          continue;
++        }
++
++      urlstr = xstrndup (url_beg, url_len);
++      DEBUGP (("URL=%s\n", urlstr));
++      DEBUGP (("rel=%s\n", rel));
++
++      /* Handle signatures.
++         Libmetalink only supports one signature per file. Therefore we stop
++         as soon as we successfully get first supported signature.  */
++      if (sig_count == 0 &&
++          !strcmp (rel, "describedby") &&
++          find_key_value (attrs_beg, val_end, "type", &reltype) &&
++          !strcmp (reltype, "application/pgp-signature")
++          )
++        {
++          /* Download the signature to a temporary file.  */
++          FILE *_output_stream = output_stream;
++          bool _output_stream_regular = output_stream_regular;
++
++          output_stream = tmpfile ();
++          if (output_stream)
++            {
++              struct iri *iri = iri_new ();
++              struct url *url;
++              int url_err;
++
++              set_uri_encoding (iri, opt.locale, true);
++              url = url_parse (urlstr, &url_err, iri, false);
++
++              if (!url)
++                {
++                  char *error = url_error (urlstr, url_err);
++                  logprintf (LOG_NOTQUIET, _("When downloading signature:\n"
++                                             "%s: %s.\n"), urlstr, error);
++                  xfree (error);
++                }
++              else
++                {
++                  /* Avoid recursive Metalink from HTTP headers.  */
++                  bool _metalink_http = opt.metalink_over_http;
++                  uerr_t retr_err;
++
++                  opt.metalink_over_http = false;
++                  retr_err = retrieve_url (url, urlstr, NULL, NULL,
++                                           NULL, NULL, false, iri, false);
++                  opt.metalink_over_http = _metalink_http;
++
++                  url_free (url);
++                  iri_free (iri);
++
++                  if (retr_err == RETROK)
++                    {
++                      /* Signature is in the temporary file. Read it into
++                         metalink resource structure.  */
++                      metalink_signature_t msig;
++                      size_t siglen;
++
++                      fseek (output_stream, 0, SEEK_END);
++                      siglen = ftell (output_stream);
++                      fseek (output_stream, 0, SEEK_SET);
++
++                      DEBUGP (("siglen=%lu\n", siglen));
++
++                      msig.signature = xmalloc (siglen + 1);
++                      if (fread (msig.signature, siglen, 1, output_stream) != 1)
++                        {
++                          logputs (LOG_NOTQUIET,
++                                   _("Unable to read signature content from "
++                                     "temporary file. Skipping.\n"));
++                          xfree (msig.signature);
++                        }
++                      else
++                        {
++                          msig.signature[siglen] = '\0'; /* Just in case.  */
++                          msig.mediatype = xstrdup ("application/pgp-signature");
++
++                          DEBUGP (("Signature (%s):\n%s\n",
++                                   msig.mediatype, msig.signature));
++
++                          mfile->signature = xnew (metalink_signature_t);
++                          *mfile->signature = msig;
++
++                          sig_count++;
++                        }
++                    }
++                }
++              fclose (output_stream);
++            }
++          else
++            {
++              logputs (LOG_NOTQUIET, _("Could not create temporary file. "
++                                       "Skipping signature download.\n"));
++            }
++          output_stream_regular = _output_stream_regular;
++          output_stream = _output_stream;
++        } /* Iterate over signatures.  */
++
++        /* Handle Metalink resources.  */
++      else if (!strcmp (rel, "duplicate"))
++        {
++          metalink_resource_t mres = {0};
++          char *pristr;
++
++          /*
++             Valid ranges for the "pri" attribute are from
++             1 to 999999.  Mirror servers with a lower value of the "pri"
++             attribute have a higher priority, while mirrors with an undefined
++             "pri" attribute are considered to have a value of 999999, which is
++             the lowest priority.
++
++             rfc6249 section 3.1
++           */
++          mres.priority = DEFAULT_PRI;
++          if (find_key_value (url_end, val_end, "pri", &pristr))
++            {
++              long pri;
++              char *end_pristr;
++              /* Do not care for errno since 0 is error in this case.  */
++              pri = strtol (pristr, &end_pristr, 10);
++              if (end_pristr != pristr + strlen (pristr) ||
++                  !VALID_PRI_RANGE (pri))
++                {
++                  /* This is against the specification, so let's inform the user.  */
++                  logprintf (LOG_NOTQUIET,
++                             _("Invalid pri value. Assuming %d.\n"),
++                             DEFAULT_PRI);
++                }
++              else
++                mres.priority = pri;
++              xfree (pristr);
++            }
++
++          switch (url_scheme (urlstr))
++            {
++            case SCHEME_HTTP:
++              mres.type = xstrdup ("http");
++              break;
++#ifdef HAVE_SSL
++            case SCHEME_HTTPS:
++              mres.type = xstrdup ("https");
++              break;
++#endif
++            case SCHEME_FTP:
++              mres.type = xstrdup ("ftp");
++              break;
++            default:
++              DEBUGP (("Unsupported url scheme in %s. Skipping resource.\n", urlstr));
++            }
++
++          if (mres.type)
++            {
++              DEBUGP (("TYPE=%s\n", mres.type));
++
++              /* At this point we have validated the new resource.  */
++
++              find_key_value (url_end, val_end, "geo", &mres.location);
++
++              mres.url = urlstr;
++              urlstr = NULL;
++
++              mres.preference = 0;
++              if (has_key (url_end, val_end, "pref"))
++                {
++                  DEBUGP (("This resource has preference\n"));
++                  mres.preference = 1;
++                }
++
++              /* 1 slot from new resource, 1 slot for null-termination.  */
++              mfile->resources = xrealloc (mfile->resources,
++                                           sizeof (metalink_resource_t *) * (res_count + 2));
++              mfile->resources[res_count] = xnew0 (metalink_resource_t);
++              *mfile->resources[res_count] = mres;
++              res_count++;
++            }
++        } /* Handle resource link (rel=duplicate).  */
++      else
++        DEBUGP (("This link header was not used for Metalink\n"));
++
++      xfree (urlstr);
++      xfree (reltype);
++      xfree (rel);
++    } /* Iterate over link headers.  */
++
++  /* Null-terminate resources array.  */
++  mfile->resources[res_count] = 0;
++
++  if (res_count == 0)
++    {
++      DEBUGP (("No valid metalink references found.\n"));
++      goto fail;
++    }
++
++  /* Find all Digest headers.  */
++  for (i = 0;
++       (i = resp_header_locate (resp, "Digest", i, &val_beg, &val_end)) != -1;
++       i++)
++    {
++      const char *dig_pos;
++      char *dig_type, *dig_hash;
++
++      /* Each Digest header can include multiple hashes. Example:
++           Digest: SHA=thvDyvhfIqlvFe+A9MYgxAfm1q5=,unixsum=30637
++           Digest: md5=HUXZLQLMuI/KZ5KDcJPcOA==
++       */
++      for (dig_pos = val_beg;
++           (dig_pos = find_key_values (dig_pos, val_end, &dig_type, &dig_hash));
++           dig_pos++)
++        {
++          /* The hash here is assumed to be base64. We need the hash in hex.
++             Therefore we convert: base64 -> binary -> hex.  */
++          const size_t dig_hash_str_len = strlen (dig_hash);
++          char *bin_hash = alloca (dig_hash_str_len * 3 / 4 + 1);
++          size_t hash_bin_len;
++
++          hash_bin_len = base64_decode (dig_hash, bin_hash);
++
++          /* One slot for me, one for zero-termination.  */
++          mfile->checksums =
++                  xrealloc (mfile->checksums,
++                            sizeof (metalink_checksum_t *) * (hash_count + 2));
++          mfile->checksums[hash_count] = xnew (metalink_checksum_t);
++          mfile->checksums[hash_count]->type = dig_type;
++
++          mfile->checksums[hash_count]->hash = xmalloc (hash_bin_len * 2 + 1);
++          hex_to_string (mfile->checksums[hash_count]->hash, bin_hash, hash_bin_len);
++
++          xfree (dig_hash);
++
++          hash_count++;
++        }
++    }
++
++  /* Zero-terminate checksums array.  */
++  mfile->checksums[hash_count] = 0;
++
++  /*
++    If Instance Digests are not provided by the Metalink servers, the
++    Link header fields pertaining to this specification MUST be ignored.
++
++    rfc6249 section 6
++   */
++  if (hash_count == 0)
++    {
++      logputs (LOG_VERBOSE,
++               _("Could not find acceptable digest for Metalink resources.\n"
++                 "Ignoring them.\n"));
++      goto fail;
++    }
++
++  /* Metalink data is OK. Now we just need to sort the resources based
++     on their priorities, preference, and perhaps location.  */
++  stable_sort (mfile->resources, res_count, sizeof (metalink_resource_t *), metalink_res_cmp);
++
++  /* Restore sensible preference values (in case someone cares to look).  */
++  for (i = 0; i < res_count; ++i)
++    mfile->resources[i]->preference = 1000000 - mfile->resources[i]->priority;
++
++  metalink = xnew0 (metalink_t);
++  metalink->files = xmalloc (sizeof (metalink_file_t *) * 2);
++  metalink->files[0] = mfile;
++  metalink->files[1] = 0;
++  metalink->origin = xstrdup (u->url);
++  metalink->version = METALINK_VERSION_4;
++  /* Leave other fields set to 0.  */
++
++  return metalink;
++
++fail:
++  /* Free all allocated memory.  */
++  if (metalink)
++    metalink_delete (metalink);
++  else
++    metalink_file_delete (mfile);
++  return NULL;
++}
++#endif /* HAVE_METALINK */
++
+ /* Retrieve a document through HTTP protocol.  It recognizes status
+    code, and correctly handles redirections.  It closes the network
+    socket.  If it receives an error from the functions below it, it
+@@ -2501,6 +3059,11 @@ gethttp (struct url *u, struct http_stat *hs, int *dt, struct url *proxy,
+   /* Whether conditional get request will be issued.  */
+   bool cond_get = !!(*dt & IF_MODIFIED_SINCE);
+ 
++#ifdef HAVE_METALINK
++  /* Are we looking for metalink info in HTTP headers?  */
++  bool metalink = !!(*dt & METALINK_METADATA);
++#endif
++
+   char *head = NULL;
+   struct response *resp = NULL;
+   char hdrval[512];
+@@ -2838,6 +3401,19 @@ gethttp (struct url *u, struct http_stat *hs, int *dt, struct url *proxy,
+        when we're done.  This means that we can register it.  */
+     register_persistent (conn->host, conn->port, sock, using_ssl);
+ 
++#ifdef HAVE_METALINK
++  /* We need to check for the Metalink data in the very first response
++     we get from the server (before redirectionrs, authorization, etc.).  */
++  if (metalink)
++    {
++      hs->metalink = metalink_from_http (resp, hs, u);
++      xfree (hs->message);
++      retval = RETR_WITH_METALINK;
++      CLOSE_FINISH (sock);
++      goto cleanup;
++    }
++#endif
++
+   if (statcode == HTTP_STATUS_UNAUTHORIZED)
+     {
+       /* Authorization is required.  */
+@@ -3383,6 +3959,14 @@ http_loop (struct url *u, struct url *original_url, char **newloc,
+   else
+     file_name = xstrdup (opt.output_document);
+ 
++#ifdef HAVE_METALINK
++  if (opt.metalink_over_http)
++    {
++      *dt |= METALINK_METADATA;
++      send_head_first = true;
++    }
++#endif
++
+   if (opt.timestamping)
+     {
+       /* Use conditional get request if requested
+@@ -3569,6 +4153,29 @@ Spider mode enabled. Check if remote file exists.\n"));
+         case RETRFINISHED:
+           /* Deal with you later.  */
+           break;
++#ifdef HAVE_METALINK
++        case RETR_WITH_METALINK:
++          {
++            if (hstat.metalink == NULL)
++              {
++                logputs (LOG_NOTQUIET,
++                         _("Could not find Metalink data in HTTP response. "
++                           "Downloading file using HTTP GET.\n"));
++                *dt &= ~METALINK_METADATA;
++                *dt &= ~HEAD_ONLY;
++                got_head = true;
++                continue;
++              }
++
++            logputs (LOG_VERBOSE,
++                     _("Metalink headers found. "
++                       "Switching to Metalink mode.\n"));
++
++            ret = retrieve_from_metalink (hstat.metalink);
++            goto exit;
++          }
++          break;
++#endif
+         default:
+           /* All possibilities should have been exhausted.  */
+           abort ();
+diff --git a/src/init.c b/src/init.c
+index 027657b..dbff1b3 100644
+--- a/src/init.c
++++ b/src/init.c
+@@ -215,6 +215,9 @@ static const struct {
+   { "inet6only",        &opt.ipv6_only,         cmd_boolean },
+ #endif
+   { "input",            &opt.input_filename,    cmd_file },
++#ifdef HAVE_METALINK
++  { "input-metalink",   &opt.input_metalink,    cmd_file },
++#endif
+   { "iri",              &opt.enable_iri,        cmd_boolean },
+   { "keepsessioncookies", &opt.keep_session_cookies, cmd_boolean },
+   { "limitrate",        &opt.limit_rate,        cmd_bytes },
+@@ -223,6 +226,9 @@ static const struct {
+   { "logfile",          &opt.lfilename,         cmd_file },
+   { "login",            &opt.ftp_user,          cmd_string },/* deprecated*/
+   { "maxredirect",      &opt.max_redirect,      cmd_number },
++#ifdef HAVE_METALINK
++  { "metalink-over-http", &opt.metalink_over_http, cmd_boolean },
++#endif
+   { "method",           &opt.method,            cmd_string_uppercase },
+   { "mirror",           NULL,                   cmd_spec_mirror },
+   { "netrc",            &opt.netrc,             cmd_boolean },
+@@ -1793,6 +1799,9 @@ cleanup (void)
+   xfree (opt.lfilename);
+   xfree (opt.dir_prefix);
+   xfree (opt.input_filename);
++#ifdef HAVE_METALINK
++  xfree (opt.input_metalink);
++#endif
+   xfree (opt.output_document);
+   free_vec (opt.accepts);
+   free_vec (opt.rejects);
+diff --git a/src/main.c b/src/main.c
+index a0044d9..a66f7bc 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -63,6 +63,11 @@ as that of the covered work.  */
+ #include <getpass.h>
+ #include <quote.h>
+ 
++#ifdef HAVE_METALINK
++# include <metalink/metalink_parser.h>
++# include "metalink.h"
++#endif
++
+ #ifdef WINDOWS
+ # include <io.h>
+ # include <fcntl.h>
+@@ -241,6 +246,9 @@ static struct cmdline_option option_data[] =
+     { "inet6-only", '6', OPT_BOOLEAN, "inet6only", -1 },
+ #endif
+     { "input-file", 'i', OPT_VALUE, "input", -1 },
++#ifdef HAVE_METALINK
++    { "input-metalink", 0, OPT_VALUE, "input-metalink", -1 },
++#endif
+     { "iri", 0, OPT_BOOLEAN, "iri", -1 },
+     { "keep-session-cookies", 0, OPT_BOOLEAN, "keepsessioncookies", -1 },
+     { "level", 'l', OPT_VALUE, "reclevel", -1 },
+@@ -248,6 +256,9 @@ static struct cmdline_option option_data[] =
+     { "load-cookies", 0, OPT_VALUE, "loadcookies", -1 },
+     { "local-encoding", 0, OPT_VALUE, "localencoding", -1 },
+     { "max-redirect", 0, OPT_VALUE, "maxredirect", -1 },
++#ifdef HAVE_METALINK
++    { "metalink-over-http", 0, OPT_BOOLEAN, "metalink-over-http", -1 },
++#endif
+     { "method", 0, OPT_VALUE, "method", -1 },
+     { "mirror", 'm', OPT_BOOLEAN, "mirror", -1 },
+     { "no", 'n', OPT__NO, NULL, required_argument },
+@@ -483,6 +494,10 @@ Logging and input file:\n"),
+        --report-speed=TYPE         output bandwidth as TYPE.  TYPE can be bits\n"),
+     N_("\
+   -i,  --input-file=FILE           download URLs found in local or external FILE\n"),
++#ifdef HAVE_METALINK
++    N_("\
++       --input-metalink=FILE       download files covered in local Metalink FILE\n"),
++#endif
+     N_("\
+   -F,  --force-html                treat input file as HTML\n"),
+     N_("\
+@@ -577,6 +592,10 @@ Download:\n"),
+        --remote-encoding=ENC       use ENC as the default remote encoding\n"),
+     N_("\
+        --unlink                    remove file before clobber\n"),
++#ifdef HAVE_METALINK
++    N_("\
++       --metalink-over-http        use Metalink metadata from HTTP response headers\n"),
++#endif
+     "\n",
+ 
+     N_("\
+@@ -1405,7 +1424,11 @@ for details.\n\n"));
+       opt.always_rest = false;
+     }
+ 
+-  if (!nurl && !opt.input_filename)
++  if (!nurl && !opt.input_filename
++#ifdef HAVE_METALINK
++      && !opt.input_metalink
++#endif
++      )
+     {
+       /* No URL specified.  */
+       fprintf (stderr, _("%s: missing URL\n"), exec_name);
+@@ -1730,6 +1753,37 @@ outputting to a regular file.\n"));
+                    opt.input_filename);
+     }
+ 
++#ifdef HAVE_METALINK
++  /* Finally, from metlink file, if any.  */
++  if (opt.input_metalink)
++    {
++      metalink_error_t meta_err;
++      uerr_t retr_err;
++      metalink_t *metalink;
++
++      meta_err = metalink_parse_file (opt.input_metalink, &metalink);
++
++      if (meta_err)
++        {
++          logprintf (LOG_NOTQUIET, _("Unable to parse metalink file %s.\n"),
++                     opt.input_metalink);
++          retr_err = METALINK_PARSE_ERROR;
++        }
++      else
++        {
++          retr_err = retrieve_from_metalink (metalink);
++          if (retr_err != RETROK)
++            {
++              logprintf (LOG_NOTQUIET,
++                         _("Could not download all resources from %s.\n"),
++                         quote (opt.input_metalink));
++            }
++        }
++      inform_exit_status (retr_err);
++      metalink_delete (metalink);
++    }
++#endif /* HAVE_METALINK */
++
+   /* Print broken links. */
+   if (opt.recursive && opt.spider)
+     print_broken_links ();
+diff --git a/src/metalink.c b/src/metalink.c
+new file mode 100644
+index 0000000..962dd94
+--- /dev/null
++++ b/src/metalink.c
+@@ -0,0 +1,448 @@
++/* Metalink module.
++   Copyright (C) 2015 Free Software Foundation, Inc.
++
++This file is part of GNU Wget.
++
++GNU Wget is free software; you can redistribute it and/or modify
++it under the terms of the GNU General Public License as published by
++the Free Software Foundation; either version 3 of the License, or (at
++your option) any later version.
++
++GNU Wget is distributed in the hope that it will be useful,
++but WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++GNU General Public License for more details.
++
++You should have received a copy of the GNU General Public License
++along with Wget.  If not, see <http://www.gnu.org/licenses/>.
++
++Additional permission under GNU GPL version 3 section 7
++
++If you modify this program, or any covered work, by linking or
++combining it with the OpenSSL project's OpenSSL library (or a
++modified version of that library), containing parts covered by the
++terms of the OpenSSL or SSLeay licenses, the Free Software Foundation
++grants you additional permission to convey the resulting work.
++Corresponding Source for a non-source form of such a combination
++shall include the source code for the parts of OpenSSL used as well
++as that of the covered work.  */
++
++#include "wget.h"
++#ifdef HAVE_METALINK
++
++#include "metalink.h"
++#include "retr.h"
++#include "exits.h"
++#include "utils.h"
++#include "sha256.h"
++#include <sys/errno.h>
++#include <unistd.h> /* For unlink.  */
++#include <metalink/metalink_parser.h>
++#ifdef HAVE_GPGME
++#include <gpgme.h>
++#include <fcntl.h> /* For open and close.  */
++#endif
++
++/* Loop through all files in metalink structure and retrieve them.
++   Returns RETROK if all files were downloaded.
++   Returns last retrieval error (from retrieve_url) if some files
++   could not be downloaded.  */
++uerr_t
++retrieve_from_metalink (const metalink_t* metalink)
++{
++  metalink_file_t **mfile_ptr;
++  uerr_t last_retr_err = RETROK; /* Store last encountered retrieve error.  */
++
++  FILE *_output_stream = output_stream;
++  bool _output_stream_regular = output_stream_regular;
++  char *_output_document = opt.output_document;
++
++  DEBUGP (("Retrieving from Metalink\n"));
++
++  /* No files to download.  */
++  if (!metalink->files)
++    return RETROK;
++
++  if (opt.output_document)
++    {
++      /* We cannot support output_document as we need to compute checksum
++         of downloaded file, and to remove it if the checksum is bad.  */
++      logputs (LOG_NOTQUIET,
++               _("-O not supported for metalink download. Ignoring.\n"));
++    }
++
++  for (mfile_ptr = metalink->files; *mfile_ptr; mfile_ptr++)
++    {
++      metalink_file_t *mfile = *mfile_ptr;
++      metalink_resource_t **mres_ptr;
++      char *filename = NULL;
++      bool hash_ok = false;
++
++      uerr_t retr_err;
++
++      /* -1 -> file should be rejected
++         0 -> could not verify
++         1 -> verified successfully  */
++      char sig_status = 0;
++
++      output_stream = NULL;
++
++      DEBUGP (("Processing metalink file %s...\n", quote (mfile->name)));
++
++      /* Resources are sorted by priority.  */
++      for (mres_ptr = mfile->resources; *mres_ptr; mres_ptr++)
++        {
++          metalink_resource_t *mres = *mres_ptr;
++          metalink_checksum_t **mchksum_ptr, *mchksum;
++          struct iri *iri;
++          struct url *url;
++          int url_err;
++
++          if (!RES_TYPE_SUPPORTED (mres->type))
++            {
++              logprintf (LOG_VERBOSE,
++                         _("Resource type %s not supported, ignoring...\n"),
++                         quote (mres->type));
++              continue;
++            }
++
++          retr_err = METALINK_RETR_ERROR;
++
++          /* If output_stream is not NULL, then we have failed on
++             previous resource and are retrying. Thus, remove the file.  */
++          if (output_stream)
++            {
++              fclose (output_stream);
++              output_stream = NULL;
++              if (unlink (filename))
++                logprintf (LOG_NOTQUIET, "unlink: %s\n", strerror (errno));
++              xfree (filename);
++            }
++
++          /* Parse our resource URL.  */
++          iri = iri_new ();
++          set_uri_encoding (iri, opt.locale, true);
++          url = url_parse (mres->url, &url_err, iri, false);
++
++          if (!url)
++            {
++              char *error = url_error (mres->url, url_err);
++              logprintf (LOG_NOTQUIET, "%s: %s.\n", mres->url, error);
++              xfree (error);
++              inform_exit_status (URLERROR);
++              iri_free (iri);
++              continue;
++            }
++          else
++            {
++              /* Avoid recursive Metalink from HTTP headers.  */
++              bool _metalink_http = opt.metalink_over_http;
++
++              /* Assure proper local file name regardless of the URL
++                 of particular Metalink resource.
++                 To do that we create the local file here and put
++                 it as output_stream. We restore the original configuration
++                 after we are finished with the file.  */
++              output_stream = unique_create (mfile->name, true, &filename);
++              output_stream_regular = true;
++
++              /* Store the real file name for displaying in messages.  */
++              opt.output_document = filename;
++
++              opt.metalink_over_http = false;
++              DEBUGP (("Storing to %s\n", filename));
++              retr_err = retrieve_url (url, mres->url, NULL, NULL,
++                                       NULL, NULL, opt.recursive, iri, false);
++              opt.metalink_over_http = _metalink_http;
++            }
++          url_free (url);
++          iri_free (iri);
++
++          if (retr_err == RETROK)
++            {
++              FILE *local_file;
++
++              /* Check the digest.  */
++              local_file = fopen (filename, "r");
++              if (!local_file)
++                {
++                  logprintf (LOG_NOTQUIET, _("Could not open downloaded file.\n"));
++                  continue;
++                }
++
++              for (mchksum_ptr = mfile->checksums; *mchksum_ptr; mchksum_ptr++)
++                {
++                  char sha256[SHA256_DIGEST_SIZE];
++                  char sha256_txt[2 * SHA256_DIGEST_SIZE + 1];
++
++                  mchksum = *mchksum_ptr;
++
++                  /* I have seen both variants...  */
++                  if (strcasecmp (mchksum->type, "sha256")
++                      && strcasecmp (mchksum->type, "sha-256"))
++                    {
++                      DEBUGP (("Ignoring unsupported checksum type %s.\n",
++                               quote (mchksum->type)));
++                      continue;
++                    }
++
++                  logprintf (LOG_VERBOSE, _("Computing checksum for %s\n"),
++                             quote (mfile->name));
++
++                  sha256_stream (local_file, sha256);
++                  hex_to_string (sha256_txt, sha256, SHA256_DIGEST_SIZE);
++                  DEBUGP (("Declared hash: %s\n", mchksum->hash));
++                  DEBUGP (("Computed hash: %s\n", sha256_txt));
++                  if (!strcmp (sha256_txt, mchksum->hash))
++                    {
++                      logputs (LOG_VERBOSE,
++                               _("Checksum matches.\n"));
++                      hash_ok = true;
++                    }
++                  else
++                    {
++                      logprintf (LOG_NOTQUIET,
++                                 _("Checksum mismatch for file %s.\n"),
++                                 quote (mfile->name));
++                      hash_ok = false;
++                    }
++
++                  /* Stop as soon as we checked the supported checksum.  */
++                  break;
++                } /* Iterate over available checksums.  */
++              fclose (local_file);
++              local_file = NULL;
++
++              if (!hash_ok)
++                continue;
++
++              sig_status = 0; /* Not verified.  */
++
++#ifdef HAVE_GPGME
++              /* Check the crypto signature.  */
++              if (mfile->signature)
++                {
++                  metalink_signature_t *msig;
++                  gpgme_error_t gpgerr;
++                  gpgme_ctx_t gpgctx;
++                  gpgme_data_t gpgsigdata, gpgdata;
++                  gpgme_verify_result_t gpgres;
++                  int fd;
++
++                  /* Initialize the library - as name suggests.  */
++                  gpgme_check_version (NULL);
++
++                  /* Open data file.  */
++                  fd = open (filename, O_RDONLY);
++                  if (fd == -1)
++                    {
++                      logputs (LOG_NOTQUIET,
++                               _("Could not open downloaded file for signature "
++                                 "verification.\n"));
++                      goto gpg_skip_verification;
++                    }
++
++                  /* Assign file descriptor to GPG data structure.  */
++                  gpgerr = gpgme_data_new_from_fd (&gpgdata, fd);
++                  if (gpgerr != GPG_ERR_NO_ERROR)
++                    {
++                      logprintf (LOG_NOTQUIET,
++                                 "GPGME data_new_from_fd: %s\n",
++                                 gpgme_strerror (gpgerr));
++                      goto gpg_cleanup_fd;
++                    }
++
++                  /* Prepare new GPGME context.  */
++                  gpgerr = gpgme_new (&gpgctx);
++                  if (gpgerr != GPG_ERR_NO_ERROR)
++                    {
++                      logprintf (LOG_NOTQUIET,
++                                 "GPGME new: %s\n",
++                                 gpgme_strerror (gpgerr));
++                      goto gpg_cleanup_data;
++                    }
++
++                  /* Note that this will only work for Metalink-over-HTTP
++                     requests (that we parse manually) due to a bug in
++                     Libmetalink. Another problem with Libmetalink is that
++                     it supports at most one signature per file. The below
++                     line should be modified after Libmetalink resolves these
++                     issues.  */
++                  for (msig = mfile->signature; msig == mfile->signature; msig++)
++                    {
++                      gpgme_signature_t gpgsig;
++                      gpgme_protocol_t gpgprot = GPGME_PROTOCOL_UNKNOWN;
++
++                      DEBUGP (("Veryfying signature %s:\n%s\n",
++                               quote (msig->mediatype),
++                               msig->signature));
++
++                      /* Check signature type.  */
++                      if (!strcmp (msig->mediatype, "application/pgp-signature"))
++                        gpgprot = GPGME_PROTOCOL_OpenPGP;
++                      else /* Unsupported signature type.  */
++                        continue;
++
++                      gpgerr = gpgme_set_protocol (gpgctx, gpgprot);
++                      if (gpgerr != GPG_ERR_NO_ERROR)
++                        {
++                          logprintf (LOG_NOTQUIET,
++                                     "GPGME set_protocol: %s\n",
++                                     gpgme_strerror (gpgerr));
++                          continue;
++                        }
++
++                      /* Load the signature.  */
++                      gpgerr = gpgme_data_new_from_mem (&gpgsigdata,
++                                                        msig->signature,
++                                                        strlen (msig->signature),
++                                                        0);
++                      if (gpgerr != GPG_ERR_NO_ERROR)
++                        {
++                          logprintf (LOG_NOTQUIET,
++                                     _("GPGME data_new_from_mem: %s\n"),
++                                     gpgme_strerror (gpgerr));
++                          continue;
++                        }
++
++                      /* Verify the signature.  */
++                      gpgerr = gpgme_op_verify (gpgctx, gpgsigdata, gpgdata, NULL);
++                      if (gpgerr != GPG_ERR_NO_ERROR)
++                        {
++                          logprintf (LOG_NOTQUIET,
++                                     _("GPGME op_verify: %s\n"),
++                                     gpgme_strerror (gpgerr));
++                          gpgme_data_release (gpgsigdata);
++                          continue;
++                        }
++
++                      /* Check the results.  */
++                      gpgres = gpgme_op_verify_result (gpgctx);
++                      if (!gpgres)
++                        {
++                          logputs (LOG_NOTQUIET,
++                                   _("GPGME op_verify_result: NULL\n"));
++                          gpgme_data_release (gpgsigdata);
++                          continue;
++                        }
++
++                      /* The list is null-terminated.  */
++                      for (gpgsig = gpgres->signatures; gpgsig; gpgsig = gpgsig->next)
++                        {
++                          DEBUGP (("Checking signature 0x%p\n",
++                                   (void *) gpgsig));
++                          DEBUGP (("Summary=0x%x Status=0x%x\n",
++                                   gpgsig->summary, gpgsig->status & 0xFFFF));
++
++                          if (gpgsig->summary
++                              & (GPGME_SIGSUM_VALID | GPGME_SIGSUM_GREEN))
++                            {
++                              logputs (LOG_VERBOSE,
++                                       _("Signature validation suceeded.\n"));
++                              sig_status = 1;
++                              break;
++                            }
++
++                          if (gpgsig->summary & GPGME_SIGSUM_RED)
++                            {
++                              logputs (LOG_NOTQUIET,
++                                       _("Invalid signature. Rejecting resource.\n"));
++                              sig_status = -1;
++                              break;
++                            }
++
++                          if (gpgsig->summary == 0
++                              && (gpgsig->status & 0xFFFF) == GPG_ERR_NO_ERROR)
++                            {
++                              logputs (LOG_VERBOSE,
++                                       _("Data matches signature, but signature "
++                                         "is not trusted.\n"));
++                            }
++
++                          if ((gpgsig->status & 0xFFFF) != GPG_ERR_NO_ERROR)
++                            {
++                              logprintf (LOG_NOTQUIET,
++                                         "GPGME: %s\n",
++                                         gpgme_strerror (gpgsig->status & 0xFFFF));
++                            }
++                        }
++
++                      gpgme_data_release (gpgsigdata);
++
++                      if (sig_status != 0)
++                        break;
++                    } /* Iterate over signatures.  */
++
++                  gpgme_release (gpgctx);
++gpg_cleanup_data:
++                  gpgme_data_release (gpgdata);
++gpg_cleanup_fd:
++                  close (fd);
++                } /* endif (mfile->signature) */
++gpg_skip_verification:
++#endif
++              /* Stop if file was downloaded with success.  */
++              if (sig_status >= 0)
++                break;
++            } /* endif RETR_OK.  */
++        } /* Iterate over resources.  */
++
++      if (retr_err != RETROK)
++        {
++          logprintf (LOG_VERBOSE, _("Failed to download %s. Skipping resource.\n"),
++                     quote (mfile->name));
++        }
++      else if (!hash_ok)
++        {
++          retr_err = METALINK_CHKSUM_ERROR;
++          logprintf (LOG_NOTQUIET,
++                     _("File %s retrieved but checksum does not match. "
++                       "\n"), quote (mfile->name));
++        }
++#ifdef HAVE_GPGME
++        /* Signature will be only validated if hash check was successful.  */
++      else if (sig_status < 0)
++        {
++          retr_err = METALINK_SIG_ERROR;
++          logprintf (LOG_NOTQUIET,
++                     _("File %s retrieved but signature does not match. "
++                       "\n"), quote (mfile->name));
++        }
++#endif
++      last_retr_err = retr_err == RETROK ? last_retr_err : retr_err;
++
++      /* Remove the file if error encountered or if option specified.
++         Note: the file has been downloaded using *_loop. Therefore, it
++         is not necessary to keep the file for continuated download.  */
++      if ((retr_err != RETROK || opt.delete_after)
++           && filename != NULL && file_exists_p (filename))
++        {
++          logprintf (LOG_VERBOSE, _("Removing %s.\n"), quote (filename));
++          if (unlink (filename))
++            logprintf (LOG_NOTQUIET, "unlink: %s\n", strerror (errno));
++        }
++      fclose (output_stream);
++      output_stream = NULL;
++      xfree (filename);
++    } /* Iterate over files.  */
++
++  /* Restore original values.  */
++  opt.output_document = _output_document;
++  output_stream_regular = _output_stream_regular;
++  output_stream = _output_stream;
++
++  return last_retr_err;
++}
++
++int metalink_res_cmp (const void* v1, const void* v2)
++{
++  const metalink_resource_t *res1 = *(metalink_resource_t **) v1,
++                            *res2 = *(metalink_resource_t **) v2;
++  if (res1->preference != res2->preference)
++    return res2->preference - res1->preference;
++  if (res1->priority != res2->priority)
++    return res1->priority - res2->priority;
++  return 0;
++}
++
++#endif /* HAVE_METALINK */
+diff --git a/src/metalink.h b/src/metalink.h
+new file mode 100644
+index 0000000..202c545
+--- /dev/null
++++ b/src/metalink.h
+@@ -0,0 +1,50 @@
++/* Declarations for metalink.c.
++   Copyright (C) 2015 Free Software Foundation, Inc.
++
++This file is part of GNU Wget.
++
++GNU Wget is free software; you can redistribute it and/or modify
++it under the terms of the GNU General Public License as published by
++the Free Software Foundation; either version 3 of the License, or
++(at your option) any later version.
++
++GNU Wget is distributed in the hope that it will be useful,
++but WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++GNU General Public License for more details.
++
++You should have received a copy of the GNU General Public License
++along with Wget.  If not, see <http://www.gnu.org/licenses/>.
++
++Additional permission under GNU GPL version 3 section 7
++
++If you modify this program, or any covered work, by linking or
++combining it with the OpenSSL project's OpenSSL library (or a
++modified version of that library), containing parts covered by the
++terms of the OpenSSL or SSLeay licenses, the Free Software Foundation
++grants you additional permission to convey the resulting work.
++Corresponding Source for a non-source form of such a combination
++shall include the source code for the parts of OpenSSL used as well
++as that of the covered work.  */
++#if ! defined METALINK_H && defined HAVE_METALINK
++#define	METALINK_H
++
++#include <metalink/metalink_types.h>
++#include "wget.h"
++
++#ifdef HAVE_SSL
++# define RES_TYPE_SUPPORTED(x)\
++    ((!x) || !strcmp (x, "ftp") || !strcmp (x, "http") || !strcmp (x, "https"))
++#else
++# define RES_TYPE_SUPPORTED(x)\
++    ((!x) || !strcmp (x, "ftp") || !strcmp (x, "http"))
++#endif
++
++#define DEFAULT_PRI 999999
++#define VALID_PRI_RANGE(x) ((x) > 0 && (x) < 1000000)
++
++uerr_t retrieve_from_metalink (const metalink_t *metalink);
++
++int metalink_res_cmp (const void *res1, const void *res2);
++
++#endif	/* METALINK_H */
+diff --git a/src/options.h b/src/options.h
+index bef1f10..c377b50 100644
+--- a/src/options.h
++++ b/src/options.h
+@@ -58,6 +58,10 @@ struct options
+   char *dir_prefix;             /* The top of directory tree */
+   char *lfilename;              /* Log filename */
+   char *input_filename;         /* Input filename */
++#ifdef HAVE_METALINK
++  char *input_metalink;         /* Input metalink file */
++  bool metalink_over_http;      /* Use Metalink if present in HTTP response */
++#endif
+   char *choose_config;          /* Specified config file */
+   bool noconfig;                /* Ignore all config files? */
+   bool force_html;              /* Is the input file an HTML file? */
+diff --git a/src/utils.c b/src/utils.c
+index 7fccf66..4da45a1 100644
+--- a/src/utils.c
++++ b/src/utils.c
+@@ -2506,6 +2506,21 @@ get_max_length (const char *path, int length, int name)
+   return ret;
+ }
+ 
++void
++hex_to_string (char *str_buffer, const char *hex_buffer, size_t hex_len)
++{
++  size_t i;
++
++  for (i = 0; i < hex_len; i++)
++    {
++      /* Each byte takes 2 characters.  */
++      sprintf (str_buffer + 2 * i, "%02x", hex_buffer[i] & 0xFF);
++    }
++
++  /* Null-terminate result.  */
++  str_buffer[2 * i] = '\0';
++}
++
+ #ifdef TESTING
+ 
+ const char *
+diff --git a/src/utils.h b/src/utils.h
+index be1888f..b265009 100644
+--- a/src/utils.h
++++ b/src/utils.h
+@@ -155,6 +155,8 @@ long get_max_length (const char *path, int length, int name);
+ size_t strlcpy (char *dst, const char *src, size_t size);
+ #endif
+ 
++void hex_to_string (char *str_buffer, const char *hex_buffer, size_t hex_len);
++
+ extern unsigned char char_prop[];
+ 
+ #endif /* UTILS_H */
+diff --git a/src/wget.h b/src/wget.h
+index 2c31713..2caa03e 100644
+--- a/src/wget.h
++++ b/src/wget.h
+@@ -332,7 +332,8 @@ enum
+   ACCEPTRANGES         = 0x0010,        /* Accept-ranges header was found */
+   ADDED_HTML_EXTENSION = 0x0020,        /* added ".html" extension due to -E */
+   TEXTCSS              = 0x0040,        /* document is of type text/css */
+-  IF_MODIFIED_SINCE    = 0x0080         /* use if-modified-since header */
++  IF_MODIFIED_SINCE    = 0x0080,        /* use if-modified-since header */
++  METALINK_METADATA    = 0x0100         /* use HTTP response for Metalink metadata */
+ };
+ 
+ /* Universal error type -- used almost everywhere.  Error reporting of
+@@ -353,7 +354,10 @@ typedef enum
+   AUTHFAILED, QUOTEXC, WRITEFAILED, SSLINITFAILED, VERIFCERTERR,
+   UNLINKERR, NEWLOCATION_KEEP_POST, CLOSEFAILED, ATTRMISSING, UNKNOWNATTR,
+   WARC_ERR, WARC_TMP_FOPENERR, WARC_TMP_FWRITEERR,
+-  TIMECONV_ERR
++  TIMECONV_ERR,
++  METALINK_PARSE_ERROR, METALINK_RETR_ERROR,
++  METALINK_CHKSUM_ERROR, METALINK_SIG_ERROR,
++  RETR_WITH_METALINK
+ } uerr_t;
+ 
+ /* 2005-02-19 SMS.
+-- 
+cgit v1.0-41-gc330
+

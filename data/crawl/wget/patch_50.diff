@@ -1,0 +1,541 @@
+diff --git a/doc/wget.texi b/doc/wget.texi
+index dbb67a1..1e55e63 100644
+--- a/doc/wget.texi
++++ b/doc/wget.texi
+@@ -1797,6 +1797,18 @@ system-specified locations, chosen at OpenSSL installation time.
+ Specifies a CRL file in @var{file}.  This is needed for certificates
+ that have been revocated by the CAs.
+ 
++@cindex SSL Public Key Pin
++@item --pinnedpubkey=file/hashes
++Tells wget to use the specified public key file (or hashes) to verify the peer.
++This can be a path to a file which contains a single public key in PEM or DER
++format, or any number of base64 encoded sha256 hashes preceded by ``sha256//''
++and separated by ``;''
++
++When negotiating a TLS or SSL connection, the server sends a certificate
++indicating its identity. A public key is extracted from this certificate and if
++it does not exactly match the public key(s) provided to this option, wget will
++abort the connection before sending or receiving any data.
++
+ @cindex entropy, specifying source of
+ @cindex randomness, specifying source of
+ @item --random-file=@var{file}
+diff --git a/src/gnutls.c b/src/gnutls.c
+index 3e1596a..185304d 100644
+--- a/src/gnutls.c
++++ b/src/gnutls.c
+@@ -38,6 +38,7 @@ as that of the covered work.  */
+ #include <stdlib.h>
+ #include <xalloc.h>
+ 
++#include <gnutls/abstract.h>
+ #include <gnutls/gnutls.h>
+ #include <gnutls/x509.h>
+ #include <sys/ioctl.h>
+@@ -692,6 +693,59 @@ ssl_connect_wget (int fd, const char *hostname, int *continue_session)
+   return true;
+ }
+ 
++static bool
++pkp_pin_peer_pubkey (gnutls_x509_crt_t cert, const char *pinnedpubkey)
++{
++  /* Scratch */
++  size_t len1 = 0, len2 = 0;
++  char *buff1 = NULL;
++
++  gnutls_pubkey_t key = NULL;
++
++  /* Result is returned to caller */
++  int ret = 0;
++  bool result = false;
++
++  /* if a path wasn't specified, don't pin */
++  if (NULL == pinnedpubkey)
++    return true;
++
++  if (NULL == cert)
++    return result;
++
++  /* Begin Gyrations to get the public key     */
++  gnutls_pubkey_init (&key);
++
++  ret = gnutls_pubkey_import_x509 (key, cert, 0);
++  if (ret < 0)
++    goto cleanup; /* failed */
++
++  ret = gnutls_pubkey_export (key, GNUTLS_X509_FMT_DER, NULL, &len1);
++  if (ret != GNUTLS_E_SHORT_MEMORY_BUFFER || len1 == 0)
++    goto cleanup; /* failed */
++
++  buff1 = xmalloc (len1);
++
++  len2 = len1;
++
++  ret = gnutls_pubkey_export (key, GNUTLS_X509_FMT_DER, buff1, &len2);
++  if (ret < 0 || len1 != len2)
++    goto cleanup; /* failed */
++
++  /* End Gyrations */
++
++  /* The one good exit point */
++  result = wg_pin_peer_pubkey (pinnedpubkey, buff1, len1);
++
++ cleanup:
++  if (NULL != key)
++    gnutls_pubkey_deinit (key);
++
++  xfree (buff1);
++
++  return result;
++}
++
+ #define _CHECK_CERT(flag,msg) \
+   if (status & (flag))\
+     {\
+@@ -712,9 +766,10 @@ ssl_check_certificate (int fd, const char *host)
+      him about problems with the server's certificate.  */
+   const char *severity = opt.check_cert ? _("ERROR") : _("WARNING");
+   bool success = true;
++  bool pinsuccess = opt.pinnedpubkey == NULL;
+ 
+   /* The user explicitly said to not check for the certificate.  */
+-  if (opt.check_cert == CHECK_CERT_QUIET)
++  if (opt.check_cert == CHECK_CERT_QUIET && pinsuccess)
+     return success;
+ 
+   err = gnutls_certificate_verify_peers2 (ctx->session, &status);
+@@ -784,6 +839,14 @@ ssl_check_certificate (int fd, const char *host)
+           success = false;
+         }
+       xfree(sni_hostname);
++
++      pinsuccess = pkp_pin_peer_pubkey (cert, opt.pinnedpubkey);
++      if (!pinsuccess)
++        {
++          logprintf (LOG_ALWAYS, _("The public key does not match pinned public key!\n"));
++          success = false;
++        }
++
+  crt_deinit:
+       gnutls_x509_crt_deinit (cert);
+     }
+@@ -794,5 +857,6 @@ ssl_check_certificate (int fd, const char *host)
+     }
+ 
+  out:
+-  return opt.check_cert == CHECK_CERT_ON ? success : true;
++  /* never return true if pinsuccess fails */
++  return !pinsuccess ? false : (opt.check_cert == CHECK_CERT_ON ? success : true);
+ }
+diff --git a/src/init.c b/src/init.c
+index c6ee9ce..d043d83 100644
+--- a/src/init.c
++++ b/src/init.c
+@@ -260,6 +260,9 @@ static const struct {
+   { "passiveftp",       &opt.ftp_pasv,          cmd_boolean },
+   { "passwd",           &opt.ftp_passwd,        cmd_string },/* deprecated*/
+   { "password",         &opt.passwd,            cmd_string },
++#ifdef HAVE_SSL
++  { "pinnedpubkey",     &opt.pinnedpubkey,      cmd_string },
++#endif
+   { "postdata",         &opt.post_data,         cmd_string },
+   { "postfile",         &opt.post_file_name,    cmd_file },
+   { "preferfamily",     NULL,                   cmd_spec_prefer_family },
+diff --git a/src/main.c b/src/main.c
+index 15b46ee..ed050a5 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -363,6 +363,7 @@ static struct cmdline_option option_data[] =
+     { "parent", 0, OPT__PARENT, NULL, optional_argument },
+     { "passive-ftp", 0, OPT_BOOLEAN, "passiveftp", -1 },
+     { "password", 0, OPT_VALUE, "password", -1 },
++    { IF_SSL ("pinnedpubkey"), 0, OPT_VALUE, "pinnedpubkey", -1 },
+     { "post-data", 0, OPT_VALUE, "postdata", -1 },
+     { "post-file", 0, OPT_VALUE, "postfile", -1 },
+     { "prefer-family", 0, OPT_VALUE, "preferfamily", -1 },
+@@ -803,6 +804,11 @@ HTTPS (SSL/TLS) options:\n"),
+        --ca-directory=DIR          directory where hash list of CAs is stored\n"),
+     N_("\
+        --crl-file=FILE             file with bundle of CRLs\n"),
++    N_("\
++       --pinnedpubkey=FILE/HASHES  Public key (PEM/DER) file, or any number\n\
++                                   of base64 encoded sha256 hashes preceded by\n\
++                                   \'sha256//\' and seperated by \';\', to verify\n\
++                                   peer against\n"),
+ #if defined(HAVE_LIBSSL) || defined(HAVE_LIBSSL32)
+     N_("\
+        --random-file=FILE          file with random data for seeding the SSL PRNG\n"),
+diff --git a/src/openssl.c b/src/openssl.c
+index 48eeadb..c6549ea 100644
+--- a/src/openssl.c
++++ b/src/openssl.c
+@@ -672,6 +672,65 @@ static char *_get_rfc2253_formatted (X509_NAME *name)
+   return out ? out : xstrdup("");
+ }
+ 
++/*
++ * Heavily modified from:
++ * https://www.owasp.org/index.php/Certificate_and_Public_Key_Pinning#OpenSSL
++ */
++static bool
++pkp_pin_peer_pubkey (X509* cert, const char *pinnedpubkey)
++{
++  /* Scratch */
++  int len1 = 0, len2 = 0;
++  char *buff1 = NULL, *temp = NULL;
++
++  /* Result is returned to caller */
++  bool result = false;
++
++  /* if a path wasn't specified, don't pin */
++  if (!pinnedpubkey)
++    return true;
++
++  if (!cert)
++    return result;
++
++  /* Begin Gyrations to get the subjectPublicKeyInfo     */
++  /* Thanks to Viktor Dukhovni on the OpenSSL mailing list */
++
++  /* https://groups.google.com/group/mailing.openssl.users/browse_thread
++   /thread/d61858dae102c6c7 */
++  len1 = i2d_X509_PUBKEY (X509_get_X509_PUBKEY (cert), NULL);
++  if (len1 < 1)
++    goto cleanup; /* failed */
++
++  /* https://www.openssl.org/docs/crypto/buffer.html */
++  buff1 = temp = OPENSSL_malloc (len1);
++  if (!buff1)
++    goto cleanup; /* failed */
++
++  /* https://www.openssl.org/docs/crypto/d2i_X509.html */
++  len2 = i2d_X509_PUBKEY (X509_get_X509_PUBKEY (cert), (unsigned char **) &temp);
++
++  /*
++   * These checks are verifying we got back the same values as when we
++   * sized the buffer. It's pretty weak since they should always be the
++   * same. But it gives us something to test.
++   */
++  if ((len1 != len2) || !temp || ((temp - buff1) != len1))
++    goto cleanup; /* failed */
++
++  /* End Gyrations */
++
++  /* The one good exit point */
++  result = wg_pin_peer_pubkey (pinnedpubkey, buff1, len1);
++
++ cleanup:
++  /* https://www.openssl.org/docs/crypto/buffer.html */
++  if (NULL != buff1)
++    OPENSSL_free (buff1);
++
++  return result;
++}
++
+ /* Verify the validity of the certificate presented by the server.
+    Also check that the "common name" of the server, as presented by
+    its certificate, corresponds to HOST.  (HOST typically comes from
+@@ -695,6 +754,7 @@ ssl_check_certificate (int fd, const char *host)
+   long vresult;
+   bool success = true;
+   bool alt_name_checked = false;
++  bool pinsuccess = opt.pinnedpubkey == NULL;
+ 
+   /* If the user has specified --no-check-cert, we still want to warn
+      him about problems with the server's certificate.  */
+@@ -705,7 +765,7 @@ ssl_check_certificate (int fd, const char *host)
+   assert (conn != NULL);
+ 
+   /* The user explicitly said to not check for the certificate.  */
+-  if (opt.check_cert == CHECK_CERT_QUIET)
++  if (opt.check_cert == CHECK_CERT_QUIET && pinsuccess)
+     return success;
+ 
+   cert = SSL_get_peer_certificate (conn);
+@@ -904,6 +964,13 @@ ssl_check_certificate (int fd, const char *host)
+         }
+     }
+ 
++    pinsuccess = pkp_pin_peer_pubkey (cert, opt.pinnedpubkey);
++    if (!pinsuccess)
++      {
++        logprintf (LOG_ALWAYS, _("The public key does not match pinned public key!\n"));
++        success = false;
++      }
++
+ 
+   if (success)
+     DEBUGP (("X509 certificate successfully verified and matches host %s\n",
+@@ -916,7 +983,8 @@ ssl_check_certificate (int fd, const char *host)
+ To connect to %s insecurely, use `--no-check-certificate'.\n"),
+                quotearg_style (escape_quoting_style, host));
+ 
+-  return opt.check_cert == CHECK_CERT_ON ? success : true;
++  /* never return true if pinsuccess fails */
++  return !pinsuccess ? false : (opt.check_cert == CHECK_CERT_ON ? success : true);
+ }
+ 
+ /*
+diff --git a/src/options.h b/src/options.h
+index b936f51..a8c494b 100644
+--- a/src/options.h
++++ b/src/options.h
+@@ -241,6 +241,11 @@ struct options
+   char *ca_cert;                /* CA certificate file to use */
+   char *crl_file;               /* file with CRLs */
+ 
++  char *pinnedpubkey;           /* Public key (PEM/DER) file, or any number
++                                   of base64 encoded sha256 hashes preceded by
++                                   \'sha256//\' and seperated by \';\', to verify
++                                   peer against */
++
+   char *random_file;            /* file with random data to seed the PRNG */
+   char *egd_file;               /* file name of the egd daemon socket */
+   bool https_only;              /* whether to follow HTTPS only */
+diff --git a/src/utils.c b/src/utils.c
+index 5222851..8285e13 100644
+--- a/src/utils.c
++++ b/src/utils.c
+@@ -31,6 +31,7 @@ as that of the covered work.  */
+ 
+ #include "wget.h"
+ 
++#include "sha256.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -2521,6 +2522,205 @@ wg_hex_to_string (char *str_buffer, const char *hex_buffer, size_t hex_len)
+   str_buffer[2 * i] = '\0';
+ }
+ 
++#ifdef HAVE_SSL
++
++/*
++ * Public key pem to der conversion
++ */
++
++static bool
++wg_pubkey_pem_to_der (const char *pem, unsigned char **der, size_t *der_len)
++{
++  char *stripped_pem, *begin_pos, *end_pos;
++  size_t pem_count, stripped_pem_count = 0, pem_len;
++  ssize_t size;
++  unsigned char *base64data;
++
++  *der = NULL;
++  *der_len = 0;
++
++  /* if no pem, exit. */
++  if (!pem)
++    return false;
++
++  begin_pos = strstr (pem, "-----BEGIN PUBLIC KEY-----");
++  if (!begin_pos)
++    return false;
++
++  pem_count = begin_pos - pem;
++  /* Invalid if not at beginning AND not directly following \n */
++  if (0 != pem_count && '\n' != pem[pem_count - 1])
++    return false;
++
++  /* 26 is length of "-----BEGIN PUBLIC KEY-----" */
++  pem_count += 26;
++
++  /* Invalid if not directly following \n */
++  end_pos = strstr (pem + pem_count, "\n-----END PUBLIC KEY-----");
++  if (!end_pos)
++    return false;
++
++  pem_len = end_pos - pem;
++
++  stripped_pem = xmalloc (pem_len - pem_count + 1);
++
++  /*
++   * Here we loop through the pem array one character at a time between the
++   * correct indices, and place each character that is not '\n' or '\r'
++   * into the stripped_pem array, which should represent the raw base64 string
++   */
++  while (pem_count < pem_len) {
++    if ('\n' != pem[pem_count] && '\r' != pem[pem_count])
++      stripped_pem[stripped_pem_count++] = pem[pem_count];
++    ++pem_count;
++  }
++  /* Place the null terminator in the correct place */
++  stripped_pem[stripped_pem_count] = '\0';
++
++  base64data = xmalloc (BASE64_LENGTH(stripped_pem_count));
++
++  size = base64_decode (stripped_pem, base64data);
++
++  if (size < 0) {
++    xfree (base64data);           /* malformed base64 from server */
++  } else {
++    *der = base64data;
++    *der_len = (size_t) size;
++  }
++
++  xfree (stripped_pem);
++
++  return *der_len > 0;
++}
++
++/*
++ * Generic pinned public key check.
++ */
++
++bool
++wg_pin_peer_pubkey (const char *pinnedpubkey, const char *pubkey, size_t pubkeylen)
++{
++  struct file_memory *fm;
++  unsigned char *buf = NULL, *pem_ptr = NULL;
++  size_t size, pem_len;
++  bool pem_read;
++  bool result = false;
++
++  size_t pinkeylen;
++  ssize_t decoded_hash_length;
++  char *pinkeycopy, *begin_pos, *end_pos;
++  unsigned char *sha256sumdigest = NULL, *expectedsha256sumdigest = NULL;
++
++  /* if a path wasn't specified, don't pin */
++  if (!pinnedpubkey)
++    return true;
++  if (!pubkey || !pubkeylen)
++    return result;
++
++  /* only do this if pinnedpubkey starts with "sha256//", length 8 */
++  if (strncmp (pinnedpubkey, "sha256//", 8) == 0) {
++    /* compute sha256sum of public key */
++    sha256sumdigest = xmalloc (SHA256_DIGEST_SIZE);
++    sha256_buffer (pubkey, pubkeylen, sha256sumdigest);
++    expectedsha256sumdigest = xmalloc (SHA256_DIGEST_SIZE + 1);
++
++    /* it starts with sha256//, copy so we can modify it */
++    pinkeylen = strlen (pinnedpubkey) + 1;
++    pinkeycopy = xmalloc (pinkeylen);
++    memcpy (pinkeycopy, pinnedpubkey, pinkeylen);
++
++    /* point begin_pos to the copy, and start extracting keys */
++    begin_pos = pinkeycopy;
++    do
++      {
++        end_pos = strstr (begin_pos, ";sha256//");
++        /*
++         * if there is an end_pos, null terminate,
++         * otherwise it'll go to the end of the original string
++         */
++        if (end_pos)
++          end_pos[0] = '\0';
++
++        /* decode base64 pinnedpubkey, 8 is length of "sha256//" */
++        decoded_hash_length = base64_decode (begin_pos + 8, expectedsha256sumdigest);
++        /* if valid base64, compare sha256 digests directly */
++        if (SHA256_DIGEST_SIZE == decoded_hash_length &&
++           !memcmp (sha256sumdigest, expectedsha256sumdigest, SHA256_DIGEST_SIZE)) {
++          result = true;
++          break;
++        }
++
++        /*
++         * change back the null-terminator we changed earlier,
++         * and look for next begin
++         */
++        if (end_pos) {
++          end_pos[0] = ';';
++          begin_pos = strstr (end_pos, "sha256//");
++        }
++      } while (end_pos && begin_pos);
++
++    xfree (sha256sumdigest);
++    xfree (expectedsha256sumdigest);
++    xfree (pinkeycopy);
++
++    return result;
++  }
++
++  /* fall back to assuming this is a file path */
++  fm = wget_read_file (pinnedpubkey);
++  if (!fm)
++    return result;
++
++  /* Check the file's size */
++  if (fm->length < 0 || fm->length > MAX_PINNED_PUBKEY_SIZE)
++    goto cleanup;
++
++  /*
++   * if the size of our certificate is bigger than the file
++   * size then it can't match
++   */
++  size = (size_t) fm->length;
++  if (pubkeylen > size)
++    goto cleanup;
++
++  /* If the sizes are the same, it can't be base64 encoded, must be der */
++  if (pubkeylen == size) {
++    if (!memcmp (pubkey, fm->content, pubkeylen))
++      result = true;
++    goto cleanup;
++  }
++
++  /*
++   * Otherwise we will assume it's PEM and try to decode it
++   * after placing null terminator
++   */
++  buf = xmalloc (size + 1);
++  memcpy (buf, fm->content, size);
++  buf[size] = '\0';
++
++  pem_read = wg_pubkey_pem_to_der ((const char *) buf, &pem_ptr, &pem_len);
++  /* if it wasn't read successfully, exit */
++  if (!pem_read)
++    goto cleanup;
++
++  /*
++   * if the size of our certificate doesn't match the size of
++   * the decoded file, they can't be the same, otherwise compare
++   */
++  if (pubkeylen == pem_len && !memcmp (pubkey, pem_ptr, pubkeylen))
++    result = true;
++
++ cleanup:
++  xfree (buf);
++  xfree (pem_ptr);
++  wget_read_file_free (fm);
++
++  return result;
++}
++
++#endif /* HAVE_SSL */
++
+ #ifdef TESTING
+ 
+ const char *
+diff --git a/src/utils.h b/src/utils.h
+index 76f4f8d..f224b73 100644
+--- a/src/utils.h
++++ b/src/utils.h
+@@ -37,6 +37,10 @@ as that of the covered work.  */
+ /* Constant is using when we don`t know attempted size exactly */
+ #define UNKNOWN_ATTEMPTED_SIZE -3
+ 
++#ifndef MAX_PINNED_PUBKEY_SIZE
++#define MAX_PINNED_PUBKEY_SIZE 1048576 /* 1MB */
++#endif
++
+ /* Macros that interface to malloc, but know about type sizes, and
+    cast the result to the appropriate type.  The casts are not
+    necessary in standard C, but Wget performs them anyway for the sake
+@@ -161,4 +165,9 @@ void wg_hex_to_string (char *str_buffer, const char *hex_buffer, size_t hex_len)
+ 
+ extern unsigned char char_prop[];
+ 
++#ifdef HAVE_SSL
++/* Check pinned public key. */
++bool wg_pin_peer_pubkey (const char *pinnedpubkey, const char *pubkey, size_t pubkeylen);
++#endif
++
+ #endif /* UTILS_H */
+-- 
+cgit v1.0-41-gc330
+

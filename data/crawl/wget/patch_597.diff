@@ -1,0 +1,754 @@
+diff --git a/src/ChangeLog b/src/ChangeLog
+index a2d4d7b..d7e088c 100644
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,5 +1,20 @@
+ 2003-09-21  Hrvoje Niksic  <hniksic@xemacs.org>
+ 
++	* main.c (main): Use setoptval() for setting the options.  Use
++	run_command for `-e'.
++
++	* init.c (parse_line): Rewritten to return COMIND right away.
++	Changed linkage to static.
++	(run_wgetrc): Use the available comind when calling setval, so it
++	doesn't have to be computed twice.
++	(setval_internal): New function, runs the command's action without
++	any error checking.
++	(setoptval): New function, does what setval used to do, but exits
++	in case of error.
++	(run_command): New function.
++
++2003-09-21  Hrvoje Niksic  <hniksic@xemacs.org>
++
+ 	* connect.c (select_fd): Change MAXTIME's type to double.  Handle
+ 	its decimal part.
+ 
+diff --git a/src/init.c b/src/init.c
+index 321e2d4..609761e 100644
+--- a/src/init.c
++++ b/src/init.c
+@@ -54,8 +54,9 @@ so, delete this exception statement from your version.  */
+ #endif
+ 
+ #ifdef HAVE_PWD_H
+-#include <pwd.h>
++# include <pwd.h>
+ #endif
++#include <assert.h>
+ 
+ #include "wget.h"
+ #include "utils.h"
+@@ -105,7 +106,7 @@ CMD_DECLARE (cmd_spec_useragent);
+ 
+ /* List of recognized commands, each consisting of name, closure and function.
+    When adding a new command, simply add it to the list, but be sure to keep the
+-   list sorted alphabetically, as comind() depends on it.  Also, be sure to add
++   list sorted alphabetically, as findcmd() depends on it.  Also, be sure to add
+    any entries that allocate memory (e.g. cmd_string and cmd_vector guys) to the
+    cleanup() function below. */
+ static struct {
+@@ -222,7 +223,7 @@ static struct {
+    is not found, -1 is returned.  This function uses binary search.  */
+ 
+ static int
+-comind (const char *com)
++findcmd (const char *com)
+ {
+   int lo = 0, hi = countof (commands) - 1;
+ 
+@@ -376,7 +377,11 @@ wgetrc_file_name (void)
+   return file;
+ }
+ 
+-/* Initialize variables from a wgetrc file */
++static int parse_line PARAMS ((const char *, char **, char **, int *));
++static int setval_internal PARAMS ((int, const char *, const char *));
++
++/* Initialize variables from a wgetrc file.  */
++
+ static void
+ run_wgetrc (const char *file)
+ {
+@@ -396,15 +401,15 @@ run_wgetrc (const char *file)
+   while ((line = read_whole_line (fp)))
+     {
+       char *com, *val;
+-      int status;
++      int comind, status;
+ 
+       /* Parse the line.  */
+-      status = parse_line (line, &com, &val);
++      status = parse_line (line, &com, &val, &comind);
+       xfree (line);
+       /* If everything is OK, set the value.  */
+       if (status == 1)
+ 	{
+-	  if (!setval (com, val))
++	  if (!setval_internal (comind, com, val))
+ 	    fprintf (stderr, _("%s: Error in %s at line %d.\n"), exec_name,
+ 		     file, ln);
+ 	  xfree (com);
+@@ -438,8 +443,8 @@ initialize (void)
+   file = wgetrc_file_name ();
+   if (!file)
+     return;
+-  /* #### We should somehow canonicalize `file' and SYSTEM_WGETRC,
+-     really.  */
++  /* #### We should canonicalize `file' and SYSTEM_WGETRC with
++     something like realpath() before comparing them with `strcmp'  */
+ #ifdef SYSTEM_WGETRC
+   if (!strcmp (file, SYSTEM_WGETRC))
+     {
+@@ -454,6 +459,22 @@ initialize (void)
+   return;
+ }
+ 
++/* Remove dashes and underscores from S, modifying S in the
++   process. */
++
++static void
++dehyphen (char *s)
++{
++  char *t = s;			/* t - tortoise */
++  char *h = s;			/* h - hare     */
++  while (*h)
++    if (*h == '_' || *h == '-')
++      ++h;
++    else
++      *t++ = *h++;
++  *t = '\0';
++}
++
+ /* Parse the line pointed by line, with the syntax:
+    <sp>* command <sp>* = <sp>* value <newline>
+    Uses malloc to allocate space for command and value.
+@@ -463,84 +484,107 @@ initialize (void)
+     1 - success
+     0 - failure
+    -1 - empty */
+-int
+-parse_line (const char *line, char **com, char **val)
++
++static int
++parse_line (const char *line, char **com, char **val, int *comind)
+ {
+-  const char *p = line;
+-  const char *orig_comptr, *end;
+-  char *new_comptr;
++  const char *p;
++  const char *end = line + strlen (line);
++  const char *cmdstart, *cmdend;
++  const char *valstart, *valend;
+ 
+-  /* Skip whitespace.  */
+-  while (*p && ISSPACE (*p))
+-    ++p;
++  char *cmdcopy;
++  int ind;
++
++  /* Skip leading and trailing whitespace.  */
++  while (*line && ISSPACE (*line))
++    ++line;
++  while (end > line && ISSPACE (end[-1]))
++    --end;
+ 
+-  /* Don't process empty lines.  */
+-  if (!*p || *p == '#')
++  /* Skip empty lines and comments.  */
++  if (!*line || *line == '#')
+     return -1;
+ 
+-  for (orig_comptr = p; ISALPHA (*p) || *p == '_' || *p == '-'; p++)
+-    ;
+-  /* The next char should be space or '='.  */
+-  if (!ISSPACE (*p) && (*p != '='))
++  p = line;
++
++  cmdstart = p;
++  while (p < end && (ISALPHA (*p) || *p == '_' || *p == '-'))
++    ++p;
++  cmdend = p;
++
++  /* Skip '=', as well as any space before or after it. */
++  while (p < end && ISSPACE (*p))
++    ++p;
++  if (p == end || *p != '=')
+     return 0;
+-  /* Here we cannot use strdupdelim() as we normally would because we
+-     want to skip the `-' and `_' characters in the input string.  */
+-  *com = (char *)xmalloc (p - orig_comptr + 1);
+-  for (new_comptr = *com; orig_comptr < p; orig_comptr++)
+-    {
+-      if (*orig_comptr == '_' || *orig_comptr == '-')
+-	continue;
+-      *new_comptr++ = *orig_comptr;
+-    }
+-  *new_comptr = '\0';
+-  /* If the command is invalid, exit now.  */
+-  if (comind (*com) == -1)
+-    {
+-      xfree (*com);
+-      return 0;
+-    }
++  ++p;
++  while (p < end && ISSPACE (*p))
++    ++p;
+ 
+-  /* Skip spaces before '='.  */
+-  for (; ISSPACE (*p); p++);
+-  /* If '=' not found, bail out.  */
+-  if (*p != '=')
+-    {
+-      xfree (*com);
+-      return 0;
+-    }
+-  /* Skip spaces after '='.  */
+-  for (++p; ISSPACE (*p); p++);
+-  /* Get the ending position for VAL by starting with the end of the
+-     line and skipping whitespace.  */
+-  end = line + strlen (line) - 1;
+-  while (end > p && ISSPACE (*end))
+-    --end;
+-  *val = strdupdelim (p, end + 1);
++  valstart = p;
++  valend   = end;
++
++  /* The line now known to be syntactically correct.  Check whether
++     the command is valid.  */
++  BOUNDED_TO_ALLOCA (cmdstart, cmdend, cmdcopy);
++  dehyphen (cmdcopy);
++  ind = findcmd (cmdcopy);
++  if (ind == -1)
++    return 0;
++
++  /* The command is valid.  Now fill in the values and report success
++     to the caller.  */
++  *comind = ind;
++  *com = strdupdelim (cmdstart, cmdend);
++  *val = strdupdelim (valstart, valend);
+   return 1;
+ }
+ 
+-/* Set COM to VAL.  This is the meat behind processing `.wgetrc'.  No
+-   fatals -- error signal prints a warning and resets to default
+-   value.  All error messages are printed to stderr, *not* to
+-   opt.lfile, since opt.lfile wasn't even generated yet.  */
+-int
+-setval (const char *com, const char *val)
++/* Run commands[comind].action. */
++
++static int
++setval_internal (int comind, const char *com, const char *val)
+ {
+-  int ind;
++  assert (0 <= comind && comind < countof (commands));
++  return ((*commands[comind].action) (com, val, commands[comind].closure));
++}
+ 
+-  if (!com || !val)
+-    return 0;
+-  ind = comind (com);
+-  if (ind == -1)
++/* Run command COM with value VAL.  If running the command produces an
++   error, report the error and exit.
++
++   This is intended to be called from main() with commands not
++   provided by the user, therefore it aborts when an unknown command
++   is encountered.  Once the COMIND's are exported to init.h, this
++   function will be changed to accept COMIND directly.  */
++
++void
++setoptval (const char *com, const char *val)
++{
++  int comind = findcmd (com);
++  assert (comind != -1);
++  if (!setval_internal (comind, com, val))
++    exit (2);
++}
++
++void
++run_command (const char *opt)
++{
++  char *com, *val;
++  int comind;
++  int status = parse_line (opt, &com, &val, &comind);
++  if (status == 1)
+     {
+-      /* #### Should I just abort()?  */
+-#ifdef DEBUG
+-      fprintf (stderr, _("%s: BUG: unknown command `%s', value `%s'.\n"),
+-	       exec_name, com, val);
+-#endif
+-      return 0;
++      if (!setval_internal (comind, com, val))
++	exit (2);
++      xfree (com);
++      xfree (val);
++    }
++  else if (status == 0)
++    {
++      fprintf (stderr, "Invalid command `%s'\n", opt);
++      exit (2);
+     }
+-  return ((*commands[ind].action) (com, val, commands[ind].closure));
+ }
+ 
+ /* Generic helper functions, for use with `commands'. */
+@@ -857,7 +901,8 @@ cmd_bytes (const char *com, const char *val, void *closure)
+ }
+ 
+ /* Store the value of VAL to *OUT.  The value is a time period, by
+-   default expressed in seconds.  */
++   default expressed in seconds, but also accepting suffixes "m", "h",
++   "d", and "w" for minutes, hours, days, and weeks respectively.  */
+ 
+ static int
+ cmd_time (const char *com, const char *val, void *closure)
+diff --git a/src/init.h b/src/init.h
+index 405202a..048653b 100644
+--- a/src/init.h
++++ b/src/init.h
+@@ -31,8 +31,8 @@ so, delete this exception statement from your version.  */
+ #define INIT_H
+ 
+ void initialize PARAMS ((void));
+-int parse_line PARAMS ((const char *, char **, char **));
+-int setval PARAMS ((const char *, const char *));
++void run_command PARAMS ((const char *));
++void setoptval PARAMS ((const char *, const char *));
+ char *home_dir PARAMS ((void));
+ void cleanup PARAMS ((void));
+ 
+diff --git a/src/main.c b/src/main.c
+index 35c5f3b..148205a 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -398,75 +398,75 @@ hpVqvdkKsxmNWrHSLcFbEY:G:g:T:U:O:l:n:i:o:a:t:D:A:R:P:B:e:Q:X:I:w:C:",
+ 	{
+ 	  /* Options without arguments: */
+ 	case 132:
+-	  setval ("spider", "on");
++	  setoptval ("spider", "on");
+ 	  break;
+ 	case 133:
+-	  setval ("noparent", "on");
++	  setoptval ("noparent", "on");
+ 	  break;
+ 	case 136:
+-	  setval ("deleteafter", "on");
++	  setoptval ("deleteafter", "on");
+ 	  break;
+ 	case 137:
+-	  setval ("retrsymlinks", "on");
++	  setoptval ("retrsymlinks", "on");
+ 	  break;
+ 	case 138:
+-	  setval ("ignorelength", "on");
++	  setoptval ("ignorelength", "on");
+ 	  break;
+ 	case 139:
+-	  setval ("passiveftp", "on");
++	  setoptval ("passiveftp", "on");
+ 	  break;
+ 	case 141:
+-	  setval ("noclobber", "on");
++	  setoptval ("noclobber", "on");
+ 	  break;
+ 	case 142:
+-	  setval ("followftp", "on");
++	  setoptval ("followftp", "on");
+ 	  break;
+ 	case 145:
+-	  setval ("cutdirs", optarg);
++	  setoptval ("cutdirs", optarg);
+ 	  break;
+ 	case 146:
+-	  setval ("verbose", "off");
++	  setoptval ("verbose", "off");
+ 	  break;
+ 	case 147:
+-	  setval ("dirstruct", "off");
++	  setoptval ("dirstruct", "off");
+ 	  break;
+ 	case 148:
+-	  setval ("addhostdir", "off");
++	  setoptval ("addhostdir", "off");
+ 	  break;
+ 	case 149:
+-	  setval ("removelisting", "off");
++	  setoptval ("removelisting", "off");
+ 	  break;
+ 	case 155:
+-	  setval ("bindaddress", optarg);
++	  setoptval ("bindaddress", optarg);
+  	  break;
+ 	case 156:
+-	  setval ("httpkeepalive", "off");
++	  setoptval ("httpkeepalive", "off");
+ 	  break;
+ 	case 165:
+-	  setval ("randomwait", "on");
++	  setoptval ("randomwait", "on");
+ 	  break;
+ 	case 'b':
+-	  setval ("background", "on");
++	  setoptval ("background", "on");
+ 	  break;
+ 	case 'c':
+-	  setval ("continue", "on");
++	  setoptval ("continue", "on");
+ 	  break;
+ 	case 'd':
+ #ifdef DEBUG
+-	  setval ("debug", "on");
++	  setoptval ("debug", "on");
+ #else  /* not DEBUG */
+ 	  fprintf (stderr, _("%s: debug support not compiled in.\n"),
+ 		   exec_name);
+ #endif /* not DEBUG */
+ 	  break;
+ 	case 'E':
+-	  setval ("htmlextension", "on");
++	  setoptval ("htmlextension", "on");
+ 	  break;
+ 	case 'F':
+-	  setval ("forcehtml", "on");
++	  setoptval ("forcehtml", "on");
+ 	  break;
+ 	case 'H':
+-	  setval ("spanhosts", "on");
++	  setoptval ("spanhosts", "on");
+ 	  break;
+ 	case 'h':
+ 	  print_help ();
+@@ -476,34 +476,34 @@ hpVqvdkKsxmNWrHSLcFbEY:G:g:T:U:O:l:n:i:o:a:t:D:A:R:P:B:e:Q:X:I:w:C:",
+ 	  exit (0);
+ 	  break;
+ 	case 'K':
+-	  setval ("backupconverted", "on");
++	  setoptval ("backupconverted", "on");
+ 	  break;
+ 	case 'k':
+-	  setval ("convertlinks", "on");
++	  setoptval ("convertlinks", "on");
+ 	  break;
+ 	case 'L':
+-	  setval ("relativeonly", "on");
++	  setoptval ("relativeonly", "on");
+ 	  break;
+ 	case 'm':
+-	  setval ("mirror", "on");
++	  setoptval ("mirror", "on");
+ 	  break;
+ 	case 'N':
+-	  setval ("timestamping", "on");
++	  setoptval ("timestamping", "on");
+ 	  break;
+ 	case 'p':
+-	  setval ("pagerequisites", "on");
++	  setoptval ("pagerequisites", "on");
+ 	  break;
+ 	case 'S':
+-	  setval ("serverresponse", "on");
++	  setoptval ("serverresponse", "on");
+ 	  break;
+ 	case 's':
+-	  setval ("saveheaders", "on");
++	  setoptval ("saveheaders", "on");
+ 	  break;
+ 	case 'q':
+-	  setval ("quiet", "on");
++	  setoptval ("quiet", "on");
+ 	  break;
+ 	case 'r':
+-	  setval ("recursive", "on");
++	  setoptval ("recursive", "on");
+ 	  break;
+ 	case 'V':
+ 	  printf ("GNU Wget %s\n\n", version_string);
+@@ -518,156 +518,141 @@ GNU General Public License for more details.\n"));
+ 	  exit (0);
+ 	  break;
+ 	case 'v':
+-	  setval ("verbose", "on");
++	  setoptval ("verbose", "on");
+ 	  break;
+ 	case 'x':
+-	  setval ("dirstruct", "on");
++	  setoptval ("dirstruct", "on");
+ 	  break;
+ 	case 174:
+-	  setval ("retryconnrefused", "on");
++	  setoptval ("retryconnrefused", "on");
+ 	  break;
+ 	case 177:
+-	  setval ("strictcomments", "on");
++	  setoptval ("strictcomments", "on");
+ 	  break;
+ 
+ 	  /* Options accepting an argument: */
+ 	case 129:
+-	  setval ("httpuser", optarg);
++	  setoptval ("httpuser", optarg);
+ 	  break;
+ 	case 130:
+-	  setval ("httppasswd", optarg);
++	  setoptval ("httppasswd", optarg);
+ 	  break;
+ 	case 131:
+-	  setval ("header", optarg);
++	  setoptval ("header", optarg);
+ 	  break;
+ 	case 134:
+-	  setval ("dotstyle", optarg);
++	  setoptval ("dotstyle", optarg);
+ 	  break;
+ 	case 135:
+-	  setval ("htmlify", optarg);
++	  setoptval ("htmlify", optarg);
+ 	  break;
+ 	case 140:
+-	  setval ("excludedomains", optarg);
++	  setoptval ("excludedomains", optarg);
+ 	  break;
+ 	case 143:
+-	  setval ("proxyuser", optarg);
++	  setoptval ("proxyuser", optarg);
+ 	  break;
+ 	case 144:
+-	  setval ("proxypasswd", optarg);
++	  setoptval ("proxypasswd", optarg);
+ 	  break;
+ 	case 151:
+-	  setval ("backups", optarg);
++	  setoptval ("backups", optarg);
+ 	  break;
+ 	case 152:
+-	  setval ("waitretry", optarg);
++	  setoptval ("waitretry", optarg);
+ 	  break;
+ 	case 153:
+-	  setval ("followtags", optarg);
++	  setoptval ("followtags", optarg);
+ 	  break;
+ 	case 160:
+-	  setval ("cookies", optarg);
++	  setoptval ("cookies", optarg);
+ 	  break;
+ 	case 161:
+-	  setval ("loadcookies", optarg);
++	  setoptval ("loadcookies", optarg);
+ 	  break;
+ 	case 162:
+-	  setval ("savecookies", optarg);
++	  setoptval ("savecookies", optarg);
+ 	  break;
+ 	case 163:
+-	  setval ("progress", optarg);
++	  setoptval ("progress", optarg);
+ 	  break;
+ 	case 164:
+-	  setval ("limitrate", optarg);
++	  setoptval ("limitrate", optarg);
+ 	  break;
+ 	case 157:
+-	  setval ("referer", optarg);
++	  setoptval ("referer", optarg);
+ 	  break;
+ #ifdef HAVE_SSL
+ 	case 158:
+-	  setval ("sslcertfile", optarg);
++	  setoptval ("sslcertfile", optarg);
+ 	  break;
+ 	case 159:
+-	  setval ("sslcertkey", optarg);
++	  setoptval ("sslcertkey", optarg);
+ 	  break;
+ 	case 166:
+-	  setval ("egdfile", optarg);
++	  setoptval ("egdfile", optarg);
+ 	  break;
+ 	case 169:
+-	  setval ("sslcadir", optarg);
++	  setoptval ("sslcadir", optarg);
+ 	  break;
+ 	case 170:
+-	  setval ("sslcafile", optarg);
++	  setoptval ("sslcafile", optarg);
+ 	  break;
+ 	case 171:
+-	  setval ("sslcerttype", optarg);
++	  setoptval ("sslcerttype", optarg);
+ 	  break;
+ 	case 172:
+-	  setval ("sslcheckcert", optarg);
++	  setoptval ("sslcheckcert", optarg);
+ 	  break;
+ 	case 173:
+-	  setval ("sslprotocol", optarg);
++	  setoptval ("sslprotocol", optarg);
+ 	  break;
+ #endif /* HAVE_SSL */
+ 	case 167:
+-	  setval ("postdata", optarg);
++	  setoptval ("postdata", optarg);
+ 	  break;
+ 	case 168:
+-	  setval ("postfile", optarg);
++	  setoptval ("postfile", optarg);
+ 	  break;
+ 	case 175:
+-	  setval ("dnscache", optarg);
++	  setoptval ("dnscache", optarg);
+ 	  break;
+ 	case 176:
+-	  setval ("restrictfilenames", optarg);
++	  setoptval ("restrictfilenames", optarg);
+ 	  break;
+ 	case 'A':
+-	  setval ("accept", optarg);
++	  setoptval ("accept", optarg);
+ 	  break;
+ 	case 'a':
+-	  setval ("logfile", optarg);
++	  setoptval ("logfile", optarg);
+ 	  append_to_log = 1;
+ 	  break;
+ 	case 'B':
+-	  setval ("base", optarg);
++	  setoptval ("base", optarg);
+ 	  break;
+ 	case 'C':
+-	  setval ("cache", optarg);
++	  setoptval ("cache", optarg);
+ 	  break;
+ 	case 'D':
+-	  setval ("domains", optarg);
++	  setoptval ("domains", optarg);
+ 	  break;
+ 	case 'e':
+-	  {
+-	    char *com, *val;
+-	    if (parse_line (optarg, &com, &val))
+-	      {
+-		if (!setval (com, val))
+-		  exit (1);
+-	      }
+-	    else
+-	      {
+-		fprintf (stderr, _("%s: %s: invalid command\n"), exec_name,
+-			 optarg);
+-		exit (1);
+-	      }
+-	    xfree (com);
+-	    xfree (val);
+-	  }
++	  run_command (optarg);
+ 	  break;
+ 	case 'G':
+-	  setval ("ignoretags", optarg);
++	  setoptval ("ignoretags", optarg);
+ 	  break;
+ 	case 'g':
+-	  setval ("glob", optarg);
++	  setoptval ("glob", optarg);
+ 	  break;
+ 	case 'I':
+-	  setval ("includedirectories", optarg);
++	  setoptval ("includedirectories", optarg);
+ 	  break;
+ 	case 'i':
+-	  setval ("input", optarg);
++	  setoptval ("input", optarg);
+ 	  break;
+ 	case 'l':
+-	  setval ("reclevel", optarg);
++	  setoptval ("reclevel", optarg);
+ 	  break;
+ 	case 'n':
+ 	  {
+@@ -678,25 +663,25 @@ GNU General Public License for more details.\n"));
+ 	      switch (*p)
+ 		{
+ 		case 'v':
+-		  setval ("verbose", "off");
++		  setoptval ("verbose", "off");
+ 		  break;
+ 		case 'H':
+-		  setval ("addhostdir", "off");
++		  setoptval ("addhostdir", "off");
+ 		  break;
+ 		case 'd':
+-		  setval ("dirstruct", "off");
++		  setoptval ("dirstruct", "off");
+ 		  break;
+ 		case 'c':
+-		  setval ("noclobber", "on");
++		  setoptval ("noclobber", "on");
+ 		  break;
+ 		case 'r':
+-		  setval ("removelisting", "off");
++		  setoptval ("removelisting", "off");
+ 		  break;
+ 		case 'p':
+-		  setval ("noparent", "on");
++		  setoptval ("noparent", "on");
+ 		  break;
+ 		case 'k':
+-		  setval ("httpkeepalive", "off");
++		  setoptval ("httpkeepalive", "off");
+ 		  break;
+ 		default:
+ 		  printf (_("%s: illegal option -- `-n%c'\n"), exec_name, *p);
+@@ -708,37 +693,37 @@ GNU General Public License for more details.\n"));
+ 	    break;
+ 	  }
+ 	case 'O':
+-	  setval ("outputdocument", optarg);
++	  setoptval ("outputdocument", optarg);
+ 	  break;
+ 	case 'o':
+-	  setval ("logfile", optarg);
++	  setoptval ("logfile", optarg);
+ 	  break;
+ 	case 'P':
+-	  setval ("dirprefix", optarg);
++	  setoptval ("dirprefix", optarg);
+ 	  break;
+ 	case 'Q':
+-	  setval ("quota", optarg);
++	  setoptval ("quota", optarg);
+ 	  break;
+ 	case 'R':
+-	  setval ("reject", optarg);
++	  setoptval ("reject", optarg);
+ 	  break;
+ 	case 'T':
+-	  setval ("timeout", optarg);
++	  setoptval ("timeout", optarg);
+ 	  break;
+ 	case 't':
+-	  setval ("tries", optarg);
++	  setoptval ("tries", optarg);
+ 	  break;
+ 	case 'U':
+-	  setval ("useragent", optarg);
++	  setoptval ("useragent", optarg);
+ 	  break;
+ 	case 'w':
+-	  setval ("wait", optarg);
++	  setoptval ("wait", optarg);
+ 	  break;
+ 	case 'X':
+-	  setval ("excludedirectories", optarg);
++	  setoptval ("excludedirectories", optarg);
+ 	  break;
+ 	case 'Y':
+-	  setval ("useproxy", optarg);
++	  setoptval ("useproxy", optarg);
+ 	  break;
+ 
+ 	case '?':
+-- 
+cgit v1.0-41-gc330
+

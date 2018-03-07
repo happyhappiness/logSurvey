@@ -1,0 +1,525 @@
+diff --git a/NEWS b/NEWS
+index 206636e..083e26c 100644
+--- a/NEWS
++++ b/NEWS
+@@ -7,6 +7,10 @@ Please send GNU Wget bug reports to <bug-wget@gnu.org>.
+ 
+ * Changes in Wget 1.9.
+ 
++** It is now possible to specify that POST method be used for HTTP
++requests.  For example, `wget --post-data="id=foo&data=bar" URL' will
++send a POST request with the specified contents.
++
+ ** IPv6 is experimentally supported.
+ 
+ ** The `--timeout' option now affects the connect timeout as well.
+diff --git a/src/ChangeLog b/src/ChangeLog
+index e7470ac..8b33fea 100644
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,5 +1,21 @@
+ 2002-04-14  Hrvoje Niksic  <hniksic@arsdigita.com>
+ 
++	* retr.c (retrieve_url): Make sure that POST is not honored for
++	redirections.
++
++	* http.c (gethttp): Send the POST data when requested.
++	(post_file): New function.
++	(gethttp): Use it.
++
++	* main.c (main): Ditto.
++
++	* init.c: Add new options.
++
++	* options.h (struct options): New options post_data and
++	post_file_name.
++
++2002-04-14  Hrvoje Niksic  <hniksic@arsdigita.com>
++
+ 	* connect.c (connect_with_timeout): Firing SIGALRM can result in
+ 	connect() exiting with EINTR.  Treat EINTR the same as ETIMEDOUT.
+ 
+diff --git a/src/connect.c b/src/connect.c
+index 29a8b6e..fa4a693 100644
+--- a/src/connect.c
++++ b/src/connect.c
+@@ -473,7 +473,6 @@ iwrite (int fd, char *buf, int len)
+ 		{
+ 		  /* Set errno to ETIMEDOUT on timeout.  */
+ 		  if (res == 0)
+-		    /* #### Potentially evil!  */
+ 		    errno = ETIMEDOUT;
+ 		  return -1;
+ 		}
+diff --git a/src/http.c b/src/http.c
+index c82eb32..e37e147 100644
+--- a/src/http.c
++++ b/src/http.c
+@@ -1,5 +1,5 @@
+ /* HTTP support.
+-   Copyright (C) 1995, 1996, 1997, 1998, 2000, 2001
++   Copyright (C) 1995, 1996, 1997, 1998, 2000, 2001, 2002
+    Free Software Foundation, Inc.
+ 
+ This file is part of GNU Wget.
+@@ -170,6 +170,79 @@ parse_http_status_line (const char *line, const char **reason_phrase_ptr)
+   return statcode;
+ }
+ 
++#define WMIN(x, y) ((x) > (y) ? (y) : (x))
++
++/* Send the contents of FILE_NAME to SOCK/SSL.  Make sure that exactly
++   PROMISED_SIZE bytes are sent over the wire -- if the file is
++   longer, read only that much; if the file is shorter, pad it with
++   zeros.  */
++
++static int
++post_file (int sock, void *ssl, const char *file_name, long promised_size)
++{
++  static char chunk[8192];
++  int written = 0;
++  int write_error;
++  FILE *fp;
++
++  /* Only one of SOCK and SSL may be active at the same time. */
++  assert (sock > -1 || ssl != NULL);
++  assert (sock == -1 || ssl == NULL);
++
++  DEBUGP (("[writing POST file %s ... ", file_name));
++
++  fp = fopen (file_name, "rb");
++  if (!fp)
++    goto pad;
++  while (written < promised_size)
++    {
++      long towrite;
++      int length = fread (chunk, 1, sizeof (chunk), fp);
++      if (length == 0)
++	break;
++      towrite = WMIN (promised_size - written, length);
++#ifdef HAVE_SSL
++      if (ssl)
++	write_error = ssl_iwrite (ssl, chunk, towrite);
++      else
++#endif
++	write_error = iwrite (sock, chunk, towrite);
++      if (write_error < 0)
++	{
++	  fclose (fp);
++	  return -1;
++	}
++      written += towrite;
++    }
++  fclose (fp);
++ pad:
++  if (written < promised_size)
++    {
++      DEBUGP (("padding ... "));
++      /* This highly unlikely case can happen only if the file has
++	 shrunk while we weren't looking.  To uphold the promise, pad
++	 the remaining data with zeros.  #### Should we abort
++	 instead?  */
++      memset (chunk, '\0', sizeof (chunk));
++      while (written < promised_size)
++	{
++	  long towrite = WMIN (promised_size - written, sizeof (chunk));
++#ifdef HAVE_SSL
++	  if (ssl)
++	    write_error = ssl_iwrite (ssl, chunk, towrite);
++	  else
++#endif
++	    write_error = iwrite (sock, chunk, towrite);
++	  if (write_error < 0)
++	    return -1;
++	  written += towrite;
++	}
++    }
++  assert (written == promised_size);
++  DEBUGP (("done]\n"));
++  return 0;
++}
++
+ /* Functions to be used as arguments to header_process(): */
+ 
+ struct http_process_range_closure {
+@@ -540,7 +613,8 @@ gethttp (struct url *u, struct http_stat *hs, int *dt, struct url *proxy)
+   char *all_headers;
+   char *port_maybe;
+   char *request_keep_alive;
+-  int sock, hcount, num_written, all_length, statcode;
++  int sock, hcount, all_length, statcode;
++  int write_error;
+   long contlen, contrange;
+   struct url *conn;
+   FILE *fp;
+@@ -549,7 +623,7 @@ gethttp (struct url *u, struct http_stat *hs, int *dt, struct url *proxy)
+ #ifdef HAVE_SSL
+   static SSL_CTX *ssl_ctx = NULL;
+   SSL *ssl = NULL;
+-#endif /* HAVE_SSL */
++#endif
+   char *cookies = NULL;
+ 
+   /* Whether this connection will be kept alive after the HTTP request
+@@ -568,6 +642,10 @@ gethttp (struct url *u, struct http_stat *hs, int *dt, struct url *proxy)
+      "Host: symbolic-name:1234". */
+   int squares_around_host = 0;
+ 
++  /* Headers sent when using POST. */
++  char *post_content_type, *post_content_length;
++  long post_data_size;
++
+ #ifdef HAVE_SSL
+   /* initialize ssl_ctx on first run */
+   if (!ssl_ctx)
+@@ -624,6 +702,9 @@ gethttp (struct url *u, struct http_stat *hs, int *dt, struct url *proxy)
+   keep_alive = 0;
+   http_keep_alive_1 = http_keep_alive_2 = 0;
+ 
++  post_content_type = NULL;
++  post_content_length = NULL;
++
+   /* Initialize certain elements of struct http_stat.  */
+   hs->len = 0L;
+   hs->contlen = -1;
+@@ -683,7 +764,12 @@ gethttp (struct url *u, struct http_stat *hs, int *dt, struct url *proxy)
+       DEBUGP (("Reusing fd %d.\n", sock));
+     }
+ 
+-  command = (*dt & HEAD_ONLY) ? "HEAD" : "GET";
++  if (*dt & HEAD_ONLY)
++    command = "HEAD";
++  else if (opt.post_file_name || opt.post_data)
++    command = "POST";
++  else
++    command = "GET";
+ 
+   referer = NULL;
+   if (hs->referer)
+@@ -812,6 +898,26 @@ gethttp (struct url *u, struct http_stat *hs, int *dt, struct url *proxy)
+ #endif
+ 				     );
+ 
++  if (opt.post_data || opt.post_file_name)
++    {
++      post_content_type = "Content-Type: application/x-www-form-urlencoded\r\n";
++      if (opt.post_data)
++	post_data_size = strlen (opt.post_data);
++      else
++	{
++	  post_data_size = file_size (opt.post_file_name);
++	  if (post_data_size == -1)
++	    {
++	      logprintf (LOG_NOTQUIET, "POST data file missing: %s\n",
++			 opt.post_file_name);
++	      post_data_size = 0;
++	    }
++	}
++      post_content_length = xmalloc (16 + numdigit (post_data_size) + 2 + 1);
++      sprintf (post_content_length,
++	       "Content-Length: %ld\r\n", post_data_size);
++    }
++
+   if (proxy)
+     full_path = xstrdup (u->url);
+   else
+@@ -838,6 +944,10 @@ gethttp (struct url *u, struct http_stat *hs, int *dt, struct url *proxy)
+ 			    + (proxyauth ? strlen (proxyauth) : 0)
+ 			    + (range ? strlen (range) : 0)
+ 			    + strlen (pragma_h)
++			    + (post_content_type
++			       ? strlen (post_content_type) : 0)
++			    + (post_content_length
++			       ? strlen (post_content_length) : 0)
+ 			    + (opt.user_header ? strlen (opt.user_header) : 0)
+ 			    + 64);
+   /* Construct the request.  */
+@@ -846,7 +956,7 @@ gethttp (struct url *u, struct http_stat *hs, int *dt, struct url *proxy)
+ User-Agent: %s\r\n\
+ Host: %s%s%s%s\r\n\
+ Accept: %s\r\n\
+-%s%s%s%s%s%s%s%s\r\n",
++%s%s%s%s%s%s%s%s%s%s\r\n",
+ 	   command, full_path,
+ 	   useragent,
+ 	   squares_around_host ? "[" : "", u->host, squares_around_host ? "]" : "",
+@@ -858,9 +968,11 @@ Accept: %s\r\n\
+ 	   wwwauth ? wwwauth : "", 
+ 	   proxyauth ? proxyauth : "", 
+ 	   range ? range : "",
+-	   pragma_h, 
++	   pragma_h,
++	   post_content_type ? post_content_type : "",
++	   post_content_length ? post_content_length : "",
+ 	   opt.user_header ? opt.user_header : "");
+-  DEBUGP (("---request begin---\n%s---request end---\n", request));
++  DEBUGP (("---request begin---\n%s", request));
+ 
+   /* Free the temporary memory.  */
+   FREE_MAYBE (wwwauth);
+@@ -871,12 +983,38 @@ Accept: %s\r\n\
+   /* Send the request to server.  */
+ #ifdef HAVE_SSL
+   if (conn->scheme == SCHEME_HTTPS)
+-    num_written = ssl_iwrite (ssl, request, strlen (request));
++    write_error = ssl_iwrite (ssl, request, strlen (request));
+   else
+-#endif /* HAVE_SSL */
+-    num_written = iwrite (sock, request, strlen (request));
++#endif
++    write_error = iwrite (sock, request, strlen (request));
++
++  if (write_error >= 0)
++    {
++      if (opt.post_data)
++	{
++	  DEBUGP (("[POST data: %s]\n", opt.post_data));
++#ifdef HAVE_SSL
++	  if (conn->scheme == SCHEME_HTTPS)
++	    write_error = ssl_iwrite (ssl, opt.post_data, post_data_size);
++	  else
++#endif
++	    write_error = iwrite (sock, opt.post_data, post_data_size);
++	}
++      else if (opt.post_file_name)
++	{
++#ifdef HAVE_SSL
++	  if (conn->scheme == SCHEME_HTTPS)
++	    write_error = post_file (-1, ssl, opt.post_file_name,
++				     post_data_size);
++	  else
++#endif
++	    write_error = post_file (sock, NULL, opt.post_file_name,
++				     post_data_size);
++	}
++    }
++  DEBUGP (("---request end---\n"));
+ 
+-  if (num_written < 0)
++  if (write_error < 0)
+     {
+       logprintf (LOG_VERBOSE, _("Failed writing HTTP request: %s.\n"),
+ 		 strerror (errno));
+diff --git a/src/init.c b/src/init.c
+index 14b5c4b..0a5bc63 100644
+--- a/src/init.c
++++ b/src/init.c
+@@ -158,6 +158,8 @@ static struct {
+   { "pagerequisites",	&opt.page_requisites,	cmd_boolean },
+   { "passiveftp",	&opt.ftp_pasv,		cmd_lockable_boolean },
+   { "passwd",		&opt.ftp_pass,		cmd_string },
++  { "postdata",		&opt.post_data,		cmd_string },
++  { "postfile",		&opt.post_file_name,	cmd_file },
+   { "progress",		&opt.progress_type,	cmd_spec_progress },
+   { "proxypasswd",	&opt.proxy_passwd,	cmd_string },
+   { "proxyuser",	&opt.proxy_user,	cmd_string },
+diff --git a/src/main.c b/src/main.c
+index a08748b..f0fc347 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -307,6 +307,8 @@ main (int argc, char *const *argv)
+     { "no", required_argument, NULL, 'n' },
+     { "output-document", required_argument, NULL, 'O' },
+     { "output-file", required_argument, NULL, 'o' },
++    { "post-data", required_argument, NULL, 167 },
++    { "post-file", required_argument, NULL, 168 },
+     { "progress", required_argument, NULL, 163 },
+     { "proxy", required_argument, NULL, 'Y' },
+     { "proxy-passwd", required_argument, NULL, 144 },
+@@ -547,6 +549,12 @@ GNU General Public License for more details.\n"));
+ 	  setval ("egdfile", optarg);
+ 	  break;
+ #endif /* HAVE_SSL */
++	case 167:
++	  setval ("postdata", optarg);
++	  break;
++	case 168:
++	  setval ("postfile", optarg);
++	  break;
+ 	case 'A':
+ 	  setval ("accept", optarg);
+ 	  break;
+diff --git a/src/options.h b/src/options.h
+index ae66d8e..c643860 100644
+--- a/src/options.h
++++ b/src/options.h
+@@ -164,6 +164,9 @@ struct options
+   int   cookies;
+   char *cookies_input;
+   char *cookies_output;
++
++  char *post_data;		/* POST query string */
++  char *post_file_name;		/* File to post */
+ };
+ 
+ extern struct options opt;
+diff --git a/src/retr.c b/src/retr.c
+index 772d922..816d522 100644
+--- a/src/retr.c
++++ b/src/retr.c
+@@ -154,7 +154,7 @@ get_contents (int fd, FILE *fp, long *len, long restval, long expected,
+ 	  res = -2;
+ 	  goto out;
+ 	}
+-      if (opt.verbose)
++      if (progress)
+ 	progress_update (progress, sz, 0);
+     }
+ 
+@@ -202,7 +202,7 @@ get_contents (int fd, FILE *fp, long *len, long restval, long expected,
+ 	      last_dltime = dltime;
+ 	    }
+ 
+-	  if (opt.verbose)
++	  if (progress)
+ 	    progress_update (progress, res, dltime);
+ 	  *len += res;
+ 	}
+@@ -213,7 +213,7 @@ get_contents (int fd, FILE *fp, long *len, long restval, long expected,
+     res = -1;
+ 
+  out:
+-  if (opt.verbose)
++  if (progress)
+     progress_finish (progress, dltime);
+   if (elapsed)
+     *elapsed = dltime;
+@@ -281,9 +281,29 @@ calc_rate (long bytes, long msecs, int *units)
+ 
+ #define MAX_REDIRECTIONS 20
+ 
++#define SUSPEND_POST_DATA do {			\
++  post_data_suspended = 1;			\
++  saved_post_data = opt.post_data;		\
++  saved_post_file_name = opt.post_file_name;	\
++  opt.post_data = NULL;				\
++  opt.post_file_name = NULL;			\
++} while (0)
++
++#define RESTORE_POST_DATA do {				\
++  if (post_data_suspended)				\
++    {							\
++      opt.post_data = saved_post_data;			\
++      opt.post_file_name = saved_post_file_name;	\
++      post_data_suspended = 0;				\
++    }							\
++} while (0)
++
+ /* Retrieve the given URL.  Decides which loop to call -- HTTP, FTP,
+    FTP, proxy, etc.  */
+ 
++/* #### This function should be rewritten so it doesn't return from
++   multiple points. */
++
+ uerr_t
+ retrieve_url (const char *origurl, char **file, char **newloc,
+ 	      const char *refurl, int *dt)
+@@ -297,6 +317,10 @@ retrieve_url (const char *origurl, char **file, char **newloc,
+   char *local_file;
+   int redirection_count = 0;
+ 
++  int post_data_suspended = 0;
++  char *saved_post_data;
++  char *saved_post_file_name;
++
+   /* If dt is NULL, just ignore it.  */
+   if (!dt)
+     dt = &dummy;
+@@ -334,6 +358,7 @@ retrieve_url (const char *origurl, char **file, char **newloc,
+ 	  logprintf (LOG_NOTQUIET, _("Error parsing proxy URL %s: %s.\n"),
+ 		     proxy, url_error (up_error_code));
+ 	  xfree (url);
++	  RESTORE_POST_DATA;
+ 	  return PROXERR;
+ 	}
+       if (proxy_url->scheme != SCHEME_HTTP && proxy_url->scheme != u->scheme)
+@@ -341,6 +366,7 @@ retrieve_url (const char *origurl, char **file, char **newloc,
+ 	  logprintf (LOG_NOTQUIET, _("Error in proxy URL %s: Must be HTTP.\n"), proxy);
+ 	  url_free (proxy_url);
+ 	  xfree (url);
++	  RESTORE_POST_DATA;
+ 	  return PROXERR;
+ 	}
+     }
+@@ -409,6 +435,7 @@ retrieve_url (const char *origurl, char **file, char **newloc,
+ 	  url_free (u);
+ 	  xfree (url);
+ 	  xfree (mynewloc);
++	  RESTORE_POST_DATA;
+ 	  return result;
+ 	}
+ 
+@@ -427,6 +454,7 @@ retrieve_url (const char *origurl, char **file, char **newloc,
+ 	  url_free (u);
+ 	  xfree (url);
+ 	  xfree (mynewloc);
++	  RESTORE_POST_DATA;
+ 	  return WRONGCODE;
+ 	}
+ 
+@@ -434,6 +462,15 @@ retrieve_url (const char *origurl, char **file, char **newloc,
+       url = mynewloc;
+       url_free (u);
+       u = newloc_parsed;
++
++      /* If we're being redirected from POST, we don't want to POST
++	 again.  Many requests answer POST with a redirection to an
++	 index page; that redirection is clearly a GET.  We "suspend"
++	 POST data for the duration of the redirections, and restore
++	 it when we're done. */
++      if (!post_data_suspended)
++	SUSPEND_POST_DATA;
++
+       goto redirected;
+     }
+ 
+@@ -471,6 +508,7 @@ retrieve_url (const char *origurl, char **file, char **newloc,
+     }
+ 
+   ++global_download_count;
++  RESTORE_POST_DATA;
+ 
+   return result;
+ }
+diff --git a/src/utils.c b/src/utils.c
+index cd1e645..3351449 100644
+--- a/src/utils.c
++++ b/src/utils.c
+@@ -554,6 +554,22 @@ file_non_directory_p (const char *path)
+   return S_ISDIR (buf.st_mode) ? 0 : 1;
+ }
+ 
++/* Return the size of file named by FILENAME, or -1 if it cannot be
++   opened or seeked into. */
++long
++file_size (const char *filename)
++{
++  long size;
++  /* We use fseek rather than stat to determine the file size because
++     that way we can also verify whether the file is readable.
++     Inspired by the POST patch by Arnaud Wylie.  */
++  FILE *fp = fopen (filename, "rb");
++  fseek (fp, 0, SEEK_END);
++  size = ftell (fp);
++  fclose (fp);
++  return size;
++}
++
+ /* Return a unique filename, given a prefix and count */
+ static char *
+ unique_name_1 (const char *fileprefix, int count)
+diff --git a/src/utils.h b/src/utils.h
+index a941c5f..ff139f7 100644
+--- a/src/utils.h
++++ b/src/utils.h
+@@ -61,6 +61,7 @@ void touch PARAMS ((const char *, time_t));
+ int remove_link PARAMS ((const char *));
+ int file_exists_p PARAMS ((const char *));
+ int file_non_directory_p PARAMS ((const char *));
++long file_size PARAMS ((const char *));
+ int make_directory PARAMS ((const char *));
+ char *unique_name PARAMS ((const char *));
+ char *file_merge PARAMS ((const char *, const char *));
+-- 
+cgit v1.0-41-gc330
+

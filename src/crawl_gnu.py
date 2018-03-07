@@ -6,7 +6,7 @@ import csv
 import my_util
 
 # some constants
-REPOS_NAME = 'tar'
+REPOS_NAME = 'wget'
 LOG_PATTERN = my_util.get_log_function_pattern(REPOS_NAME)
 MAIN_URL = 'http://git.savannah.gnu.org'
 
@@ -38,7 +38,7 @@ def generate_record(url, commit_info, counter, writer):
     # regex parser for store [url, date, title, changes, patch_file]
     date_pattern = r'Date: \w*, (\d* \w* \d*) \d*:\d*:.*'
     title_pattern = r'Subject: (.*)'
-    patch_pattern = r'\d* \w* changed, (\d*)\D*(\d*)\D*'
+    patch_pattern = r'^---'
     title = None
     date = None
     patch = None
@@ -69,11 +69,13 @@ def generate_record(url, commit_info, counter, writer):
         return counter
     # retrieve modify and diff
     changes = 0
+    # modify pattern 1 file changed, 5 insertions, 6 deletions
+    modify_pattern = r'\d* \w* changed, (\d*)\D*(\d*)\D*'
     diff_pattern = r'diff --git .*'
     for line in patch:
         # find changes(just one time)
         if changes == 0:
-            is_modify = is_patch
+            is_modify = re.search(modify_pattern, line, re.I)
             if is_modify:
                 for i in range(1, is_modify.lastindex + 1):
                     num_str = is_modify.group(i)
@@ -115,30 +117,32 @@ def analyze_commit_list(commit_list_page, total_counter, counter, writer):
     html = response.read()
     html = html.split("\n")
     commit_page_pattern = r"(?:href|HREF)='(/cgit/" + REPOS_NAME + r"\.git/commit/\?id=\w*)'>"
+    next_list_page_pattern = r"(?:href|HREF)='(/cgit/" + REPOS_NAME + r"\.git/log/\?ofs=\d*)'>\[next\]"
 
     # check html content against git-2.*.tar.gz
     commit_count = 0
     # every commit list page has at most 50 commits
     for line in html:
         # one page has at most 50 commits
-        if commit_count >= 50:
-            break
-        # retrieve commit address
-        is_commit = re.search(commit_page_pattern, line, re.I)
-        if is_commit:
-            # analyze commit and counter
-            counter = analyze_commit(is_commit.group(1), counter, writer)
-            # update commit counter and total counter
-            commit_count += 1
-            total_counter += 1
-            if total_counter % 10 == 0:
-                print 'now analyzing %d total commit, find %d log commit' %(total_counter, counter)
-    # fetch next button
-    next_list_page_pattern = r"(?:href|HREF)='(/cgit/" + REPOS_NAME + r"\.git/log/\?ofs=.*)'>"
-    for line in html:
-        is_next_list = re.search(next_list_page_pattern, line, re.I)
-        if is_next_list:
-            analyze_commit_list(is_next_list.group(1), total_counter, counter, writer)
+        if commit_count == 50:
+            # find next page
+            is_next_list = re.search(next_list_page_pattern, line, re.I)
+            if is_next_list:
+                analyze_commit_list(is_next_list.group(1), total_counter, counter, writer)
+                return
+        else:
+            # retrieve commit address
+            is_commit = re.search(commit_page_pattern, line, re.I)
+            if is_commit:
+                # analyze commit and counter
+                counter = analyze_commit(is_commit.group(1), counter, writer)
+                # update commit counter and total counter
+                commit_count += 1
+                total_counter += 1
+                if total_counter % 10 == 0:
+                    print 'now analyzing %d total commit, find %d log commit' %(total_counter, counter)
+    
+    print 'can not find next page'
 
 """
 main function
@@ -148,6 +152,6 @@ if __name__ == "__main__":
     writer = csv.writer(record_file)
     writer.writerow(['url', 'date', 'title', 'changes', 'file_name'])
     # analyze commit list
-    analyze_commit_list('/cgit/' + REPOS_NAME + '.git/log/?ofs=50', 0, 0, writer)
+    analyze_commit_list('/cgit/' + REPOS_NAME + '.git/log/', 0, 0, writer)
 
     record_file.close()

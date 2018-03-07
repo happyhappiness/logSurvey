@@ -1,0 +1,395 @@
+diff --git a/src/ChangeLog b/src/ChangeLog
+index d15c340..8853c86 100644
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,5 +1,14 @@
+ 2005-04-27  Hrvoje Niksic  <hniksic@xemacs.org>
+ 
++	* openssl.c (init_prng): Disable the weak random seed by default.
++
++	* http.c (gethttp): Simplify SSL initialization; disable SSL when
++	anything goes wrong with the initialization.
++
++	* options.h (struct options): New option opt.random_file.
++
++2005-04-27  Hrvoje Niksic  <hniksic@xemacs.org>
++
+ 	* init.c: Wrap private key commands in IF_SSL.
+ 
+ 2005-04-27  Hrvoje Niksic  <hniksic@xemacs.org>
+diff --git a/src/http.c b/src/http.c
+index 5d382de..9162d85 100644
+--- a/src/http.c
++++ b/src/http.c
+@@ -1187,29 +1187,12 @@ gethttp (struct url *u, struct http_stat *hs, int *dt, struct url *proxy)
+     {
+       /* Initialize the SSL context.  After this has once been done,
+ 	 it becomes a no-op.  */
+-      switch (ssl_init ())
++      if (!ssl_init ())
+ 	{
+-	case SSLERRCTXCREATE:
+-	  /* this is fatal */
+-	  logprintf (LOG_NOTQUIET, _("Failed to set up an SSL context\n"));
+-	  return SSLERRCTXCREATE;
+-	case SSLERRCERTFILE:
+-	  /* try without certfile */
++	  scheme_disable (SCHEME_HTTPS);
+ 	  logprintf (LOG_NOTQUIET,
+-		     _("Failed to load certificates from %s\n"),
+-		     opt.cert_file);
+-	  logprintf (LOG_NOTQUIET,
+-		     _("Trying without the specified certificate\n"));
+-	  break;
+-	case SSLERRCERTKEY:
+-	  logprintf (LOG_NOTQUIET,
+-		     _("Failed to get private key from %s\n"),
+-		     opt.private_key);
+-	  logprintf (LOG_NOTQUIET,
+-		     _("Trying without the specified certificate\n"));
+-	  break;
+-	default:
+-	  break;
++		     _("Disabling SSL due to encountered errors.\n"));
++	  return SSLINITFAILED;
+ 	}
+     }
+ #endif /* HAVE_SSL */
+@@ -2232,7 +2215,7 @@ File `%s' already there, will not retrieve.\n"), *hstat.local_file);
+ 	  continue;
+ 	  break;
+ 	case HOSTERR: case CONIMPOSSIBLE: case PROXERR: case AUTHFAILED: 
+-	case SSLERRCTXCREATE: case CONTNOTSUPPORTED:
++	case SSLINITFAILED: case CONTNOTSUPPORTED:
+ 	  /* Fatal errors just return from the function.  */
+ 	  free_hstat (&hstat);
+ 	  xfree_null (dummy);
+diff --git a/src/init.c b/src/init.c
+index 9a341ab..5957aa5 100644
+--- a/src/init.c
++++ b/src/init.c
+@@ -205,6 +205,7 @@ static struct {
+   { "proxyuser",	&opt.proxy_user,	cmd_string },
+   { "quiet",		&opt.quiet,		cmd_boolean },
+   { "quota",		&opt.quota,		cmd_bytes_large },
++  { "randomfile",	&opt.random_file,	cmd_file },
+   { "randomwait",	&opt.random_wait,	cmd_boolean },
+   { "readtimeout",	&opt.read_timeout,	cmd_time },
+   { "reclevel",		&opt.reclevel,		cmd_number_inf },
+diff --git a/src/main.c b/src/main.c
+index 6470c1e..0be2c90 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -231,6 +231,7 @@ struct cmdline_option option_data[] =
+     { "proxy-user", 0, OPT_VALUE, "proxyuser", -1 },
+     { "quiet", 'q', OPT_BOOLEAN, "quiet", -1 },
+     { "quota", 'Q', OPT_VALUE, "quota", -1 },
++    { "random-file", 0, OPT_VALUE, "randomfile", -1 },
+     { "random-wait", 0, OPT_BOOLEAN, "randomwait", -1 },
+     { "read-timeout", 0, OPT_VALUE, "readtimeout", -1 },
+     { "recursive", 'r', OPT_BOOLEAN, "recursive", -1 },
+@@ -552,7 +553,9 @@ HTTPS (SSL/TLS) options:\n"),
+     N_("\
+        --ca-directory=DIR       directory where hash list of CA's is stored.\n"),
+     N_("\
+-       --egd-file=FILE          file name of the EGD socket.\n"),
++       --random-file=FILE       file with random data for seeding the SSL PRNG.\n"),
++    N_("\
++       --egd-file=FILE          file naming the EGD socket with random data.\n"),
+     "\n",
+ #endif /* HAVE_SSL */
+ 
+diff --git a/src/openssl.c b/src/openssl.c
+index 920f5a5..91552de 100644
+--- a/src/openssl.c
++++ b/src/openssl.c
+@@ -59,29 +59,43 @@ so, delete this exception statement from your version.  */
+ extern int errno;
+ #endif
+ 
++/* Application-wide SSL context.  This is common to all SSL
++   connections.  */
+ SSL_CTX *ssl_ctx;
+ 
++/* Initialize the SSL's PRNG using various methods. */
++
+ static void
+-ssl_init_prng (void)
++init_prng (void)
+ {
+-  /* It is likely that older versions of OpenSSL will fail on
+-     non-Linux machines because this code is unable to seed the PRNG
+-     on older versions of the library.  */
++  char namebuf[256];
++  const char *random_file;
++
++  if (RAND_status ())
++    /* The PRNG has been seeded; no further action is necessary. */
++    return;
+ 
+-#if SSLEAY_VERSION_NUMBER >= 0x00905100
+-  char rand_file[256];
++  /* Seed from a file specified by the user.  This will be the file
++     specified with --random-file, $RANDFILE, if set, or ~/.rnd, if it
++     exists.  */
++  if (opt.random_file)
++    random_file = opt.random_file;
++  else
++    {
++      /* Get the random file name using RAND_file_name. */
++      namebuf[0] = '\0';
++      random_file = RAND_file_name (namebuf, sizeof (namebuf));
++    }
+ 
+-  /* First, seed from a file specified by the user.  This will be
+-     $RANDFILE, if set, or ~/.rnd.  */
+-  RAND_file_name (rand_file, sizeof (rand_file));
+-  if (rand_file)
+-    /* Seed at most 16k (value borrowed from curl) from random file. */
+-    RAND_load_file (rand_file, 16384);
++  if (random_file && *random_file)
++    /* Seed at most 16k (apparently arbitrary value borrowed from
++       curl) from random file. */
++    RAND_load_file (random_file, 16384);
+ 
+   if (RAND_status ())
+     return;
+ 
+-  /* Get random data from EGD if opt.egd_file was set.  */
++  /* Get random data from EGD if opt.egd_file was used.  */
+   if (opt.egd_file && *opt.egd_file)
+     RAND_egd (opt.egd_file);
+ 
+@@ -107,7 +121,7 @@ ssl_init_prng (void)
+        PRNG.  This is cryptographically weak and defeats the purpose
+        of using OpenSSL, which is why it is highly discouraged.  */
+ 
+-    logprintf (LOG_VERBOSE, _("WARNING: using a weak random seed.\n"));
++    logprintf (LOG_NOTQUIET, _("WARNING: using a weak random seed.\n"));
+ 
+     while (RAND_status () == 0 && maxrand-- > 0)
+       {
+@@ -116,16 +130,17 @@ ssl_init_prng (void)
+       }
+   }
+ #endif
+-
+-#endif /* SSLEAY_VERSION_NUMBER >= 0x00905100 */
+ }
+ 
++/* #### Someone should audit and document this. */
++
+ static int
+ verify_callback (int ok, X509_STORE_CTX *ctx)
+ {
+-  char *s, buf[256];
+-  s = X509_NAME_oneline (X509_get_subject_name (ctx->current_cert),
+-			 buf, sizeof (buf));
++  char buf[256];
++  /* #### Why are we not using the result of this call? */
++  X509_NAME_oneline (X509_get_subject_name (ctx->current_cert),
++		     buf, sizeof (buf));
+   if (ok == 0)
+     {
+       switch (ctx->error)
+@@ -144,10 +159,10 @@ verify_callback (int ok, X509_STORE_CTX *ctx)
+   return ok;
+ }
+ 
+-/* Print SSL errors. */
++/* Print errors in the OpenSSL error stack. */
+ 
+ static void
+-ssl_print_errors (void) 
++print_errors (void) 
+ {
+   unsigned long curerr = 0;
+   while ((curerr = ERR_get_error ()) != 0)
+@@ -174,29 +189,34 @@ key_type_to_ssl_type (enum keyfile_type type)
+     }
+ }
+ 
+-/* Creates a SSL Context and sets some defaults for it */
+-uerr_t
++/* Create an SSL Context and set default paths etc.  Called the first
++   time an HTTP download is attempted.
++
++   Returns 0 on success, non-zero otherwise.  */
++
++int
+ ssl_init ()
+ {
+-  SSL_METHOD *meth = NULL;
++  SSL_METHOD *meth;
+ 
+   if (ssl_ctx)
+-    return 0;
++    /* The SSL has already been initialized. */
++    return 1;
+ 
+   /* Init the PRNG.  If that fails, bail out.  */
+-  ssl_init_prng ();
+-  if (RAND_status () == 0)
++  init_prng ();
++  if (RAND_status () != 1)
+     {
+       logprintf (LOG_NOTQUIET,
+-		 _("Could not seed OpenSSL PRNG; disabling SSL.\n"));
+-      scheme_disable (SCHEME_HTTPS);
+-      return SSLERRCTXCREATE;
++		 _("Could not seed PRNG; consider using --random-file.\n"));
++      goto error;
+     }
+ 
+   SSL_library_init ();
+   SSL_load_error_strings ();
+   SSLeay_add_all_algorithms ();
+   SSLeay_add_ssl_algorithms ();
++
+   switch (opt.secure_protocol)
+     {
+     case secure_protocol_auto:
+@@ -216,6 +236,9 @@ ssl_init ()
+     }
+ 
+   ssl_ctx = SSL_CTX_new (meth);
++  if (!ssl_ctx)
++    goto error;
++
+   SSL_CTX_set_default_verify_paths (ssl_ctx);
+   SSL_CTX_load_verify_locations (ssl_ctx, opt.ca_cert, opt.ca_directory);
+   SSL_CTX_set_verify (ssl_ctx,
+@@ -226,24 +249,24 @@ ssl_init ()
+     if (SSL_CTX_use_certificate_file (ssl_ctx, opt.cert_file,
+ 				      key_type_to_ssl_type (opt.cert_type))
+ 	!= 1)
+-      {
+-	ssl_print_errors ();
+-	return SSLERRCERTFILE;
+-      }
++      goto error;
+   if (opt.private_key)
+     if (SSL_CTX_use_PrivateKey_file (ssl_ctx, opt.private_key,
+ 				     key_type_to_ssl_type (opt.private_key_type))
+ 	!= 1)
+-      {
+-	ssl_print_errors ();
+-	return SSLERRCERTKEY;
+-      }
++      goto error;
++
++  return 1;
+ 
+-  return 0; /* Succeded */
++ error:
++  if (ssl_ctx)
++    SSL_CTX_free (ssl_ctx);
++  print_errors ();
++  return 0;
+ }
+ 
+ static int
+-ssl_read (int fd, char *buf, int bufsize, void *ctx)
++openssl_read (int fd, char *buf, int bufsize, void *ctx)
+ {
+   int ret;
+   SSL *ssl = (SSL *) ctx;
+@@ -256,7 +279,7 @@ ssl_read (int fd, char *buf, int bufsize, void *ctx)
+ }
+ 
+ static int
+-ssl_write (int fd, char *buf, int bufsize, void *ctx)
++openssl_write (int fd, char *buf, int bufsize, void *ctx)
+ {
+   int ret = 0;
+   SSL *ssl = (SSL *) ctx;
+@@ -269,7 +292,7 @@ ssl_write (int fd, char *buf, int bufsize, void *ctx)
+ }
+ 
+ static int
+-ssl_poll (int fd, double timeout, int wait_for, void *ctx)
++openssl_poll (int fd, double timeout, int wait_for, void *ctx)
+ {
+   SSL *ssl = (SSL *) ctx;
+   if (timeout == 0)
+@@ -280,7 +303,7 @@ ssl_poll (int fd, double timeout, int wait_for, void *ctx)
+ }
+ 
+ static int
+-ssl_peek (int fd, char *buf, int bufsize, void *ctx)
++openssl_peek (int fd, char *buf, int bufsize, void *ctx)
+ {
+   int ret;
+   SSL *ssl = (SSL *) ctx;
+@@ -293,7 +316,7 @@ ssl_peek (int fd, char *buf, int bufsize, void *ctx)
+ }
+ 
+ static void
+-ssl_close (int fd, void *ctx)
++openssl_close (int fd, void *ctx)
+ {
+   SSL *ssl = (SSL *) ctx;
+   SSL_shutdown (ssl);
+@@ -332,16 +355,16 @@ ssl_connect (int fd)
+ 
+   /* Register FD with Wget's transport layer, i.e. arrange that
+      SSL-enabled functions are used for reading, writing, and polling.
+-     That way the rest of Wget can keep using xread, xwrite, and
++     That way the rest of Wget can keep using fd_read, fd_write, and
+      friends and not care what happens underneath.  */
+-  fd_register_transport (fd, ssl_read, ssl_write, ssl_poll, ssl_peek,
+-			 ssl_close, ssl);
++  fd_register_transport (fd, openssl_read, openssl_write, openssl_poll,
++			 openssl_peek, openssl_close, ssl);
+   DEBUGP (("Connected %d to SSL 0x%0*lx\n", fd, 2 * sizeof (void *),
+ 	   (unsigned long) ssl));
+   return 1;
+ 
+  err:
+-  ssl_print_errors ();
++  print_errors ();
+   if (ssl)
+     SSL_free (ssl);
+   return 0;
+diff --git a/src/options.h b/src/options.h
+index eea4061..6e968aa 100644
+--- a/src/options.h
++++ b/src/options.h
+@@ -179,6 +179,7 @@ struct options
+   char *ca_cert;		/* CA certificate file to use */
+ 
+ 
++  char *random_file;		/* file with random data to seed the PRNG */
+   char *egd_file;		/* file name of the egd daemon socket */
+ #endif /* HAVE_SSL */
+ 
+diff --git a/src/ssl.h b/src/ssl.h
+index 14e65f0..f6299e7 100644
+--- a/src/ssl.h
++++ b/src/ssl.h
+@@ -31,7 +31,7 @@ so, delete this exception statement from your version.  */
+ #ifndef GEN_SSLFUNC_H
+ #define GEN_SSLFUNC_H
+ 
+-uerr_t ssl_init PARAMS ((void));
++int ssl_init PARAMS ((void));
+ int ssl_connect PARAMS ((int));
+ 
+ #endif /* GEN_SSLFUNC_H */
+diff --git a/src/wget.h b/src/wget.h
+index d2f207e..f7467bb 100644
+--- a/src/wget.h
++++ b/src/wget.h
+@@ -252,8 +252,7 @@ typedef enum
+   CONTNOTSUPPORTED, RETRUNNEEDED, RETRFINISHED, READERR, TRYLIMEXC,
+   URLBADPATTERN, FILEBADFILE, RANGEERR, RETRBADPATTERN,
+   RETNOTSUP, ROBOTSOK, NOROBOTS, PROXERR, AUTHFAILED,
+-  QUOTEXC, WRITEFAILED,
+-  SSLERRCERTFILE,SSLERRCERTKEY,SSLERRCTXCREATE
++  QUOTEXC, WRITEFAILED, SSLINITFAILED
+ } uerr_t;
+ 
+ #endif /* WGET_H */
+-- 
+cgit v1.0-41-gc330
+

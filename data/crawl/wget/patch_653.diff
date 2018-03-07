@@ -1,0 +1,947 @@
+diff --git a/src/ChangeLog b/src/ChangeLog
+index 3a29317..0ac1869 100644
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,5 +1,36 @@
+ 2001-11-26  Hrvoje Niksic  <hniksic@arsdigita.com>
+ 
++	* http.c (last_host_ip): Made into an address_list.
++	(invalidate_persistent): Release pc_last_host_ip.
++	(register_persistent): Use lookup_host.
++	(persistent_available_p): Check for equality of hosts using
++	address_list_match_all.  Call address_list_release.
++	(http_cleanup): New function.
++
++	* ftp.c (getftp): Use lookup_host and connect_to_many.
++
++	* http.c (gethttp): Use lookup_host and connect_to_many.
++
++	* connect.c (make_connection): Removed.
++	(connect_to_one): New function.
++	(connect_to_many): Ditto.
++	(set_connection_host_name): Ditto.
++
++	* host.c (lookup_host): New function; new return type.
++	(address_list_new): New function.
++	(address_list_count): Ditto.
++	(address_list_copy_one): Ditto.
++	(address_list_delete): Ditto.
++	(address_list_release): Ditto.
++	(pretty_print_address): Ditto.
++
++2001-11-26  Hrvoje Niksic  <hniksic@arsdigita.com>
++
++	* recur.c (retrieve_tree): In case of followed redirection,
++	blacklist the pre-redirection URL.
++
++2001-11-26  Hrvoje Niksic  <hniksic@arsdigita.com>
++
+ 	* recur.c (descend_redirect_p): New function.
+ 	(retrieve_tree): Make sure redirections are not blindly followed.
+ 
+diff --git a/src/connect.c b/src/connect.c
+index aa3153e..619fd41 100644
+--- a/src/connect.c
++++ b/src/connect.c
+@@ -24,6 +24,7 @@ Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.  */
+ #ifdef HAVE_UNISTD_H
+ # include <unistd.h>
+ #endif
++#include <assert.h>
+ 
+ #ifdef WINDOWS
+ # include <winsock.h>
+@@ -58,43 +59,113 @@ extern int errno;
+ static int msock = -1;
+ static struct sockaddr *addr;
+ 
++/* A kludge, but still better than passing the host name all the way
++   to connect_to_one.  */
++static const char *connection_host_name;
+ 
+-/* Create an internet connection to HOSTNAME on PORT.  The created
+-   socket will be stored to *SOCK.  */
+-uerr_t
+-make_connection (int *sock, char *hostname, unsigned short port)
++void
++set_connection_host_name (const char *host)
+ {
+-  struct sockaddr_in sock_name;
++  if (host)
++    assert (connection_host_name == NULL);
++  else
++    assert (connection_host_name != NULL);
+ 
+-  if (!lookup_host (hostname, (unsigned char *)&sock_name.sin_addr))
+-    return HOSTERR;
++  connection_host_name = host;
++}
++
++/* Connect to a remote host whose address has been resolved. */
++static int
++connect_to_one (unsigned char *addr, unsigned short port, int silent)
++{
++  struct sockaddr_in sock_name;
++  int sock, save_errno;
+ 
+   /* Set port and protocol */
+   sock_name.sin_family = AF_INET;
+   sock_name.sin_port = htons (port);
++  memcpy ((unsigned char *)&sock_name.sin_addr, addr, 4);
++
++  if (!silent)
++    {
++      char *pretty_addr = pretty_print_address (addr);
++      if (connection_host_name
++	  && 0 != strcmp (connection_host_name, pretty_addr))
++	logprintf (LOG_VERBOSE, _("Connecting to %s[%s]:%hu... "),
++		   connection_host_name, pretty_addr, port);
++      else
++	logprintf (LOG_VERBOSE, _("Connecting to %s:%hu... "),
++		   pretty_addr, port);
++    }
+ 
+   /* Make an internet socket, stream type.  */
+-  if ((*sock = socket (AF_INET, SOCK_STREAM, 0)) == -1)
+-    return CONSOCKERR;
++  sock = socket (AF_INET, SOCK_STREAM, 0);
++  if (sock < 0)
++    goto out;
+ 
+-  if (opt.bind_address != NULL)
++  if (opt.bind_address)
+     {
+       /* Bind the client side to the requested address. */
+-      if (bind (*sock, (struct sockaddr *) opt.bind_address,
++      if (bind (sock, (struct sockaddr *)opt.bind_address,
+ 		sizeof (*opt.bind_address)))
+-	return CONSOCKERR;
++	{
++	  close (sock);
++	  sock = -1;
++	  goto out;
++	}
+     }
+ 
+   /* Connect the socket to the remote host.  */
+-  if (connect (*sock, (struct sockaddr *) &sock_name, sizeof (sock_name)))
++  if (connect (sock, (struct sockaddr *)&sock_name, sizeof (sock_name)) < 0)
+     {
+-      if (errno == ECONNREFUSED)
+-	return CONREFUSED;
+-      else
+-	return CONERROR;
++      close (sock);
++      sock = -1;
++      goto out;
++    }
++
++ out:
++  if (sock >= 0)
++    {
++      /* Success. */
++      if (!silent)
++	logprintf (LOG_VERBOSE, _("connected.\n"));
++      DEBUGP (("Created socket %d.\n", sock));
++    }
++  else
++    {
++      save_errno = errno;
++      if (!silent)
++	logprintf (LOG_VERBOSE, "failed: %s.\n", strerror (errno));
++      errno = save_errno;
+     }
+-  DEBUGP (("Created fd %d.\n", *sock));
+-  return NOCONERROR;
++
++  return sock;
++}
++
++/* Connect to a remote host whose address has been resolved. */
++int
++connect_to_many (struct address_list *al, unsigned short port, int silent)
++{
++  int i;
++
++  for (i = 0; i < address_list_count (al); i++)
++    {
++      unsigned char addr[4];
++      int sock;
++      address_list_copy_one (al, i, addr);
++
++      sock = connect_to_one (addr, port, silent);
++      if (sock >= 0)
++	return sock;
++
++      /* Perhaps we should have a way of removing the failing entry
++	 from the address list?  */
++
++      /* The attempt to connect has failed.  Continue with the loop
++	 and try next address. */
++    }
++
++  return -1;
+ }
+ 
+ int
+diff --git a/src/connect.h b/src/connect.h
+index 8c1cb93..1c378dd 100644
+--- a/src/connect.h
++++ b/src/connect.h
+@@ -20,8 +20,13 @@ Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.  */
+ #ifndef CONNECT_H
+ #define CONNECT_H
+ 
++struct address_list;
++
+ /* Function declarations */
+-uerr_t make_connection PARAMS ((int *, char *, unsigned short));
++
++int connect_to_many PARAMS ((struct address_list *, unsigned short, int));
++void set_connection_host_name PARAMS ((const char *));
++
+ int test_socket_open PARAMS ((int));
+ uerr_t bindport PARAMS ((unsigned short *));
+ uerr_t acceptport PARAMS ((int *));
+diff --git a/src/ftp.c b/src/ftp.c
+index abad6a1..1c43854 100644
+--- a/src/ftp.c
++++ b/src/ftp.c
+@@ -158,54 +158,33 @@ getftp (struct url *u, long *len, long restval, ccon *con)
+   else				/* cmd & DO_LOGIN */
+     {
+       char type_char;
++      struct address_list *al;
+ 
+       /* Login to the server: */
+ 
+       /* First: Establish the control connection.  */
+-      logprintf (LOG_VERBOSE, _("Connecting to %s:%hu... "), u->host, u->port);
+-      err = make_connection (&csock, u->host, u->port);
++
++      al = lookup_host (u->host, 0);
++      if (!al)
++	return HOSTERR;
++      set_connection_host_name (u->host);
++      csock = connect_to_many (al, u->port, 0);
++      set_connection_host_name (NULL);
++      address_list_release (al);
++
++      if (csock < 0)
++	return errno == ECONNREFUSED ? CONREFUSED : CONERROR;
++
+       if (cmd & LEAVE_PENDING)
+ 	rbuf_initialize (&con->rbuf, csock);
+       else
+ 	rbuf_uninitialize (&con->rbuf);
+-      switch (err)
+-	{
+-	  /* Do not close the socket in first several cases, since it
+-	     wasn't created at all.  */
+-	case HOSTERR:
+-	  logputs (LOG_VERBOSE, "\n");
+-	  logprintf (LOG_NOTQUIET, "%s: %s\n", u->host, herrmsg (h_errno));
+-	  return HOSTERR;
+-	  break;
+-	case CONSOCKERR:
+-	  logputs (LOG_VERBOSE, "\n");
+-	  logprintf (LOG_NOTQUIET, "socket: %s\n", strerror (errno));
+-	  return CONSOCKERR;
+-	  break;
+-	case CONREFUSED:
+-	  logputs (LOG_VERBOSE, "\n");
+-	  logprintf (LOG_NOTQUIET, _("Connection to %s:%hu refused.\n"),
+-		     u->host, u->port);
+-	  CLOSE (csock);
+-	  rbuf_uninitialize (&con->rbuf);
+-	  return CONREFUSED;
+-	case CONERROR:
+-	  logputs (LOG_VERBOSE, "\n");
+-	  logprintf (LOG_NOTQUIET, "connect: %s\n", strerror (errno));
+-	  CLOSE (csock);
+-	  rbuf_uninitialize (&con->rbuf);
+-	  return CONERROR;
+-	  break;
+-	default:
+-	  DO_NOTHING;
+-	  /* #### Hmm?  */
+-	}
++
+       /* Since this is a new connection, we may safely discard
+ 	 anything left in the buffer.  */
+       rbuf_discard (&con->rbuf);
+ 
+       /* Second: Login with proper USER/PASS sequence.  */
+-      logputs (LOG_VERBOSE, _("connected!\n"));
+       logprintf (LOG_VERBOSE, _("Logging in as %s ... "), user);
+       if (opt.server_response)
+ 	logputs (LOG_ALWAYS, "\n");
+@@ -557,52 +536,30 @@ Error in server response, closing control connection.\n"));
+ 	    }
+ 	  if (err==FTPOK)
+ 	    {
++	      struct address_list *al;
++
+ 	      sprintf (thost, "%d.%d.%d.%d",
+ 		       pasv_addr[0], pasv_addr[1], pasv_addr[2], pasv_addr[3]);
+ 	      tport = (pasv_addr[4] << 8) + pasv_addr[5];
+-	      DEBUGP ((_("Will try connecting to %s:%hu.\n"), thost, tport));
+-	      err = make_connection (&dtsock, thost, tport);
+-	      switch (err)
++
++	      al = lookup_host (thost, 0);
++	      if (!al)
+ 		{
+-		  /* Do not close the socket in first several cases,
+-		     since it wasn't created at all.  */
+-		case HOSTERR:
+-		  logputs (LOG_VERBOSE, "\n");
+-		  logprintf (LOG_NOTQUIET, "%s: %s\n", thost,
+-			     herrmsg (h_errno));
+ 		  CLOSE (csock);
+ 		  rbuf_uninitialize (&con->rbuf);
+ 		  return HOSTERR;
+-		  break;
+-		case CONSOCKERR:
+-		  logputs (LOG_VERBOSE, "\n");
+-		  logprintf (LOG_NOTQUIET, "socket: %s\n", strerror (errno));
+-		  CLOSE (csock);
+-		  rbuf_uninitialize (&con->rbuf);
+-		  return CONSOCKERR;
+-		  break;
+-		case CONREFUSED:
+-		  logputs (LOG_VERBOSE, "\n");
+-		  logprintf (LOG_NOTQUIET,
+-			     _("Connection to %s:%hu refused.\n"),
+-			     thost, tport);
+-		  CLOSE (csock);
+-		  rbuf_uninitialize (&con->rbuf);
+-		  closeport (dtsock);
+-		  return CONREFUSED;
+-		case CONERROR:
+-		  logputs (LOG_VERBOSE, "\n");
+-		  logprintf (LOG_NOTQUIET, "connect: %s\n",
+-			     strerror (errno));
++		}
++	      dtsock = connect_to_many (al, tport, 0);
++	      address_list_release (al);
++
++	      if (dtsock < 0)
++		{
++		  int save_errno = errno;
+ 		  CLOSE (csock);
+ 		  rbuf_uninitialize (&con->rbuf);
+-		  closeport (dtsock);
+-		  return CONERROR;
+-		  break;
+-		default:
+-		  /* #### What?!  */
+-		  DO_NOTHING;
++		  return save_errno == ECONNREFUSED ? CONREFUSED : CONERROR;
+ 		}
++
+ 	      passive_mode_open= 1;  /* Flag to avoid accept port */
+ 	      if (!opt.server_response)
+ 		logputs (LOG_VERBOSE, _("done.    "));
+diff --git a/src/host.c b/src/host.c
+index 2c0ef42..c31cc05 100644
+--- a/src/host.c
++++ b/src/host.c
+@@ -59,120 +59,199 @@ Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.  */
+ extern int errno;
+ #endif
+ 
+-/* Mapping between all known hosts to their addresses (n.n.n.n). */
++#define IP4_ADDRESS_LENGTH 4
+ 
+-/* #### We should map to *lists* of IP addresses. */
++/* Mapping between known hosts and to lists of their addresses. */
+ 
+-struct hash_table *host_name_address_map;
++struct hash_table *host_name_addresses_map;
+ 
+-#if 0
++/* Lists of addresses.  This should eventually be extended to handle
++   IPv6.  */
+ 
+-/* This function is no longer used. */
++struct address_list {
++  int count;			/* number of adrresses */
++  unsigned char *buffer;	/* buffer which holds all of them. */
+ 
+-/* The same as gethostbyname, but supports internet addresses of the
+-   form `N.N.N.N'.  On some systems gethostbyname() knows how to do
+-   this automatically.  */
+-struct hostent *
+-ngethostbyname (const char *name)
++  int refcount;			/* so we know whether to free it or
++				   not. */
++};
++
++#define ADDR_LOCATION(al, index) ((al)->buffer + index * IP4_ADDRESS_LENGTH)
++
++/* Return the number of addresses in the list. */
++
++int
++address_list_count (struct address_list *al)
+ {
+-  struct hostent *hp;
+-  unsigned long addr;
++  return al->count;
++}
+ 
+-  addr = (unsigned long)inet_addr (name);
+-  if ((int)addr != -1)
+-    hp = gethostbyaddr ((char *)&addr, sizeof (addr), AF_INET);
+-  else
+-    hp = gethostbyname (name);
+-  return hp;
++/* Copy address number INDEX to IP_STORE.  */
++
++void
++address_list_copy_one (struct address_list *al, int index,
++		       unsigned char *ip_store)
++{
++  memcpy (ip_store, ADDR_LOCATION (al, index), IP4_ADDRESS_LENGTH);
+ }
+-#endif
+ 
+-/* Add host name HOST with the address ADDR_TEXT to the cache.  */
++/* Check whether two address lists have all their IPs in common.  */
++
++int
++address_list_match_all (struct address_list *al1, struct address_list *al2)
++{
++  if (al1 == al2)
++    return 1;
++  if (al1->count != al2->count)
++    return 0;
++  return 0 == memcmp (al1->buffer, al2->buffer,
++		      al1->count * IP4_ADDRESS_LENGTH);
++}
++
++/* Create an address_list out of a NULL-terminated list of addresses,
++   as returned by gethostbyname.  */
++
++static struct address_list *
++address_list_new (char **h_addr_list)
++{
++  int count = 0, i;
++
++  struct address_list *al = xmalloc (sizeof (struct address_list));
++
++  while (h_addr_list[count])
++    ++count;
++  assert (count > 0);
++  al->count    = count;
++  al->buffer   = xmalloc (count * IP4_ADDRESS_LENGTH);
++  al->refcount = 1;
++
++  for (i = 0; i < count; i++)
++    memcpy (ADDR_LOCATION (al, i), h_addr_list[i], IP4_ADDRESS_LENGTH);
++
++  return al;
++}
+ 
+ static void
+-add_host_to_cache (const char *host, const char *addr_text)
++address_list_delete (struct address_list *al)
+ {
+-  DEBUGP (("Caching %s => %s\n", host, addr_text));
++  xfree (al->buffer);
++  xfree (al);
++}
+ 
+-  if (!host_name_address_map)
+-    host_name_address_map = make_nocase_string_hash_table (0);
++void
++address_list_release (struct address_list *al)
++{
++  --al->refcount;
++  DEBUGP (("Releasing %p (new refcount %d).\n", al, al->refcount));
++  if (al->refcount <= 0)
++    {
++      DEBUGP (("Deleting unused %p.\n", al));
++      address_list_delete (al);
++    }
++}
++
++/* The same as inet_ntoa, but without the need for a cast, or for
++   #including the netinet stuff.  */
+ 
+-  hash_table_put (host_name_address_map,
+-		  xstrdup_lower (host), xstrdup (addr_text));
++char *
++pretty_print_address (const unsigned char *addr)
++{
++  return inet_ntoa (*(struct in_addr *)addr);
+ }
+ 
+-/* Store the address of HOSTNAME, internet-style (four octets in
+-   network order), to WHERE.  First try to get the address from the
+-   cache; if it is not available, call the DNS functions and update
+-   the cache.
++/* Add host name HOST with the address ADDR_TEXT to the cache.
++   ADDR_LIST is a NULL-terminated list of addresses, as in struct
++   hostent.  */
+ 
+-   Return 1 on successful finding of the hostname, 0 otherwise.  */
+-int
+-lookup_host (const char *hostname, unsigned char *store_ip)
++static void
++cache_host_lookup (const char *host, struct address_list *al)
+ {
++  if (!host_name_addresses_map)
++    host_name_addresses_map = make_nocase_string_hash_table (0);
++
++  ++al->refcount;
++  hash_table_put (host_name_addresses_map, xstrdup_lower (host), al);
++
++#ifdef DEBUG
++  if (opt.debug)
++    {
++      int i;
++      debug_logprintf ("Caching %s =>", host);
++      for (i = 0; i < al->count; i++)
++	debug_logprintf (" %s",
++			 pretty_print_address (ADDR_LOCATION (al, i)));
++      debug_logprintf ("\n");
++    }
++#endif
++}
++
++struct address_list *
++lookup_host (const char *host, int silent)
++{
++  struct address_list *al = NULL;
+   unsigned long addr;
+-  char *addr_text = NULL;
+   struct hostent *hptr;
+-  struct in_addr in;
+-  char *inet_s;
+ 
+   /* If the address is of the form d.d.d.d, no further lookup is
+      needed.  */
+-  addr = (unsigned long)inet_addr (hostname);
++  addr = (unsigned long)inet_addr (host);
+   if ((int)addr != -1)
+     {
++      unsigned char tmpstore[IP4_ADDRESS_LENGTH];
++      char *lst[] = { tmpstore, NULL };
++
+       /* ADDR is defined to be in network byte order, which is what
+ 	 this returns, so we can just copy it to STORE_IP.  However,
+ 	 on big endian 64-bit architectures the value will be stored
+ 	 in the *last*, not first four bytes.  OFFSET makes sure that
+ 	 we copy the correct four bytes.  */
+       int offset;
+-    have_addr:
+ #ifdef WORDS_BIGENDIAN
+-      offset = sizeof (unsigned long) - 4;
++      offset = sizeof (unsigned long) - IP4_ADDRESS_LENGTH;
+ #else
+       offset = 0;
+ #endif
+-      memcpy (store_ip, (char *)&addr + offset, 4);
+-      return 1;
++      memcpy (tmpstore, (char *)&addr + offset, IP4_ADDRESS_LENGTH);
++      return address_list_new (lst);
+     }
+ 
+   /* By now we know that the host name we got is not of the form
+      d.d.d.d.  Try to find it in our cache of host names.  */
+-  if (host_name_address_map)
+-    addr_text = hash_table_get (host_name_address_map, hostname);
++  if (host_name_addresses_map)
++    al = hash_table_get (host_name_addresses_map, host);
+ 
+-  if (addr_text)
++  if (al)
+     {
+-      DEBUGP (("Found %s in host_name_address_map: %s\n",
+-	       hostname, addr_text));
+-      addr = (unsigned long)inet_addr (addr_text);
+-      goto have_addr;
++      DEBUGP (("Found %s in host_name_addresses_map (%p)\n", host, al));
++      ++al->refcount;
++      return al;
+     }
+ 
++  if (!silent)
++    logprintf (LOG_VERBOSE, _("Resolving %s... "), host);
++
+   /* Look up the host using gethostbyname().  Note that we use
+      gethostbyname() rather than ngethostbyname(), because we already
+      know that the address is not numerical.  */
+-  hptr = gethostbyname (hostname);
++  hptr = gethostbyname (host);
+   if (!hptr)
+-    return 0;
++    {
++      if (!silent)
++	logprintf (LOG_VERBOSE, _("failed: %s.\n"), herrmsg (h_errno));
++      return NULL;
++    }
+ 
+-  /* Store the IP address to the desired location. */
+-  assert (hptr->h_length == 4);
+-  memcpy (store_ip, hptr->h_addr_list[0], hptr->h_length);
++  if (!silent)
++    logprintf (LOG_VERBOSE, _("done.\n"));
+ 
+-  /* Now that we've successfully looked up the host, store this
+-     information in the cache.  */
++  al = address_list_new (hptr->h_addr_list);
+ 
+-  /* Originally, we copied to in.s_addr, but it appears to be missing
+-     on some systems.  */
+-  memcpy (&in, *hptr->h_addr_list, sizeof (in));
+-  inet_s = inet_ntoa (in);
+-  add_host_to_cache (hostname, inet_s);
++  /* Cache the lookup information. */
++  cache_host_lookup (host, al);
+ 
+-  return 1;
++  return al;
+ }
+-
++
+ /* Determine whether a URL is acceptable to be followed, according to
+    a list of domains to accept.  */
+ int
+@@ -231,9 +310,27 @@ herrmsg (int error)
+     return _("Unknown error");
+ }
+ 
++static int
++host_cleanup_mapper (void *key, void *value, void *arg_ignored)
++{
++  struct address_list *al;
++
++  xfree (key);			/* host */
++
++  al = (struct address_list *)value;
++  assert (al->refcount == 1);
++  address_list_delete (al);
++
++  return 0;
++}
++
+ void
+ host_cleanup (void)
+ {
+-  free_keys_and_values (host_name_address_map);
+-  hash_table_destroy (host_name_address_map);
++  if (host_name_addresses_map)
++    {
++      hash_table_map (host_name_addresses_map, host_cleanup_mapper, NULL);
++      hash_table_destroy (host_name_addresses_map);
++      host_name_addresses_map = NULL;
++    }
+ }
+diff --git a/src/host.h b/src/host.h
+index 5099a31..c3cc1e5 100644
+--- a/src/host.h
++++ b/src/host.h
+@@ -1,5 +1,5 @@
+ /* Declarations for host.c
+-   Copyright (C) 1995, 1996, 1997 Free Software Foundation, Inc.
++   Copyright (C) 1995, 1996, 1997, 2001 Free Software Foundation, Inc.
+ 
+ This file is part of GNU Wget.
+ 
+@@ -21,12 +21,23 @@ Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.  */
+ #define HOST_H
+ 
+ struct url;
++struct address_list;
+ 
+ /* Function declarations */
+-
+-int lookup_host PARAMS ((const char *, unsigned char *));
++struct address_list *lookup_host PARAMS ((const char *, int));
+ char *herrmsg PARAMS ((int));
+ 
++int address_list_count PARAMS ((struct address_list *));
++void address_list_copy_one PARAMS ((struct address_list *, int,
++				    unsigned char *));
++void address_list_release PARAMS ((struct address_list *));
++int address_list_match_all PARAMS ((struct address_list *,
++				    struct address_list *));
++
++/* This was originally going to be a macro, but then every caller
++   would have to #include the netinet stuff.  */
++char *pretty_print_address PARAMS ((const unsigned char *));
++
+ int accept_domain PARAMS ((struct url *));
+ int sufmatch PARAMS ((const char **, const char *));
+ 
+diff --git a/src/http.c b/src/http.c
+index ffb83d9..a886f48 100644
+--- a/src/http.c
++++ b/src/http.c
+@@ -276,7 +276,7 @@ http_process_connection (const char *hdr, void *arg)
+ /* Whether a persistent connection is active. */
+ static int pc_active_p;
+ /* Host and port of currently active persistent connection. */
+-static unsigned char pc_last_host_ip[4];
++static struct address_list *pc_last_host_ip;
+ static unsigned short pc_last_port;
+ 
+ /* File descriptor of the currently active persistent connection. */
+@@ -301,6 +301,11 @@ invalidate_persistent (void)
+ #ifdef HAVE_SSL
+   pc_active_ssl = 0;
+ #endif /* HAVE_SSL */
++  if (pc_last_host_ip != NULL)
++    {
++      address_list_release (pc_last_host_ip);
++      pc_last_host_ip = NULL;
++    }
+   DEBUGP (("Invalidating fd %d from further reuse.\n", pc_last_fd));
+ }
+ 
+@@ -319,8 +324,6 @@ register_persistent (const char *host, unsigned short port, int fd
+ #endif
+ 		     )
+ {
+-  int success;
+-
+   if (pc_active_p)
+     {
+       if (pc_last_fd == fd)
+@@ -347,10 +350,13 @@ register_persistent (const char *host, unsigned short port, int fd
+ 	}
+     }
+ 
++  assert (pc_last_host_ip == NULL);
++
+   /* This lookup_host cannot fail, because it has the results in the
+      cache.  */
+-  success = lookup_host (host, pc_last_host_ip);
+-  assert (success);
++  pc_last_host_ip = lookup_host (host, 1);
++  assert (pc_last_host_ip != NULL);
++
+   pc_last_port = port;
+   pc_last_fd = fd;
+   pc_active_p = 1;
+@@ -371,7 +377,9 @@ persistent_available_p (const char *host, unsigned short port
+ #endif
+ 			)
+ {
+-  unsigned char this_host_ip[4];
++  int success;
++  struct address_list *this_host_ip;
++
+   /* First, check whether a persistent connection is active at all.  */
+   if (!pc_active_p)
+     return 0;
+@@ -379,6 +387,7 @@ persistent_available_p (const char *host, unsigned short port
+      (HOST, PORT) ordered pair.  */
+   if (port != pc_last_port)
+     return 0;
++
+ #ifdef HAVE_SSL
+   /* Second, a): check if current connection is (not) ssl, too.  This
+      test is unlikely to fail because HTTP and HTTPS typicaly use
+@@ -388,10 +397,19 @@ persistent_available_p (const char *host, unsigned short port
+   if (ssl != pc_active_ssl)
+     return 0;
+ #endif /* HAVE_SSL */
+-  if (!lookup_host (host, this_host_ip))
++
++  this_host_ip = lookup_host (host, 1);
++  if (!this_host_ip)
+     return 0;
+-  if (memcmp (pc_last_host_ip, this_host_ip, 4))
++
++  /* To equate the two host names for the purposes of persistent
++     connections, they need to share all the IP addresses in the
++     list.  */
++  success = address_list_match_all (pc_last_host_ip, this_host_ip);
++  address_list_release (this_host_ip);
++  if (!success)
+     return 0;
++
+   /* Third: check whether the connection is still open.  This is
+      important because most server implement a liberal (short) timeout
+      on persistent connections.  Wget can of course always reconnect
+@@ -521,7 +539,6 @@ gethttp (struct url *u, struct http_stat *hs, int *dt, struct url *proxy)
+   int sock, hcount, num_written, all_length, statcode;
+   long contlen, contrange;
+   struct url *conn;
+-  uerr_t err;
+   FILE *fp;
+   int auth_tried_already;
+   struct rbuf rbuf;
+@@ -622,42 +639,17 @@ gethttp (struct url *u, struct http_stat *hs, int *dt, struct url *proxy)
+ #endif /* HAVE_SSL */
+       )
+     {
+-      logprintf (LOG_VERBOSE, _("Connecting to %s:%hu... "),
+-		 conn->host, conn->port);
+-      err = make_connection (&sock, conn->host, conn->port);
+-      switch (err)
+-	{
+-	case HOSTERR:
+-	  logputs (LOG_VERBOSE, "\n");
+-	  logprintf (LOG_NOTQUIET, "%s: %s.\n", conn->host, herrmsg (h_errno));
+-	  return HOSTERR;
+-	  break;
+-	case CONSOCKERR:
+-	  logputs (LOG_VERBOSE, "\n");
+-	  logprintf (LOG_NOTQUIET, "socket: %s\n", strerror (errno));
+-	  return CONSOCKERR;
+-	  break;
+-	case CONREFUSED:
+-	  logputs (LOG_VERBOSE, "\n");
+-	  logprintf (LOG_NOTQUIET,
+-		     _("Connection to %s:%hu refused.\n"), conn->host,
+-		     conn->port);
+-	  CLOSE (sock);
+-	  return CONREFUSED;
+-	case CONERROR:
+-	  logputs (LOG_VERBOSE, "\n");
+-	  logprintf (LOG_NOTQUIET, "connect: %s\n", strerror (errno));
+-	  CLOSE (sock);
+-	  return CONERROR;
+-	  break;
+-	case NOCONERROR:
+-	  /* Everything is fine!  */
+-	  logputs (LOG_VERBOSE, _("connected!\n"));
+-	  break;
+-	default:
+-	  abort ();
+-	  break;
+-	}
++      struct address_list *al = lookup_host (conn->host, 0);
++      if (!al)
++	return HOSTERR;
++      set_connection_host_name (conn->host);
++      sock = connect_to_many (al, conn->port, 0);
++      set_connection_host_name (NULL);
++      address_list_release (al);
++
++      if (sock < 0)
++	return errno == ECONNREFUSED ? CONREFUSED : CONERROR;
++
+ #ifdef HAVE_SSL
+      if (conn->scheme == SCHEME_HTTPS)
+        if (connect_ssl (&ssl, ssl_ctx,sock) != 0)
+@@ -2334,3 +2326,10 @@ create_authorization_line (const char *au, const char *user,
+ #endif /* USE_DIGEST */
+   return wwwauth;
+ }
++
++void
++http_cleanup (void)
++{
++  if (pc_last_host_ip)
++    address_list_release (pc_last_host_ip);
++}
+diff --git a/src/init.c b/src/init.c
+index 0d61b66..38918f4 100644
+--- a/src/init.c
++++ b/src/init.c
+@@ -521,17 +521,22 @@ static int myatoi PARAMS ((const char *s));
+ static int
+ cmd_address (const char *com, const char *val, void *closure)
+ {
++  struct address_list *al;
+   struct sockaddr_in sin;
+   struct sockaddr_in **target = (struct sockaddr_in **)closure;
+ 
+   memset (&sin, '\0', sizeof (sin));
+ 
+-  if (!lookup_host (val, (unsigned char *)&sin.sin_addr))
++  al = lookup_host (val, 1);
++  if (!al)
+     {
+       fprintf (stderr, _("%s: %s: Cannot convert `%s' to an IP address.\n"),
+ 	       exec_name, com, val);
+       return 0;
+     }
++  address_list_copy_one (al, 0, (unsigned char *)&sin.sin_addr);
++  address_list_release (al);
++
+   sin.sin_family = AF_INET;
+   sin.sin_port = 0;
+ 
+@@ -1011,6 +1016,7 @@ check_user_specified_header (const char *s)
+ void cleanup_html_url PARAMS ((void));
+ void res_cleanup PARAMS ((void));
+ void downloaded_files_free PARAMS ((void));
++void http_cleanup PARAMS ((void));
+ 
+ 
+ /* Free the memory allocated by global variables.  */
+@@ -1033,14 +1039,16 @@ cleanup (void)
+ #ifdef DEBUG_MALLOC
+   recursive_cleanup ();
+   res_cleanup ();
++  http_cleanup ();
++  cleanup_html_url ();
++  downloaded_files_free ();
++  cookies_cleanup ();
+   host_cleanup ();
++
+   {
+     extern acc_t *netrc_list;
+     free_netrc (netrc_list);
+   }
+-  cleanup_html_url ();
+-  downloaded_files_free ();
+-  cookies_cleanup ();
+   FREE_MAYBE (opt.lfilename);
+   xfree (opt.dir_prefix);
+   FREE_MAYBE (opt.input_filename);
+diff --git a/src/recur.c b/src/recur.c
+index 8e71383..f312960 100644
+--- a/src/recur.c
++++ b/src/recur.c
+@@ -241,6 +241,10 @@ retrieve_tree (const char *start_url)
+ 		if (!descend_redirect_p (redirected, url, depth,
+ 					 start_url_parsed, blacklist))
+ 		  descend = 0;
++		else
++		  /* Make sure that the old pre-redirect form gets
++		     blacklisted. */
++		  string_set_add (blacklist, url);
+ 	      }
+ 
+ 	    xfree (url);
+diff --git a/src/retr.c b/src/retr.c
+index b8fb6c8..dc1587e 100644
+--- a/src/retr.c
++++ b/src/retr.c
+@@ -427,13 +427,21 @@ retrieve_url (const char *origurl, char **file, char **newloc,
+     FREE_MAYBE (local_file);
+ 
+   url_free (u);
+-  if (redirections)
+-    string_set_free (redirections);
+ 
+-  if (newloc)
+-    *newloc = url;
++  if (redirections)
++    {
++      string_set_free (redirections);
++      if (newloc)
++	*newloc = url;
++      else
++	xfree (url);
++    }
+   else
+-    xfree (url);
++    {
++      if (newloc)
++	*newloc = NULL;
++      xfree (url);
++    }
+ 
+   ++global_download_count;
+ 
+-- 
+cgit v1.0-41-gc330
+

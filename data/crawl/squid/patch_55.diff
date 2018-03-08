@@ -1,0 +1,208 @@
+----++++src/SquidString.h
+@@ -80,6 +80,13 @@ class String
+     _SQUID_INLINE_ int caseCmp(char const *, size_type count) const;
+     _SQUID_INLINE_ int caseCmp(String const &amp;) const;
+ 
++    /// Whether creating a totalLen-character string is safe (i.e., unlikely to assert).
++    /// Optional extras can be used for overflow-safe length addition.
++    /// Implementation has to add 1 because many String allocation methods do.
++    static bool CanGrowTo(size_type totalLen, const size_type extras = 0) { return SafeAdd(totalLen, extras) &amp;&amp; SafeAdd(totalLen, 1); }
++    /// whether appending growthLen characters is safe (i.e., unlikely to assert)
++    bool canGrowBy(const size_type growthLen) const { return CanGrowTo(size(), growthLen); }
++
+     String substr(size_type from, size_type to) const;
+ 
+     _SQUID_INLINE_ void cut(size_type newLength);
+@@ -95,10 +102,14 @@ class String
+     _SQUID_INLINE_ bool nilCmp(bool, bool, int &amp;) const;
+ 
+     /* never reference these directly! */
+-    size_type size_; /* buffer size; 64K limit */
++    size_type size_; /* buffer size; limited by SizeMax_ */
+ 
+     size_type len_;  /* current length  */
+ 
++    static const size_type SizeMax_ = 65535; ///&lt; 64K limit protects some fixed-size buffers
++    /// returns true after increasing the first argument by extra if the sum does not exceed SizeMax_
++    static bool SafeAdd(size_type &amp;base, size_type extra) { if (extra &lt;= SizeMax_ &amp;&amp; base &lt;= SizeMax_ - extra) { base += extra; return true; } return false; }
++
+     char *buf_;
+ 
+     _SQUID_INLINE_ void set(char const *loc, char const ch);
+----++++src/StrList.cc
+@@ -11,20 +11,24 @@
+ #include &quot;squid.h&quot;
+ #include &quot;SquidString.h&quot;
+ #include &quot;StrList.h&quot;
++#include &quot;base/TextException.h&quot; 
+ 
+ /** appends an item to the list */
+ void
+ strListAdd(String * str, const char *item, char del)
+ {
+     assert(str &amp;&amp; item);
++    const auto itemSize = strlen(item);
+     if (str-&gt;size()) {
+         char buf[3];
+         buf[0] = del;
+         buf[1] = &#39; &#39;;
+         buf[2] = &#39;\0&#39;;
++        Must(str-&gt;canGrowBy(2));
+         str-&gt;append(buf, 2);
+     }
+-    str-&gt;append(item, strlen(item));
++    Must(str-&gt;canGrowBy(itemSize));
++    str-&gt;append(item, itemSize);
+ }
+ 
+ /** returns true iff &quot;m&quot; is a member of the list */
+----++++src/String.cc
+@@ -41,7 +41,7 @@ void
+ String::setBuffer(char *aBuf, String::size_type aSize)
+ {
+     assert(undefined());
+-    assert(aSize &lt; 65536);
++    assert(aSize &lt;= SizeMax_);
+     buf_ = aBuf;
+     size_ = aSize;
+ }
+@@ -170,7 +170,7 @@ String::append( char const *str, int len)
+     } else {
+         // Create a temporary string and absorb it later.
+         String snew;
+-        assert(len_ + len &lt; 65536); // otherwise snew.len_ overflows below
++        assert(canGrowBy(len)); // otherwise snew.len_ may overflow below
+         snew.len_ = len_ + len;
+         snew.allocBuffer(snew.len_ + 1);
+ 
+----++++src/clients/Client.cc
+@@ -49,6 +49,7 @@ Client::Client(FwdState *theFwdState): AsyncJob(&quot;Client&quot;),
+     startedAdaptation(false),
+ #endif
+     receivedWholeRequestBody(false),
++    doneWithFwd(nullptr),
+     theVirginReply(NULL),
+     theFinalReply(NULL)
+ {
+@@ -74,8 +75,6 @@ Client::~Client()
+     HTTPMSGUNLOCK(theVirginReply);
+     HTTPMSGUNLOCK(theFinalReply);
+ 
+-    fwd = NULL; // refcounted
+-
+     if (responseBodyBuffer != NULL) {
+         delete responseBodyBuffer;
+         responseBodyBuffer = NULL;
+@@ -93,6 +92,14 @@ Client::swanSong()
+     cleanAdaptation();
+ #endif
+ 
++    if (!doneWithServer())
++        closeServer();
++
++    if (!doneWithFwd) {
++        doneWithFwd = &quot;swanSong()&quot;;
++        fwd-&gt;handleUnregisteredServerEnd();
++    }
++
+     BodyConsumer::swanSong();
+ #if USE_ADAPTATION
+     Initiator::swanSong();
+@@ -218,6 +225,7 @@ Client::completeForwarding()
+ {
+     debugs(11,5, HERE &lt;&lt; &quot;completing forwarding for &quot;  &lt;&lt; fwd);
+     assert(fwd != NULL);
++    doneWithFwd = &quot;completeForwarding()&quot;;
+     fwd-&gt;complete();
+ }
+ 
+----++++src/clients/Client.h
+@@ -179,6 +179,10 @@ class Client:
+ #endif
+     bool receivedWholeRequestBody; ///&lt; handleRequestBodyProductionEnded called
+ 
++    /// whether we should not be talking to FwdState; XXX: clear fwd instead
++    /// points to a string literal which is used only for debugging
++    const char *doneWithFwd;
++
+ private:
+     void sendBodyIsTooLargeError();
+     void maybePurgeOthers();
+----++++src/clients/FtpClient.cc
+@@ -841,6 +841,7 @@ Ftp::Client::ctrlClosed(const CommCloseCbParams &amp;)
+ {
+     debugs(9, 4, status());
+     ctrl.clear();
++    doneWithFwd = &quot;ctrlClosed()&quot;; // assume FwdState is monitoring too
+     mustStop(&quot;Ftp::Client::ctrlClosed&quot;);
+ }
+ 
+@@ -993,24 +994,12 @@ Ftp::Client::dataComplete()
+     scheduleReadControlReply(1);
+ }
+ 
+-/**
+- * Quickly abort the transaction
+- *
+- \todo destruction should be sufficient as the destructor should cleanup,
+- * including canceling close handlers
+- */
+ void
+ Ftp::Client::abortAll(const char *reason)
+ {
+     debugs(9, 3, &quot;aborting transaction for &quot; &lt;&lt; reason &lt;&lt;
+            &quot;; FD &quot; &lt;&lt; (ctrl.conn!=NULL?ctrl.conn-&gt;fd:-1) &lt;&lt; &quot;, Data FD &quot; &lt;&lt; (data.conn!=NULL?data.conn-&gt;fd:-1) &lt;&lt; &quot;, this &quot; &lt;&lt; this);
+-    if (Comm::IsConnOpen(ctrl.conn)) {
+-        ctrl.conn-&gt;close();
+-        return;
+-    }
+-
+-    fwd-&gt;handleUnregisteredServerEnd();
+-    mustStop(&quot;Ftp::Client::abortTransaction&quot;);
++    mustStop(reason);
+ }
+ 
+ /**
+----++++src/http.cc
+@@ -153,6 +153,7 @@ void
+ HttpStateData::httpStateConnClosed(const CommCloseCbParams &amp;params)
+ {
+     debugs(11, 5, &quot;httpStateFree: FD &quot; &lt;&lt; params.fd &lt;&lt; &quot;, httpState=&quot; &lt;&lt; params.data);
++    doneWithFwd = &quot;httpStateConnClosed()&quot;; // assume FwdState is monitoring too
+     mustStop(&quot;HttpStateData::httpStateConnClosed&quot;);
+ }
+ 
+@@ -1825,7 +1826,8 @@ HttpStateData::httpBuildRequestHeader(HttpRequest * request,
+ 
+         String strFwd = hdr_in-&gt;getList(Http::HdrType::X_FORWARDED_FOR);
+ 
+-        if (strFwd.size() &gt; 65536/2) {
++        // if we cannot double strFwd size, then it grew past 50% of the limit
++        if (!strFwd.canGrowBy(strFwd.size())) {
+             // There is probably a forwarding loop with Via detection disabled.
+             // If we do nothing, String will assert on overflow soon.
+             // TODO: Terminate all transactions with huge XFF?
+@@ -2462,21 +2464,11 @@ HttpStateData::sentRequestBody(const CommIoCbParams &amp;io)
+     Client::sentRequestBody(io);
+ }
+ 
+-// Quickly abort the transaction
+-// TODO: destruction should be sufficient as the destructor should cleanup,
+-// including canceling close handlers
+ void
+ HttpStateData::abortAll(const char *reason)
+ {
+     debugs(11,5, HERE &lt;&lt; &quot;aborting transaction for &quot; &lt;&lt; reason &lt;&lt;
+            &quot;; &quot; &lt;&lt; serverConnection &lt;&lt; &quot;, this &quot; &lt;&lt; this);
+-
+-    if (Comm::IsConnOpen(serverConnection)) {
+-        serverConnection-&gt;close();
+-        return;
+-    }
+-
+-    fwd-&gt;handleUnregisteredServerEnd();
+-    mustStop(&quot;HttpStateData::abortAll&quot;);
++    mustStop(reason);
+ }
+ 
+----++++GitHub

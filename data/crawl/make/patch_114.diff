@@ -1,0 +1,404 @@
+diff --git a/ChangeLog b/ChangeLog
+index 25e9554..487b2d3 100644
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -1,5 +1,24 @@
++2009-06-07  Paul Smith  <psmith@gnu.org>
++
++	* read.c (record_files): The second-expansion "f->updating" hack
++	was not completely correct: if assumed that the target with
++	commands always had prerequisites; if one didn't then the ordering
++	was messed up.  Fixed for now to use f->updating to decide whether
++	to preserve the last element in the deps list... but this whole
++	area of constructing and reversing the deps list is too confusing
++	and needs to be reworked.  Fixes Savannah bug #21198.
++
+ 2009-06-06  Paul Smith  <psmith@gnu.org>
+ 
++	* hash.c (hash_insert): Remove useless test for NULL.
++	Fixes Savannah bug #21823.
++
++	* make.h: Move SET_STACK_SIZE determination to make.h.
++	* main.c (main): New global variable, STACK_LIMIT, holds the
++	original stack limit when make was started.
++	* job.c (start_job_command): Reset the stack limit, if we changed it.
++	Fixes Savannah bug #22010.
++
+ 	* remake.c (check_dep): Only set the target's state to not-started
+ 	if it's not already running.  Found this while testing -j10 builds
+ 	of glibc: various targets were being rebuilt multiple times.
+diff --git a/hash.c b/hash.c
+index ed7d8fd..7f9530d 100644
+--- a/hash.c
++++ b/hash.c
+@@ -126,7 +126,7 @@ void *
+ hash_insert (struct hash_table *ht, const void *item)
+ {
+   void **slot = hash_find_slot (ht, item);
+-  const void *old_item = slot ? *slot : 0;
++  const void *old_item = *slot;
+   hash_insert_at (ht, item, slot);
+   return (void *)((HASH_VACANT (old_item)) ? 0 : old_item);
+ }
+diff --git a/job.c b/job.c
+index 27999f8..6cbfd31 100644
+--- a/job.c
++++ b/job.c
+@@ -1275,6 +1275,12 @@ start_job_command (struct child *child)
+           if (job_rfd >= 0)
+             close (job_rfd);
+ 
++#ifdef SET_STACK_SIZE
++          /* Reset limits, if necessary.  */
++          if (stack_limit.rlim_cur)
++            setrlimit (RLIMIT_STACK, &stack_limit);
++#endif
++
+ 	  child_execute_job (child->good_stdin ? 0 : bad_stdin, 1,
+                              argv, child->environment);
+ 	}
+@@ -2252,7 +2258,7 @@ construct_command_argv_internal (char *line, char **restp, char *shell,
+ 				 "for", "case", "if", ":", ".", "break",
+ 				 "continue", "export", "read", "readonly",
+ 				 "shift", "times", "trap", "switch", "unset",
+-                                 0 };
++                                 "ulimit", 0 };
+ 
+   char *sh_chars;
+   char **sh_cmds;
+diff --git a/main.c b/main.c
+index bad1902..67a544d 100644
+--- a/main.c
++++ b/main.c
+@@ -44,14 +44,6 @@ this program.  If not, see <http://www.gnu.org/licenses/>.  */
+ # include <fcntl.h>
+ #endif
+ 
+-#if defined(HAVE_SYS_RESOURCE_H) && defined(HAVE_GETRLIMIT) && defined(HAVE_SETRLIMIT)
+-# define SET_STACK_SIZE
+-#endif
+-
+-#ifdef SET_STACK_SIZE
+-# include <sys/resource.h>
+-#endif
+-
+ #ifdef _AMIGA
+ int __stack = 20000; /* Make sure we have 20K of stack space */
+ #endif
+@@ -220,6 +212,13 @@ int print_version_flag = 0;
+ 
+ static struct stringlist *makefiles = 0;
+ 
++/* Size of the stack when we started.  */
++
++#ifdef SET_STACK_SIZE
++struct rlimit stack_limit;
++#endif
++
++
+ /* Number of job slots (commands that can be run at once).  */
+ 
+ unsigned int job_slots = 1;
+@@ -928,11 +927,15 @@ main (int argc, char **argv, char **envp)
+     struct rlimit rlim;
+ 
+     /* Set the stack limit huge so that alloca does not fail.  */
+-    if (getrlimit (RLIMIT_STACK, &rlim) == 0)
++    if (getrlimit (RLIMIT_STACK, &rlim) == 0
++        && rlim.rlim_cur > 0 && rlim.rlim_cur < rlim.rlim_max)
+       {
++        stack_limit = rlim;
+         rlim.rlim_cur = rlim.rlim_max;
+         setrlimit (RLIMIT_STACK, &rlim);
+       }
++    else
++      stack_limit.rlim_cur = 0;
+   }
+ #endif
+ 
+diff --git a/make.h b/make.h
+index 7836543..3d8f7ee 100644
+--- a/make.h
++++ b/make.h
+@@ -340,6 +340,14 @@ extern int no_default_sh_exe;
+ extern int unixy_shell;
+ #endif  /* WINDOWS32 */
+ 
++#if defined(HAVE_SYS_RESOURCE_H) && defined(HAVE_GETRLIMIT) && defined(HAVE_SETRLIMIT)
++# define SET_STACK_SIZE
++#endif
++#ifdef SET_STACK_SIZE
++# include <sys/resource.h>
++struct rlimit stack_limit;
++#endif
++
+ struct floc
+   {
+     const char *filenm;
+diff --git a/read.c b/read.c
+index 0459f8c..8796dfc 100644
+--- a/read.c
++++ b/read.c
+@@ -2019,21 +2019,37 @@ record_files (struct nameseq *filenames, const char *pattern,
+                     d_ptr = &(*d_ptr)->next;
+ 
+                   if (cmds != 0)
+-                    /* This is the rule with commands, so put its deps
+-                       last. The rationale behind this is that $< expands to
+-                       the first dep in the chain, and commands use $<
+-                       expecting to get the dep that rule specifies.  However
+-                       the second expansion algorithm reverses the order thus
+-                       we need to make it last here.  */
+-                    (*d_ptr)->next = this;
++                    {
++                      /* This is the rule with commands, so put its deps
++                         last. The rationale behind this is that $< expands to
++                         the first dep in the chain, and commands use $<
++                         expecting to get the dep that rule specifies.  However
++                         the second expansion algorithm reverses the order thus
++                         we need to make it last here.  */
++                      (*d_ptr)->next = this;
++                      /* This is a hack. I need a way to communicate to
++                         snap_deps() that the last dependency line in this
++                         file came with commands (so that logic in snap_deps()
++                         can put it in front and all this $< -logic works). I
++                         cannot simply rely on file->cmds being not 0 because
++                         of the cases like the following:
++
++                         foo: bar
++                         foo:
++                         ...
++
++                         I am going to temporarily "borrow" UPDATING member in
++                         `struct file' for this.   */
++                      f->updating = 1;
++                    }
+                   else
+                     {
+-                      /* This is the rule without commands. Put its
+-                         dependencies at the end but before dependencies from
+-                         the rule with commands (if any). This way everything
+-                         appears in makefile order.  */
+-
+-                      if (f->cmds != 0)
++                      /* This is a rule without commands.  If we already have
++                         a rule with commands and prerequisites (see "hack"
++                         comment above), put these prereqs at the end but
++                         before prereqs from the rule with commands. This way
++                         everything appears in makefile order.  */
++                      if (f->updating)
+                         {
+                           this->next = *d_ptr;
+                           *d_ptr = this;
+@@ -2044,22 +2060,6 @@ record_files (struct nameseq *filenames, const char *pattern,
+                 }
+               else
+                 f->deps = this;
+-
+-              /* This is a hack. I need a way to communicate to snap_deps()
+-                 that the last dependency line in this file came with commands
+-                 (so that logic in snap_deps() can put it in front and all
+-                 this $< -logic works). I cannot simply rely on file->cmds
+-                 being not 0 because of the cases like the following:
+-
+-                 foo: bar
+-                 foo:
+-                     ...
+-
+-                 I am going to temporarily "borrow" UPDATING member in
+-                 `struct file' for this.   */
+-
+-              if (cmds != 0)
+-                f->updating = 1;
+ 	    }
+ 	}
+       else
+diff --git a/remake.c b/remake.c
+index ab8dd80..0d940d6 100644
+--- a/remake.c
++++ b/remake.c
+@@ -1465,28 +1465,23 @@ library_search (const char *lib, FILE_TIMESTAMP *mtime_ptr)
+       0
+     };
+ 
+-  static char *libpatterns = NULL;
+-
+-  const char *libname = lib+2;	/* Name without the '-l'.  */
++  const char *file = 0;
++  char *libpatterns;
+   FILE_TIMESTAMP mtime;
+ 
+   /* Loop variables for the libpatterns value.  */
+   char *p;
+   const char *p2;
+   unsigned int len;
++  unsigned int liblen;
+ 
+   char **dp;
+ 
+-  /* If we don't have libpatterns, get it.  */
+-  if (!libpatterns)
+-    {
+-      int save = warn_undefined_variables_flag;
+-      warn_undefined_variables_flag = 0;
++  libpatterns = xstrdup (variable_expand ("$(.LIBPATTERNS)"));
+ 
+-      libpatterns = xstrdup (variable_expand ("$(strip $(.LIBPATTERNS))"));
+-
+-      warn_undefined_variables_flag = save;
+-    }
++  /* Skip the '-l'.  */
++  lib += 2;
++  liblen = strlen (lib);
+ 
+   /* Loop through all the patterns in .LIBPATTERNS, and search on each one.  */
+   p2 = libpatterns;
+@@ -1497,7 +1492,7 @@ library_search (const char *lib, FILE_TIMESTAMP *mtime_ptr)
+       static int libdir_maxlen = -1;
+       char *libbuf = variable_expand ("");
+ 
+-      /* Expand the pattern using LIBNAME as a replacement.  */
++      /* Expand the pattern using LIB as a replacement.  */
+       {
+ 	char c = p[len];
+ 	char *p3, *p4;
+@@ -1506,16 +1501,13 @@ library_search (const char *lib, FILE_TIMESTAMP *mtime_ptr)
+ 	p3 = find_percent (p);
+ 	if (!p3)
+ 	  {
+-	    /* Give a warning if there is no pattern, then remove the
+-	       pattern so it's ignored next time.  */
++	    /* Give a warning if there is no pattern.  */
+ 	    error (NILF, _(".LIBPATTERNS element `%s' is not a pattern"), p);
+-	    for (; len; --len, ++p)
+-	      *p = ' ';
+-	    *p = c;
++            p[len] = c;
+ 	    continue;
+ 	  }
+ 	p4 = variable_buffer_output (libbuf, p, p3-p);
+-	p4 = variable_buffer_output (p4, libname, strlen (libname));
++	p4 = variable_buffer_output (p4, lib, liblen);
+ 	p4 = variable_buffer_output (p4, p3+1, len - (p3-p));
+ 	p[len] = c;
+       }
+@@ -1526,15 +1518,16 @@ library_search (const char *lib, FILE_TIMESTAMP *mtime_ptr)
+ 	{
+ 	  if (mtime_ptr != 0)
+ 	    *mtime_ptr = mtime;
+-	  return strcache_add (libbuf);
++	  file = strcache_add (libbuf);
++          goto fini;
+ 	}
+ 
+       /* Now try VPATH search on that.  */
+ 
+       {
+-        const char *file = vpath_search (libbuf, mtime_ptr);
++        file = vpath_search (libbuf, mtime_ptr);
+         if (file)
+-          return file;
++          goto fini;
+       }
+ 
+       /* Now try the standard set of directories.  */
+@@ -1564,10 +1557,13 @@ library_search (const char *lib, FILE_TIMESTAMP *mtime_ptr)
+ 	    {
+ 	      if (mtime_ptr != 0)
+ 		*mtime_ptr = mtime;
+-	      return strcache_add (buf);
++	      file = strcache_add (buf);
++              goto fini;
+ 	    }
+ 	}
+     }
+ 
+-  return 0;
++ fini:
++  free (libpatterns);
++  return file;
+ }
+diff --git a/tests/ChangeLog b/tests/ChangeLog
+index 9e48022..062e619 100644
+--- a/tests/ChangeLog
++++ b/tests/ChangeLog
+@@ -1,3 +1,11 @@
++2009-06-07  Paul Smith  <psmith@gnu.org>
++
++	* scripts/variables/automatic: Check prereq ordering when the
++	target with the recipe has no prereqs.  Savannah bug #21198.
++
++	* scripts/variables/LIBPATTERNS: Add a new set of test for
++	$(.LIBPATTERNS) (previously untested!)
++
+ 2009-06-04  Paul Smith  <psmith@gnu.org>
+ 
+ 	* scripts/variables/SHELL: The export target-specific SHELL test
+diff --git a/tests/scripts/variables/LIBPATTERNS b/tests/scripts/variables/LIBPATTERNS
+new file mode 100644
+index 0000000..826f2fa
+--- /dev/null
++++ b/tests/scripts/variables/LIBPATTERNS
+@@ -0,0 +1,38 @@
++#                                                                    -*-perl-*-
++
++$description = "Test .LIBPATTERNS special variable.";
++
++$details = "";
++
++# TEST 0: basics
++
++touch('mtest_foo.a');
++
++run_make_test('
++.LIBPATTERNS = mtest_%.a
++all: -lfoo ; @echo "build $@ from $<"
++',
++              '', "build all from mtest_foo.a\n");
++
++# TEST 1: Handle elements that are not patterns.
++
++run_make_test('
++.LIBPATTERNS = mtest_foo.a mtest_%.a
++all: -lfoo ; @echo "build $@ from $<"
++',
++              '', "#MAKE#: .LIBPATTERNS element `mtest_foo.a' is not a pattern
++build all from mtest_foo.a\n");
++
++# TEST 2: target-specific override
++
++# Uncomment this when we add support, see Savannah bug #25703
++# run_make_test('
++# .LIBPATTERNS = mbad_%.a
++# all: .LIBPATTERNS += mtest_%.a
++# all: -lfoo ; @echo "build $@ from $<"
++# ',
++#               '', "build all from mtest_foo.a\n");
++
++unlink('mtest_foo.a');
++
++1;
+diff --git a/tests/scripts/variables/automatic b/tests/scripts/variables/automatic
+index c0fdff8..33c482d 100644
+--- a/tests/scripts/variables/automatic
++++ b/tests/scripts/variables/automatic
+@@ -107,4 +107,16 @@ bar: ;',
+ 
+ unlink('foo');
+ 
++# TEST #4: ensure prereq ordering is correct when the commmand target has none
++# See Savannah bug #21198
++
++run_make_test('
++all : A B
++all : ; @echo $@ -- $^ -- $<
++all : C D
++all : E F
++A B C D E F G H : ; @:
++',
++              '', "all -- A B C D E F -- A\n");
++
+ 1;
+-- 
+cgit v1.0-41-gc330
+

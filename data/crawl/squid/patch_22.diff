@@ -1,0 +1,260 @@
+----++++doc/Programming-Guide/BasicAuthentication.dox
+@@ -1,51 +0,0 @@
+-/*
+- * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+- *
+- * Squid software is distributed under GPLv2+ license and includes
+- * contributions from numerous individuals and organizations.
+- * Please see the COPYING and CONTRIBUTORS files for details.
+- */
+-
+-/**
+-\defgroup AuthAPIBasic Basic Authentication
+-\ingroup AuthAPI
+-
+-\par
+-Basic authentication provides a username and password.  These
+-are written to the authentication module processes on a single
+-line, separated by a space:
+-\code
+-&lt;USERNAME&gt; &lt;PASSWORD&gt;
+-\endcode
+-
+-\par
+-	The authentication module process reads username, password pairs
+-	on stdin and returns either &quot;OK&quot; or &quot;ERR&quot; on stdout for
+-	each input line.
+-
+-\par
+-	The following simple perl script demonstrates how the
+-	authentication module works.  This script allows any
+-	user named &quot;Dirk&quot; (without checking the password)
+-	and allows any user that uses the password &quot;Sekrit&quot;:
+-
+-\code
+-#!/usr/bin/perl -w
+-$|=1;		# no buffering, important!
+-while (&lt;&gt;) {
+-        chop;
+-        ($u,$p) = split;
+-        $ans = &amp;amp;check($u,$p);
+-        print &quot;$ans\n&quot;;
+-}
+-
+-sub check {
+-        local($u,$p) = @_;
+-        return &#39;ERR&#39; unless (defined $p &amp;amp;&amp;amp; defined $u);
+-        return &#39;OK&#39; if (&#39;Dirk&#39; eq $u);
+-        return &#39;OK&#39; if (&#39;Sekrit&#39; eq $p);
+-        return &#39;ERR&#39;;
+-}
+-\endcode
+-
+- */
+----++++src/SquidConfig.h
+@@ -10,9 +10,6 @@
+ #define SQUID_SQUIDCONFIG_H_
+ 
+ #include &quot;acl/forward.h&quot;
+-#if USE_AUTH
+-#include &quot;auth/SchemesConfig.h&quot;
+-#endif
+ #include &quot;base/RefCount.h&quot;
+ #include &quot;base/YesNoNone.h&quot;
+ #include &quot;ClientDelayConfig.h&quot;
+@@ -201,9 +198,6 @@ class SquidConfig
+ 
+     Helper::ChildConfig redirectChildren;
+     Helper::ChildConfig storeIdChildren;
+-    time_t authenticateGCInterval;
+-    time_t authenticateTTL;
+-    time_t authenticateIpTTL;
+ 
+     struct {
+         char *surrogate_id;
+@@ -400,9 +394,6 @@ class SquidConfig
+ 
+         acl_access *forceRequestBodyContinuation;
+         acl_access *serverPconnForNonretriable;
+-#if USE_AUTH
+-        acl_access *authSchemes;
+-#endif
+     } accessList;
+     AclDenyInfoList *denyInfoList;
+ 
+@@ -543,10 +534,6 @@ class SquidConfig
+         int v4_first;       ///&lt; Place IPv4 first in the order of DNS results.
+         ssize_t packet_max; ///&lt; maximum size EDNS advertised for DNS replies.
+     } dns;
+-
+-#if USE_AUTH
+-    Auth::SchemesConfigs authSchemesConfigs;
+-#endif
+ };
+ 
+ extern SquidConfig Config;
+----++++src/auth/Config.cc
+@@ -9,160 +9,8 @@
+ /* DEBUG: section 29    Authenticator */
+ 
+ #include &quot;squid.h&quot;
++#include &quot;acl/Tree.h&quot;
+ #include &quot;auth/Config.h&quot;
+-#include &quot;auth/Gadgets.h&quot;
+-#include &quot;auth/UserRequest.h&quot;
+-#include &quot;cache_cf.h&quot;
+-#include &quot;ConfigParser.h&quot;
+-#include &quot;Debug.h&quot;
+-#include &quot;format/Format.h&quot;
+-#include &quot;globals.h&quot;
+-#include &quot;Store.h&quot;
+-#include &quot;wordlist.h&quot;
+ 
+-Auth::ConfigVector Auth::TheConfig;
+-
+-/**
+- * Get an User credentials object filled out for the given Proxy- or WWW-Authenticate header.
+- * Any decoding which needs to be done will be done.
+- *
+- * It may be a cached AuthUser or a new Unauthenticated object.
+- * It may also be NULL reflecting that no user could be created.
+- */
+-Auth::UserRequest::Pointer
+-Auth::Config::CreateAuthUser(const char *proxy_auth, AccessLogEntry::Pointer &amp;al)
+-{
+-    assert(proxy_auth != NULL);
+-    debugs(29, 9, HERE &lt;&lt; &quot;header = &#39;&quot; &lt;&lt; proxy_auth &lt;&lt; &quot;&#39;&quot;);
+-
+-    Auth::Config *config = Find(proxy_auth);
+-
+-    if (config == NULL || !config-&gt;active()) {
+-        debugs(29, (shutting_down?3:DBG_IMPORTANT), (shutting_down?&quot;&quot;:&quot;WARNING: &quot;) &lt;&lt;
+-               &quot;Unsupported or unconfigured/inactive proxy-auth scheme, &#39;&quot; &lt;&lt; proxy_auth &lt;&lt; &quot;&#39;&quot;);
+-        return NULL;
+-    }
+-    static MemBuf rmb;
+-    rmb.reset();
+-    if (config-&gt;keyExtras) {
+-        // %credentials and %username, which normally included in
+-        // request_format, are - at this time, but that is OK
+-        // because user name is added to key explicitly, and we do
+-        // not want to store authenticated credentials at all.
+-        config-&gt;keyExtras-&gt;assemble(rmb, al, 0);
+-    }
+-
+-    return config-&gt;decode(proxy_auth, rmb.hasContent() ? rmb.content() : NULL);
+-}
+-
+-Auth::Config *
+-Auth::Config::Find(const char *proxy_auth)
+-{
+-    for (Auth::ConfigVector::iterator  i = Auth::TheConfig.begin(); i != Auth::TheConfig.end(); ++i)
+-        if (strncasecmp(proxy_auth, (*i)-&gt;type(), strlen((*i)-&gt;type())) == 0)
+-            return *i;
+-
+-    return NULL;
+-}
+-
+-Auth::Config *
+-Auth::Config::GetParsed(const char *proxy_auth)
+-{
+-    if (auto *cfg = Find(proxy_auth))
+-        return cfg;
+-    fatalf(&quot;auth_schemes: required authentication method &#39;%s&#39; is not configured&quot;, proxy_auth);
+-    return nullptr;
+-}
+-
+-/** Default behaviour is to expose nothing */
+-void
+-Auth::Config::registerWithCacheManager(void)
+-{}
+-
+-void
+-Auth::Config::parse(Auth::Config * scheme, int, char *param_str)
+-{
+-    if (strcmp(param_str, &quot;program&quot;) == 0) {
+-        if (authenticateProgram)
+-            wordlistDestroy(&amp;authenticateProgram);
+-
+-        parse_wordlist(&amp;authenticateProgram);
+-
+-        requirePathnameExists(&quot;Authentication helper program&quot;, authenticateProgram-&gt;key);
+-
+-    } else if (strcmp(param_str, &quot;realm&quot;) == 0) {
+-        realm.clear();
+-
+-        char *token = ConfigParser::NextQuotedOrToEol();
+-
+-        while (token &amp;&amp; *token &amp;&amp; xisspace(*token))
+-            ++token;
+-
+-        if (!token || !*token) {
+-            debugs(29, DBG_PARSE_NOTE(DBG_IMPORTANT), &quot;ERROR: Missing auth_param &quot; &lt;&lt; scheme-&gt;type() &lt;&lt; &quot; realm&quot;);
+-            self_destruct();
+-            return;
+-        }
+-
+-        realm = token;
+-
+-    } else if (strcmp(param_str, &quot;children&quot;) == 0) {
+-        authenticateChildren.parseConfig();
+-
+-    } else if (strcmp(param_str, &quot;key_extras&quot;) == 0) {
+-        keyExtrasLine = ConfigParser::NextQuotedToken();
+-        Format::Format *nlf =  new ::Format::Format(scheme-&gt;type());
+-        if (!nlf-&gt;parse(keyExtrasLine.termedBuf())) {
+-            debugs(29, DBG_CRITICAL, &quot;FATAL: Failed parsing key_extras formatting value&quot;);
+-            self_destruct();
+-            return;
+-        }
+-        if (keyExtras)
+-            delete keyExtras;
+-
+-        keyExtras = nlf;
+-
+-        if (char *t = strtok(NULL, w_space)) {
+-            debugs(29, DBG_CRITICAL, &quot;FATAL: Unexpected argument &#39;&quot; &lt;&lt; t &lt;&lt; &quot;&#39; after request_format specification&quot;);
+-            self_destruct();
+-        }
+-    } else {
+-        debugs(29, DBG_CRITICAL, &quot;Unrecognised &quot; &lt;&lt; scheme-&gt;type() &lt;&lt; &quot; auth scheme parameter &#39;&quot; &lt;&lt; param_str &lt;&lt; &quot;&#39;&quot;);
+-    }
+-}
+-
+-bool
+-Auth::Config::dump(StoreEntry *entry, const char *name, Auth::Config *scheme) const
+-{
+-    if (!authenticateProgram)
+-        return false; // not configured
+-
+-    wordlist *list = authenticateProgram;
+-    storeAppendPrintf(entry, &quot;%s %s&quot;, name, scheme-&gt;type());
+-    while (list != NULL) {
+-        storeAppendPrintf(entry, &quot; %s&quot;, list-&gt;key);
+-        list = list-&gt;next;
+-    }
+-    storeAppendPrintf(entry, &quot;\n&quot;);
+-
+-    storeAppendPrintf(entry, &quot;%s %s realm &quot; SQUIDSBUFPH &quot;\n&quot;, name, scheme-&gt;type(), SQUIDSBUFPRINT(realm));
+-
+-    storeAppendPrintf(entry, &quot;%s %s children %d startup=%d idle=%d concurrency=%d\n&quot;,
+-                      name, scheme-&gt;type(),
+-                      authenticateChildren.n_max, authenticateChildren.n_startup,
+-                      authenticateChildren.n_idle, authenticateChildren.concurrency);
+-
+-    if (keyExtrasLine.size() &gt; 0)
+-        storeAppendPrintf(entry, &quot;%s %s key_extras \&quot;%s\&quot;\n&quot;, name, scheme-&gt;type(), keyExtrasLine.termedBuf());
+-
+-    return true;
+-}
+-
+-void
+-Auth::Config::done()
+-{
+-    delete keyExtras;
+-    keyExtras = NULL;
+-    keyExtrasLine.clean();
+-}
++Auth::Config Auth::TheConfig;
+ 
+----++++GitHub

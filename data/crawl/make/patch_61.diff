@@ -1,0 +1,277 @@
+diff --git a/ChangeLog b/ChangeLog
+index c317594..d9c3167 100644
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -1,3 +1,21 @@
++2013-05-17  Paul Smith  <psmith@gnu.org>
++
++	* makeint.h: Prototype new unload_file() function.
++	* load.c (unload_file): Create a function to unload a file.
++	(struct load_list): Type to remember loaded objects.
++	(loaded_syms): Global variable of remembered loaded objects so we
++	can unload them later.  We don't have to remove from the list
++	because the only time we unload is if we're about to re-exec.
++	(load_object): Remove unneeded extra DLP argument.
++	(load_file): Remove unneeded extra DLP argument.
++	* filedef.h (struct file): Remove the DLP pointer and add the
++	LOADED bit flag.  Saves 32/64 bytes per file, as this pointer is
++	almost never needed.
++	* read.c (eval): Set the new LOADED bit flag on the file.
++	* file.c (rehash_file): Merge the loaded bitfield.
++	* commands.c (execute_file_commands): Call unload_file() instead
++	of dlclose() directly.
++
+ 2013-05-14  Paul Smith  <psmith@gnu.org>
+ 
+ 	* doc/make.texi (Loaded Object API): Document the requirement for
+diff --git a/commands.c b/commands.c
+index e8a9f1c..1627702 100644
+--- a/commands.c
++++ b/commands.c
+@@ -471,10 +471,9 @@ execute_file_commands (struct file *file)
+   set_file_variables (file);
+ 
+   /* If this is a loaded dynamic object, unload it before remaking.
+-     Some systems don't allow to overwrite a loaded shared
+-     library.  */
+-  if (file->dlopen_ptr)
+-    dlclose (file->dlopen_ptr);
++     Some systems don't support overwriting a loaded object.  */
++  if (file->loaded)
++    unload_file (file->name);
+ 
+   /* Start the commands running.  */
+   new_job (file);
+diff --git a/file.c b/file.c
+index 444a81d..b77efad 100644
+--- a/file.c
++++ b/file.c
+@@ -322,6 +322,7 @@ rehash_file (struct file *from_file, const char *to_hname)
+   MERGE (is_target);
+   MERGE (cmd_target);
+   MERGE (phony);
++  MERGE (loaded);
+   MERGE (ignore_vpath);
+ #undef MERGE
+ 
+diff --git a/filedef.h b/filedef.h
+index 5fa6429..001b904 100644
+--- a/filedef.h
++++ b/filedef.h
+@@ -61,8 +61,6 @@ struct file
+     int command_flags;		/* Flags OR'd in for cmds; see commands.h.  */
+     char update_status;         /* Status of the last attempt to update,
+ 				   or -1 if none has been made.  */
+-    void *dlopen_ptr;		/* For dynamic loaded objects: pointer to
+-				   pass to dlclose to unload the object.  */
+     enum cmd_state		/* State of the commands.  */
+       {		/* Note: It is important that cs_not_started be zero.  */
+ 	cs_not_started,		/* Not yet started.  */
+@@ -71,7 +69,9 @@ struct file
+ 	cs_finished		/* Commands finished.  */
+       } command_state ENUM_BITFIELD (2);
+ 
++    unsigned int builtin:1;     /* True if the file is a builtin rule. */
+     unsigned int precious:1;	/* Non-0 means don't delete file on quit */
++    unsigned int loaded:1;      /* True if the file is a loaded object. */
+     unsigned int low_resolution_time:1;	/* Nonzero if this file's time stamp
+ 					   has only one-second resolution.  */
+     unsigned int tried_implicit:1; /* Nonzero if have searched
+@@ -95,7 +95,6 @@ struct file
+                                    considered on current scan of goal chain */
+     unsigned int no_diag:1;     /* True if the file failed to update and no
+                                    diagnostics has been issued (dontcare). */
+-    unsigned int builtin:1;     /* True if the file is a builtin rule. */
+   };
+ 
+ 
+diff --git a/load.c b/load.c
+index 655928a..6147741 100644
+--- a/load.c
++++ b/load.c
+@@ -30,15 +30,22 @@ this program.  If not, see <http://www.gnu.org/licenses/>.  */
+ #include "filedef.h"
+ #include "variable.h"
+ 
++struct load_list
++  {
++    struct load_list *next;
++    const char *name;
++    void *dlp;
++  };
++
++static struct load_list *loaded_syms = NULL;
++
+ static load_func_t
+ load_object (const gmk_floc *flocp, int noerror,
+-             const char *ldname, const char *symname, void **dlp)
++             const char *ldname, const char *symname)
+ {
+   static void *global_dl = NULL;
+   load_func_t symp;
+ 
+-  *dlp = NULL;
+-
+   if (! global_dl)
+     {
+       global_dl = dlopen (NULL, RTLD_NOW|RTLD_GLOBAL);
+@@ -48,6 +55,8 @@ load_object (const gmk_floc *flocp, int noerror,
+ 
+   symp = (load_func_t) dlsym (global_dl, symname);
+   if (! symp) {
++    struct load_list *new;
++    void *dlp = NULL;
+ 
+     /* If the path has no "/", try the current directory first.  */
+     if (! strchr (ldname, '/')
+@@ -55,14 +64,14 @@ load_object (const gmk_floc *flocp, int noerror,
+ 	&& ! strchr (ldname, '\\')
+ #endif
+ 	)
+-      *dlp = dlopen (concat (2, "./", ldname), RTLD_LAZY|RTLD_GLOBAL);
++      dlp = dlopen (concat (2, "./", ldname), RTLD_LAZY|RTLD_GLOBAL);
+ 
+     /* If we haven't opened it yet, try the default search path.  */
+-    if (! *dlp)
+-      *dlp = dlopen (ldname, RTLD_LAZY|RTLD_GLOBAL);
++    if (! dlp)
++      dlp = dlopen (ldname, RTLD_LAZY|RTLD_GLOBAL);
+ 
+     /* Still no?  Then fail.  */
+-    if (! *dlp)
++    if (! dlp)
+       {
+         if (noerror)
+           DB (DB_BASIC, ("%s", dlerror()));
+@@ -72,22 +81,31 @@ load_object (const gmk_floc *flocp, int noerror,
+       }
+ 
+     /* Assert that the GPL license symbol is defined.  */
+-    symp = dlsym (*dlp, "plugin_is_GPL_compatible");
++    symp = dlsym (dlp, "plugin_is_GPL_compatible");
+     if (! symp)
+       fatal (flocp, _("Loaded object %s is not declared to be GPL compatible"),
+              ldname);
+ 
+-    symp = dlsym (*dlp, symname);
++    symp = dlsym (dlp, symname);
+     if (! symp)
+       fatal (flocp, _("Failed to load symbol %s from %s: %s"),
+              symname, ldname, dlerror());
++
++    /* Add this symbol to a trivial lookup table.  This is not efficient but
++       it's highly unlikely we'll be loading lots of objects, and we only need
++       it to look them up on unload, if we rebuild them.  */
++    new = xmalloc (sizeof (struct load_list));
++    new->name = xstrdup (ldname);
++    new->dlp = dlp;
++    new->next = loaded_syms;
++    loaded_syms = new;
+   }
+ 
+   return symp;
+ }
+ 
+ int
+-load_file (const gmk_floc *flocp, const char **ldname, int noerror, void **dlp)
++load_file (const gmk_floc *flocp, const char **ldname, int noerror)
+ {
+   int nmlen = strlen (*ldname);
+   char *new = alloca (nmlen + CSTRLEN (SYMBOL_EXTENSION) + 1);
+@@ -97,8 +115,6 @@ load_file (const gmk_floc *flocp, const char **ldname, int noerror, void **dlp)
+   int r;
+   load_func_t symp;
+ 
+-  *dlp = NULL;
+-
+   /* Break the input into an object file name and a symbol name.  If no symbol
+      name was provided, compute one from the object file name.  */
+   fp = strchr (*ldname, '(');
+@@ -174,7 +190,7 @@ load_file (const gmk_floc *flocp, const char **ldname, int noerror, void **dlp)
+   DB (DB_VERBOSE, (_("Loading symbol %s from %s\n"), symname, *ldname));
+ 
+   /* Load it!  */
+-  symp = load_object(flocp, noerror, *ldname, symname, dlp);
++  symp = load_object(flocp, noerror, *ldname, symname);
+   if (! symp)
+     return 0;
+ 
+@@ -188,6 +204,21 @@ load_file (const gmk_floc *flocp, const char **ldname, int noerror, void **dlp)
+   return r;
+ }
+ 
++void
++unload_file (const char *name)
++{
++  struct load_list *d;
++
++  for (d = loaded_syms; d != NULL; d = d->next)
++    if (streq (d->name, name) && d->dlp)
++      {
++        if (dlclose (d->dlp))
++          perror_with_name ("dlclose", d->name);
++        d->dlp = NULL;
++        break;
++      }
++}
++
+ #else
+ 
+ int
+@@ -199,4 +230,11 @@ load_file (const gmk_floc *flocp, const char **ldname, int noerror)
+   return 0;
+ }
+ 
++int
++unload_file (struct file *file)
++{
++  fatal (flocp, "INTERNAL: Cannot unload when load is not supported!");
++  return 0;
++}
++
+ #endif  /* MAKE_LOAD */
+diff --git a/makeint.h b/makeint.h
+index 9d351c9..72124ec 100644
+--- a/makeint.h
++++ b/makeint.h
+@@ -490,8 +490,8 @@ int guile_gmake_setup (const gmk_floc *flocp);
+ 
+ /* Loadable object support.  Sets to the strcached name of the loaded file.  */
+ typedef int (*load_func_t)(const gmk_floc *flocp);
+-int load_file (const gmk_floc *flocp, const char **filename, int noerror,
+-	       void **dlp);
++int load_file (const gmk_floc *flocp, const char **filename, int noerror);
++void unload_file (const char *name);
+ 
+ /* We omit these declarations on non-POSIX systems which define _POSIX_VERSION,
+    because such systems often declare them in header files anyway.  */
+diff --git a/read.c b/read.c
+index 50f8414..9dce583 100644
+--- a/read.c
++++ b/read.c
+@@ -937,12 +937,11 @@ eval (struct ebuffer *ebuf, int set_default)
+               struct nameseq *next = files->next;
+               const char *name = files->name;
+               struct dep *deps;
+-              void *dlp;
+ 
+               free_ns (files);
+               files = next;
+ 
+-              if (! load_file (&ebuf->floc, &name, noerror, &dlp) && ! noerror)
++              if (! load_file (&ebuf->floc, &name, noerror) && ! noerror)
+                 fatal (&ebuf->floc, _("%s: failed to load"), name);
+ 
+               deps = alloc_dep ();
+@@ -951,7 +950,7 @@ eval (struct ebuffer *ebuf, int set_default)
+               deps->file = lookup_file (name);
+               if (deps->file == 0)
+                 deps->file = enter_file (name);
+-              deps->file->dlopen_ptr = dlp;
++              deps->file->loaded = 1;
+             }
+ 
+           continue;
+-- 
+cgit v1.0-41-gc330
+

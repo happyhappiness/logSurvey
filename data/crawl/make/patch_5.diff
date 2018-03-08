@@ -1,0 +1,206 @@
+diff --git a/main.c b/main.c
+index aa3d80d..df7bb3a 100644
+--- a/main.c
++++ b/main.c
+@@ -2150,12 +2150,11 @@ main (int argc, char **argv, char **envp)
+   OUTPUT_UNSET ();
+   output_close (&make_sync);
+ 
+-  if (read_files != 0)
++  if (read_files)
+     {
+       /* Update any makefiles if necessary.  */
+ 
+-      FILE_TIMESTAMP *makefile_mtimes = 0;
+-      unsigned int mm_idx = 0;
++      FILE_TIMESTAMP *makefile_mtimes;
+       char **aargv = NULL;
+       const char **nargv;
+       int nargc;
+@@ -2163,12 +2162,22 @@ main (int argc, char **argv, char **envp)
+ 
+       DB (DB_BASIC, (_("Updating makefiles....\n")));
+ 
++      {
++        struct goaldep *d;
++        unsigned int num_mkfiles;
++        for (d = read_files; d != NULL; d = d->next)
++          ++num_mkfiles;
++
++        makefile_mtimes = alloca (num_mkfiles * sizeof (FILE_TIMESTAMP));
++      }
++
+       /* Remove any makefiles we don't want to try to update.  Record the
+          current modtimes of the others so we can compare them later.  */
+       {
+-        register struct goaldep *d, *last;
+-        last = 0;
+-        d = read_files;
++        struct goaldep *d = read_files;
++        struct goaldep *last = NULL;
++        unsigned int mm_idx = 0;
++
+         while (d != 0)
+           {
+             struct file *f;
+@@ -2202,9 +2211,6 @@ main (int argc, char **argv, char **envp)
+               }
+             else
+               {
+-                makefile_mtimes = xrealloc (makefile_mtimes,
+-                                            (mm_idx+1)
+-                                            * sizeof (FILE_TIMESTAMP));
+                 makefile_mtimes[mm_idx++] = file_mtime_no_search (d->file);
+                 last = d;
+                 d = d->next;
+@@ -2453,9 +2459,6 @@ main (int argc, char **argv, char **envp)
+           free (aargv);
+           break;
+         }
+-
+-      /* Free the makefile mtimes.  */
+-      free (makefile_mtimes);
+     }
+ 
+   /* Set up 'MAKEFLAGS' again for the normal targets.  */
+diff --git a/read.c b/read.c
+index 26ba6f9..047807a 100644
+--- a/read.c
++++ b/read.c
+@@ -318,7 +318,11 @@ eval_makefile (const char *filename, int flags)
+   struct ebuffer ebuf;
+   const floc *curfile;
+   char *expanded = 0;
+-  int makefile_errno;
++
++  /* Create a new goaldep entry.  */
++  deps = alloc_goaldep ();
++  deps->next = read_files;
++  read_files = deps;
+ 
+   ebuf.floc.filenm = filename; /* Use the original file name.  */
+   ebuf.floc.lineno = 1;
+@@ -349,13 +353,12 @@ eval_makefile (const char *filename, int flags)
+         filename = expanded;
+     }
+ 
++  errno = 0;
+   ENULLLOOP (ebuf.fp, fopen (filename, "r"));
+-
+-  /* Save the error code so we print the right message later.  */
+-  makefile_errno = errno;
++  deps->error = errno;
+ 
+   /* Check for unrecoverable errors: out of mem or FILE slots.  */
+-  switch (makefile_errno)
++  switch (deps->error)
+     {
+ #ifdef EMFILE
+     case EMFILE:
+@@ -365,7 +368,7 @@ eval_makefile (const char *filename, int flags)
+ #endif
+     case ENOMEM:
+       {
+-        const char *err = strerror (makefile_errno);
++        const char *err = strerror (deps->error);
+         OS (fatal, reading_file, "%s", err);
+       }
+     }
+@@ -389,14 +392,8 @@ eval_makefile (const char *filename, int flags)
+         }
+     }
+ 
+-  /* Now we have the final name for this makefile. Enter it into
+-     the cache.  */
++  /* Enter the final name for this makefile as a goaldep.  */
+   filename = strcache_add (filename);
+-
+-  /* Add FILENAME to the chain of read makefiles.  */
+-  deps = alloc_goaldep ();
+-  deps->next = read_files;
+-  read_files = deps;
+   deps->file = lookup_file (filename);
+   if (deps->file == 0)
+     deps->file = enter_file (filename);
+@@ -405,17 +402,19 @@ eval_makefile (const char *filename, int flags)
+ 
+   free (expanded);
+ 
+-  /* If the makefile can't be found at all, give up entirely.  */
+-
+   if (ebuf.fp == 0)
+     {
+-      /* If we did some searching, errno has the error from the last
+-         attempt, rather from FILENAME itself.  Store it in case the
+-         caller wants to use it in a message.  */
+-      errno = makefile_errno;
++      /* The makefile can't be read at all, give up entirely.
++         If we did some searching errno has the error from the last attempt,
++         rather from FILENAME itself: recover the more accurate one.  */
++      errno = deps->error;
++      deps->file->last_mtime = NONEXISTENT_MTIME;
+       return deps;
+     }
+ 
++  /* Success; clear errno.  */
++  deps->error = 0;
++
+   /* Set close-on-exec to avoid leaking the makefile to children, such as
+      $(shell ...).  */
+ #ifdef HAVE_FILENO
+@@ -904,10 +903,7 @@ eval (struct ebuffer *ebuf, int set_default)
+               struct goaldep *d = eval_makefile (files->name, flags);
+ 
+               if (errno)
+-                {
+-                  d->error = (unsigned short)errno;
+-                  d->floc = *fstart;
+-                }
++                d->floc = *fstart;
+ 
+               free_ns (files);
+               files = next;
+diff --git a/tests/scripts/features/include b/tests/scripts/features/include
+index a21455d..fe404ad 100644
+--- a/tests/scripts/features/include
++++ b/tests/scripts/features/include
+@@ -235,17 +235,25 @@ inc1: foo; echo > $@
+ 
+ rmfiles('inc1');
+ 
+-# include a directory
+-
+-if ($all_tests) {
+-    # Test that include of a rebuild-able file doesn't show a warning
+-    # Savannah bug #102
+-    run_make_test(q!
+-include foo
+-foo: ; @echo foo = bar > $@
++# Including files that can't be read should show an error
++create_file('inc1', 'FOO := foo');
++chmod 0000, 'inc1';
++
++run_make_test(q!
++include inc1
++all:;@echo $(FOO)
+ !,
+-                  '', "#MAKE#: 'foo' is up to date.\n");
+-    rmfiles('foo');
+-}
++              '', "#MAKEFILE#:2: inc1: $ERR_unreadable_file\n#MAKE#: *** No rule to make target 'inc1'.  Stop.", 512);
++
++# Unreadable files that we know how to successfully recreate should work
++
++run_make_test(sprintf(q!
++all:;@echo $(FOO)
++include inc1
++inc1:; @%s $@ && echo FOO := bar > $@
++!, $CMD_rmfile),
++              '', "bar");
++
++rmfiles('inc1');
+ 
+ 1;
+-- 
+cgit v1.0-41-gc330
+

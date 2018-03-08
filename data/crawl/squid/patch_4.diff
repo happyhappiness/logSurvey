@@ -1,0 +1,360 @@
+----++++src/anyp/PortCfg.cc
+@@ -42,16 +42,14 @@ AnyP::PortCfg::PortCfg() :
+     listenConn()
+ #if USE_OPENSSL
+     ,
+-    clientca(NULL),
+     sslContextSessionId(NULL),
+     generateHostCertificates(true),
+     dynamicCertMemCacheSize(4*1024*1024), // 4 MB
+     signingCert(),
+     signPkey(),
+     certsToChain(),
+     untrustedSigningCert(),
+-    untrustedSignPkey(),
+-    clientCA()
++    untrustedSignPkey()
+ #endif
+ {
+     memset(&amp;tcp_keepalive, 0, sizeof(tcp_keepalive));
+@@ -68,7 +66,6 @@ AnyP::PortCfg::~PortCfg()
+     safe_free(defaultsite);
+ 
+ #if USE_OPENSSL
+-    safe_free(clientca);
+     safe_free(sslContextSessionId);
+ #endif
+ }
+@@ -95,8 +92,6 @@ AnyP::PortCfg::clone() const
+     b-&gt;secure = secure;
+ 
+ #if USE_OPENSSL
+-    if (clientca)
+-        b-&gt;clientca = xstrdup(clientca);
+     if (sslContextSessionId)
+         b-&gt;sslContextSessionId = xstrdup(sslContextSessionId);
+ 
+@@ -136,13 +131,6 @@ AnyP::PortCfg::configureSslServerContext()
+         fatalf(&quot;Unable to generate signing SSL certificate for untrusted sites for %s_port %s&quot;, AnyP::ProtocolType_str[transport.protocol], s.toUrl(buf, sizeof(buf)));
+     }
+ 
+-    if (clientca) {
+-        clientCA.reset(SSL_load_client_CA_file(clientca));
+-        if (clientCA.get() == NULL) {
+-            fatalf(&quot;Unable to read client CAs! from %s&quot;, clientca);
+-        }
+-    }
+-
+     if (!secure.createStaticServerContext(*this)) {
+         char buf[128];
+         fatalf(&quot;%s_port %s initialization error&quot;, AnyP::ProtocolType_str[transport.protocol], s.toUrl(buf, sizeof(buf)));
+----++++src/anyp/PortCfg.h
+@@ -73,7 +73,6 @@ class PortCfg : public RefCountable
+     Security::ServerOptions secure;
+ 
+ #if USE_OPENSSL
+-    char *clientca;
+     char *sslContextSessionId; ///&lt; &quot;session id context&quot; for secure.staticSslContext
+     bool generateHostCertificates; ///&lt; dynamically make host cert for sslBump
+     size_t dynamicCertMemCacheSize; ///&lt; max size of generated certificates memory cache
+@@ -83,8 +82,6 @@ class PortCfg : public RefCountable
+     Ssl::X509_STACK_Pointer certsToChain; ///&lt;  x509 certificates to send with the generated cert
+     Security::CertPointer untrustedSigningCert; ///&lt; x509 certificate for signing untrusted generated certificates
+     Ssl::EVP_PKEY_Pointer untrustedSignPkey; ///&lt; private key for signing untrusted generated certificates
+-
+-    Ssl::X509_NAME_STACK_Pointer clientCA; ///&lt; CA certificates to use when verifying client certificates
+ #endif
+ };
+ 
+----++++src/cache_cf.cc
+@@ -3718,8 +3718,7 @@ parse_port_option(AnyP::PortCfgPointer &amp;s, char *token)
+     } else if (strncmp(token, &quot;cipher=&quot;, 7) == 0) {
+         s-&gt;secure.parse(token);
+     } else if (strncmp(token, &quot;clientca=&quot;, 9) == 0) {
+-        safe_free(s-&gt;clientca);
+-        s-&gt;clientca = xstrdup(token + 9);
++        s-&gt;secure.parse(token);
+     } else if (strncmp(token, &quot;cafile=&quot;, 7) == 0) {
+         debugs(3, DBG_PARSE_NOTE(1), &quot;UPGRADE WARNING: &#39;&quot; &lt;&lt; token &lt;&lt; &quot;&#39; is deprecated &quot; &lt;&lt;
+                &quot;in &quot; &lt;&lt; cfg_directive &lt;&lt; &quot;. Use &#39;tls-cafile=&#39; instead.&quot;);
+@@ -3801,12 +3800,7 @@ parsePortCfg(AnyP::PortCfgPointer *head, const char *optionName)
+         parse_port_option(s, token);
+     }
+ 
+-#if USE_OPENSSL
+-    // if clientca has been defined but not cafile, then use it to verify
+-    // but if cafile has been defined, only use that to verify
+-    if (s-&gt;clientca &amp;&amp; !s-&gt;secure.caFiles.size())
+-        s-&gt;secure.caFiles.emplace_back(SBuf(s-&gt;clientca));
+-#endif
++    s-&gt;secure.syncCaFiles();
+ 
+     if (s-&gt;transport.protocol == AnyP::PROTO_HTTPS) {
+         s-&gt;secure.encryptTransport = true;
+----++++src/security/ServerOptions.cc
+@@ -21,6 +21,25 @@
+ #include &lt;openssl/x509.h&gt;
+ #endif
+ 
++Security::ServerOptions &amp;
++Security::ServerOptions::operator =(const Security::ServerOptions &amp;old) {
++    if (this != &amp;old) {
++        Security::PeerOptions::operator =(old);
++        clientCaFile = old.clientCaFile;
++        dh = old.dh;
++        dhParamsFile = old.dhParamsFile;
++        eecdhCurve = old.eecdhCurve;
++        parsedDhParams = old.parsedDhParams;
++#if USE_OPENSSL
++        if (auto *stk = SSL_dup_CA_list(old.clientCaStack.get()))
++            clientCaStack = Security::ServerOptions::X509_NAME_STACK_Pointer(stk);
++#else
++        clientCaStack = nullptr;
++#endif
++    }
++    return *this;
++}
++
+ void
+ Security::ServerOptions::parse(const char *token)
+ {
+@@ -130,12 +149,46 @@ Security::ServerOptions::createStaticServerContext(AnyP::PortCfg &amp;port)
+         if (!Ssl::InitServerContext(t, port))
+             return false;
+ #endif
++        if (!loadClientCaFile())
++            return false;
+     }
+ 
+     staticContext = std::move(t);
+     return bool(staticContext);
+ }
+ 
++void
++Security::ServerOptions::syncCaFiles()
++{
++    // if caFiles is set, just use that
++    if (caFiles.size())
++        return;
++
++    // otherwise fall back to clientca if it is defined
++    if (!clientCaFile.isEmpty())
++        caFiles.emplace_back(clientCaFile);
++}
++
++/// load clientca= file (if any) into memory.
++/// \retval true   clientca is not set, or loaded successfully
++/// \retval false  unable to load the file, or not using OpenSSL
++bool
++Security::ServerOptions::loadClientCaFile()
++{
++    if (clientCaFile.isEmpty())
++        return true;
++
++#if USE_OPENSSL
++    auto *stk = SSL_load_client_CA_file(clientCaFile.c_str());
++    clientCaStack = Security::ServerOptions::X509_NAME_STACK_Pointer(stk);
++#endif
++    if (!clientCaStack) {
++        debugs(83, DBG_CRITICAL, &quot;FATAL: Unable to read client CAs from file: &quot; &lt;&lt; clientCaFile);
++    }
++
++    return bool(clientCaStack);
++}
++
+ void
+ Security::ServerOptions::loadDhParams()
+ {
+@@ -167,6 +220,37 @@ Security::ServerOptions::loadDhParams()
+ #endif
+ }
+ 
++void
++Security::ServerOptions::updateContextClientCa(Security::ContextPointer &amp;ctx)
++{
++#if USE_OPENSSL
++    if (clientCaStack) {
++        ERR_clear_error();
++        if (STACK_OF(X509_NAME) *clientca = SSL_dup_CA_list(clientCaStack.get())) {
++            SSL_CTX_set_client_CA_list(ctx.get(), clientca);
++        } else {
++            auto ssl_error = ERR_get_error();
++            debugs(83, DBG_CRITICAL, &quot;ERROR: Failed to dupe the client CA list: &quot; &lt;&lt; Security::ErrorString(ssl_error));
++            return;
++        }
++
++        if (parsedFlags &amp; SSL_FLAG_DELAYED_AUTH) {
++            debugs(83, 9, &quot;Not requesting client certificates until acl processing requires one&quot;);
++            SSL_CTX_set_verify(ctx.get(), SSL_VERIFY_NONE, nullptr);
++        } else {
++            debugs(83, 9, &quot;Requiring client certificates.&quot;);
++            Ssl::SetupVerifyCallback(ctx);
++        }
++
++        updateContextCrl(ctx);
++
++    } else {
++        debugs(83, 9, &quot;Not requiring any client certificates&quot;);
++        SSL_CTX_set_verify(ctx.get(), SSL_VERIFY_NONE, NULL);
++    }
++#endif
++}
++
+ void
+ Security::ServerOptions::updateContextEecdh(Security::ContextPointer &amp;ctx)
+ {
+----++++src/security/ServerOptions.h
+@@ -19,15 +19,20 @@ namespace Security
+ class ServerOptions : public PeerOptions
+ {
+ public:
++#if USE_OPENSSL
++    sk_dtor_wrapper(sk_X509_NAME, STACK_OF(X509_NAME) *, X509_NAME_free);
++    typedef std::unique_ptr&lt;STACK_OF(X509_NAME), Security::ServerOptions::sk_X509_NAME_free_wrapper&gt; X509_NAME_STACK_Pointer;
++#endif
++
+     ServerOptions() : PeerOptions() {
+         // Bug 4005: dynamic contexts use a lot of memory and it
+         // is more secure to have only a small set of trusted CA.
+         flags.tlsDefaultCa.defaultTo(false);
+     }
+     ServerOptions(const ServerOptions &amp;) = default;
+-    ServerOptions &amp;operator =(const ServerOptions &amp;) = default;
+-    ServerOptions(ServerOptions &amp;&amp;) = default;
+-    ServerOptions &amp;operator =(ServerOptions &amp;&amp;) = default;
++    ServerOptions &amp;operator =(const ServerOptions &amp;);
++    ServerOptions(ServerOptions &amp;&amp;o) { this-&gt;operator =(o); }
++    ServerOptions &amp;operator =(ServerOptions &amp;&amp;o) { this-&gt;operator =(o); return *this; }
+     virtual ~ServerOptions() = default;
+ 
+     /* Security::PeerOptions API */
+@@ -44,14 +49,29 @@ class ServerOptions : public PeerOptions
+     /// update the context with DH, EDH, EECDH settings
+     void updateContextEecdh(Security::ContextPointer &amp;);
+ 
++    /// update the context with CA details used to verify client certificates
++    void updateContextClientCa(Security::ContextPointer &amp;);
++
++    /// sync the various sources of CA files to be loaded
++    void syncCaFiles();
++
+ public:
+     /// TLS context to use for HTTPS accelerator or static SSL-Bump
+     Security::ContextPointer staticContext;
+ 
+ private:
++    bool loadClientCaFile();
+     void loadDhParams();
+ 
+ private:
++    SBuf clientCaFile;  ///&lt; name of file to load client CAs from
++#if USE_OPENSSL
++    /// CA certificate(s) to use when verifying client certificates
++    X509_NAME_STACK_Pointer clientCaStack;
++#else
++    void *clientCaStack = nullptr;
++#endif
++
+     SBuf dh;            ///&lt; Diffi-Helman cipher config
+     SBuf dhParamsFile;  ///&lt; Diffi-Helman ciphers parameter file
+     SBuf eecdhCurve;    ///&lt; Elliptic curve for ephemeral EC-based DH key exchanges
+----++++src/ssl/gadgets.h
+@@ -67,9 +67,6 @@ typedef std::unique_ptr&lt;RSA, HardFun&lt;void, RSA*, &amp;RSA_free&gt;&gt; RSA_Pointer;
+ 
+ typedef std::unique_ptr&lt;X509_REQ, HardFun&lt;void, X509_REQ*, &amp;X509_REQ_free&gt;&gt; X509_REQ_Pointer;
+ 
+-sk_dtor_wrapper(sk_X509_NAME, STACK_OF(X509_NAME) *, X509_NAME_free);
+-typedef std::unique_ptr&lt;STACK_OF(X509_NAME), sk_X509_NAME_free_wrapper&gt; X509_NAME_STACK_Pointer;
+-
+ typedef std::unique_ptr&lt;AUTHORITY_KEYID, HardFun&lt;void, AUTHORITY_KEYID*, &amp;AUTHORITY_KEYID_free&gt;&gt; AUTHORITY_KEYID_Pointer;
+ 
+ sk_dtor_wrapper(sk_GENERAL_NAME, STACK_OF(GENERAL_NAME) *, GENERAL_NAME_free);
+----++++src/ssl/support.cc
+@@ -376,6 +376,12 @@ ssl_verify_cb(int ok, X509_STORE_CTX * ctx)
+     return ok;
+ }
+ 
++void
++Ssl::SetupVerifyCallback(Security::ContextPointer &amp;ctx)
++{
++    SSL_CTX_set_verify(ctx.get(), SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, ssl_verify_cb);
++}
++
+ // &quot;dup&quot; function for SSL_get_ex_new_index(&quot;cert_err_check&quot;)
+ #if SQUID_USE_CONST_CRYPTO_EX_DATA_DUP
+ static int
+@@ -533,31 +539,7 @@ configureSslContext(Security::ContextPointer &amp;ctx, AnyP::PortCfg &amp;port)
+ 
+     port.secure.updateContextEecdh(ctx);
+     port.secure.updateContextCa(ctx);
+-
+-    if (port.clientCA.get()) {
+-        ERR_clear_error();
+-        if (STACK_OF(X509_NAME) *clientca = SSL_dup_CA_list(port.clientCA.get())) {
+-            SSL_CTX_set_client_CA_list(ctx.get(), clientca);
+-        } else {
+-            ssl_error = ERR_get_error();
+-            debugs(83, DBG_CRITICAL, &quot;ERROR: Failed to dupe the client CA list: &quot; &lt;&lt; Security::ErrorString(ssl_error));
+-            return false;
+-        }
+-
+-        if (port.secure.parsedFlags &amp; SSL_FLAG_DELAYED_AUTH) {
+-            debugs(83, 9, &quot;Not requesting client certificates until acl processing requires one&quot;);
+-            SSL_CTX_set_verify(ctx.get(), SSL_VERIFY_NONE, NULL);
+-        } else {
+-            debugs(83, 9, &quot;Requiring client certificates.&quot;);
+-            SSL_CTX_set_verify(ctx.get(), SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, ssl_verify_cb);
+-        }
+-
+-        port.secure.updateContextCrl(ctx);
+-
+-    } else {
+-        debugs(83, 9, &quot;Not requiring any client certificates&quot;);
+-        SSL_CTX_set_verify(ctx.get(), SSL_VERIFY_NONE, NULL);
+-    }
++    port.secure.updateContextClientCa(ctx);
+ 
+     if (port.secure.parsedFlags &amp; SSL_FLAG_DONT_VERIFY_DOMAIN)
+         SSL_CTX_set_ex_data(ctx.get(), ssl_ctx_ex_index_dont_verify_domain, (void *) -1);
+@@ -678,11 +660,11 @@ Ssl::InitClientContext(Security::ContextPointer &amp;ctx, Security::PeerOptions &amp;pee
+     maybeSetupRsaCallback(ctx);
+ 
+     if (fl &amp; SSL_FLAG_DONT_VERIFY_PEER) {
+-        debugs(83, 2, "NOTICE: Peer certificates are not verified for validity!");
++        debugs(83, 2, "SECURITY WARNING: Peer certificates are not verified for validity!");
+         SSL_CTX_set_verify(ctx.get(), SSL_VERIFY_NONE, NULL);
+     } else {
+         debugs(83, 9, &quot;Setting certificate verification callback.&quot;);
+-        SSL_CTX_set_verify(ctx.get(), SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, ssl_verify_cb);
++        Ssl::SetupVerifyCallback(ctx);
+     }
+ 
+     return true;
+----++++src/ssl/support.h
+@@ -79,6 +79,9 @@ bool InitServerContext(Security::ContextPointer &amp;, AnyP::PortCfg &amp;);
+ /// initialize a TLS client context with OpenSSL specific settings
+ bool InitClientContext(Security::ContextPointer &amp;, Security::PeerOptions &amp;, long flags);
+ 
++/// set the certificate verify callback for a context
++void SetupVerifyCallback(Security::ContextPointer &amp;);
++
+ } //namespace Ssl
+ 
+ /// \ingroup ServerProtocolSSLAPI
+----++++src/tests/stub_libsecurity.cc
+@@ -87,11 +87,14 @@ void parse_securePeerOptions(Security::PeerOptions *) STUB
+ 
+ #include &quot;security/ServerOptions.h&quot;
+ //Security::ServerOptions::ServerOptions(const Security::ServerOptions &amp;) STUB
++Security::ServerOptions &amp;Security::ServerOptions::operator=(Security::ServerOptions const&amp;) STUB_RETVAL(*this);
+ void Security::ServerOptions::parse(const char *) STUB
+ void Security::ServerOptions::dumpCfg(Packable *, const char *) const STUB
+ Security::ContextPointer Security::ServerOptions::createBlankContext() const STUB_RETVAL(Security::ContextPointer())
+ bool Security::ServerOptions::createStaticServerContext(AnyP::PortCfg &amp;) STUB_RETVAL(false)
+ void Security::ServerOptions::updateContextEecdh(Security::ContextPointer &amp;) STUB
++void Security::ServerOptions::updateContextClientCa(Security::ContextPointer &amp;) STUB
++void Security::ServerOptions::syncCaFiles() STUB
+ 
+ #include &quot;security/Session.h&quot;
+ namespace Security {
+----++++GitHub

@@ -28,7 +28,7 @@ def get_log_function_pattern(repos):
     log_functions = retrieve_log_function(log_function_file_name)
 
     # concate log functions to create log pattern
-    regrex_string = r'('
+    regrex_string = r'\W('
     for log_function in log_functions:
         regrex_string += log_function + r'|'
     regrex_string = regrex_string[:-1]

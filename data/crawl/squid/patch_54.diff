@@ -1,0 +1,160 @@
+----++++src/FwdState.cc
+@@ -123,7 +123,8 @@ void
+ FwdState::closeServerConnection(const char *reason)
+ {
+     debugs(17, 3, &quot;because &quot; &lt;&lt; reason &lt;&lt; &quot;; &quot; &lt;&lt; serverConn);
+-    comm_remove_close_handler(serverConn-&gt;fd, fwdServerClosedWrapper, this);
++    comm_remove_close_handler(serverConn-&gt;fd, closeHandler);
++    closeHandler = NULL;
+     fwdPconnPool-&gt;noteUses(fd_table[serverConn-&gt;fd].pconn.uses);
+     serverConn-&gt;close();
+ }
+@@ -456,7 +457,8 @@ FwdState::unregister(Comm::ConnectionPointer &amp;conn)
+     debugs(17, 3, HERE &lt;&lt; entry-&gt;url() );
+     assert(serverConnection() == conn);
+     assert(Comm::IsConnOpen(conn));
+-    comm_remove_close_handler(conn-&gt;fd, fwdServerClosedWrapper, this);
++    comm_remove_close_handler(conn-&gt;fd, closeHandler);
++    closeHandler = NULL;
+     serverConn = NULL;
+ }
+ 
+@@ -687,7 +689,7 @@ FwdState::connectDone(const Comm::ConnectionPointer &amp;conn, Comm::Flag status, in
+     serverConn = conn;
+     debugs(17, 3, HERE &lt;&lt; serverConnection() &lt;&lt; &quot;: &#39;&quot; &lt;&lt; entry-&gt;url() &lt;&lt; &quot;&#39;&quot; );
+ 
+-    comm_add_close_handler(serverConnection()-&gt;fd, fwdServerClosedWrapper, this);
++    closeHandler = comm_add_close_handler(serverConnection()-&gt;fd, fwdServerClosedWrapper, this);
+ 
+ #if USE_OPENSSL
+     if (!request-&gt;flags.pinned) {
+@@ -865,7 +867,8 @@ FwdState::connectStart()
+             request-&gt;flags.pinned = true;
+             if (pinned_connection-&gt;pinnedAuth())
+                 request-&gt;flags.auth = true;
+-            comm_add_close_handler(serverConn-&gt;fd, fwdServerClosedWrapper, this);
++
++            closeHandler = comm_add_close_handler(serverConn-&gt;fd,  fwdServerClosedWrapper, this);
+ 
+             syncWithServerConn(pinned_connection-&gt;pinning.host);
+ 
+@@ -904,7 +907,7 @@ FwdState::connectStart()
+         debugs(17, 3, HERE &lt;&lt; &quot;reusing pconn &quot; &lt;&lt; serverConnection());
+         ++n_tries;
+ 
+-        comm_add_close_handler(serverConnection()-&gt;fd, fwdServerClosedWrapper, this);
++        closeHandler = comm_add_close_handler(serverConnection()-&gt;fd,  fwdServerClosedWrapper, this);
+ 
+         syncWithServerConn(request-&gt;url.host());
+ 
+----++++src/FwdState.h
+@@ -153,6 +153,8 @@ class FwdState : public RefCountable
+ 
+     Comm::ConnectionPointer serverConn; ///&lt; a successfully opened connection to a server.
+ 
++    AsyncCall::Pointer closeHandler; ///&lt; The serverConn close handler
++
+     /// possible pconn race states
+     typedef enum { raceImpossible, racePossible, raceHappened } PconnRace;
+     PconnRace pconnRace; ///&lt; current pconn race state
+----++++src/clients/Client.h
+@@ -104,7 +104,9 @@ class Client:
+     virtual void sentRequestBody(const CommIoCbParams &amp;io) = 0;
+     virtual void doneSendingRequestBody() = 0;
+ 
+-    virtual void closeServer() = 0;            /**&lt; end communication with the server */
++    /// Use this to end communication with the server. The call cancels our
++    /// closure handler and tells FwdState to forget about the connection.
++    virtual void closeServer() = 0;
+     virtual bool doneWithServer() const = 0;   /**&lt; did we end communication? */
+     /// whether we may receive more virgin response body bytes
+     virtual bool mayReadVirginReplyBody() const = 0;
+----++++src/comm.cc
+@@ -972,7 +972,7 @@ comm_udp_sendto(int fd,
+     return Comm::COMM_ERROR;
+ }
+ 
+-void
++AsyncCall::Pointer
+ comm_add_close_handler(int fd, CLCB * handler, void *data)
+ {
+     debugs(5, 5, &quot;comm_add_close_handler: FD &quot; &lt;&lt; fd &lt;&lt; &quot;, handler=&quot; &lt;&lt;
+@@ -981,6 +981,7 @@ comm_add_close_handler(int fd, CLCB * handler, void *data)
+     AsyncCall::Pointer call=commCbCall(5,4, &quot;SomeCloseHandler&quot;,
+                                        CommCloseCbPtrFun(handler, data));
+     comm_add_close_handler(fd, call);
++    return call;
+ }
+ 
+ void
+----++++src/comm.h
+@@ -79,7 +79,7 @@ int ignoreErrno(int);
+ void commCloseAllSockets(void);
+ void checkTimeouts(void);
+ 
+-void comm_add_close_handler(int fd, CLCB *, void *);
++AsyncCall::Pointer comm_add_close_handler(int fd, CLCB *, void *);
+ void comm_add_close_handler(int fd, AsyncCall::Pointer &amp;);
+ void comm_remove_close_handler(int fd, CLCB *, void *);
+ void comm_remove_close_handler(int fd, AsyncCall::Pointer &amp;);
+----++++src/http.cc
+@@ -166,7 +166,8 @@ HttpStateData::httpTimeout(const CommTimeoutCbParams &amp;)
+         fwd-&gt;fail(new ErrorState(ERR_READ_TIMEOUT, Http::scGatewayTimeout, fwd-&gt;request));
+     }
+ 
+-    serverConnection-&gt;close();
++    closeServer();
++    mustStop(&quot;HttpStateData::httpTimeout&quot;);
+ }
+ 
+ /// Remove an existing public store entry if the incoming response (to be
+@@ -1234,8 +1235,8 @@ HttpStateData::readReply(const CommIoCbParams &amp;io)
+         err-&gt;xerrno = rd.xerrno;
+         fwd-&gt;fail(err);
+         flags.do_next_read = false;
+-        io.conn-&gt;close();
+-
++        closeServer();
++        mustStop("HttpStateData::readReply");
+         return;
+     }
+ 
+@@ -1335,7 +1336,8 @@ HttpStateData::continueAfterParsingHeader()
+     entry-&gt;reset();
+     fwd-&gt;fail(new ErrorState(error, Http::scBadGateway, fwd-&gt;request));
+     flags.do_next_read = false;
+-    serverConnection-&gt;close();
++    closeServer();
++    mustStop(&quot;HttpStateData::continueAfterParsingHeader&quot;);
+     return false; // quit on error
+ }
+ 
+@@ -1599,7 +1601,8 @@ HttpStateData::wroteLast(const CommIoCbParams &amp;io)
+         ErrorState *err = new ErrorState(ERR_WRITE_ERROR, Http::scBadGateway, fwd-&gt;request);
+         err-&gt;xerrno = io.xerrno;
+         fwd-&gt;fail(err);
+-        serverConnection-&gt;close();
++        closeServer();
++        mustStop(&quot;HttpStateData::wroteLast&quot;);
+         return;
+     }
+ 
+@@ -1627,7 +1630,6 @@ HttpStateData::sendComplete()
+     request-&gt;hier.peer_http_request_sent = current_time;
+ }
+ 
+-// Close the HTTP server connection. Used by serverComplete().
+ void
+ HttpStateData::closeServer()
+ {
+@@ -2426,7 +2428,8 @@ HttpStateData::handleMoreRequestBodyAvailable()
+             debugs(11, DBG_IMPORTANT, &quot;http handleMoreRequestBodyAvailable: Likely proxy abuse detected &#39;&quot; &lt;&lt; request-&gt;client_addr &lt;&lt; &quot;&#39; -&gt; &#39;&quot; &lt;&lt; entry-&gt;url() &lt;&lt; &quot;&#39;&quot; );
+ 
+             if (virginReply()-&gt;sline.status() == Http::scInvalidHeader) {
+-                serverConnection-&gt;close();
++                closeServer();
++                mustStop(&quot;HttpStateData::handleMoreRequestBodyAvailable&quot;);
+                 return;
+             }
+         }
+----++++GitHub

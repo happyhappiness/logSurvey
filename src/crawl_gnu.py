@@ -6,7 +6,7 @@ import csv
 import my_util
 
 # some constants
-REPOS_NAME = 'wget'
+REPOS_NAME = 'tar'
 LOG_PATTERN = my_util.get_log_function_pattern(REPOS_NAME)
 MAIN_URL = 'http://git.savannah.gnu.org'
 
@@ -129,7 +129,9 @@ def analyze_commit_list(commit_list_page, total_counter, counter, writer):
             is_next_list = re.search(next_list_page_pattern, line, re.I)
             if is_next_list:
                 analyze_commit_list(is_next_list.group(1), total_counter, counter, writer)
-                return
+            else:
+                print 'end of repos'
+            return
         else:
             # retrieve commit address
             is_commit = re.search(commit_page_pattern, line, re.I)
@@ -139,10 +141,10 @@ def analyze_commit_list(commit_list_page, total_counter, counter, writer):
                 # update commit counter and total counter
                 commit_count += 1
                 total_counter += 1
-                if total_counter % 10 == 0:
+                if total_counter % 5 == 0:
                     print 'now analyzing %d total commit, find %d log commit' %(total_counter, counter)
     
-    print 'can not find next page'
+    print 'end of repos'
 
 """
 main function

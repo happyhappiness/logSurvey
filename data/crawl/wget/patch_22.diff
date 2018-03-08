@@ -1,20 +1,236 @@
-diff --git a/src/ftp.c b/src/ftp.c
-index c443630..8501f22 100644
---- a/src/ftp.c
-+++ b/src/ftp.c
-@@ -561,10 +561,10 @@ Error in server response, closing control connection.\n"));
-                 logputs (LOG_VERBOSE, "done.");
+diff --git a/src/log.c b/src/log.c
+index a1338ca..e122238 100644
+--- a/src/log.c
++++ b/src/log.c
+@@ -80,6 +80,18 @@ as that of the covered work.  */
+    logging is inhibited, logfp is set back to NULL. */
+ static FILE *logfp;
  
-               if (!opt.server_response)
--                logprintf (LOG_VERBOSE, "  ==> PROT %c ... ", prot);
-+                logprintf (LOG_VERBOSE, "  ==> PROT %c ... ", (int) prot);
-               if ((err = ftp_prot (csock, prot)) == FTPNOPROT)
-                 {
--                  logprintf (LOG_NOTQUIET, _("Server did not accept the 'PROT %c' command.\n"), prot);
-+                  logprintf (LOG_NOTQUIET, _("Server did not accept the 'PROT %c' command.\n"), (int) prot);
-                   return err;
-                 }
-               if (!opt.server_response)
++/* Descriptor of the stdout|stderr */
++static FILE *stdlogfp;
++
++/* Descriptor of the wget.log* file (if created) */
++static FILE *filelogfp;
++
++/* Name of log file */
++static char *logfile;
++
++/* Is interactive shell ? */
++static int shell_is_interactive;
++
+ /* A second file descriptor pointing to the temporary log file for the
+    WARC writer.  If WARC writing is disabled, this is NULL.  */
+ static FILE *warclogfp;
+@@ -611,16 +623,18 @@ log_init (const char *file, bool appendp)
+     {
+       if (HYPHENP (file))
+         {
+-          logfp = stdout;
++          stdlogfp = stdout;
++          logfp = stdlogfp;
+         }
+       else
+         {
+-          logfp = fopen (file, appendp ? "a" : "w");
+-          if (!logfp)
++          filelogfp = fopen (file, appendp ? "a" : "w");
++          if (!filelogfp)
+             {
+               fprintf (stderr, "%s: %s: %s\n", exec_name, file, strerror (errno));
+               exit (WGET_EXIT_GENERIC_ERROR);
+             }
++          logfp = filelogfp;
+         }
+     }
+   else
+@@ -631,7 +645,8 @@ log_init (const char *file, bool appendp)
+          stderr only if the user actually specifies `-O -'.  He says
+          this inconsistency is harder to document, but is overall
+          easier on the user.  */
+-      logfp = stderr;
++      stdlogfp = stderr;
++      logfp = stdlogfp;
+ 
+       if (1
+ #ifdef HAVE_ISATTY
+@@ -646,6 +661,11 @@ log_init (const char *file, bool appendp)
+           save_context_p = true;
+         }
+     }
++
++#ifndef WINDOWS
++  /* Initialize this values so we don't have to ask every time we print line */
++  shell_is_interactive = isatty (STDIN_FILENO);
++#endif
+ }
+ 
+ /* Close LOGFP (only if we opened it, not if it's stderr), inhibit
+@@ -880,59 +900,78 @@ log_cleanup (void)
+ 
+ /* When SIGHUP or SIGUSR1 are received, the output is redirected
+    elsewhere.  Such redirection is only allowed once. */
+-static enum { RR_NONE, RR_REQUESTED, RR_DONE } redirect_request = RR_NONE;
+ static const char *redirect_request_signal_name;
+ 
+-/* Redirect output to `wget-log'.  */
++/* Redirect output to `wget-log' or back to stdout/stderr.  */
+ 
+-static void
+-redirect_output (void)
++void
++redirect_output (bool to_file, const char *signal_name)
+ {
+-  char *logfile;
+-  logfp = unique_create (DEFAULT_LOGFILE, false, &logfile);
+-  if (logfp)
++  if (to_file && logfp != filelogfp)
+     {
+-      fprintf (stderr, _("\n%s received, redirecting output to %s.\n"),
+-               redirect_request_signal_name, quote (logfile));
+-      xfree (logfile);
+-      /* Dump the context output to the newly opened log.  */
+-      log_dump_context ();
++      if (signal_name)
++        {
++          fprintf (stderr, "\n%s received.", signal_name);
++        }
++      if (!filelogfp)
++        {
++          filelogfp = unique_create (DEFAULT_LOGFILE, false, &logfile);
++          if (filelogfp)
++            {
++              fprintf (stderr, _("\nRedirecting output to %s.\n"),
++                  quote (logfile));
++              /* Store signal name to tell wget it's permanent redirect to log file */
++              redirect_request_signal_name = signal_name;
++              logfp = filelogfp;
++              /* Dump the context output to the newly opened log.  */
++              log_dump_context ();
++            }
++          else
++            {
++              /* Eek!  Opening the alternate log file has failed.  Nothing we
++                can do but disable printing completely. */
++              fprintf (stderr, _("%s: %s; disabling logging.\n"),
++                      (logfile) ? logfile : DEFAULT_LOGFILE, strerror (errno));
++              inhibit_logging = true;
++            }
++        }
++      else
++        {
++          fprintf (stderr, _("\nRedirecting output to %s.\n"),
++              quote (logfile));
++          logfp = filelogfp;
++          log_dump_context ();
++        }
+     }
+-  else
++  else if (!to_file && logfp != stdlogfp)
+     {
+-      /* Eek!  Opening the alternate log file has failed.  Nothing we
+-         can do but disable printing completely. */
+-      fprintf (stderr, _("\n%s received.\n"), redirect_request_signal_name);
+-      fprintf (stderr, _("%s: %s; disabling logging.\n"),
+-               (logfile) ? logfile : DEFAULT_LOGFILE, strerror (errno));
+-      inhibit_logging = true;
++      logfp = stdlogfp;
++      log_dump_context ();
+     }
+-  save_context_p = false;
+ }
+ 
+-/* Check whether a signal handler requested the output to be
+-   redirected. */
++/* Check whether there's a need to redirect output. */
+ 
+ static void
+ check_redirect_output (void)
+ {
+-  if (redirect_request == RR_REQUESTED)
++#ifndef WINDOWS
++  /* If it was redirected already to log file by SIGHUP or SIGUSR1,
++   * it was permanent and since that redirect_request_signal_name is set.
++   * If there was no SIGHUP or SIGUSR1 and shell is interactive
++   * we check if process is fg or bg before every line is printed.*/
++  if (!redirect_request_signal_name && shell_is_interactive)
+     {
+-      redirect_request = RR_DONE;
+-      redirect_output ();
++      if (tcgetpgrp (STDIN_FILENO) != getpgrp ())
++        {
++          // Process backgrounded
++          redirect_output (true,NULL);
++        }
++      else
++        {
++          // Process foregrounded
++          redirect_output (false,NULL);
++        }
+     }
+-}
+-
+-/* Request redirection at a convenient time.  This may be called from
+-   a signal handler. */
+-
+-void
+-log_request_redirect_output (const char *signal_name)
+-{
+-  if (redirect_request == RR_NONE && save_context_p)
+-    /* Request output redirection.  The request will be processed by
+-       check_redirect_output(), which is called from entry point log
+-       functions. */
+-    redirect_request = RR_REQUESTED;
+-  redirect_request_signal_name = signal_name;
++#endif /* WINDOWS */
+ }
+diff --git a/src/log.h b/src/log.h
+index 0ccc26d..c3b7fec 100644
+--- a/src/log.h
++++ b/src/log.h
+@@ -52,6 +52,7 @@ void log_init (const char *, bool);
+ void log_close (void);
+ void log_cleanup (void);
+ void log_request_redirect_output (const char *);
++void redirect_output (bool, const char *);
+ 
+ const char *escnonprint (const char *);
+ const char *escnonprint_uri (const char *);
+diff --git a/src/main.c b/src/main.c
+index d48e3b2..c2c7853 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -132,7 +132,7 @@ redirect_output_signal (int sig)
+     signal_name = "SIGUSR1";
+ #endif
+ 
+-  log_request_redirect_output (signal_name);
++  redirect_output (true,signal_name);
+   progress_schedule_redirect ();
+   signal (sig, redirect_output_signal);
+ }
+diff --git a/src/mswindows.c b/src/mswindows.c
+index 9735370..90e6ec4 100644
+--- a/src/mswindows.c
++++ b/src/mswindows.c
+@@ -53,9 +53,6 @@ as that of the covered work.  */
+ #endif
+ 
+ 
+-/* Defined in log.c.  */
+-void log_request_redirect_output (const char *);
+-
+ /* Windows version of xsleep in utils.c.  */
+ 
+ void
+@@ -98,7 +95,7 @@ static void
+ ws_hangup (const char *reason)
+ {
+   fprintf (stderr, _("Continuing in background.\n"));
+-  log_request_redirect_output (reason);
++  redirect_output (true, reason);
+ 
+   /* Detach process from the current console.  Under Windows 9x, if we
+      were launched from a 16-bit process (which is usually the case;
 -- 
 cgit v1.0-41-gc330
 

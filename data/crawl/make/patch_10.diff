@@ -1,0 +1,293 @@
+diff --git a/job.c b/job.c
+index c2ecf1f..220f637 100644
+--- a/job.c
++++ b/job.c
+@@ -1562,7 +1562,7 @@ start_waiting_job (struct child *c)
+   if (!c->remote
+       && ((job_slots_used > 0 && load_too_high ())
+ #ifdef WINDOWS32
+-          || (process_used_slots () >= MAXIMUM_WAIT_OBJECTS)
++          || process_table_full ()
+ #endif
+           ))
+     {
+@@ -1937,8 +1937,8 @@ load_too_high (void)
+   time_t now;
+ 
+ #ifdef WINDOWS32
+-  /* sub_proc.c cannot wait for more than MAXIMUM_WAIT_OBJECTS children */
+-  if (process_used_slots () >= MAXIMUM_WAIT_OBJECTS)
++  /* sub_proc.c is limited in the number of objects it can wait for. */
++  if (process_table_full ())
+     return 1;
+ #endif
+ 
+diff --git a/w32/include/sub_proc.h b/w32/include/sub_proc.h
+index 4afa4b4..4b7f10f 100644
+--- a/w32/include/sub_proc.h
++++ b/w32/include/sub_proc.h
+@@ -44,8 +44,11 @@ EXTERN_DECL(void process_register, (HANDLE proc));
+ EXTERN_DECL(HANDLE process_easy, (char** argv, char** env,
+                                   int outfd, int errfd));
+ EXTERN_DECL(BOOL process_kill, (HANDLE proc, int signal));
+-EXTERN_DECL(int process_used_slots, (VOID_DECL));
++EXTERN_DECL(BOOL process_table_full, (VOID_DECL));
++EXTERN_DECL(int process_table_usable_size, (VOID_DECL));
++EXTERN_DECL(int process_table_actual_size, (VOID_DECL));
+ EXTERN_DECL(DWORD process_set_handles, (HANDLE *handles));
++EXTERN_DECL(DWORD process_wait_for_multiple_objects, (DWORD, const HANDLE*, BOOL, DWORD));
+ 
+ /* support routines */
+ EXTERN_DECL(long process_errno, (HANDLE proc));
+diff --git a/w32/subproc/sub_proc.c b/w32/subproc/sub_proc.c
+index d34e840..af15dbc 100644
+--- a/w32/subproc/sub_proc.c
++++ b/w32/subproc/sub_proc.c
+@@ -14,6 +14,7 @@ A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+ You should have received a copy of the GNU General Public License along with
+ this program.  If not, see <http://www.gnu.org/licenses/>.  */
+ 
++#include <assert.h>
+ #include <config.h>
+ #include <stdlib.h>
+ #include <stdio.h>
+@@ -35,6 +36,13 @@ this program.  If not, see <http://www.gnu.org/licenses/>.  */
+ #include "proc.h"
+ #include "w32err.h"
+ #include "debug.h"
++#include "os.h"
++
++#define GMAKE_MAXIMUM_WAIT_OBJECTS (MAXIMUM_WAIT_OBJECTS * MAXIMUM_WAIT_OBJECTS)
++
++/* We need to move these special-case return codes out-of-band */
++#define GMAKE_WAIT_TIMEOUT      0xFFFF0102L
++#define GMAKE_WAIT_ABANDONED_0  0x00080000L
+ 
+ static char *make_command_line(char *shell_name, char *exec_path, char **argv);
+ 
+@@ -57,10 +65,72 @@ typedef struct sub_process_t {
+ } sub_process;
+ 
+ /* keep track of children so we can implement a waitpid-like routine */
+-static sub_process *proc_array[MAXIMUM_WAIT_OBJECTS];
++static sub_process *proc_array[GMAKE_MAXIMUM_WAIT_OBJECTS];
+ static int proc_index = 0;
+ static int fake_exits_pending = 0;
+ 
++/*
++ * Address the scalability limit intrisic to WaitForMultipleOjects by
++ * calling WaitForMultipleObjects on 64 element chunks of the input
++ * array with 0 timeout.  Exit with an appropriately conditioned result
++ * or repeat again every 10 ms if no handle has signaled and the
++ * requested timeout was not zero.
++ */
++DWORD process_wait_for_multiple_objects(
++  DWORD nCount,
++  const HANDLE *lpHandles,
++  BOOL bWaitAll,
++  DWORD dwMilliseconds
++)
++{
++  assert(nCount <= GMAKE_MAXIMUM_WAIT_OBJECTS);
++
++  if (nCount <= MAXIMUM_WAIT_OBJECTS) {
++    DWORD retVal =  WaitForMultipleObjects(nCount, lpHandles, bWaitAll, dwMilliseconds);
++    return (retVal == WAIT_TIMEOUT) ? GMAKE_WAIT_TIMEOUT : retVal;
++  } else {
++    for (;;) {
++      DWORD objectCount = nCount;
++      int blockCount  = 0;
++      DWORD retVal;
++
++      assert(bWaitAll == FALSE); /* This logic only works for this use case */
++      assert(dwMilliseconds == 0 || dwMilliseconds == INFINITE); /* No support for timeouts */
++
++      for (; objectCount > 0; blockCount++) {
++	DWORD n = objectCount <= MAXIMUM_WAIT_OBJECTS ? objectCount : MAXIMUM_WAIT_OBJECTS;
++	objectCount -= n;
++	retVal = WaitForMultipleObjects(n, &lpHandles[blockCount * MAXIMUM_WAIT_OBJECTS],
++					    FALSE, 0);
++	switch (retVal) {
++	  case WAIT_TIMEOUT:
++	    retVal = GMAKE_WAIT_TIMEOUT;
++	    continue;
++	    break;
++	  case WAIT_FAILED:
++	    fprintf(stderr,"WaitForMultipleOjbects failed waiting with error %d\n", GetLastError());
++	    break;
++	  default:
++	    if (retVal >= WAIT_ABANDONED_0) {
++	      assert(retVal < WAIT_ABANDONED_0 + MAXIMUM_WAIT_OBJECTS);
++	      retVal += blockCount * MAXIMUM_WAIT_OBJECTS - WAIT_ABANDONED_0 + GMAKE_WAIT_ABANDONED_0;
++	    } else {
++	      assert(retVal < WAIT_OBJECT_0 + MAXIMUM_WAIT_OBJECTS);
++	      retVal += blockCount * MAXIMUM_WAIT_OBJECTS;
++	    }
++	    break;
++	}
++
++	return retVal;
++
++      }
++
++      if (dwMilliseconds == 0) return retVal;
++
++      Sleep(10);  /* Sleep for 10 ms */
++    }
++  }
++}
+ 
+ /*
+  * Fill a HANDLE list with handles to wait for.
+@@ -114,7 +184,7 @@ process_adjust_wait_state(sub_process* pproc)
+ static sub_process *
+ process_wait_for_any_private(int block, DWORD* pdwWaitStatus)
+ {
+-        HANDLE handles[MAXIMUM_WAIT_OBJECTS];
++        HANDLE handles[GMAKE_MAXIMUM_WAIT_OBJECTS];
+         DWORD retval, which;
+         int i;
+ 
+@@ -131,7 +201,7 @@ process_wait_for_any_private(int block, DWORD* pdwWaitStatus)
+ 
+         /* wait for someone to exit */
+         if (!fake_exits_pending) {
+-                retval = WaitForMultipleObjects(proc_index, handles, FALSE, (block ? INFINITE : 0));
++                retval = process_wait_for_multiple_objects(proc_index, handles, FALSE, (block ? INFINITE : 0));
+                 which = retval - WAIT_OBJECT_0;
+         } else {
+                 fake_exits_pending--;
+@@ -141,10 +211,10 @@ process_wait_for_any_private(int block, DWORD* pdwWaitStatus)
+ 
+         /* If the pointer is not NULL, set the wait status result variable. */
+         if (pdwWaitStatus)
+-            *pdwWaitStatus = retval;
++                *pdwWaitStatus = (retval == GMAKE_WAIT_TIMEOUT) ? WAIT_TIMEOUT : retval;
+ 
+         /* return pointer to process */
+-        if ((retval == WAIT_TIMEOUT) || (retval == WAIT_FAILED)) {
++        if ((retval == GMAKE_WAIT_TIMEOUT) || (retval == WAIT_FAILED)) {
+                 return NULL;
+         }
+         else {
+@@ -166,25 +236,47 @@ process_kill(HANDLE proc, int signal)
+ }
+ 
+ /*
+- * Use this function to register processes you wish to wait for by
+- * calling process_file_io(NULL) or process_wait_any(). This must be done
+- * because it is possible for callers of this library to reuse the same
+- * handle for multiple processes launches :-(
++ * Returns true when we have no more available slots in our process table.
+  */
+-void
+-process_register(HANDLE proc)
++BOOL
++process_table_full()
+ {
+-        if (proc_index < MAXIMUM_WAIT_OBJECTS)
+-                proc_array[proc_index++] = (sub_process *) proc;
++  extern int shell_function_pid;
++
++  /* Reserve slots for jobserver_semaphore if we have one and the shell function if not active */
++  return(proc_index >= GMAKE_MAXIMUM_WAIT_OBJECTS - jobserver_enabled() - (shell_function_pid == 0));
+ }
+ 
+ /*
+- * Return the number of processes that we are still waiting for.
++ * Returns the maximum number of job slots we can support when using the jobserver.
+  */
+ int
+-process_used_slots(void)
++process_table_usable_size()
++{
++  /* Reserve slots for jobserver_semaphore and shell function */
++  return(GMAKE_MAXIMUM_WAIT_OBJECTS - 2);
++}
++
++/*
++ * Returns the actual size of the process table.
++ */
++int
++process_table_actual_size()
++{
++  return(GMAKE_MAXIMUM_WAIT_OBJECTS);
++}
++
++/*
++ * Use this function to register processes you wish to wait for by
++ * calling process_file_io(NULL) or process_wait_any(). This must be done
++ * because it is possible for callers of this library to reuse the same
++ * handle for multiple processes launches :-(
++ */
++void
++process_register(HANDLE proc)
+ {
+-        return proc_index;
++  assert(proc_index < GMAKE_MAXIMUM_WAIT_OBJECTS);
++  proc_array[proc_index++] = (sub_process *) proc;
+ }
+ 
+ /*
+@@ -1362,7 +1454,7 @@ process_easy(
+   HANDLE hProcess, tmpIn, tmpOut, tmpErr;
+   DWORD e;
+ 
+-  if (proc_index >= MAXIMUM_WAIT_OBJECTS) {
++  if (process_table_full()) {
+         DB (DB_JOBS, ("process_easy: All process slots used up\n"));
+         return INVALID_HANDLE_VALUE;
+   }
+diff --git a/w32/w32os.c b/w32/w32os.c
+index 533b910..b1485fe 100644
+--- a/w32/w32os.c
++++ b/w32/w32os.c
+@@ -36,13 +36,11 @@ static HANDLE jobserver_semaphore = NULL;
+ unsigned int
+ jobserver_setup (int slots)
+ {
+-  /* sub_proc.c cannot wait for more than MAXIMUM_WAIT_OBJECTS objects
+-   * and one of them is the job-server semaphore object.  Limit the
+-   * number of available job slots to (MAXIMUM_WAIT_OBJECTS - 1). */
++  /* sub_proc.c is limited in the number of objects it can wait for. */
+ 
+-  if (slots >= MAXIMUM_WAIT_OBJECTS)
++  if (slots > process_table_usable_size())
+     {
+-      slots = MAXIMUM_WAIT_OBJECTS - 1;
++      slots = process_table_usable_size();
+       DB (DB_JOBS, (_("Jobserver slots limited to %d\n"), slots));
+     }
+ 
+@@ -168,22 +166,26 @@ jobserver_pre_acquire ()
+ unsigned int
+ jobserver_acquire (int timeout)
+ {
+-    HANDLE handles[MAXIMUM_WAIT_OBJECTS];
++    HANDLE *handles;
+     DWORD dwHandleCount;
+     DWORD dwEvent;
+ 
++    handles = xmalloc(process_table_actual_size() * sizeof(HANDLE));
++
+     /* Add jobserver semaphore to first slot. */
+     handles[0] = jobserver_semaphore;
+ 
+     /* Build array of handles to wait for.  */
+     dwHandleCount = 1 + process_set_handles (&handles[1]);
+ 
+-    dwEvent = WaitForMultipleObjects (
++    dwEvent = process_wait_for_multiple_objects (
+         dwHandleCount,  /* number of objects in array */
+         handles,        /* array of objects */
+         FALSE,          /* wait for any object */
+         INFINITE);      /* wait until object is signalled */
+ 
++    free(handles);
++
+     if (dwEvent == WAIT_FAILED)
+       {
+         DWORD err = GetLastError ();
+-- 
+cgit v1.0-41-gc330
+

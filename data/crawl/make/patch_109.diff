@@ -1,0 +1,2923 @@
+diff --git a/ChangeLog b/ChangeLog
+index 03f9145..12bf933 100644
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -1,3 +1,56 @@
++2009-09-23  Paul  <psmith@gnu.org>
++
++	Rework the way secondary expansion is stored, for efficiency.
++	This changes secondary expansion so that ONLY WHEN we know we have
++	a possibility of needing secondary expansion, do we defer the
++	secondary expansion.  This means more parsing the deps but we use
++	a lot less memory (due to the strcache).  Also, this fixes
++	Savannah bug #18622.
++
++	* read.c (eval): Don't parse the dep string here anymore.
++	(record_files): Take the dep argument as an unparsed string.  If
++	secondary expansion is enabled AND the prereq string has a '$' in
++	it, then set NEED_2ND_EXPANSION and keep the entire string.
++	Otherwise, parse the dep string here to construct the dep list
++	with the names in the strcache.
++
++	* misc.c (copy_dep_chain): For NEED_2ND_EXPANSION, we need to
++	duplicate the name string (others are in the strcache).
++
++	* implicit.c: Remove struct idep and free_idep_chain(): unused.
++	(struct patdeps): New structure to store prereq information.
++	(pattern_search): Use the NEED_2ND_EXPANSION flag to determine
++	which prerequisites need expansion, and expand only those.
++
++	* file.c (split_prereqs): Break parse_prereqs() into two parts: this
++	and enter_prereqs().  split_prereqs() takes a fully-expanded string
++	and splits it into a DEP list, handling order-only prereqs.
++	(enter_prereqs): This function enters a list of DEPs into the file
++	database.  If there's a stem defined, expand any pattern chars.
++	(expand_deps): Only try to expand DEPs which have NEED_2ND_EXPANSION
++	set.  Use the above functions.
++	(snap_deps): Only perform second expansion on prereqs that need it,
++	as defined by the NEED_2ND_EXPANSION flag.
++	(print_prereqs): New function to print the prereqs
++	(print_file): Call print_prereqs() rather than print inline.
++
++	* hash.h (STRING_COMPARE): Take advantage of strcache() by
++	comparing pointers.
++	(STRING_N_COMPARE): Ditto.
++	(ISTRING_COMPARE): Ditto.
++
++	* dep.h (PARSE_FILE_SEQ): New macro to reduce casts.
++	(parse_file_seq): Return void*
++	* read.c (parse_file_seq): Return void*.
++	(eval): Invoke macroized version of parse_file_seq()
++	* default.c (set_default_suffixes): Ditto.
++	* file.c (split_prereqs): Ditto.
++	* function.c (string_glob): Ditto.
++	* main.c (main): Ditto.
++	* rule.c (install_pattern_rule): Ditto.
++
++	* filedef.h: Add split_prereqs(), enter_prereqs(), etc.
++
+ 2009-09-16  Paul Smith  <psmith@gnu.org>
+ 
+ 	* misc.c (alloc_dep, free_dep): Now that we have xcalloc(),
+diff --git a/commands.c b/commands.c
+index 94c4867..d9d7f53 100644
+--- a/commands.c
++++ b/commands.c
+@@ -116,7 +116,8 @@ set_file_variables (struct file *file)
+   for (d = file->deps; d != 0; d = d->next)
+     if (!d->ignore_mtime)
+       {
+-        less = dep_name (d);
++        if (!d->need_2nd_expansion)
++          less = dep_name (d);
+         break;
+       }
+ 
+@@ -153,7 +154,7 @@ set_file_variables (struct file *file)
+ 
+     plus_len = 0;
+     for (d = file->deps; d != 0; d = d->next)
+-      if (! d->ignore_mtime)
++      if (! d->ignore_mtime && ! d->need_2nd_expansion)
+ 	plus_len += strlen (dep_name (d)) + 1;
+     if (plus_len == 0)
+       plus_len++;
+@@ -164,7 +165,7 @@ set_file_variables (struct file *file)
+ 
+     qmark_len = plus_len + 1;	/* Will be this or less.  */
+     for (d = file->deps; d != 0; d = d->next)
+-      if (! d->ignore_mtime)
++      if (! d->ignore_mtime && ! d->need_2nd_expansion)
+         {
+           const char *c = dep_name (d);
+ 
+@@ -198,7 +199,7 @@ set_file_variables (struct file *file)
+ 
+     bar_len = 0;
+     for (d = file->deps; d != 0; d = d->next)
+-      if (d->ignore_mtime)
++      if (d->ignore_mtime && ! d->need_2nd_expansion)
+ 	bar_len += strlen (dep_name (d)) + 1;
+     if (bar_len == 0)
+       bar_len++;
+@@ -217,8 +218,12 @@ set_file_variables (struct file *file)
+ 
+     for (d = file->deps; d != 0; d = d->next)
+       {
+-	const char *c = dep_name (d);
++	const char *c;
+ 
++        if (d->need_2nd_expansion)
++          continue;
++
++        c = dep_name (d);
+ #ifndef	NO_ARCHIVES
+ 	if (ar_name (c))
+ 	  {
+diff --git a/default.c b/default.c
+index 763db6d..2787bf2 100644
+--- a/default.c
++++ b/default.c
+@@ -542,8 +542,9 @@ set_default_suffixes (void)
+   else
+     {
+       char *p = default_suffixes;
+-      suffix_file->deps = (struct dep *)
+-	parse_file_seq (&p, sizeof (struct dep), '\0', NULL, 0);
++      suffix_file->deps = enter_prereqs(PARSE_FILE_SEQ (&p, struct dep, '\0',
++                                                        NULL, 0),
++                                        NULL);
+       define_variable ("SUFFIXES", 8, default_suffixes, o_default, 0);
+     }
+ }
+diff --git a/dep.h b/dep.h
+index 67dac33..eda0211 100644
+--- a/dep.h
++++ b/dep.h
+@@ -61,11 +61,14 @@ struct nameseq
+ #define PARSEFS_EXISTS  (0x0004)
+ #define PARSEFS_NOCACHE (0x0008)
+ 
++#define PARSE_FILE_SEQ(_s,_t,_c,_p,_f) \
++            (_t *)parse_file_seq ((_s),sizeof (_t),(_c),(_p),(_f))
++
+ #ifdef VMS
+-struct nameseq *parse_file_seq ();
++void *parse_file_seq ();
+ #else
+-struct nameseq *parse_file_seq (char **stringp, unsigned int size,
+-                                int stopchar, const char *prefix, int flags);
++void *parse_file_seq (char **stringp, unsigned int size,
++                      int stopchar, const char *prefix, int flags);
+ #endif
+ 
+ char *tilde_expand (const char *name);
+diff --git a/expand.c b/expand.c
+index b5d5338..6cdf4ea 100644
+--- a/expand.c
++++ b/expand.c
+@@ -407,8 +407,8 @@ variable_expand_string (char *line, const char *string, long length)
+ 
+       if (*p == '\0')
+ 	break;
+-      else
+-	++p;
++
++      ++p;
+     }
+ 
+   if (abuf)
+diff --git a/file.c b/file.c
+index 4e3bece..9e744b7 100644
+--- a/file.c
++++ b/file.c
+@@ -411,11 +411,13 @@ remove_intermediates (int sig)
+     }
+ }
+ 
++/* Given a string containing prerequisites (fully expanded), break it up into
++   a struct dep list.  Enter each of these prereqs into the file database.
++ */
+ struct dep *
+-parse_prereqs (char *p)
++split_prereqs (char *p)
+ {
+-  struct dep *new = (struct dep *)
+-    parse_file_seq (&p, sizeof (struct dep), '|', NULL, 0);
++  struct dep *new = PARSE_FILE_SEQ (&p, struct dep, '|', NULL, 0);
+ 
+   if (*p)
+     {
+@@ -424,8 +426,7 @@ parse_prereqs (char *p)
+       struct dep *ood;
+ 
+       ++p;
+-      ood = (struct dep *)
+-        parse_file_seq (&p, sizeof (struct dep), '\0', NULL, 0);
++      ood = PARSE_FILE_SEQ (&p, struct dep, '\0', NULL, 0);
+ 
+       if (! new)
+         new = ood;
+@@ -444,6 +445,85 @@ parse_prereqs (char *p)
+   return new;
+ }
+ 
++/* Given a list of prerequisites, enter them into the file database.
++   If STEM is set then first expand patterns using STEM.  */
++struct dep *
++enter_prereqs (struct dep *deps, const char *stem)
++{
++  struct dep *d1;
++
++  if (deps == 0)
++    return 0;
++
++  /* If we have a stem, expand the %'s.  We use patsubst_expand to translate
++     the prerequisites' patterns into plain prerequisite names.  */
++  if (stem)
++    {
++      const char *pattern = "%";
++      char *buffer = variable_expand ("");
++      struct dep *dp = deps, *dl = 0;
++
++      while (dp != 0)
++        {
++          char *percent;
++          int nl = strlen (dp->name) + 1;
++          char *nm = alloca (nl);
++          memcpy (nm, dp->name, nl);
++          percent = find_percent (nm);
++          if (percent)
++            {
++              char *o;
++
++              /* We have to handle empty stems specially, because that
++                 would be equivalent to $(patsubst %,dp->name,) which
++                 will always be empty.  */
++              if (stem[0] == '\0')
++                {
++                  memmove (percent, percent+1, strlen (percent));
++                  o = variable_buffer_output (buffer, nm, strlen (nm) + 1);
++                }
++              else
++                o = patsubst_expand_pat (buffer, stem, pattern, nm,
++                                         pattern+1, percent+1);
++
++              /* If the name expanded to the empty string, ignore it.  */
++              if (buffer[0] == '\0')
++                {
++                  struct dep *df = dp;
++                  if (dp == deps)
++                    dp = deps = deps->next;
++                  else
++                    dp = dl->next = dp->next;
++                  free_dep (df);
++                  continue;
++                }
++
++              /* Save the name.  */
++              dp->name = strcache_add_len (buffer, o - buffer);
++            }
++          dp->stem = stem;
++          dp->staticpattern = 1;
++          dl = dp;
++          dp = dp->next;
++        }
++    }
++
++  /* Enter them as files, unless they need a 2nd expansion.  */
++  for (d1 = deps; d1 != 0; d1 = d1->next)
++    {
++      if (d1->need_2nd_expansion)
++        continue;
++
++      d1->file = lookup_file (d1->name);
++      if (d1->file == 0)
++        d1->file = enter_file (d1->name);
++      d1->staticpattern = 0;
++      d1->name = 0;
++    }
++
++  return deps;
++}
++
+ /* Set the intermediate flag.  */
+ 
+ static void
+@@ -458,166 +538,94 @@ static void
+ expand_deps (struct file *f)
+ {
+   struct dep *d;
+-  struct dep *old = f->deps;
++  struct dep **dp;
+   const char *file_stem = f->stem;
+-  unsigned int last_dep_has_cmds = f->updating;
+   int initialized = 0;
+ 
+   f->updating = 0;
+-  f->deps = 0;
+ 
+-  for (d = old; d != 0; d = d->next)
++  /* Walk through the dependencies.  For any dependency that needs 2nd
++     expansion, expand it then insert the result into the list.  */
++  dp = &f->deps;
++  d = f->deps;
++  while (d != 0)
+     {
+-      struct dep *new, *d1;
+       char *p;
++      struct dep *new, *next;
++      char *name = (char *)d->name;
+ 
+-      if (! d->name)
+-        continue;
+-
+-      /* Create the dependency list.
+-         If we're not doing 2nd expansion, then it's just the name.  We will
+-         still need to massage it though.  */
+-      if (! d->need_2nd_expansion)
++      if (! d->name || ! d->need_2nd_expansion)
+         {
+-          p = variable_expand ("");
+-          variable_buffer_output (p, d->name, strlen (d->name) + 1);
+-          p = variable_buffer;
++          /* This one is all set already.  */
++          dp = &d->next;
++          d = d->next;
++          continue;
+         }
+-      else
+-        {
+-          /* If it's from a static pattern rule, convert the patterns into
+-             "$*" so they'll expand properly.  */
+-          if (d->staticpattern)
+-            {
+-              char *o;
+-              char *buffer = variable_expand ("");
+ 
+-              o = subst_expand (buffer, d->name, "%", "$*", 1, 2, 0);
++      /* If it's from a static pattern rule, convert the patterns into
++         "$*" so they'll expand properly.  */
++      if (d->staticpattern)
++        {
++          char *o;
++          d->name = o = variable_expand ("");
++          o = subst_expand (o, name, "%", "$*", 1, 2, 0);
++          *o = '\0';
++          free (name);
++          d->name = name = xstrdup (d->name);
++          d->staticpattern = 0;
++        }
+ 
+-              d->name = strcache_add_len (variable_buffer,
+-                                          o - variable_buffer);
+-              d->staticpattern = 0; /* Clear staticpattern so that we don't
+-                                       re-expand %s below. */
+-            }
++      /* We're going to do second expansion so initialize file variables for
++         the file. Since the stem for static pattern rules comes from
++         individual dep lines, we will temporarily set f->stem to d->stem.  */
++      if (!initialized)
++        {
++          initialize_file_variables (f, 0);
++          initialized = 1;
++        }
+ 
+-          /* We are going to do second expansion so initialize file variables
+-             for the file. Since the stem for static pattern rules comes from
+-             individual dep lines, we will temporarily set f->stem to d->stem.
+-          */
+-          if (!initialized)
+-            {
+-              initialize_file_variables (f, 0);
+-              initialized = 1;
+-            }
++      if (d->stem != 0)
++        f->stem = d->stem;
+ 
+-          if (d->stem != 0)
+-            f->stem = d->stem;
++      set_file_variables (f);
+ 
+-          set_file_variables (f);
++      p = variable_expand_for_file (d->name, f);
+ 
+-          p = variable_expand_for_file (d->name, f);
++      if (d->stem != 0)
++        f->stem = file_stem;
+ 
+-          if (d->stem != 0)
+-            f->stem = file_stem;
+-        }
++      /* At this point we don't need the name anymore: free it.  */
++      free (name);
+ 
+-      /* Parse the prerequisites.  */
+-      new = parse_prereqs (p);
++      /* Parse the prerequisites and enter them into the file database.  */
++      new = enter_prereqs (split_prereqs (p), d->stem);
+ 
+-      /* If this dep list was from a static pattern rule, expand the %s.  We
+-         use patsubst_expand to translate the prerequisites' patterns into
+-         plain prerequisite names.  */
+-      if (new && d->staticpattern)
++      /* If there were no prereqs here (blank!) then throw this one out.  */
++      if (new == 0)
+         {
+-          const char *pattern = "%";
+-          char *buffer = variable_expand ("");
+-          struct dep *dp = new, *dl = 0;
+-
+-          while (dp != 0)
+-            {
+-              char *percent;
+-              int nl = strlen (dp->name) + 1;
+-              char *nm = alloca (nl);
+-              memcpy (nm, dp->name, nl);
+-              percent = find_percent (nm);
+-              if (percent)
+-                {
+-                  char *o;
+-
+-                  /* We have to handle empty stems specially, because that
+-                     would be equivalent to $(patsubst %,dp->name,) which
+-                     will always be empty.  */
+-                  if (d->stem[0] == '\0')
+-                    {
+-                      memmove (percent, percent+1, strlen (percent));
+-                      o = variable_buffer_output (buffer, nm, strlen (nm) + 1);
+-                    }
+-                  else
+-                    o = patsubst_expand_pat (buffer, d->stem, pattern, nm,
+-                                             pattern+1, percent+1);
+-
+-                  /* If the name expanded to the empty string, ignore it.  */
+-                  if (buffer[0] == '\0')
+-                    {
+-                      struct dep *df = dp;
+-                      if (dp == new)
+-                        dp = new = new->next;
+-                      else
+-                        dp = dl->next = dp->next;
+-                      free_dep (df);
+-                      continue;
+-                    }
+-
+-                  /* Save the name.  */
+-                  dp->name = strcache_add_len (buffer, o - buffer);
+-                }
+-              dl = dp;
+-              dp = dp->next;
+-            }
++          *dp = d->next;
++          free_dep (d);
++          d = *dp;
++          continue;
+         }
+ 
+-      /* Enter them as files. */
+-      for (d1 = new; d1 != 0; d1 = d1->next)
+-        {
+-          d1->file = lookup_file (d1->name);
+-          if (d1->file == 0)
+-            d1->file = enter_file (d1->name);
+-          d1->name = 0;
+-          d1->staticpattern = 0;
+-          d1->need_2nd_expansion = 0;
+-        }
+-
+-      /* Add newly parsed deps to f->deps. If this is the last dependency
+-         line and this target has commands then put it in front so the
+-         last dependency line (the one with commands) ends up being the
+-         first. This is important because people expect $< to hold first
+-         prerequisite from the rule with commands. If it is not the last
+-         dependency line or the rule does not have commands then link it
+-         at the end so it appears in makefile order.  */
+-
+-      if (new != 0)
+-        {
+-          if (d->next == 0 && last_dep_has_cmds)
+-            {
+-              struct dep **d_ptr;
+-              for (d_ptr = &new; *d_ptr; d_ptr = &(*d_ptr)->next)
+-                ;
+-
+-              *d_ptr = f->deps;
+-              f->deps = new;
+-            }
+-          else
+-            {
+-              struct dep **d_ptr;
+-              for (d_ptr = &f->deps; *d_ptr; d_ptr = &(*d_ptr)->next)
+-                ;
+-
+-              *d_ptr = new;
+-            }
+-        }
++      /* Add newly parsed prerequisites.  */
++      next = d->next;
++      *dp = new;
++      for (dp = &new->next, d = new->next; d != 0; dp = &d->next, d = d->next)
++        ;
++      *dp = next;
++      d = *dp;
+     }
++}
++
++/* Reset the updating flag.  */
+ 
+-  free_dep_chain (old);
++static void
++reset_updating (const void *item)
++{
++  struct file *f = (struct file *) item;
++  f->updating = 0;
+ }
+ 
+ /* For each dependency of each file, make the `struct dep' point
+@@ -632,30 +640,44 @@ snap_deps (void)
+   struct file *f;
+   struct file *f2;
+   struct dep *d;
+-  struct file **file_slot_0;
+-  struct file **file_slot;
+-  struct file **file_end;
+ 
+   /* Remember that we've done this.  Once we start snapping deps we can no
+      longer define new targets.  */
+   snapped_deps = 1;
+ 
+-  /* Perform second expansion and enter each dependency name as a file. */
++  /* Perform second expansion and enter each dependency name as a file.  We
++     must use hash_dump() here because within these loops we likely add new
++     files to the table, possibly causing an in-situ table expansion.
+ 
+-  /* Expand .SUFFIXES first; it's dependencies are used for $$* calculation. */
+-  for (f = lookup_file (".SUFFIXES"); f != 0; f = f->prev)
+-    expand_deps (f);
++     We only need to do this if second_expansion has been defined; if it
++     hasn't then all deps were expanded as the makefile was read in.  If we
++     ever change make to be able to unset .SECONDARY_EXPANSION this will have
++     to change.  */
+ 
+-  /* For every target that's not .SUFFIXES, expand its dependencies.
+-     We must use hash_dump (), because within this loop we might add new files
+-     to the table, possibly causing an in-situ table expansion.  */
+-  file_slot_0 = (struct file **) hash_dump (&files, 0, 0);
+-  file_end = file_slot_0 + files.ht_fill;
+-  for (file_slot = file_slot_0; file_slot < file_end; file_slot++)
+-    for (f = *file_slot; f != 0; f = f->prev)
+-      if (strcmp (f->name, ".SUFFIXES") != 0)
++  if (second_expansion)
++    {
++      struct file **file_slot_0 = (struct file **) hash_dump (&files, 0, 0);
++      struct file **file_end = file_slot_0 + files.ht_fill;
++      struct file **file_slot;
++      const char *suffixes;
++
++      /* Expand .SUFFIXES: its prerequisites are used for $$* calc.  */
++      f = lookup_file (".SUFFIXES");
++      suffixes = f ? f->name : 0;
++      for (; f != 0; f = f->prev)
+         expand_deps (f);
+-  free (file_slot_0);
++
++      /* For every target that's not .SUFFIXES, expand its prerequisites.  */
++
++      for (file_slot = file_slot_0; file_slot < file_end; file_slot++)
++        for (f = *file_slot; f != 0; f = f->prev)
++          if (f->name != suffixes)
++            expand_deps (f);
++      free (file_slot_0);
++    }
++  else
++    /* We're not doing second expansion, so reset updating.  */
++    hash_map (&files, reset_updating);
+ 
+   /* Now manage all the special targets.  */
+ 
+@@ -859,35 +881,40 @@ file_timestamp_sprintf (char *p, FILE_TIMESTAMP ts)
+ 
+ /* Print the data base of files.  */
+ 
+-static void
+-print_file (const void *item)
++void
++print_prereqs (const struct dep *deps)
+ {
+-  const struct file *f = item;
+-  struct dep *d;
+-  struct dep *ood = 0;
+-
+-  putchar ('\n');
+-  if (!f->is_target)
+-    puts (_("# Not a target:"));
+-  printf ("%s:%s", f->name, f->double_colon ? ":" : "");
++  const struct dep *ood = 0;
+ 
+   /* Print all normal dependencies; note any order-only deps.  */
+-  for (d = f->deps; d != 0; d = d->next)
+-    if (! d->ignore_mtime)
+-      printf (" %s", dep_name (d));
++  for (; deps != 0; deps = deps->next)
++    if (! deps->ignore_mtime)
++      printf (" %s", dep_name (deps));
+     else if (! ood)
+-      ood = d;
++      ood = deps;
+ 
+   /* Print order-only deps, if we have any.  */
+   if (ood)
+     {
+       printf (" | %s", dep_name (ood));
+-      for (d = ood->next; d != 0; d = d->next)
+-        if (d->ignore_mtime)
+-          printf (" %s", dep_name (d));
++      for (ood = ood->next; ood != 0; ood = ood->next)
++        if (ood->ignore_mtime)
++          printf (" %s", dep_name (ood));
+     }
+ 
+   putchar ('\n');
++}
++
++static void
++print_file (const void *item)
++{
++  const struct file *f = item;
++
++  putchar ('\n');
++  if (!f->is_target)
++    puts (_("# Not a target:"));
++  printf ("%s:%s", f->name, f->double_colon ? ":" : "");
++  print_prereqs (f->deps);
+ 
+   if (f->precious)
+     puts (_("#  Precious file (prerequisite of .PRECIOUS)."));
+@@ -906,6 +933,7 @@ print_file (const void *item)
+     puts (_("#  File is an intermediate prerequisite."));
+   if (f->also_make != 0)
+     {
++      const struct dep *d;
+       fputs (_("#  Also makes:"), stdout);
+       for (d = f->also_make; d != 0; d = d->next)
+ 	printf (" %s", dep_name (d));
+@@ -989,7 +1017,7 @@ print_file_data_base (void)
+ #define VERIFY_CACHED(_p,_n) \
+     do{\
+         if (_p->_n && _p->_n[0] && !strcache_iscached (_p->_n)) \
+-          printf ("%s: Field %s not cached: %s\n", _p->name, # _n, _p->_n); \
++          error (NULL, "%s: Field '%s' not cached: %s\n", _p->name, # _n, _p->_n); \
+     }while(0)
+ 
+ static void
+@@ -1006,7 +1034,8 @@ verify_file (const void *item)
+   /* Check the deps.  */
+   for (d = f->deps; d != 0; d = d->next)
+     {
+-      VERIFY_CACHED (d, name);
++      if (! d->need_2nd_expansion)
++        VERIFY_CACHED (d, name);
+       VERIFY_CACHED (d, stem);
+     }
+ }
+diff --git a/filedef.h b/filedef.h
+index fb6caef..0d09e16 100644
+--- a/filedef.h
++++ b/filedef.h
+@@ -102,7 +102,8 @@ extern struct file *suffix_file, *default_file;
+ 
+ struct file *lookup_file (const char *name);
+ struct file *enter_file (const char *name);
+-struct dep *parse_prereqs (char *prereqs);
++struct dep *split_prereqs (char *prereqstr);
++struct dep *enter_prereqs (struct dep *prereqs, const char *stem);
+ void remove_intermediates (int sig);
+ void snap_deps (void);
+ void rename_file (struct file *file, const char *name);
+@@ -111,6 +112,8 @@ void set_command_state (struct file *file, enum cmd_state state);
+ void notice_finished_file (struct file *file);
+ void init_hash_files (void);
+ char *build_target_list (char *old_list);
++void print_prereqs (const struct dep *deps);
++void print_file_data_base (void);
+ 
+ #if FILE_TIMESTAMP_HI_RES
+ # define FILE_TIMESTAMP_STAT_MODTIME(fname, st) \
+diff --git a/function.c b/function.c
+index 02dbbf8..a2adc31 100644
+--- a/function.c
++++ b/function.c
+@@ -355,7 +355,7 @@ string_glob (char *line)
+   struct nameseq *chain;
+   unsigned int idx;
+ 
+-  chain = parse_file_seq (&line, sizeof (struct nameseq), '\0', NULL,
++  chain = PARSE_FILE_SEQ (&line, struct nameseq, '\0', NULL,
+                           /* We do not want parse_file_seq to strip `./'s.
+                              That would break examples like:
+                              $(patsubst ./%.c,obj/%.o,$(wildcard ./?*.c)).  */
+diff --git a/hash.h b/hash.h
+index 02dbc8f..aaf69ad 100644
+--- a/hash.h
++++ b/hash.h
+@@ -79,6 +79,9 @@ extern void *hash_deleted_item;
+ 
+ /* hash and comparison macros for case-sensitive string keys. */
+ 
++/* Due to the strcache, it's not uncommon for the string pointers to
++   be identical.  Take advantage of that to short-circuit string compares.  */
++
+ #define STRING_HASH_1(KEY, RESULT) do { \
+   unsigned char const *_key_ = (unsigned char const *) (KEY) - 1; \
+   while (*++_key_) \
+@@ -102,10 +105,10 @@ extern void *hash_deleted_item;
+ } while (0)
+ 
+ #define STRING_COMPARE(X, Y, RESULT) do { \
+-  RESULT = strcmp ((X), (Y)); \
++    RESULT = (X) == (Y) ? 0 : strcmp ((X), (Y)); \
+ } while (0)
+ #define return_STRING_COMPARE(X, Y) do { \
+-  return strcmp ((X), (Y)); \
++  return (X) == (Y) ? 0 : strcmp ((X), (Y)); \
+ } while (0)
+ 
+ 
+@@ -138,10 +141,10 @@ extern void *hash_deleted_item;
+ } while (0)
+ 
+ #define STRING_N_COMPARE(X, Y, N, RESULT) do { \
+-  RESULT = strncmp ((X), (Y), (N)); \
++  RESULT = (X) == (Y) ? 0 : strncmp ((X), (Y), (N)); \
+ } while (0)
+ #define return_STRING_N_COMPARE(X, Y, N) do { \
+-  return strncmp ((X), (Y), (N)); \
++  return (X) == (Y) ? 0 : strncmp ((X), (Y), (N)); \
+ } while (0)
+ 
+ #ifdef HAVE_CASE_INSENSITIVE_FS
+@@ -171,10 +174,10 @@ extern void *hash_deleted_item;
+ } while (0)
+ 
+ #define ISTRING_COMPARE(X, Y, RESULT) do { \
+-  RESULT = strcasecmp ((X), (Y)); \
++  RESULT = (X) == (Y) ? 0 : strcasecmp ((X), (Y)); \
+ } while (0)
+ #define return_ISTRING_COMPARE(X, Y) do { \
+-  return strcasecmp ((X), (Y)); \
++  return (X) == (Y) ? 0 : strcasecmp ((X), (Y)); \
+ } while (0)
+ 
+ #else
+diff --git a/implicit.c b/implicit.c
+index 4285b66..2cb80fa 100644
+--- a/implicit.c
++++ b/implicit.c
+@@ -63,36 +63,11 @@ try_implicit_rule (struct file *file, unsigned int depth)
+ }
+ 
+ 
+-/* Struct idep captures information about implicit prerequisites
+-   that come from implicit rules. */
+-struct idep
+-{
+-  struct idep *next;              /* struct dep -compatible interface */
+-  const char *name;               /* name of the prerequisite */
+-  struct file *intermediate_file; /* intermediate file, 0 otherwise */
+-  const char *intermediate_pattern; /* pattern for intermediate file */
+-  unsigned char had_stem;         /* had % substituted with stem */
+-  unsigned char ignore_mtime;     /* ignore_mtime flag */
+-};
+-
+-static void
+-free_idep_chain (struct idep *p)
+-{
+-  struct idep *n;
+-
+-  for (; p != 0; p = n)
+-    {
+-      n = p->next;
+-      free (p);
+-    }
+-}
+-
+-
+ /* Scans the BUFFER for the next word with whitespace as a separator.
+    Returns the pointer to the beginning of the word. LENGTH hold the
+    length of the word.  */
+ 
+-static char *
++static const char *
+ get_next_word (const char *buffer, unsigned int *length)
+ {
+   const char *p = buffer, *beg;
+@@ -166,9 +141,22 @@ get_next_word (const char *buffer, unsigned int *length)
+   if (length)
+     *length = p - beg;
+ 
+-  return (char *)beg;
++  return beg;
+ }
+ 
++/* This structure stores information about the expanded prerequisites for a
++   pattern rule.  NAME is always set, to the strcache'd name of the prereq.
++   FILE and PATTERN will be set for intermediate files only.  IGNORE_MTIME is
++   copied from the prerequisite we expanded.
++ */
++struct patdeps
++  {
++    const char *name;
++    const char *pattern;
++    struct file *file;
++    unsigned int ignore_mtime : 1;
++  };
++
+ /* Search the pattern rules for a rule with an existing dependency to make
+    FILE.  If a rule is found, the appropriate commands and deps are put in FILE
+    and 1 is returned.  If not, 0 is returned.
+@@ -199,15 +187,15 @@ pattern_search (struct file *file, int archive,
+   /* This is a file-object used as an argument in
+      recursive calls.  It never contains any data
+      except during a recursive call.  */
+-  struct file *intermediate_file = 0;
++  struct file *int_file = 0;
+ 
+-  /* This linked list records all the prerequisites actually
+-     found for a rule along with some other useful information
+-     (see struct idep for details). */
+-  struct idep* deps = 0;
++  /* List of dependencies found recursively.  */
++  struct patdeps *deplist
++    = xmalloc (max_pattern_deps * sizeof (struct patdeps));
++  struct patdeps *pat = deplist;
+ 
+-  /* 1 if we need to remove explicit prerequisites, 0 otherwise. */
+-  unsigned int remove_explicit_deps = 0;
++  /* All the prerequisites actually found for a rule, after expansion.  */
++  struct dep *deps;
+ 
+   /* Names of possible dependencies are constructed in this buffer.  */
+   char *depname = alloca (namelen + max_pattern_dep_length);
+@@ -242,13 +230,13 @@ pattern_search (struct file *file, int archive,
+      that is not just `%'.  */
+   int specific_rule_matched = 0;
+ 
++  struct nameseq ns_simple;
++
+   unsigned int ri;  /* uninit checks OK */
+   struct rule *rule;
+-  struct dep *dep, *expl_d;
+ 
+-  struct idep *d;
+-  struct idep **id_ptr;
+-  struct dep **d_ptr;
++  char *pathdir = NULL;
++  unsigned long pathlen;
+ 
+   PATH_VAR (stem_str); /* @@ Need to get rid of stem, stemlen, etc. */
+ 
+@@ -283,8 +271,12 @@ pattern_search (struct file *file, int archive,
+ 	lastslash = 0;
+     }
+ 
+-  /* First see which pattern rules match this target
+-     and may be considered.  Put them in TRYRULES.  */
++  pathlen = lastslash - filename + 1;
++
++  ns_simple.next = 0;
++
++  /* First see which pattern rules match this target and may be considered.
++     Put them in TRYRULES.  */
+ 
+   nrules = 0;
+   for (rule = pattern_rules; rule != 0; rule = rule->next)
+@@ -349,11 +341,10 @@ pattern_search (struct file *file, int archive,
+ 	  if (check_lastslash)
+ 	    {
+ 	      /* If so, don't include the directory prefix in STEM here.  */
+-	      unsigned int difference = lastslash - filename + 1;
+-	      if (difference > stemlen)
++	      if (pathlen > stemlen)
+ 		continue;
+-	      stemlen -= difference;
+-	      stem += difference;
++	      stemlen -= pathlen;
++	      stem += pathlen;
+ 	    }
+ 
+ 	  /* Check that the rule pattern matches the text before the stem.  */
+@@ -415,46 +406,44 @@ pattern_search (struct file *file, int archive,
+   initialize_file_variables (file, 0);
+ 
+   /* Try each rule once without intermediate files, then once with them.  */
+-  for (intermed_ok = 0; intermed_ok == !!intermed_ok; ++intermed_ok)
++  for (intermed_ok = 0; intermed_ok < 2; ++intermed_ok)
+     {
+-      /* Try each pattern rule till we find one that applies.
+-	 If it does, expand its dependencies (as substituted)
+-	 and chain them in DEPS.  */
++      pat = deplist;
+ 
++      /* Try each pattern rule till we find one that applies.  If it does,
++	 expand its dependencies (as substituted) and chain them in DEPS.  */
+       for (ri = 0; ri < nrules; ri++)
+ 	{
++          struct dep *dep;
+           unsigned int failed = 0;
+-	  int check_lastslash;
++          int check_lastslash;
+           int file_variables_set = 0;
++          unsigned int deps_found = 0;
++          /* NPTR points to the part of the prereq we haven't processed.  */
++          const char *nptr = 0;
+ 
+ 	  rule = tryrules[ri];
+ 
+-          remove_explicit_deps = 0;
+-
+-	  /* RULE is nil when we discover that a rule,
+-	     already placed in TRYRULES, should not be applied.  */
++	  /* RULE is nil when we discover that a rule, already placed in
++	     TRYRULES, should not be applied.  */
+ 	  if (rule == 0)
+ 	    continue;
+ 
+-	  /* Reject any terminal rules if we're
+-	     looking to make intermediate files.  */
++	  /* Reject any terminal rules if we're looking to make intermediate
++	     files.  */
+ 	  if (intermed_ok && rule->terminal)
+ 	    continue;
+ 
+-	  /* Mark this rule as in use so a recursive
+-	     pattern_search won't try to use it.  */
+-	  rule->in_use = 1;
+-
+ 	  /* From the lengths of the filename and the matching pattern parts,
+ 	     find the stem: the part of the filename that matches the %.  */
+-	  stem = filename
+-	    + (rule->suffixes[matches[ri]] - rule->targets[matches[ri]]) - 1;
+-	  stemlen = namelen - rule->lens[matches[ri]] + 1;
++	  stem = filename + (rule->suffixes[matches[ri]]
++                             - rule->targets[matches[ri]]) - 1;
++	  stemlen = (namelen - rule->lens[matches[ri]]) + 1;
+ 	  check_lastslash = checked_lastslash[ri];
+ 	  if (check_lastslash)
+ 	    {
+-	      stem += lastslash - filename + 1;
+-	      stemlen -= (lastslash - filename) + 1;
++	      stem += pathlen;
++	      stemlen -= pathlen;
+ 	    }
+ 
+ 	  DBS (DB_IMPLICIT, (_("Trying pattern rule with stem `%.*s'.\n"),
+@@ -463,350 +452,345 @@ pattern_search (struct file *file, int archive,
+           strncpy (stem_str, stem, stemlen);
+           stem_str[stemlen] = '\0';
+ 
++          /* If there are no prerequisites, then this rule matches.  */
++          if (rule->deps == 0)
++            break;
++
+           /* Temporary assign STEM to file->stem (needed to set file
+              variables below).   */
+           file->stem = stem_str;
+ 
+-	  /* Try each dependency; see if it "exists".  */
++	  /* Mark this rule as in use so a recursive pattern_search won't try
++	     to use it.  */
++	  rule->in_use = 1;
+ 
+-	  for (dep = rule->deps; dep != 0; dep = dep->next)
+-	    {
+-              unsigned int len;
++	  /* Try each prerequisite; see if it exists or can be created.  We'll
++             build a list of prereq info in DEPLIST.  Due to 2nd expansion we
++             may have to process multiple prereqs for a single dep entry.  */
++
++          pat = deplist;
++          dep = rule->deps;
++          nptr = dep_name (dep);
++          while (1)
++            {
++              const char *dir = NULL;
++              struct nameseq *ns, *n;
+               char *p;
+-              char *p2;
+-              unsigned int order_only = 0; /* Set if '|' was seen. */
+-
+-              /* In an ideal world we would take the dependency line,
+-                 substitute the stem, re-expand the whole line and chop it
+-                 into individual prerequisites. Unfortunately this won't work
+-                 because of the "check_lastslash" twist.  Instead, we will
+-                 have to go word by word, taking $()'s into account, for each
+-                 word we will substitute the stem, re-expand, chop it up, and,
+-                 if check_lastslash != 0, add the directory part to each
+-                 resulting prerequisite.  */
+ 
+-              p = get_next_word (dep->name, &len);
++              /* If we need to add the directory prefix set it up.  */
++              if (check_lastslash)
++                {
++                  if (! pathdir)
++                    {
++                      pathdir = alloca (pathlen + 1);
++                      memcpy (pathdir, filename, pathlen);
++                      pathdir[pathlen] = '\0';
++                    }
++                  dir = pathdir;
++                }
+ 
+-              while (1)
++              /* If we're out of name to parse, start the next prereq.  */
++              if (! nptr)
+                 {
+-                  const char *dir = NULL;
+-                  int add_dir = 0;
+-                  int had_stem = 0;
++                  dep = dep->next;
++                  if (dep == 0)
++                    break;
++                  nptr = dep_name (dep);
++                }
+ 
++              /* If we don't need a second expansion, just replace the %.  */
++              if (! dep->need_2nd_expansion)
++                {
++                  p = strchr (nptr, '%');
+                   if (p == 0)
+-                    break; /* No more words */
+-
+-                  /* Is there a pattern in this prerequisite?  */
+-
+-                  for (p2 = p; p2 < p + len && *p2 != '%'; ++p2)
+-                    ;
+-
+-                  if (dep->need_2nd_expansion)
++                    ns_simple.name = nptr;
++                  else
+                     {
+-                      /* If the dependency name has %, substitute the stem.
+-
+-                         Watch out, we are going to do something tricky
+-                         here. If we just replace % with the stem value,
+-                         later, when we do the second expansion, we will
+-                         re-expand this stem value once again. This is not
+-                         good especially if you have certain characters in
+-                         your stem (like $).
++                      char *o = depname;
++                      if (check_lastslash)
++                        {
++                          memcpy (o, filename, pathlen);
++                          o += pathlen;
++                        }
++                      memcpy (o, nptr, p - nptr);
++                      o += p - nptr;
++                      memcpy (o, stem_str, stemlen);
++                      o += stemlen;
++                      strcpy (o, p + 1);
++                      ns_simple.name = strcache_add (depname);
++                    }
++                  ns = &ns_simple;
+ 
+-                         Instead, we will replace % with $* and allow the
+-                         second expansion to take care of it for us. This way
+-                         (since $* is a simple variable) there won't be
+-                         additional re-expansion of the stem.  */
++                  /* We've used up this dep, so next time get a new one.  */
++                  nptr = 0;
++                  ++deps_found;
++                }
+ 
+-                      if (p2 < p + len)
+-                        {
+-                          unsigned int i = p2 - p;
+-                          memcpy (depname, p, i);
+-                          memcpy (depname + i, "$*", 2);
+-                          memcpy (depname + i + 2, p2 + 1, len - i - 1);
+-                          depname[len + 2 - 1] = '\0';
++              /* We have to perform second expansion on this prereq.  In an
++                 ideal world we would take the dependency line, substitute the
++                 stem, re-expand the whole line and chop it into individual
++                 prerequisites.  Unfortunately this won't work because of the
++                 "check_lastslash" twist.  Instead, we will have to go word by
++                 word, taking $()'s into account.  For each word we will
++                 substitute the stem, re-expand, chop it up, and, if
++                 check_lastslash != 0, add the directory part to each
++                 resulting prerequisite.  */
++              else
++                {
++                  int order_only = 0;
++                  int add_dir = 0;
++                  unsigned int len;
+ 
+-                          if (check_lastslash)
+-                            add_dir = 1;
++                  nptr = get_next_word (nptr, &len);
++                  if (nptr == 0)
++                    continue;
+ 
+-                          had_stem = 1;
+-                        }
+-                      else
+-                        {
+-                          memcpy (depname, p, len);
+-                          depname[len] = '\0';
+-                        }
++                  /* If the dependency name has %, substitute the stem.  If we
++                     just replace % with the stem value then later, when we do
++                     the 2nd expansion, we will re-expand this stem value
++                     again.  This is not good if you have certain characters
++                     in your stem (like $).
+ 
+-                      /* Set file variables. Note that we cannot do it once
+-                         at the beginning of the function because of the stem
+-                         value.  */
+-                      if (!file_variables_set)
+-                        {
+-                          set_file_variables (file);
+-                          file_variables_set = 1;
+-                        }
++                     Instead, we will replace % with $* and allow the second
++                     expansion to take care of it for us.  This way (since $*
++                     is a simple variable) there won't be additional
++                     re-expansion of the stem.  */
+ 
+-                      p2 = variable_expand_for_file (depname, file);
++                  p = lindex (nptr, nptr + len, '%');
++                  if (p == 0)
++                    {
++                      memcpy (depname, nptr, len);
++                      depname[len] = '\0';
+                     }
+                   else
+                     {
+-                       if (p2 < p + len)
+-                        {
+-                          unsigned int i = p2 - p;
+-                          memcpy (depname, p, i);
+-                          memcpy (depname + i, stem_str, stemlen);
+-                          memcpy (depname + i + stemlen, p2 + 1, len - i - 1);
+-                          depname[len + stemlen - 1] = '\0';
+-
+-                          if (check_lastslash)
+-                            add_dir = 1;
+-
+-                          had_stem = 1;
+-                        }
+-                      else
+-                        {
+-                          memcpy (depname, p, len);
+-                          depname[len] = '\0';
+-                        }
+-
+-                       p2 = depname;
++                      unsigned int i = p - nptr;
++                      memcpy (depname, nptr, i);
++                      memcpy (depname + i, "$*", 2);
++                      memcpy (depname + i + 2, p + 1, len - i - 1);
++                      depname[len + 2 - 1] = '\0';
++
++                      if (check_lastslash)
++                        add_dir = 1;
+                     }
+ 
+-                  /* If we need to add the directory prefix set it up.  */
+-                  if (add_dir)
++                  /* Set file variables. Note that we cannot do it once at the
++                     beginning of the function because the stem value changes
++                     for each rule.  */
++                  if (!file_variables_set)
+                     {
+-                      unsigned long l = lastslash - filename + 1;
+-                      char *n = alloca (l + 1);
+-                      memcpy (n, filename, l);
+-                      n[l] = '\0';
+-                      dir = n;
++                      set_file_variables (file);
++                      file_variables_set = 1;
+                     }
+ 
+-                  /* Parse the dependencies. */
++                  /* Perform the 2nd expansion.  */
++                  p = variable_expand_for_file (depname, file);
+ 
+-                  while (1)
+-                    {
+-                      id_ptr = &deps;
++                  /* Parse the expanded string. */
++                  ns = parse_file_seq (&p, sizeof (struct dep),
++                                       order_only ? '\0' : '|',
++                                       add_dir ? dir : NULL, 0);
+ 
+-                      for (; *id_ptr; id_ptr = &(*id_ptr)->next)
+-                        ;
++                  for (n = ns; n != NULL; n = n->next)
++                    ++deps_found;
+ 
+-                      *id_ptr = (struct idep *)
+-                        parse_file_seq (&p2, sizeof (struct idep),
+-                                        order_only ? '\0' : '|', dir, 0);
+-
+-                      if (order_only || had_stem)
+-                        {
+-                          for (d = *id_ptr; d != 0; d = d->next)
+-                            {
+-                              if (order_only)
+-                                d->ignore_mtime = 1;
+-
+-                              if (had_stem)
+-                                d->had_stem = 1;
+-                            }
+-                        }
++                  /* Set up for the next word.  */
++                  nptr += len;
++                }
+ 
+-                      if (!order_only && *p2)
+-                      {
+-                        ++p2;
+-                        order_only = 1;
+-                        continue;
+-                      }
++              /* If there are more than max_pattern_deps prerequisites (due to
++                 2nd expansion), reset it and realloc the arrays.  */
+ 
+-                      break;
+-                    }
+-
+-                  p += len;
+-                  p = get_next_word (p, &len);
++              if (deps_found > max_pattern_deps)
++                {
++                  unsigned int l = pat - deplist;
++                  deplist = xrealloc (deplist,
++                                      deps_found * sizeof (struct patdeps));
++                  pat = deplist + l;
++                  max_pattern_deps = deps_found;
+                 }
+-	    }
+ 
+-          /* Reset the stem in FILE. */
+-
+-          file->stem = 0;
++              /* Go through the nameseq and handle each as a prereq name.  */
++              for (n = ns; n != 0; n = n->next)
++                {
++                  struct dep *expl_d;
++                  int is_rule = n->name == dep_name (dep);
+ 
+-          /* @@ This loop can be combined with the previous one. I do
+-             it separately for now for transparency.*/
++                  if (file_impossible_p (n->name))
++                    {
++                      /* If this prereq has already been ruled "impossible",
++                         then the rule fails.  Don't bother trying it on the
++                         second pass either since we know that will fail.  */
++                      DBS (DB_IMPLICIT,
++                           (is_rule
++                            ? _("Rejecting impossible rule prerequisite `%s'.\n")
++                            : _("Rejecting impossible implicit prerequisite `%s'.\n"),
++                            n->name));
++                      tryrules[ri] = 0;
++
++                      failed = 1;
++                      break;
++                    }
+ 
+-          for (d = deps; d != 0; d = d->next)
+-            {
+-              const char *name = d->name;
++                  memset (pat, '\0', sizeof (struct patdeps));
++                  pat->ignore_mtime = dep->ignore_mtime;
+ 
+-              if (file_impossible_p (name))
+-                {
+-                  /* If this dependency has already been ruled "impossible",
+-                     then the rule fails and don't bother trying it on the
+-                     second pass either since we know that will fail too.  */
+                   DBS (DB_IMPLICIT,
+-                       (d->had_stem
+-                        ? _("Rejecting impossible implicit prerequisite `%s'.\n")
+-                        : _("Rejecting impossible rule prerequisite `%s'.\n"),
+-                        name));
+-                  tryrules[ri] = 0;
++                       (is_rule
++                        ? _("Trying rule prerequisite `%s'.\n")
++                        : _("Trying implicit prerequisite `%s'.\n"), n->name));
+ 
+-                  failed = 1;
+-                  break;
+-                }
++                  /* If this prereq is also explicitly mentioned for FILE,
++                     skip all tests below since it must be built no matter
++                     which implicit rule we choose. */
+ 
+-              DBS (DB_IMPLICIT,
+-                   (d->had_stem
+-                    ? _("Trying implicit prerequisite `%s'.\n")
+-                    : _("Trying rule prerequisite `%s'.\n"), name));
++                  for (expl_d = file->deps; expl_d != 0; expl_d = expl_d->next)
++                    if (streq (dep_name (expl_d), n->name))
++                      break;
++                  if (expl_d != 0)
++                    {
++                      (pat++)->name = n->name;
++                      continue;
++                    }
+ 
+-              /* If this prerequisite also happened to be explicitly mentioned
+-                 for FILE skip all the test below since it it has to be built
+-                 anyway, no matter which implicit rule we choose. */
++                  /* The DEP->changed flag says that this dependency resides
++                     in a nonexistent directory.  So we normally can skip
++                     looking for the file.  However, if CHECK_LASTSLASH is
++                     set, then the dependency file we are actually looking for
++                     is in a different directory (the one gotten by prepending
++                     FILENAME's directory), so it might actually exist.  */
++
++                  /* @@ dep->changed check is disabled. */
++                  if (lookup_file (n->name) != 0
++                      /*|| ((!dep->changed || check_lastslash) && */
++                      || file_exists_p (n->name))
++                    {
++                      (pat++)->name = n->name;
++                      continue;
++                    }
+ 
+-              for (expl_d = file->deps; expl_d != 0; expl_d = expl_d->next)
+-                if (streq (dep_name (expl_d), name))
+-                  break;
+-              if (expl_d != 0)
+-                continue;
+-
+-              /* The DEP->changed flag says that this dependency resides in a
+-                 nonexistent directory.  So we normally can skip looking for
+-                 the file.  However, if CHECK_LASTSLASH is set, then the
+-                 dependency file we are actually looking for is in a different
+-                 directory (the one gotten by prepending FILENAME's directory),
+-                 so it might actually exist.  */
+-
+-              /* @@ dep->changed check is disabled. */
+-              if (lookup_file (name) != 0
+-                  /*|| ((!dep->changed || check_lastslash) && */
+-                  || file_exists_p (name))
+-                continue;
+-
+-              /* This code, given FILENAME = "lib/foo.o", dependency name
+-                 "lib/foo.c", and VPATH=src, searches for "src/lib/foo.c".  */
+-              {
+-                const char *vname = vpath_search (name, 0);
+-                if (vname)
++                  /* This code, given FILENAME = "lib/foo.o", dependency name
++                     "lib/foo.c", and VPATH=src, searches for
++                     "src/lib/foo.c".  */
+                   {
+-                    DBS (DB_IMPLICIT,
+-                         (_("Found prerequisite `%s' as VPATH `%s'\n"),
+-                          name, vname));
+-                    continue;
++                    const char *vname = vpath_search (n->name, 0);
++                    if (vname)
++                      {
++                        DBS (DB_IMPLICIT,
++                             (_("Found prerequisite `%s' as VPATH `%s'\n"),
++                              n->name, vname));
++                        (pat++)->name = n->name;
++                        continue;
++                      }
+                   }
+-              }
+ 
++                  /* We could not find the file in any place we should look.
++                     Try to make this dependency as an intermediate file, but
++                     only on the second pass.  */
+ 
+-              /* We could not find the file in any place we should look.  Try
+-                 to make this dependency as an intermediate file, but only on
+-                 the second pass.  */
+-
+-              if (intermed_ok)
+-                {
+-                  if (intermediate_file == 0)
+-                    intermediate_file = alloca (sizeof (struct file));
+-
+-                  DBS (DB_IMPLICIT,
+-                       (_("Looking for a rule with intermediate file `%s'.\n"),
+-                        name));
+-
+-                  memset (intermediate_file, '\0', sizeof (struct file));
+-                  intermediate_file->name = name;
+-                  if (pattern_search (intermediate_file,
+-                                      0,
+-                                      depth + 1,
+-                                      recursions + 1))
++                  if (intermed_ok)
+                     {
+-                      d->intermediate_pattern = intermediate_file->name;
+-                      intermediate_file->name = strcache_add (name);
+-                      d->intermediate_file = intermediate_file;
+-                      intermediate_file = 0;
++                      DBS (DB_IMPLICIT,
++                           (_("Looking for a rule with intermediate file `%s'.\n"),
++                            n->name));
++
++                      if (int_file == 0)
++                        int_file = alloca (sizeof (struct file));
++                      memset (int_file, '\0', sizeof (struct file));
++                      int_file->name = n->name;
++
++                      if (pattern_search (int_file,
++                                          0,
++                                          depth + 1,
++                                          recursions + 1))
++                        {
++                          pat->pattern = int_file->name;
++                          int_file->name = n->name;
++                          pat->file = int_file;
++                          (pat++)->name = n->name;
++                          int_file = 0;
++                          continue;
++                        }
+ 
+-                      continue;
++                      /* If we have tried to find P as an intermediate file
++                         and failed, mark that name as impossible so we won't
++                         go through the search again later.  */
++                      if (int_file->variables)
++                        free_variable_set (int_file->variables);
++                      file_impossible (n->name);
+                     }
+ 
+-                  /* If we have tried to find P as an intermediate
+-                     file and failed, mark that name as impossible
+-                     so we won't go through the search again later.  */
+-                  if (intermediate_file->variables)
+-                    free_variable_set (intermediate_file->variables);
+-                  file_impossible (name);
++                  /* A dependency of this rule does not exist. Therefore, this
++                     rule fails.  */
++                  failed = 1;
++                  break;
+                 }
+ 
+-              /* A dependency of this rule does not exist. Therefore,
+-                 this rule fails.  */
+-              failed = 1;
+-              break;
++              /* Free the ns chain.  */
++              if (ns != &ns_simple)
++                free_ns_chain (ns);
++
++              if (failed)
++                break;
+             }
+ 
++          /* Reset the stem in FILE. */
++
++          file->stem = 0;
++
+           /* This rule is no longer `in use' for recursive searches.  */
+ 	  rule->in_use = 0;
+ 
+-          if (failed)
+-            {
+-              /* This pattern rule does not apply. If some of its
+-                 dependencies succeeded, free the data structure
+-                 describing them.  */
+-              free_idep_chain (deps);
+-              deps = 0;
+-            }
+-	  else
++          if (! failed)
+ 	    /* This pattern rule does apply.  Stop looking for one.  */
+ 	    break;
++
++          /* This pattern rule does not apply. If some of its dependencies
++             succeeded, free the data structure describing them.  */
++          /* free_idep_chain (deps); */
++          deps = 0;
+ 	}
+ 
+-      /* If we found an applicable rule without
+-	 intermediate files, don't try with them.  */
++      /* If we found an applicable rule without intermediate files, don't try
++	 with them.  */
+       if (ri < nrules)
+ 	break;
+ 
+       rule = 0;
+     }
+ 
+-  /* RULE is nil if the loop went all the way
+-     through the list and everything failed.  */
++  /* RULE is nil if the loop went through the list but everything failed.  */
+   if (rule == 0)
+     goto done;
+ 
+   foundrule = ri;
+ 
+-  /* If we are recursing, store the pattern that matched
+-     FILENAME in FILE->name for use in upper levels.  */
++  /* If we are recursing, store the pattern that matched FILENAME in
++     FILE->name for use in upper levels.  */
+ 
+   if (recursions > 0)
+     /* Kludge-o-matic */
+     file->name = rule->targets[matches[foundrule]];
+ 
+-  /* FOUND_FILES lists the dependencies for the rule we found.
+-     This includes the intermediate files, if any.
+-     Convert them into entries on the deps-chain of FILE.  */
+-
+-  if (remove_explicit_deps)
+-    {
+-      /* Remove all the dependencies that didn't come from
+-         this implicit rule. */
+-
+-      dep = file->deps;
+-      while (dep != 0)
+-        {
+-          struct dep *next = dep->next;
+-          free_dep (dep);
+-          dep = next;
+-        }
+-      file->deps = 0;
+-  }
+-
+-  expl_d = file->deps; /* We will add them at the end. */
+-  d_ptr = &file->deps;
++  /* DEPLIST lists the prerequisites for the rule we found.  This includes the
++     intermediate files, if any.  Convert them into entries on the deps-chain
++     of FILE.  */
+ 
+-  for (d = deps; d != 0; d = d->next)
++  while (pat-- > deplist)
+     {
++      struct dep *dep;
+       const char *s;
+ 
+-      if (d->intermediate_file != 0)
++      if (pat->file != 0)
+ 	{
+-	  /* If we need to use an intermediate file,
+-	     make sure it is entered as a target, with the info that was
+-	     found for it in the recursive pattern_search call.
+-	     We know that the intermediate file did not already exist as
+-	     a target; therefore we can assume that the deps and cmds
+-	     of F below are null before we change them.  */
++	  /* If we need to use an intermediate file, make sure it is entered
++	     as a target, with the info that was found for it in the recursive
++	     pattern_search call.  We know that the intermediate file did not
++	     already exist as a target; therefore we can assume that the deps
++	     and cmds of F below are null before we change them.  */
+ 
+-	  struct file *imf = d->intermediate_file;
+-	  register struct file *f = lookup_file (imf->name);
++	  struct file *imf = pat->file;
++	  struct file *f = lookup_file (imf->name);
+ 
+           /* We don't want to delete an intermediate file that happened
+              to be a prerequisite of some (other) target. Mark it as
+@@ -814,23 +798,20 @@ pattern_search (struct file *file, int archive,
+           if (f != 0)
+             f->precious = 1;
+           else
+-            f = enter_file (strcache_add (imf->name));
++            f = enter_file (imf->name);
+ 
+ 	  f->deps = imf->deps;
+ 	  f->cmds = imf->cmds;
+ 	  f->stem = imf->stem;
+           f->also_make = imf->also_make;
+           f->is_target = 1;
+-
+-          if (!f->precious)
+-            {
+-              imf = lookup_file (d->intermediate_pattern);
+-              if (imf != 0 && imf->precious)
+-                f->precious = 1;
+-            }
+-
+ 	  f->intermediate = 1;
+ 	  f->tried_implicit = 1;
++
++          imf = lookup_file (pat->pattern);
++          if (imf != 0 && imf->precious)
++            f->precious = 1;
++
+ 	  for (dep = f->deps; dep != 0; dep = dep->next)
+ 	    {
+ 	      dep->file = enter_file (dep->name);
+@@ -840,41 +821,38 @@ pattern_search (struct file *file, int archive,
+ 	}
+ 
+       dep = alloc_dep ();
+-      dep->ignore_mtime = d->ignore_mtime;
+-      s = d->name; /* Hijacking the name. */
+-      d->name = 0;
+-      if (recursions == 0)
++      dep->ignore_mtime = pat->ignore_mtime;
++      s = strcache_add (pat->name);
++      if (recursions)
++        dep->name = s;
++      else
+ 	{
+ 	  dep->file = lookup_file (s);
+ 	  if (dep->file == 0)
+ 	    dep->file = enter_file (s);
+ 	}
+-      else
+-        dep->name = s;
+ 
+-      if (d->intermediate_file == 0 && tryrules[foundrule]->terminal)
++      if (pat->file == 0 && tryrules[foundrule]->terminal)
+ 	{
+-	  /* If the file actually existed (was not an intermediate file),
+-	     and the rule that found it was a terminal one, then we want
+-	     to mark the found file so that it will not have implicit rule
+-	     search done for it.  If we are not entering a `struct file' for
+-	     it now, we indicate this with the `changed' flag.  */
++	  /* If the file actually existed (was not an intermediate file), and
++	     the rule that found it was a terminal one, then we want to mark
++	     the found file so that it will not have implicit rule search done
++	     for it.  If we are not entering a `struct file' for it now, we
++	     indicate this with the `changed' flag.  */
+ 	  if (dep->file == 0)
+ 	    dep->changed = 1;
+ 	  else
+ 	    dep->file->tried_implicit = 1;
+ 	}
+ 
+-      *d_ptr = dep;
+-      d_ptr = &dep->next;
++      dep->next = file->deps;
++      file->deps = dep;
+     }
+ 
+-  *d_ptr = expl_d;
+-
+   if (!checked_lastslash[foundrule])
+     {
+-      /* Always allocate new storage, since STEM might be
+-         on the stack for an intermediate file.  */
++      /* Always allocate new storage, since STEM might be on the stack for an
++         intermediate file.  */
+       file->stem = strcache_add_len (stem, stemlen);
+       fullstemlen = stemlen;
+     }
+@@ -932,8 +910,8 @@ pattern_search (struct file *file, int archive,
+ 	  if (f && f->precious)
+             new->file->precious = 1;
+ 
+-          /* Set the is_target flag so that this file is not treated
+-             as intermediate by the pattern rule search algorithm and
++          /* Set the is_target flag so that this file is not treated as
++             intermediate by the pattern rule search algorithm and
+              file_exists_p cannot pick it up yet.  */
+           new->file->is_target = 1;
+ 
+@@ -941,8 +919,8 @@ pattern_search (struct file *file, int archive,
+ 	}
+ 
+  done:
+-  free_idep_chain (deps);
+   free (tryrules);
++  free (deplist);
+ 
+   return rule != 0;
+ }
+diff --git a/job.c b/job.c
+index a4dadb1..b3fef25 100644
+--- a/job.c
++++ b/job.c
+@@ -967,8 +967,9 @@ start_job_command (struct child *child)
+ #if !defined(_AMIGA) && !defined(WINDOWS32)
+   static int bad_stdin = -1;
+ #endif
+-  register char *p;
+-  int flags;
++  char *p;
++  /* Must be volatile to silence bogus GCC warning about longjmp/vfork.  */
++  volatile int flags;
+ #ifdef VMS
+   char *argv;
+ #else
+diff --git a/main.c b/main.c
+index dd309df..f447e57 100644
+--- a/main.c
++++ b/main.c
+@@ -56,7 +56,6 @@ RETSIGTYPE fatal_error_signal (int sig);
+ void print_variable_data_base (void);
+ void print_dir_data_base (void);
+ void print_rule_data_base (void);
+-void print_file_data_base (void);
+ void print_vpath_data_base (void);
+ 
+ void verify_file_data_base (void);
+@@ -2192,7 +2191,7 @@ main (int argc, char **argv, char **envp)
+             {
+               struct nameseq *ns;
+ 
+-              ns = parse_file_seq (&p, sizeof (struct nameseq), '\0', NULL, 0);
++              ns = PARSE_FILE_SEQ (&p, struct nameseq, '\0', NULL, 0);
+               if (ns)
+                 {
+                   /* .DEFAULT_GOAL should contain one target. */
+diff --git a/misc.c b/misc.c
+index f822747..67d1563 100644
+--- a/misc.c
++++ b/misc.c
+@@ -430,7 +430,8 @@ xstrndup (const char *str, unsigned int length)
+     fatal (NILF, _("virtual memory exhausted"));
+ #else
+   result = xmalloc (length + 1);
+-  strncpy (result, str, length);
++  if (length > 0)
++    strncpy (result, str, length);
+   result[length] = '\0';
+ #endif
+ 
+@@ -524,8 +525,7 @@ find_next_token (const char **ptr, unsigned int *lengthptr)
+ }
+ 
+ 
+-/* Copy a chain of `struct dep', making a new chain
+-   with the same contents as the old one.  */
++/* Copy a chain of `struct dep'.  For 2nd expansion deps, dup the name.  */
+ 
+ struct dep *
+ copy_dep_chain (const struct dep *d)
+@@ -538,6 +538,9 @@ copy_dep_chain (const struct dep *d)
+       struct dep *c = xmalloc (sizeof (struct dep));
+       memcpy (c, d, sizeof (struct dep));
+ 
++      if (c->need_2nd_expansion)
++        c->name = xstrdup (c->name);
++
+       c->next = 0;
+       if (firstnew == 0)
+ 	firstnew = lastnew = c;
+diff --git a/read.c b/read.c
+index bb85d4e..87bb046 100644
+--- a/read.c
++++ b/read.c
+@@ -1,6 +1,6 @@
+ /* Reading and parsing of makefiles for GNU Make.
+ Copyright (C) 1988, 1989, 1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997,
+-1998, 1999, 2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007 Free Software
++1998, 1999, 2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2009 Free Software
+ Foundation, Inc.
+ This file is part of GNU Make.
+ 
+@@ -140,7 +140,7 @@ static struct variable *do_define (char *name, enum variable_origin origin,
+                                    struct ebuffer *ebuf);
+ static int conditional_line (char *line, int len, const struct floc *flocp);
+ static void record_files (struct nameseq *filenames, const char *pattern,
+-                          const char *pattern_percent, struct dep *deps,
++                          const char *pattern_percent, char *depstr,
+                           unsigned int cmds_started, char *commands,
+                           unsigned int commands_idx, int two_colon,
+                           const struct floc *flocp);
+@@ -549,7 +549,7 @@ eval (struct ebuffer *ebuf, int set_default)
+   int ignoring = 0, in_ignored_define = 0;
+   int no_targets = 0;		/* Set when reading a rule without targets.  */
+   struct nameseq *filenames = 0;
+-  struct dep *deps = 0;
++  char *depstr = 0;
+   long nlines = 0;
+   int two_colon = 0;
+   const char *pattern = 0;
+@@ -563,7 +563,7 @@ eval (struct ebuffer *ebuf, int set_default)
+       if (filenames != 0)						      \
+         {                                                                     \
+ 	  fi.lineno = tgts_started;                                           \
+-	  record_files (filenames, pattern, pattern_percent, deps,            \
++	  record_files (filenames, pattern, pattern_percent, depstr,          \
+                         cmds_started, commands, commands_idx, two_colon,      \
+                         &fi);                                                 \
+         }                                                                     \
+@@ -834,8 +834,7 @@ eval (struct ebuffer *ebuf, int set_default)
+ 
+ 	  /* Parse the list of file names.  */
+ 	  p2 = p;
+-	  files = parse_file_seq (&p2, sizeof (struct nameseq), '\0',
+-                                  NULL, 0);
++	  files = PARSE_FILE_SEQ (&p2, struct nameseq, '\0', NULL, 0);
+ 	  free (p);
+ 
+ 	  /* Save the state of conditionals and start
+@@ -1019,8 +1018,7 @@ eval (struct ebuffer *ebuf, int set_default)
+         /* Make the colon the end-of-string so we know where to stop
+            looking for targets.  */
+         *colonp = '\0';
+-        filenames = parse_file_seq (&p2, sizeof (struct nameseq), '\0',
+-                                    NULL, 0);
++        filenames = PARSE_FILE_SEQ (&p2, struct nameseq, '\0', NULL, 0);
+         *p2 = ':';
+ 
+         if (!filenames)
+@@ -1099,8 +1097,8 @@ eval (struct ebuffer *ebuf, int set_default)
+         p = strchr (p2, ':');
+         while (p != 0 && p[-1] == '\\')
+           {
+-            register char *q = &p[-1];
+-            register int backslash = 0;
++            char *q = &p[-1];
++            int backslash = 0;
+             while (*q-- == '\\')
+               backslash = !backslash;
+             if (backslash)
+@@ -1143,8 +1141,8 @@ eval (struct ebuffer *ebuf, int set_default)
+         if (p != 0)
+           {
+             struct nameseq *target;
+-            target = parse_file_seq (&p2, sizeof (struct nameseq), ':',
+-                                     NULL, PARSEFS_NOGLOB|PARSEFS_NOCACHE);
++            target = PARSE_FILE_SEQ (&p2, struct nameseq, ':', NULL,
++                                     PARSEFS_NOGLOB|PARSEFS_NOCACHE);
+             ++p2;
+             if (target == 0)
+               fatal (fstart, _("missing target pattern"));
+@@ -1164,14 +1162,11 @@ eval (struct ebuffer *ebuf, int set_default)
+         end = beg + strlen (beg) - 1;
+         strip_whitespace (&beg, &end);
+ 
++        /* Put all the prerequisites here; they'll be parsed later.  */
+         if (beg <= end && *beg != '\0')
+-          {
+-            /* Put all the prerequisites here; they'll be parsed later.  */
+-            deps = alloc_dep ();
+-            deps->name = strcache_add_len (beg, end - beg + 1);
+-          }
++          depstr = xstrndup (beg, end - beg + 1);
+         else
+-          deps = 0;
++          depstr = 0;
+ 
+         commands_idx = 0;
+         if (cmdleft != 0)
+@@ -1870,16 +1865,15 @@ record_target_var (struct nameseq *filenames, char *defn,
+ 
+ static void
+ record_files (struct nameseq *filenames, const char *pattern,
+-              const char *pattern_percent, struct dep *deps,
++              const char *pattern_percent, char *depstr,
+               unsigned int cmds_started, char *commands,
+               unsigned int commands_idx, int two_colon,
+               const struct floc *flocp)
+ {
+-  struct nameseq *nextf;
+-  int implicit = 0;
+-  unsigned int max_targets = 0, target_idx = 0;
+-  const char **targets = 0, **target_percents = 0;
+   struct commands *cmds;
++  struct dep *deps;
++  const char *implicit_percent;
++  const char *name;
+ 
+   /* If we've already snapped deps, that means we're in an eval being
+      resolved after the makefiles have been read in.  We can't add more rules
+@@ -1888,6 +1882,11 @@ record_files (struct nameseq *filenames, const char *pattern,
+   if (snapped_deps)
+     fatal (flocp, _("prerequisites cannot be defined in recipes"));
+ 
++  /* Determine if this is a pattern rule or not.  */
++  name = filenames->name;
++  implicit_percent = find_percent_cached (&name);
++
++  /* If there's a recipe, set up a struct for it.  */
+   if (commands_idx > 0)
+     {
+       cmds = xmalloc (sizeof (struct commands));
+@@ -1897,78 +1896,106 @@ record_files (struct nameseq *filenames, const char *pattern,
+       cmds->command_lines = 0;
+     }
+   else
+-    cmds = 0;
++     cmds = 0;
+ 
+-  for (; filenames != 0; filenames = nextf)
++  /* If there's a prereq string then parse it--unless it's eligible for 2nd
++     expansion: if so, snap_deps() will do it.  */
++  if (depstr == 0)
++    deps = 0;
++  else if (second_expansion && strchr (depstr, '$'))
+     {
+-      const char *name = filenames->name;
++      deps = alloc_dep ();
++      deps->name = depstr;
++      deps->need_2nd_expansion = 1;
++      deps->staticpattern = pattern != 0;
++    }
++  else
++    {
++      deps = split_prereqs (depstr);
++      free (depstr);
++
++      /* We'll enter static pattern prereqs later when we have the stem.  We
++         don't want to enter pattern rules at all so that we don't think that
++         they ought to exist (make manual "Implicit Rule Search Algorithm",
++         item 5c).  */
++      if (! pattern && ! implicit_percent)
++        deps = enter_prereqs (deps, NULL);
++    }
++
++  /* For implicit rules, _all_ the targets must have a pattern.  That means we
++     can test the first one to see if we're working with an implicit rule; if
++     so we handle it specially. */
++
++  if (implicit_percent)
++    {
++      struct nameseq *nextf;
++      const char **targets, **target_pats;
++      unsigned int c;
++
++      if (pattern != 0)
++        fatal (flocp, _("mixed implicit and static pattern rules"));
++
++      /* Create an array of target names */
++      for (c = 1, nextf = filenames->next; nextf; ++c, nextf = nextf->next)
++        ;
++      targets = xmalloc (c * sizeof (const char *));
++      target_pats = xmalloc (c * sizeof (const char *));
++
++      targets[0] = name;
++      target_pats[0] = implicit_percent;
++
++      for (c = 1, nextf = filenames->next; nextf; ++c, nextf = nextf->next)
++        {
++          name = nextf->name;
++          implicit_percent = find_percent_cached (&name);
++
++          if (implicit_percent == 0)
++            fatal (flocp, _("mixed implicit and normal rules"));
++
++	  targets[c] = name;
++	  target_pats[c] = implicit_percent;
++        }
++
++      create_pattern_rule (targets, target_pats, c, two_colon, deps, cmds, 1);
++
++      return;
++    }
++
++
++  /* Walk through each target and create it in the database.
++     We already set up the first target, above.  */
++  while (1)
++    {
++      struct nameseq *nextf = filenames->next;
+       struct file *f;
+       struct dep *this = 0;
+-      const char *implicit_percent;
+ 
+-      nextf = filenames->next;
+       free (filenames);
+ 
+       /* Check for special targets.  Do it here instead of, say, snap_deps()
+          so that we can immediately use the value.  */
+-
+       if (streq (name, ".POSIX"))
+         posix_pedantic = 1;
+       else if (streq (name, ".SECONDEXPANSION"))
+         second_expansion = 1;
+ 
+-      implicit_percent = find_percent_cached (&name);
+-      implicit |= implicit_percent != 0;
+-
+-      if (implicit)
+-        {
+-          if (pattern != 0)
+-            fatal (flocp, _("mixed implicit and static pattern rules"));
+-
+-          if (implicit_percent == 0)
+-            fatal (flocp, _("mixed implicit and normal rules"));
+-
+-	  if (targets == 0)
+-	    {
+-	      max_targets = 5;
+-	      targets = xmalloc (5 * sizeof (char *));
+-	      target_percents = xmalloc (5 * sizeof (char *));
+-	      target_idx = 0;
+-	    }
+-	  else if (target_idx == max_targets - 1)
+-	    {
+-	      max_targets += 5;
+-	      targets = xrealloc (targets, max_targets * sizeof (char *));
+-	      target_percents = xrealloc (target_percents,
+-                                          max_targets * sizeof (char *));
+-	    }
+-	  targets[target_idx] = name;
+-	  target_percents[target_idx] = implicit_percent;
+-	  ++target_idx;
+-	  continue;
+-	}
+-
+       /* If this is a static pattern rule:
+-         `targets: target%pattern: dep%pattern; cmds',
++         `targets: target%pattern: prereq%pattern; recipe',
+          make sure the pattern matches this target name.  */
+       if (pattern && !pattern_matches (pattern, pattern_percent, name))
+         error (flocp, _("target `%s' doesn't match the target pattern"), name);
+       else if (deps)
+-        {
+-          /* If there are multiple filenames, copy the chain DEPS for all but
+-             the last one.  It is not safe for the same deps to go in more
+-             than one place in the database.  */
+-          this = nextf != 0 ? copy_dep_chain (deps) : deps;
+-          this->need_2nd_expansion = (second_expansion
+-				      && strchr (this->name, '$'));
+-        }
++        /* If there are multiple targets, copy the chain DEPS for all but the
++           last one.  It is not safe for the same deps to go in more than one
++           place in the database.  */
++        this = nextf != 0 ? copy_dep_chain (deps) : deps;
+ 
++      /* Find or create an entry in the file database for this target.  */
+       if (!two_colon)
+ 	{
+-	  /* Single-colon.  Combine these dependencies
+-	     with others in file's existing record, if any.  */
++	  /* Single-colon.  Combine this rule with the file's existing record,
++	     if any.  */
+ 	  f = enter_file (strcache_add (name));
+-
+ 	  if (f->double_colon)
+ 	    fatal (flocp,
+                    _("target file `%s' has both : and :: entries"), f->name);
+@@ -1993,8 +2020,6 @@ record_files (struct nameseq *filenames, const char *pattern,
+                      f->name);
+ 	    }
+ 
+-	  f->is_target = 1;
+-
+ 	  /* Defining .DEFAULT with no deps or cmds clears it.  */
+ 	  if (f == default_file && this == 0 && cmds == 0)
+ 	    f->cmds = 0;
+@@ -2008,71 +2033,18 @@ record_files (struct nameseq *filenames, const char *pattern,
+               free_dep_chain (f->deps);
+ 	      f->deps = 0;
+ 	    }
+-          else if (this != 0)
+-	    {
+-	      /* Add the file's old deps and the new ones in THIS together.  */
+-
+-              if (f->deps != 0)
+-                {
+-                  struct dep **d_ptr = &f->deps;
+-
+-                  while ((*d_ptr)->next != 0)
+-                    d_ptr = &(*d_ptr)->next;
+-
+-                  if (cmds != 0)
+-                    {
+-                      /* This is the rule with commands, so put its deps
+-                         last. The rationale behind this is that $< expands to
+-                         the first dep in the chain, and commands use $<
+-                         expecting to get the dep that rule specifies.  However
+-                         the second expansion algorithm reverses the order thus
+-                         we need to make it last here.  */
+-                      (*d_ptr)->next = this;
+-                      /* This is a hack. I need a way to communicate to
+-                         snap_deps() that the last dependency line in this
+-                         file came with commands (so that logic in snap_deps()
+-                         can put it in front and all this $< -logic works). I
+-                         cannot simply rely on file->cmds being not 0 because
+-                         of the cases like the following:
+-
+-                         foo: bar
+-                         foo:
+-                         ...
+-
+-                         I am going to temporarily "borrow" UPDATING member in
+-                         `struct file' for this.   */
+-                      f->updating = 1;
+-                    }
+-                  else
+-                    {
+-                      /* This is a rule without commands.  If we already have
+-                         a rule with commands and prerequisites (see "hack"
+-                         comment above), put these prereqs at the end but
+-                         before prereqs from the rule with commands. This way
+-                         everything appears in makefile order.  */
+-                      if (f->updating)
+-                        {
+-                          this->next = *d_ptr;
+-                          *d_ptr = this;
+-                        }
+-                      else
+-                        (*d_ptr)->next = this;
+-                    }
+-                }
+-              else
+-                f->deps = this;
+-	    }
+ 	}
+       else
+ 	{
+ 	  /* Double-colon.  Make a new record even if there already is one.  */
+ 	  f = lookup_file (name);
+ 
+-	  /* Check for both : and :: rules.  Check is_target so
+-	     we don't lose on default suffix rules or makefiles.  */
++	  /* Check for both : and :: rules.  Check is_target so we don't lose
++	     on default suffix rules or makefiles.  */
+ 	  if (f != 0 && f->is_target && !f->double_colon)
+ 	    fatal (flocp,
+                    _("target file `%s' has both : and :: entries"), f->name);
++
+ 	  f = enter_file (strcache_add (name));
+ 	  /* If there was an existing entry and it was a double-colon entry,
+ 	     enter_file will have returned a new one, making it the prev
+@@ -2082,14 +2054,15 @@ record_files (struct nameseq *filenames, const char *pattern,
+ 	    /* This is the first entry for this name, so we must set its
+ 	       double_colon pointer to itself.  */
+ 	    f->double_colon = f;
+-	  f->is_target = 1;
+-	  f->deps = this;
++
+ 	  f->cmds = cmds;
+ 	}
+ 
++      f->is_target = 1;
++
+       /* If this is a static pattern rule, set the stem to the part of its
+          name that matched the `%' in the pattern, so you can use $* in the
+-         commands.  */
++         commands.  If we didn't do it before, enter the prereqs now.  */
+       if (pattern)
+         {
+           static const char *percent = "%";
+@@ -2099,20 +2072,54 @@ record_files (struct nameseq *filenames, const char *pattern,
+           f->stem = strcache_add_len (buffer, o - buffer);
+           if (this)
+             {
+-              this->staticpattern = 1;
+-              this->stem = f->stem;
++              if (! this->need_2nd_expansion)
++                this = enter_prereqs (this, f->stem);
++              else
++                this->stem = f->stem;
++            }
++        }
++
++      /* Add the dependencies to this file entry.  */
++      if (this != 0)
++        {
++          /* Add the file's old deps and the new ones in THIS together.  */
++          if (f->deps == 0)
++            f->deps = this;
++          else if (cmds != 0)
++            {
++              struct dep *d = this;
++
++              /* If this rule has commands, put these deps first.  */
++              while (d->next != 0)
++                d = d->next;
++
++              d->next = f->deps;
++              f->deps = this;
++            }
++          else
++            {
++              struct dep *d = f->deps;
++
++              /* A rule without commands: put its prereqs at the end.  */
++              while (d->next != 0)
++                d = d->next;
++
++              d->next = this;
+             }
+         }
+ 
+       name = f->name;
+-    }
+ 
+-  if (implicit)
+-    {
+-      if (deps)
+-        deps->need_2nd_expansion = second_expansion;
+-      create_pattern_rule (targets, target_percents, target_idx,
+-                           two_colon, deps, cmds, 1);
++      /* All done!  Set up for the next one.  */
++      if (nextf == 0)
++        break;
++
++      filenames = nextf;
++
++      /* Reduce escaped percents.  If there are any unescaped it's an error  */
++      name = filenames->name;
++      if (find_percent_cached (&name))
++        fatal (flocp, _("mixed implicit and normal rules"));
+     }
+ }
+ 
+@@ -2235,7 +2242,7 @@ find_percent_cached (const char **string)
+ {
+   const char *p = *string;
+   char *new = 0;
+-  int slen;
++  int slen = 0;
+ 
+   /* If the first char is a % return now.  This lets us avoid extra tests
+      inside the loop.  */
+@@ -2330,11 +2337,11 @@ readstring (struct ebuffer *ebuf)
+   while (1)
+     {
+       int backslash = 0;
+-      char *bol = eol;
+-      char *p;
++      const char *bol = eol;
++      const char *p;
+ 
+       /* Find the next newline.  At EOS, stop.  */
+-      eol = p = strchr (eol , '\n');
++      p = eol = strchr (eol , '\n');
+       if (!eol)
+         {
+           ebuf->bufnext = ebuf->bufstart + ebuf->size + 1;
+@@ -2850,7 +2857,7 @@ tilde_expand (const char *name)
+         PARSEFS_NOCACHE - Do not add filenames to the strcache (caller frees)
+   */
+ 
+-struct nameseq *
++void *
+ parse_file_seq (char **stringp, unsigned int size, int stopchar,
+                 const char *prefix, int flags)
+ {
+diff --git a/rule.c b/rule.c
+index 64a1a2d..8311fb6 100644
+--- a/rule.c
++++ b/rule.c
+@@ -94,19 +94,20 @@ count_implicit_rule_limits (void)
+ 
+       for (dep = rule->deps; dep != 0; dep = dep->next)
+ 	{
+-	  unsigned int len = strlen (dep->name);
++          const char *dname = dep_name (dep);
++          unsigned int len = strlen (dname);
+ 
+ #ifdef VMS
+-	  const char *p = strrchr (dep->name, ']');
++          const char *p = strrchr (dname, ']');
+           const char *p2;
+           if (p == 0)
+-            p = strrchr (dep->name, ':');
+-          p2 = p != 0 ? strchr (dep->name, '%') : 0;
++            p = strrchr (dname, ':');
++          p2 = p != 0 ? strchr (dname, '%') : 0;
+ #else
+-	  const char *p = strrchr (dep->name, '/');
+-	  const char *p2 = p != 0 ? strchr (dep->name, '%') : 0;
++          const char *p = strrchr (dname, '/');
++          const char *p2 = p != 0 ? strchr (dname, '%') : 0;
+ #endif
+-	  ndeps++;
++          ndeps++;
+ 
+ 	  if (len > max_pattern_dep_length)
+ 	    max_pattern_dep_length = len;
+@@ -115,15 +116,15 @@ count_implicit_rule_limits (void)
+ 	    {
+ 	      /* There is a slash before the % in the dep name.
+ 		 Extract the directory name.  */
+-	      if (p == dep->name)
++	      if (p == dname)
+ 		++p;
+-	      if (p - dep->name > namelen)
++	      if (p - dname > namelen)
+ 		{
+-		  namelen = p - dep->name;
++		  namelen = p - dname;
+ 		  name = xrealloc (name, namelen + 1);
+ 		}
+-	      memcpy (name, dep->name, p - dep->name);
+-	      name[p - dep->name] = '\0';
++	      memcpy (name, dname, p - dname);
++	      name[p - dname] = '\0';
+ 
+ 	      /* In the deps of an implicit rule the `changed' flag
+ 		 actually indicates that the dependency is in a
+@@ -376,8 +377,7 @@ install_pattern_rule (struct pspec *p, int terminal)
+   ++r->suffixes[0];
+ 
+   ptr = p->dep;
+-  r->deps = (struct dep *) parse_file_seq (&ptr, sizeof (struct dep), '\0',
+-                                           NULL, 0);
++  r->deps = PARSE_FILE_SEQ (&ptr, struct dep, '\0', NULL, 0);
+ 
+   if (new_pattern_rule (r, 0))
+     {
+@@ -481,7 +481,6 @@ static void			/* Useful to call from gdb.  */
+ print_rule (struct rule *r)
+ {
+   unsigned int i;
+-  struct dep *d;
+ 
+   for (i = 0; i < r->num; ++i)
+     {
+@@ -491,9 +490,7 @@ print_rule (struct rule *r)
+   if (r->terminal)
+     putchar (':');
+ 
+-  for (d = r->deps; d != 0; d = d->next)
+-    printf (" %s", dep_name (d));
+-  putchar ('\n');
++  print_prereqs (r->deps);
+ 
+   if (r->cmds != 0)
+     print_commands (r->cmds);
+diff --git a/tests/ChangeLog b/tests/ChangeLog
+index d51290f..f1c6695 100644
+--- a/tests/ChangeLog
++++ b/tests/ChangeLog
+@@ -1,3 +1,10 @@
++2009-09-23  Paul  <psmith@gnu.org>
++
++	* scripts/features/patternrules: Test that we can remove pattern
++	rules, both single and multiple prerequisites.  Savannah bug #18622.
++
++	* scripts/features/echoing: Rework for run_make_test().
++
+ 2009-06-14  Paul Smith  <psmith@gnu.org>
+ 
+ 	* scripts/features/vpath: Verify we don't get bogus circular
+diff --git a/tests/scripts/features/echoing b/tests/scripts/features/echoing
+index 2e366cd..40debf5 100644
+--- a/tests/scripts/features/echoing
++++ b/tests/scripts/features/echoing
+@@ -1,87 +1,64 @@
+-$description = "The following test creates a makefile to test command \n"
+-              ."echoing.  It tests that when a command line starts with \n"
+-              ."a '\@', the echoing of that line is suppressed.  It also \n"
+-              ."tests the -n option which tells make to ONLY echo the  \n"
+-              ."commands and no execution happens.  In this case, even \n"
+-              ."the commands with '\@' are printed. Lastly, it tests the \n"
+-              ."-s flag which tells make to prevent all echoing, as if \n"
+-              ."all commands started with a '\@'.";
+-
+-$details = "This test is similar to the 'clean' test except that a '\@' has\n"
+-          ."been placed in front of the delete command line.  Four tests \n"
+-          ."are run here.  First, make is run normally and the first echo\n"
+-          ."command should be executed.  In this case there is no '\@' so \n"
+-          ."we should expect make to display the command AND display the \n"
+-          ."echoed message.  Secondly, make is run with the clean target, \n"
+-          ."but since there is a '\@' at the beginning of the command, we\n"
+-          ."expect no output; just the deletion of a file which we check \n"
+-          ."for.  Third, we give the clean target again except this time\n"
+-          ."we give make the -n option.  We now expect the command to be \n"
+-          ."displayed but not to be executed.  In this case we need only \n"
+-          ."to check the output since an error message would be displayed\n"
+-          ."if it actually tried to run the delete command again and the \n"
+-          ."file didn't exist. Lastly, we run the first test again with \n"
+-          ."the -s option and check that make did not echo the echo \n"
+-          ."command before printing the message.";
++#                                                                    -*-perl-*-
++$description = "The following test creates a makefile to test command
++echoing.  It tests that when a command line starts with
++a '\@', the echoing of that line is suppressed.  It also
++tests the -n option which tells make to ONLY echo the
++commands and no execution happens.  In this case, even
++the commands with '\@' are printed. Lastly, it tests the
++-s flag which tells make to prevent all echoing, as if
++all commands started with a '\@'.";
++
++$details = "This test is similar to the 'clean' test except that a '\@' has
++been placed in front of the delete command line.  Four tests
++are run here.  First, make is run normally and the first echo
++command should be executed.  In this case there is no '\@' so
++we should expect make to display the command AND display the
++echoed message.  Secondly, make is run with the clean target,
++but since there is a '\@' at the beginning of the command, we
++expect no output; just the deletion of a file which we check
++for.  Third, we give the clean target again except this time
++we give make the -n option.  We now expect the command to be
++displayed but not to be executed.  In this case we need only
++to check the output since an error message would be displayed
++if it actually tried to run the delete command again and the
++file didn't exist. Lastly, we run the first test again with
++the -s option and check that make did not echo the echo
++command before printing the message.\n";
+ 
+ $example = "EXAMPLE_FILE";
+ 
+-open(MAKEFILE,"> $makefile");
+-
+-# The Contents of the MAKEFILE ...
+-
+-print MAKEFILE "all: \n";
+-print MAKEFILE "\techo This makefile did not clean the dir... good\n";
+-print MAKEFILE "clean: \n";
+-print MAKEFILE "\t\@$delete_command $example\n";
+-
+-# END of Contents of MAKEFILE
+-
+-close(MAKEFILE);
+-
+-&touch($example);
++touch($example);
+ 
+ # TEST #1
+ # -------
+ 
+-&run_make_with_options($makefile,"",&get_logfile,0);
+-$answer = "echo This makefile did not clean the dir... good\n"
+-         ."This makefile did not clean the dir... good\n";
+-&compare_output($answer,&get_logfile(1));
+-
++run_make_test("
++all:
++\techo This makefile did not clean the dir... good
++clean:
++\t\@$delete_command $example\n",
++              '', 'echo This makefile did not clean the dir... good
++This makefile did not clean the dir... good');
+ 
+ # TEST #2
+ # -------
+ 
+-&run_make_with_options($makefile,"clean",&get_logfile,0);
++run_make_test(undef, 'clean', '');
+ if (-f $example) {
+   $test_passed = 0;
++  unlink($example);
+ }
+-&compare_output('',&get_logfile(1));
+ 
+ # TEST #3
+ # -------
+ 
+-&run_make_with_options($makefile,"-n clean",&get_logfile,0);
+-$answer = "$delete_command $example\n";
+-&compare_output($answer,&get_logfile(1));
++run_make_test(undef, '-n clean', "$delete_command $example\n");
+ 
+ 
+ # TEST #4
+ # -------
+ 
+-&run_make_with_options($makefile,"-s",&get_logfile,0);
+-$answer = "This makefile did not clean the dir... good\n";
+-&compare_output($answer,&get_logfile(1));
++run_make_test(undef, '-s', "This makefile did not clean the dir... good\n");
+ 
+ 
+ 1;
+-
+-
+-
+-
+-
+-
+-
+-
+-
+diff --git a/tests/scripts/features/patternrules b/tests/scripts/features/patternrules
+index c5bc3db..dcaf0dd 100644
+--- a/tests/scripts/features/patternrules
++++ b/tests/scripts/features/patternrules
+@@ -190,5 +190,23 @@ dep: ; @echo $@
+               '', "dep\nx.t1\nx.t2\nx\nfinal\n");
+ 
+ 
++# TEST 8: Verify we can remove pattern rules.  Savannah bug #18622.
++
++my @f = (qw(foo.w foo.ch));
++touch(@f);
++
++run_make_test(q!
++CWEAVE := :
++
++# Disable builtin rules
++%.tex : %.w
++%.tex : %.w %.ch
++!,
++              'foo.tex',
++              "#MAKE#: *** No rule to make target `foo.tex'.  Stop.", 512);
++
++unlink(@f);
++
++
+ # This tells the test driver that the perl test script executed properly.
+ 1;
+diff --git a/tests/scripts/features/se_explicit b/tests/scripts/features/se_explicit
+index 454d494..adf6b33 100644
+--- a/tests/scripts/features/se_explicit
++++ b/tests/scripts/features/se_explicit
+@@ -24,9 +24,9 @@ run_make_test(undef, 'SE=1', "three\nfour\nbariz\nfoo\$bar : baraz bariz");
+ 
+ # TEST #1: automatic variables.
+ #
+-run_make_test('
++run_make_test(q!
+ .SECONDEXPANSION:
+-.DEFAULT: ; @echo $@
++.DEFAULT: ; @echo '$@'
+ 
+ foo: bar baz
+ 
+@@ -39,7 +39,7 @@ foo: $$@.1 \
+      $$|.5 \
+      $$*.6
+ 
+-',
++!,
+ '',
+ 'bar
+ baz
+@@ -60,17 +60,16 @@ buz.5
+ 
+ # Test #2: target/pattern -specific variables.
+ #
+-run_make_test('
++run_make_test(q!
+ .SECONDEXPANSION:
+-.DEFAULT: ; @echo $@
++.DEFAULT: ; @echo '$@'
+ 
+ foo.x: $$a $$b
+ 
+ foo.x: a := bar
+ 
+ %.x: b := baz
+-
+-',
++!,
+ '',
+ 'bar
+ baz
+@@ -79,9 +78,9 @@ baz
+ 
+ # Test #3: order of prerequisites.
+ #
+-run_make_test('
++run_make_test(q!
+ .SECONDEXPANSION:
+-.DEFAULT: ; @echo $@
++.DEFAULT: ; @echo '$@'
+ 
+ all: foo bar baz
+ 
+@@ -99,7 +98,7 @@ bar: bar.3
+ baz: baz.1
+ baz: baz.2
+ baz: ; @:
+-',
++!,
+ '',
+ 'foo.1
+ foo.2
+@@ -112,22 +111,23 @@ baz.2
+ ');
+ 
+ # TEST #4: eval in a context where there is no reading_file
+-run_make_test('
++run_make_test(q!
+ .SECONDEXPANSION:
+ all : $$(eval $$(info test))
+-',            '', "test\n#MAKE#: Nothing to be done for `all'.\n");
++!,
++            '', "test\n#MAKE#: Nothing to be done for `all'.\n");
+ 
+ # TEST #5: (NEGATIVE) catch eval in a prereq list trying to create new
+ # target/prereq relationships.
+ 
+-run_make_test('
++run_make_test(q!
+ .SECONDEXPANSION:
+ proj1.exe : proj1.o $$(eval $$(test))
+ define test
+ proj1.o : proj1.c
+ proj1.c: proj1.h
+ endef
+-',
++!,
+               '', "#MAKE#: *** prerequisites cannot be defined in recipes.  Stop.\n", 512);
+ 
+ # This tells the test driver that the perl test script executed properly.
+diff --git a/tests/scripts/features/se_implicit b/tests/scripts/features/se_implicit
+index c2ae648..6db0031 100644
+--- a/tests/scripts/features/se_implicit
++++ b/tests/scripts/features/se_implicit
+@@ -11,9 +11,9 @@ $dir =~ s,.*/([^/]+)$,../$1,;
+ 
+ # Test #1: automatic variables.
+ #
+-run_make_test('
++run_make_test(q!
+ .SECONDEXPANSION:
+-.DEFAULT: ; @echo $@
++.DEFAULT: ; @echo '$@'
+ 
+ foo.a: bar baz
+ 
+@@ -37,9 +37,9 @@ foo.%: 1.$$@ \
+ 4.biz \
+ 5.buz \
+ 6.a:
+-	@echo $@
++	@echo '$@'
+ 
+-',
++!,
+ '',
+ '1.foo.a
+ 2.bar
+@@ -60,7 +60,7 @@ buz
+ 
+ # Test #2: target/pattern -specific variables.
+ #
+-run_make_test('
++run_make_test(q!
+ .SECONDEXPANSION:
+ foo.x:
+ 
+@@ -71,20 +71,16 @@ foo.x: x_a := bar
+ 
+ %.x: x_b := baz
+ 
+-bar baz: ; @echo $@
+-
+-',
+-'',
+-'bar
+-baz
+-');
++bar baz: ; @echo '$@'
++!,
++              '', "bar\nbaz\n");
+ 
+ 
+ # Test #3: order of prerequisites.
+ #
+-run_make_test('
++run_make_test(q!
+ .SECONDEXPANSION:
+-.DEFAULT: ; @echo $@
++.DEFAULT: ; @echo '$@'
+ 
+ all: foo bar baz
+ 
+@@ -97,7 +93,7 @@ foo: foo.2
+ 
+ foo: foo.3
+ 
+-foo.1: ; @echo $@
++foo.1: ; @echo '$@'
+ 
+ 
+ # Subtest #2
+@@ -108,7 +104,7 @@ bar: bar.2
+ 
+ bar: bar.3
+ 
+-bar.1: ; @echo $@
++bar.1: ; @echo '$@'
+ 
+ 
+ # Subtest #3
+@@ -118,9 +114,8 @@ baz: baz.1
+ baz: baz.2
+ 
+ %az: ; @:
+-
+-',
+-'',
++!,
++              '',
+ 'foo.1
+ foo.2
+ foo.3
+@@ -134,20 +129,18 @@ baz.2
+ 
+ # Test #4: stem splitting logic.
+ #
+-run_make_test('
++run_make_test(q!
+ .SECONDEXPANSION:
+ $(dir)/tmp/bar.o:
+ 
+-$(dir)/tmp/foo/bar.c: ; @echo $@
+-$(dir)/tmp/bar/bar.c: ; @echo $@
+-foo.h: ; @echo $@
++$(dir)/tmp/foo/bar.c: ; @echo '$@'
++$(dir)/tmp/bar/bar.c: ; @echo '$@'
++foo.h: ; @echo '$@'
+ 
+ %.o: $$(addsuffix /%.c,foo bar) foo.h
+-	@echo $@: {$<} $^
+-
+-',
+-"dir=$dir",
+-"$dir/tmp/foo/bar.c
++	@echo '$@: {$<} $^'
++!,
++              "dir=$dir", "$dir/tmp/foo/bar.c
+ $dir/tmp/bar/bar.c
+ foo.h
+ $dir/tmp/bar.o: {$dir/tmp/foo/bar.c} $dir/tmp/foo/bar.c $dir/tmp/bar/bar.c foo.h
+@@ -156,18 +149,17 @@ $dir/tmp/bar.o: {$dir/tmp/foo/bar.c} $dir/tmp/foo/bar.c $dir/tmp/bar/bar.c foo.h
+ 
+ # Test #5: stem splitting logic and order-only prerequisites.
+ #
+-run_make_test('
++run_make_test(q!
+ .SECONDEXPANSION:
+ $(dir)/tmp/foo.o: $(dir)/tmp/foo.c
+-$(dir)/tmp/foo.c: ; @echo $@
+-bar.h: ; @echo $@
++$(dir)/tmp/foo.c: ; @echo '$@'
++bar.h: ; @echo '$@'
+ 
+ %.o: %.c|bar.h
+-	@echo $@: {$<} {$|} $^
++	@echo '$@: {$<} {$|} $^'
+ 
+-',
+-"dir=$dir",
+-"$dir/tmp/foo.c
++!,
++              "dir=$dir", "$dir/tmp/foo.c
+ bar.h
+ $dir/tmp/foo.o: {$dir/tmp/foo.c} {bar.h} $dir/tmp/foo.c
+ ");
+@@ -175,54 +167,45 @@ $dir/tmp/foo.o: {$dir/tmp/foo.c} {bar.h} $dir/tmp/foo.c
+ 
+ # Test #6: lack of implicit prerequisites.
+ #
+-run_make_test('
++run_make_test(q!
+ .SECONDEXPANSION:
+ foo.o: foo.c
+-foo.c: ; @echo $@
++foo.c: ; @echo '$@'
+ 
+ %.o:
+-	@echo $@: {$<} $^
++	@echo '$@: {$<} $^'
++!,
++              '', "foo.c\nfoo.o: {foo.c} foo.c\n");
+ 
+-',
+-'',
+-'foo.c
+-foo.o: {foo.c} foo.c
+-');
+ 
+ # Test #7: Test stem from the middle of the name.
+ #
+-run_make_test('
++run_make_test(q!
+ .SECONDEXPANSION:
+ foobarbaz:
+ 
+ foo%baz: % $$*.1
+-	@echo $*
++	@echo '$*'
+ 
+ bar bar.1:
+-	@echo $@
++	@echo '$@'
++!,
++              '', "bar\nbar.1\nbar\n");
+ 
+-',
+-'',
+-'bar
+-bar.1
+-bar
+-');
+ 
+ # Test #8: Make sure stem triple-expansion does not happen.
+ #
+-run_make_test('
++run_make_test(q!
+ .SECONDEXPANSION:
+ foo$$bar:
+ 
+ f%r: % $$*.1
+-	@echo \'$*\'
++	@echo '$*'
+ 
+ oo$$ba oo$$ba.1:
+-	@echo \'$@\'
+-
+-',
+-'',
+-'oo$ba
++	@echo '$@'
++!,
++              '', 'oo$ba
+ oo$ba.1
+ oo$ba
+ ');
+diff --git a/tests/scripts/features/se_statpat b/tests/scripts/features/se_statpat
+index 096b240..b1e59e1 100644
+--- a/tests/scripts/features/se_statpat
++++ b/tests/scripts/features/se_statpat
+@@ -5,12 +5,11 @@ $details = "";
+ 
+ # Test #1: automatic variables.
+ #
+-run_make_test('
++run_make_test(q!
+ .SECONDEXPANSION:
+-.DEFAULT: ; @echo $@
++.DEFAULT: ; @echo '$@'
+ 
+ foo.a foo.b: foo.%: bar.% baz.%
+-
+ foo.a foo.b: foo.%: biz.% | buz.%
+ 
+ foo.a foo.b: foo.%: $$@.1 \
+@@ -19,10 +18,8 @@ foo.a foo.b: foo.%: $$@.1 \
+                     $$(addsuffix .4,$$+) \
+                     $$|.5 \
+                     $$*.6
+-
+-',
+-'',
+-'bar.a
++!,
++              '', 'bar.a
+ baz.a
+ biz.a
+ buz.a
+@@ -41,61 +38,45 @@ a.6
+ 
+ # Test #2: target/pattern -specific variables.
+ #
+-run_make_test('
++run_make_test(q!
+ .SECONDEXPANSION:
+-.DEFAULT: ; @echo $@
++.DEFAULT: ; @echo '$@'
+ 
+ foo.x foo.y: foo.%: $$(%_a) $$($$*_b)
+ 
+ foo.x: x_a := bar
+ 
+ %.x: x_b := baz
+-
+-
+-',
+-'',
+-'bar
+-baz
+-');
++!,
++              '', "bar\nbaz\n");
+ 
+ 
+ # Test #3: order of prerequisites.
+ #
+-run_make_test('
++run_make_test(q!
+ .SECONDEXPANSION:
+-.DEFAULT: ; @echo $@
++.DEFAULT: ; @echo '$@'
+ 
+ all: foo.a bar.a baz.a
+ 
+ # Subtest #1
+-#
+ foo.a foo.b: foo.%: foo.%.1; @:
+-
+ foo.a foo.b: foo.%: foo.%.2
+-
+ foo.a foo.b: foo.%: foo.%.3
+ 
+ 
+ # Subtest #2
+-#
+ bar.a bar.b: bar.%: bar.%.2
+-
+ bar.a bar.b: bar.%: bar.%.1; @:
+-
+ bar.a bar.b: bar.%: bar.%.3
+ 
+ 
+ # Subtest #3
+-#
+ baz.a baz.b: baz.%: baz.%.1
+-
+ baz.a baz.b: baz.%: baz.%.2
+-
+ baz.a baz.b: ; @:
+-
+-',
+-'',
+-'foo.a.1
++!,
++             '', 'foo.a.1
+ foo.a.2
+ foo.a.3
+ bar.a.1
+@@ -108,17 +89,15 @@ baz.a.2
+ 
+ # Test #4: Make sure stem triple-expansion does not happen.
+ #
+-run_make_test('
++run_make_test(q!
+ .SECONDEXPANSION:
+ foo$$bar: f%r: % $$*.1
+-	@echo \'$*\'
++	@echo '$*'
+ 
+ oo$$ba oo$$ba.1:
+-	@echo \'$@\'
+-
+-',
+-'',
+-'oo$ba
++	@echo '$@'
++!,
++              '', 'oo$ba
+ oo$ba.1
+ oo$ba
+ ');
+-- 
+cgit v1.0-41-gc330
+

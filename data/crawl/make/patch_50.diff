@@ -1,0 +1,297 @@
+diff --git a/ChangeLog b/ChangeLog
+index 4e80e38..899b471 100644
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -1,27 +1,29 @@
+ 2013-09-15  Paul Smith  <psmith@gnu.org>
+ 
+-	Fix Savannah bug #39203.
++	* main.c (main): Perform the validation of the jobserver FDs
++	early, before we read makefiles, to ensure that something hasn't
++	opened and used those FDs for some other reason.
++	Fixes Savannah bug #39934.
+ 
+ 	* main.c (main): Don't set MAKEFLAGS in the environment when we
+ 	restart.  We have the original command line flags so keep the
+ 	original MAKEFLAGS settings as well.
++	Fixes Savannah bug #39203.
+ 
+ 2013-09-14  Paul Smith  <psmith@gnu.org>
+ 
+-	Fix Savannah bug #35248.
+-
+ 	* main.c (decode_debug_flags): Add support for the "n" flag to
+ 	disable all debugging.
+ 	* make.1: Document the "n" (none) flag.
+ 	* doc/make.texi (Options Summary): Ditto.
+ 	* NEWS: Ditto.
+-
+-	Fix Savannah bug #33134.  Suggested by David Boyce <dsb@boyski.com>.
++	Fixes Savannah bug #35248.
+ 
+ 	* misc.c (close_stdout): Move to output.c.
+ 	* main.c (main): Move atexit call to output_init().
+ 	* makeint.h: Remove close_stdout() declaration.
+ 	* output.c (output_init): Add close_stdout at exit only if it's	open.
++	Fixes Savannah bug #33134.  Suggested by David Boyce <dsb@boyski.com>.
+ 
+ 2013-09-14  Paul Smith  <psmith@gnu.org>
+ 
+diff --git a/main.c b/main.c
+index 0fdf501..bfc125c 100644
+--- a/main.c
++++ b/main.c
+@@ -1393,6 +1393,15 @@ main (int argc, char **argv, char **envp)
+ 
+   decode_switches (argc, argv, 0);
+ 
++  /* Figure out the level of recursion.  */
++  {
++    struct variable *v = lookup_variable (STRING_SIZE_TUPLE (MAKELEVEL_NAME));
++    if (v && v->value[0] != '\0' && v->value[0] != '-')
++      makelevel = (unsigned int) atoi (v->value);
++    else
++      makelevel = 0;
++  }
++
+ #ifdef WINDOWS32
+   if (suspend_flag)
+     {
+@@ -1468,6 +1477,91 @@ main (int argc, char **argv, char **envp)
+ #endif /* WINDOWS32 */
+ #endif
+ 
++#ifdef MAKE_JOBSERVER
++  /* If the jobserver-fds option is seen, make sure that -j is reasonable.
++     This can't be usefully set in the makefile, and we want to verify the
++     FDs are valid before any other aspect of make has a chance to start
++     using them for something else.  */
++
++  if (jobserver_fds)
++    {
++      const char *cp;
++      unsigned int ui;
++
++      for (ui=1; ui < jobserver_fds->idx; ++ui)
++        if (!streq (jobserver_fds->list[0], jobserver_fds->list[ui]))
++          fatal (NILF, _("internal error: multiple --jobserver-fds options"));
++
++      /* Now parse the fds string and make sure it has the proper format.  */
++
++      cp = jobserver_fds->list[0];
++
++#ifdef WINDOWS32
++      if (! open_jobserver_semaphore (cp))
++        {
++          DWORD err = GetLastError ();
++          fatal (NILF, _("internal error: unable to open jobserver semaphore '%s': (Error %ld: %s)"),
++                 cp, err, map_windows32_error_to_string (err));
++        }
++      DB (DB_JOBS, (_("Jobserver client (semaphore %s)\n"), cp));
++#else
++      if (sscanf (cp, "%d,%d", &job_fds[0], &job_fds[1]) != 2)
++        fatal (NILF,
++               _("internal error: invalid --jobserver-fds string '%s'"), cp);
++
++      DB (DB_JOBS,
++          (_("Jobserver client (fds %d,%d)\n"), job_fds[0], job_fds[1]));
++#endif
++
++      /* The combination of a pipe + !job_slots means we're using the
++         jobserver.  If !job_slots and we don't have a pipe, we can start
++         infinite jobs.  If we see both a pipe and job_slots >0 that means the
++         user set -j explicitly.  This is broken; in this case obey the user
++         (ignore the jobserver pipe for this make) but print a message.
++         If we've restarted, we already printed this the first time.  */
++
++      if (job_slots > 0)
++        {
++          if (! restarts)
++            error (NILF, _("warning: -jN forced in submake: disabling jobserver mode."));
++        }
++#ifndef WINDOWS32
++#define FD_OK(_f) ((fcntl ((_f), F_GETFD) != -1) || (errno != EBADF))
++      /* Create a duplicate pipe, that will be closed in the SIGCHLD
++         handler.  If this fails with EBADF, the parent has closed the pipe
++         on us because it didn't think we were a submake.  If so, print a
++         warning then default to -j1.  */
++      else if (!FD_OK (job_fds[0]) || !FD_OK (job_fds[1])
++               || (job_rfd = dup (job_fds[0])) < 0)
++        {
++          if (errno != EBADF)
++            pfatal_with_name (_("dup jobserver"));
++
++          error (NILF,
++                 _("warning: jobserver unavailable: using -j1.  Add '+' to parent make rule."));
++          job_slots = 1;
++          job_fds[0] = job_fds[1] = -1;
++        }
++#endif
++
++      if (job_slots > 0)
++        {
++#ifdef WINDOWS32
++          free_jobserver_semaphore ();
++#else
++          if (job_fds[0] >= 0)
++            close (job_fds[0]);
++          if (job_fds[1] >= 0)
++            close (job_fds[1]);
++#endif
++          job_fds[0] = job_fds[1] = -1;
++          free (jobserver_fds->list);
++          free (jobserver_fds);
++          jobserver_fds = 0;
++        }
++    }
++#endif
++
+   /* The extra indirection through $(MAKE_COMMAND) is done
+      for hysterical raisins.  */
+   define_variable_cname ("MAKE_COMMAND", argv[0], o_default, 0);
+@@ -1554,16 +1648,7 @@ main (int argc, char **argv, char **envp)
+    * at the wrong place when it was first evaluated.
+    */
+    no_default_sh_exe = !find_and_set_default_shell (NULL);
+-
+ #endif /* WINDOWS32 */
+-  /* Figure out the level of recursion.  */
+-  {
+-    struct variable *v = lookup_variable (STRING_SIZE_TUPLE (MAKELEVEL_NAME));
+-    if (v != 0 && v->value[0] != '\0' && v->value[0] != '-')
+-      makelevel = (unsigned int) atoi (v->value);
+-    else
+-      makelevel = 0;
+-  }
+ 
+   /* Except under -s, always do -w in sub-makes and under -C.  */
+   if (!silent_flag && (directories != 0 || makelevel > 0))
+@@ -1851,81 +1936,6 @@ main (int argc, char **argv, char **envp)
+ #endif
+ 
+ #ifdef MAKE_JOBSERVER
+-  /* If the jobserver-fds option is seen, make sure that -j is reasonable.  */
+-
+-  if (jobserver_fds)
+-    {
+-      const char *cp;
+-      unsigned int ui;
+-
+-      for (ui=1; ui < jobserver_fds->idx; ++ui)
+-        if (!streq (jobserver_fds->list[0], jobserver_fds->list[ui]))
+-          fatal (NILF, _("internal error: multiple --jobserver-fds options"));
+-
+-      /* Now parse the fds string and make sure it has the proper format.  */
+-
+-      cp = jobserver_fds->list[0];
+-
+-#ifdef WINDOWS32
+-      if (! open_jobserver_semaphore (cp))
+-        {
+-          DWORD err = GetLastError ();
+-          fatal (NILF, _("internal error: unable to open jobserver semaphore '%s': (Error %ld: %s)"),
+-                 cp, err, map_windows32_error_to_string (err));
+-        }
+-      DB (DB_JOBS, (_("Jobserver client (semaphore %s)\n"), cp));
+-#else
+-      if (sscanf (cp, "%d,%d", &job_fds[0], &job_fds[1]) != 2)
+-        fatal (NILF,
+-               _("internal error: invalid --jobserver-fds string '%s'"), cp);
+-
+-      DB (DB_JOBS,
+-          (_("Jobserver client (fds %d,%d)\n"), job_fds[0], job_fds[1]));
+-#endif
+-
+-      /* The combination of a pipe + !job_slots means we're using the
+-         jobserver.  If !job_slots and we don't have a pipe, we can start
+-         infinite jobs.  If we see both a pipe and job_slots >0 that means the
+-         user set -j explicitly.  This is broken; in this case obey the user
+-         (ignore the jobserver pipe for this make) but print a message.
+-         If we've restarted, we already printed this the first time.  */
+-
+-      if (job_slots > 0)
+-        {
+-          if (! restarts)
+-            error (NILF, _("warning: -jN forced in submake: disabling jobserver mode."));
+-        }
+-#ifndef WINDOWS32
+-      /* Create a duplicate pipe, that will be closed in the SIGCHLD
+-         handler.  If this fails with EBADF, the parent has closed the pipe
+-         on us because it didn't think we were a submake.  If so, print a
+-         warning then default to -j1.  */
+-      else if ((job_rfd = dup (job_fds[0])) < 0)
+-        {
+-          if (errno != EBADF)
+-            pfatal_with_name (_("dup jobserver"));
+-
+-          error (NILF,
+-                 _("warning: jobserver unavailable: using -j1.  Add '+' to parent make rule."));
+-          job_slots = 1;
+-        }
+-#endif
+-
+-      if (job_slots > 0)
+-        {
+-#ifdef WINDOWS32
+-          free_jobserver_semaphore ();
+-#else
+-          close (job_fds[0]);
+-          close (job_fds[1]);
+-#endif
+-          job_fds[0] = job_fds[1] = -1;
+-          free (jobserver_fds->list);
+-          free (jobserver_fds);
+-          jobserver_fds = 0;
+-        }
+-    }
+-
+   /* If we have >1 slot but no jobserver-fds, then we're a top-level make.
+      Set up the pipe and install the fds option for our children.  */
+ 
+diff --git a/tests/ChangeLog b/tests/ChangeLog
+index c629a0e..d97e7e2 100644
+--- a/tests/ChangeLog
++++ b/tests/ChangeLog
+@@ -1,5 +1,8 @@
+ 2013-09-15  Paul Smith  <psmith@gnu.org>
+ 
++	* scripts/features/parallelism: Test broken jobserver on recursion.
++	Test for Savannah bug #39934.
++
+ 	* scripts/options/eval: Verify --eval during restart.
+ 	Test for Savannah bug #39203.
+ 
+diff --git a/tests/scripts/features/parallelism b/tests/scripts/features/parallelism
+index a895517..6e8376d 100644
+--- a/tests/scripts/features/parallelism
++++ b/tests/scripts/features/parallelism
+@@ -254,6 +254,26 @@ true
+ ');
+ }
+ 
++# Test recursion when make doesn't think it exists.
++# See Savannah bug #39934
++# Or Red Hat bug https://bugzilla.redhat.com/show_bug.cgi?id=885474
++
++open(MAKEFILE,"> Makefile2");
++print MAKEFILE <<EOF;
++vpath %.c $ENV{HOME}/
++foo:
++EOF
++close(MAKEFILE);
++
++run_make_test(q!
++default: ; @ #MAKEPATH# -f Makefile2
++!,
++              '-j2 --no-print-directory',
++"#MAKE#[1]: warning: jobserver unavailable: using -j1.  Add '+' to parent make rule.
++#MAKE#[1]: Nothing to be done for 'foo'.");
++
++unlink('Makefile2');
++
+ # Make sure that all jobserver FDs are closed if we need to re-exec the
+ # master copy.
+ #
+-- 
+cgit v1.0-41-gc330
+

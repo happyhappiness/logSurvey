@@ -1,0 +1,388 @@
+----++++src/BandwidthBucket.cc
+@@ -0,0 +1,107 @@
++/*
++ * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#include &quot;squid.h&quot;
++
++#if USE_DELAY_POOLS
++
++#include &quot;BandwidthBucket.h&quot;
++#include &quot;ClientInfo.h&quot;
++#include &quot;comm/Connection.h&quot;
++#include &quot;Debug.h&quot;
++#include &quot;fde.h&quot;
++
++BandwidthBucket::BandwidthBucket(const int speed, const int initialLevelPercent, const double sizeLimit) :
++    bucketLevel( sizeLimit * (initialLevelPercent / 100.0)),
++    selectWaiting(false),
++    writeSpeedLimit(speed),
++    bucketSizeLimit(sizeLimit)
++{
++    getCurrentTime();
++    /* put current time to have something sensible here */
++    prevTime = current_dtime;
++}
++
++void
++BandwidthBucket::refillBucket()
++{
++    if (noLimit())
++        return;
++    // all these times are in seconds, with double precision
++    const double currTime = current_dtime;
++    const double timePassed = currTime - prevTime;
++
++    // Calculate allowance for the time passed. Use double to avoid
++    // accumulating rounding errors for small intervals. For example, always
++    // adding 1 byte instead of 1.4 results in 29% bandwidth allocation error.
++    const double gain = timePassed * writeSpeedLimit;
++
++    // to further combat error accumulation during micro updates,
++    // quit before updating time if we cannot add at least one byte
++    if (gain &lt; 1.0)
++        return;
++
++    prevTime = currTime;
++
++    // for &quot;first&quot; connections, drain initial fat before refilling but keep
++    // updating prevTime to avoid bursts after the fat is gone
++    if (bucketLevel &gt; bucketSizeLimit) {
++        debugs(77, 4, &quot;not refilling while draining initial fat&quot;);
++        return;
++    }
++
++    bucketLevel += gain;
++
++    // obey quota limits
++    if (bucketLevel &gt; bucketSizeLimit)
++        bucketLevel = bucketSizeLimit;
++}
++
++bool
++BandwidthBucket::applyQuota(int &amp;nleft, Comm::IoCallback *state)
++{
++    const int q = quota();
++    if (!q)
++        return false;
++    else if (q &lt; 0)
++        return true;
++    const int nleft_corrected = min(nleft, q);
++    if (nleft != nleft_corrected) {
++        debugs(77, 5, state-&gt;conn &lt;&lt; &quot; writes only &quot; &lt;&lt;
++               nleft_corrected &lt;&lt; &quot; out of &quot; &lt;&lt; nleft);
++        nleft = nleft_corrected;
++    }
++    return true;
++}
++
++void
++BandwidthBucket::reduceBucket(const int len)
++{
++    if (len &lt;= 0 || noLimit())
++        return;
++    bucketLevel -= len;
++    if (bucketLevel &lt; 0.0) {
++        debugs(77, DBG_IMPORTANT, &quot;drained too much&quot;); // should not happen
++        bucketLevel = 0;
++    }
++}
++
++BandwidthBucket *
++BandwidthBucket::SelectBucket(fde *f)
++{
++    BandwidthBucket *bucket = f-&gt;writeQuotaHandler.getRaw();
++    if (!bucket) {
++        ClientInfo *clientInfo = f-&gt;clientInfo;
++        if (clientInfo &amp;&amp; clientInfo-&gt;writeLimitingActive)
++            bucket = clientInfo;
++    }
++    return bucket;
++}
++
++#endif /* USE_DELAY_POOLS */
++
+----++++src/BandwidthBucket.h
+@@ -0,0 +1,60 @@
++/*
++ * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef BANDWIDTHBUCKET_H
++#define BANDWIDTHBUCKET_H
++
++#if USE_DELAY_POOLS
++
++#include &quot;comm/IoCallback.h&quot;
++
++class fde;
++
++/// Base class for Squid-to-client bandwidth limiting
++class BandwidthBucket
++{
++public:
++    BandwidthBucket(const int speed, const int initialLevelPercent, const double sizeLimit);
++    virtual ~BandwidthBucket() {}
++
++    static BandwidthBucket *SelectBucket(fde *f);
++
++    /// \returns the number of bytes this bucket allows to write,
++    /// also considering aggregates, if any. Negative quota means
++    /// no limitations by this bucket.
++    virtual int quota() = 0;
++    /// Adjusts nleft to not exceed the current bucket quota value,
++    /// if needed.
++    virtual bool applyQuota(int &amp;nleft, Comm::IoCallback *state);
++    /// Will plan another write call.
++    virtual void scheduleWrite(Comm::IoCallback *state) = 0;
++    /// Performs cleanup when the related file descriptor becomes closed.
++    virtual void onFdClosed() { selectWaiting = false; }
++    /// Decreases the bucket level.
++    virtual void reduceBucket(const int len);
++    /// Whether this bucket will not do bandwidth limiting.
++    bool noLimit() const { return writeSpeedLimit &lt; 0; }
++
++protected:
++    /// Increases the bucket level with the writeSpeedLimit speed.
++    void refillBucket();
++
++public:
++    double bucketLevel; ///&lt; how much can be written now
++    bool selectWaiting; ///&lt; is between commSetSelect and commHandleWrite
++
++protected:
++    double prevTime; ///&lt; previous time when we checked
++    double writeSpeedLimit; ///&lt; Write speed limit in bytes per second.
++    double bucketSizeLimit; ///&lt; maximum bucket size
++};
++
++#endif /* USE_DELAY_POOLS */
++
++#endif
++
+----++++src/ClientDelayConfig.cc
+@@ -14,6 +14,12 @@
+ #include &quot;Parsing.h&quot;
+ #include &quot;Store.h&quot;
+ 
++ClientDelayPool::~ClientDelayPool()
++{
++    if (access)
++        aclDestroyAccessList(&amp;access);
++}
++
+ void ClientDelayPool::dump(StoreEntry * entry, unsigned int poolNumberMinusOne) const
+ {
+     LOCAL_ARRAY(char, nom, 32);
+@@ -23,81 +29,85 @@ void ClientDelayPool::dump(StoreEntry * entry, unsigned int poolNumberMinusOne)
+     storeAppendPrintf(entry, &quot;\n&quot;);
+ }
+ 
++ClientDelayPools *
++ClientDelayPools::Instance()
++{
++    static ClientDelayPools pools;
++    return &amp;pools;
++}
++
++ClientDelayPools::~ClientDelayPools()
++{
++    pools.clear();
++}
++
+ void
+ ClientDelayConfig::finalize()
+ {
+-    for (unsigned int i = 0; i &lt; pools.size(); ++i) {
++    for (unsigned int i = 0; i &lt; pools().size(); ++i) {
+         /* pools require explicit &#39;allow&#39; to assign a client into them */
+-        if (!pools[i].access) {
+-            debugs(77, DBG_IMPORTANT, "client_delay_pool #" &lt;&lt; (i+1) &lt;&lt;
++        if (!pool(i).access) {
++            debugs(77, DBG_IMPORTANT, "WARNING: client_delay_pool #" &lt;&lt; (i+1) &lt;&lt;
+                    &quot; has no client_delay_access configured. &quot; &lt;&lt;
+                    &quot;No client will ever use it.&quot;);
+         }
+     }
+ }
+ 
+-void ClientDelayConfig::freePoolCount()
++void ClientDelayConfig::dumpPoolCount(StoreEntry * entry, const char *name) const
+ {
+-    pools.clear();
++    const auto &amp;pools_ = ClientDelayPools::Instance()-&gt;pools;
++    if (pools_.size()) {
++        storeAppendPrintf(entry, &quot;%s %d\n&quot;, name, static_cast&lt;int&gt;(pools_.size()));
++        for (unsigned int i = 0; i &lt; pools_.size(); ++i)
++            pools_[i]-&gt;dump(entry, i);
++    }
+ }
+ 
+-void ClientDelayConfig::dumpPoolCount(StoreEntry * entry, const char *name) const
++void
++ClientDelayConfig::freePools()
+ {
+-    if (pools.size()) {
+-        storeAppendPrintf(entry, &quot;%s %d\n&quot;, name, (int)pools.size());
+-        for (unsigned int i = 0; i &lt; pools.size(); ++i)
+-            pools[i].dump(entry, i);
+-    }
++    pools().clear();
+ }
+ 
+ void ClientDelayConfig::parsePoolCount()
+ {
+-    if (pools.size()) {
+-        debugs(3, DBG_CRITICAL, &quot;parse_client_delay_pool_count: multiple client_delay_pools lines, aborting all previous client_delay_pools config&quot;);
+-        clean();
++    if (pools().size()) {
++        debugs(3, DBG_CRITICAL, &quot;parse_client_delay_pool_count: multiple client_delay_pools lines, &quot; &lt;&lt;
++               &quot;aborting all previous client_delay_pools config&quot;);
++        freePools();
+     }
+     unsigned short pools_;
+     ConfigParser::ParseUShort(&amp;pools_);
+-    for (int i = 0; i &lt; pools_; ++i) {
+-        pools.push_back(ClientDelayPool());
+-    }
++    for (int i = 0; i &lt; pools_; ++i)
++        pools().push_back(new ClientDelayPool());
+ }
+ 
+ void ClientDelayConfig::parsePoolRates()
+ {
+-    unsigned short pool;
+-    ConfigParser::ParseUShort(&amp;pool);
+-
+-    if (pool &lt; 1 || pool &gt; pools.size()) {
+-        debugs(3, DBG_CRITICAL, &quot;parse_client_delay_pool_rates: Ignoring pool &quot; &lt;&lt; pool &lt;&lt; &quot; not in 1 .. &quot; &lt;&lt; pools.size());
+-        return;
++    if (unsigned short poolId = parsePoolId()) {
++        --poolId;
++        pool(poolId).rate = GetInteger();
++        pool(poolId).highwatermark = GetInteger64();
+     }
+-
+-    --pool;
+-
+-    pools[pool].rate = GetInteger();
+-    pools[pool].highwatermark = GetInteger64();
+ }
+ 
+ void ClientDelayConfig::parsePoolAccess(ConfigParser &amp;parser)
+ {
+-    unsigned short pool;
+-
+-    ConfigParser::ParseUShort(&amp;pool);
+-
+-    if (pool &lt; 1 || pool &gt; pools.size()) {
+-        debugs(3, DBG_CRITICAL, &quot;parse_client_delay_pool_rates: Ignoring pool &quot; &lt;&lt; pool &lt;&lt; &quot; not in 1 .. &quot; &lt;&lt; pools.size());
+-        return;
+-    }
+-
+-    --pool;
+-    aclParseAccessLine(&quot;client_delay_access&quot;, parser, &amp;pools[pool].access);
++    if (const unsigned short poolId = parsePoolId())
++        aclParseAccessLine(&quot;client_delay_access&quot;, parser, &amp;(pool(poolId-1).access));
+ }
+ 
+-void ClientDelayConfig::clean()
++unsigned short
++ClientDelayConfig::parsePoolId()
+ {
+-    for (unsigned int i = 0; i &lt; pools.size(); ++i) {
+-        aclDestroyAccessList(&amp;pools[i].access);
++    unsigned short poolId = 0;
++    ConfigParser::ParseUShort(&amp;poolId);
++    if (poolId &lt; 1 || poolId &gt; pools().size()) {
++        debugs(3, DBG_CRITICAL, &quot;parse_client_delay_pool_rates: Ignoring pool &quot; &lt;&lt;
++               poolId &lt;&lt; &quot; not in 1 .. &quot; &lt;&lt; pools().size());
++        return 0;
+     }
++    return poolId;
+ }
+ 
+----++++src/ClientDelayConfig.h
+@@ -10,6 +10,7 @@
+ #define SQUID_CLIENTDELAYCONFIG_H
+ 
+ #include &quot;acl/forward.h&quot;
++#include &quot;base/RefCount.h&quot;
+ 
+ #include &lt;vector&gt;
+ 
+@@ -19,26 +20,46 @@ class ConfigParser;
+ /// \ingroup DelayPoolsAPI
+ 
+ /* represents one client write limiting delay &#39;pool&#39; */
+-class ClientDelayPool
++class ClientDelayPool : public RefCountable
+ {
+ public:
++    typedef RefCount&lt;ClientDelayPool&gt; Pointer;
++
+     ClientDelayPool()
+-        :   access(NULL), rate(0), highwatermark(0) {}
++        :   access(nullptr), rate(0), highwatermark(0) {}
++    ~ClientDelayPool();
++    ClientDelayPool(const ClientDelayPool &amp;) = delete;
++    ClientDelayPool &amp;operator=(const ClientDelayPool &amp;) = delete;
++
+     void dump (StoreEntry * entry, unsigned int poolNumberMinusOne) const;
+     acl_access *access;
+     int rate;
+     int64_t highwatermark;
+ };
+ 
+-typedef std::vector&lt;ClientDelayPool&gt; ClientDelayPools;
++class ClientDelayPools
++{
++public:
++    ClientDelayPools(const ClientDelayPools &amp;) = delete;
++    ClientDelayPools &amp;operator=(const ClientDelayPools &amp;) = delete;
++    static ClientDelayPools *Instance();
++
++    std::vector&lt;ClientDelayPool::Pointer&gt; pools;
++private:
++    ClientDelayPools() {}
++    ~ClientDelayPools();
++};
+ 
+ /* represents configuration of client write limiting delay pools */
+ class ClientDelayConfig
+ {
+ public:
+     ClientDelayConfig()
+         :   initial(50) {}
+-    void freePoolCount();
++    ClientDelayConfig(const ClientDelayConfig &amp;) = delete;
++    ClientDelayConfig &amp;operator=(const ClientDelayConfig &amp;) = delete;
++
++    void freePools();
+     void dumpPoolCount(StoreEntry * entry, const char *name) const;
+     /* parsing of client_delay_pools - number of pools */
+     void parsePoolCount();
+@@ -51,9 +72,11 @@ class ClientDelayConfig
+ 
+     /* initial bucket level, how fill bucket at startup */
+     unsigned short initial;
+-    ClientDelayPools pools;
++
+ private:
+-    void clean();
++    unsigned short parsePoolId();
++    std::vector&lt;ClientDelayPool::Pointer&gt; &amp;pools() { return ClientDelayPools::Instance()-&gt;pools; }
++    ClientDelayPool &amp;pool(const int i) { return *(ClientDelayPools::Instance()-&gt;pools.at(i)); }
+ };
+ 
+ #endif // SQUID_CLIENTDELAYCONFIG_H
+----++++GitHub

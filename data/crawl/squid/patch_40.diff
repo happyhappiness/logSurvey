@@ -1,0 +1,162 @@
+----++++src/cache_cf.cc
+@@ -946,10 +946,6 @@ configDoConfigure(void)
+         }
+     }
+ #endif
+-
+-    if (Config.readAheadGap &lt;= 0) {
+-        fatalf(&quot;read_ahead_gap must be greater than 0 bytes&quot;);
+-    }
+ }
+ 
+ /** Parse a line containing an obsolete directive.
+----++++src/cf.data.pre
+@@ -5650,17 +5650,6 @@ DEFAULT: 16 KB
+ DOC_START
+ 	The amount of data the cache will buffer ahead of what has been
+ 	sent to the client when retrieving an object from another server.
+-	
+-	This also influences the maximum network read(2)/write(2) sizes in some
+-	circumstances. Reducing the size of this buffer will decrease
+-	per-connection memory usage at the cost of more read(2)/write(2) calls.
+-	Conversely, increasing the size of this buffer will decrease the number of
+-	read(2)/write(2) calls at the cost of memory usage, potentially improving
+-	performance.
+-
+-	Squid does not slow does the response delivery to the client in order to
+-	fill the buffer.
+-
+ DOC_END
+ 
+ NAME: negative_ttl
+----++++src/client_side.cc
+@@ -1012,9 +1012,12 @@ ConnStateData::abortRequestParsing(const char *const uri)
+     http-&gt;uri = xstrdup(uri);
+     setLogUri (http, uri);
+     auto *context = new Http::Stream(clientConnection, http);
++    StoreIOBuffer tempBuffer;
++    tempBuffer.data = context-&gt;reqbuf;
++    tempBuffer.length = HTTP_REQBUF_SZ;
+     clientStreamInit(&amp;http-&gt;client_stream, clientGetMoreData, clientReplyDetach,
+                      clientReplyStatus, new clientReplyContext(http), clientSocketRecipient,
+-                     clientSocketDetach, context, context-&gt;getClientStreamBuffer());
++                     clientSocketDetach, context, tempBuffer);
+     return context;
+ }
+ 
+@@ -1356,11 +1359,15 @@ parseHttpRequest(ConnStateData *csd, const Http1::RequestParserPointer &amp;hp)
+     http-&gt;req_sz = hp-&gt;messageHeaderSize();
+     Http::Stream *result = new Http::Stream(csd-&gt;clientConnection, http);
+ 
++    StoreIOBuffer tempBuffer;
++    tempBuffer.data = result-&gt;reqbuf;
++    tempBuffer.length = HTTP_REQBUF_SZ;
++
+     ClientStreamData newServer = new clientReplyContext(http);
+     ClientStreamData newClient = result;
+     clientStreamInit(&amp;http-&gt;client_stream, clientGetMoreData, clientReplyDetach,
+                      clientReplyStatus, newServer, clientSocketRecipient,
+-                     clientSocketDetach, newClient, result-&gt;getClientStreamBuffer());
++                     clientSocketDetach, newClient, tempBuffer);
+ 
+     /* set url */
+     debugs(33,5, &quot;Prepare absolute URL from &quot; &lt;&lt;
+----++++src/http/Stream.cc
+@@ -11,7 +11,6 @@
+ #include &quot;http/Stream.h&quot;
+ #include &quot;HttpHdrContRange.h&quot;
+ #include &quot;HttpHeaderTools.h&quot;
+-#include &quot;SquidConfig.h&quot;
+ #include &quot;Store.h&quot;
+ #include &quot;TimeOrTag.h&quot;
+ 
+@@ -21,10 +20,10 @@ Http::Stream::Stream(const Comm::ConnectionPointer &amp;aConn, ClientHttpRequest *aR
+     reply(nullptr),
+     writtenToSocket(0),
+     mayUseConnection_(false),
+-    connRegistered_(false),
+-    requestBuffer(nullptr)
++    connRegistered_(false)
+ {
+     assert(http != nullptr);
++    memset(reqbuf, &#39;\0&#39;, sizeof (reqbuf));
+     flags.deferred = 0;
+     flags.parsed_ok = 0;
+     deferredparams.node = nullptr;
+@@ -110,10 +109,12 @@ Http::Stream::pullData()
+     debugs(33, 5, reply &lt;&lt; &quot; written &quot; &lt;&lt; http-&gt;out.size &lt;&lt; &quot; into &quot; &lt;&lt; clientConnection);
+ 
+     /* More data will be coming from the stream. */
+-    StoreIOBuffer readBuffer = getClientStreamBuffer();
++    StoreIOBuffer readBuffer;
+     /* XXX: Next requested byte in the range sequence */
+     /* XXX: length = getmaximumrangelenfgth */
+     readBuffer.offset = getNextRangeOffset();
++    readBuffer.length = HTTP_REQBUF_SZ;
++    readBuffer.data = reqbuf;
+     /* we may note we have reached the end of the wanted ranges */
+     clientStreamRead(getTail(), http, readBuffer);
+ }
+@@ -567,18 +568,6 @@ Http::Stream::deferRecipientForLater(clientStreamNode *node, HttpReply *rep, Sto
+     deferredparams.queuedBuffer = receivedData;
+ }
+ 
+-StoreIOBuffer
+-Http::Stream::getClientStreamBuffer()
+-{
+-    if (!requestBuffer) {
+-        requestBuffer = new MemBlob(Config.readAheadGap);
+-    }
+-    StoreIOBuffer tempBuffer;
+-    tempBuffer.data = requestBuffer-&gt;mem;
+-    tempBuffer.length = requestBuffer-&gt;spaceSize();
+-    return tempBuffer;
+-}
+-
+ void
+ Http::Stream::prepareReply(HttpReply *rep)
+ {
+----++++src/http/Stream.h
+@@ -120,13 +120,12 @@ class Stream : public RefCountable
+ 
+     void deferRecipientForLater(clientStreamNode *, HttpReply *, StoreIOBuffer receivedData);
+ 
+-    StoreIOBuffer getClientStreamBuffer();
+-
+ public: // HTTP/1.x state data
+ 
+     Comm::ConnectionPointer clientConnection; ///&lt; details about the client connection socket
+     ClientHttpRequest *http;    /* we pretend to own that Job */
+     HttpReply *reply;
++    char reqbuf[HTTP_REQBUF_SZ];
+     struct {
+         unsigned deferred:1; ///&lt; This is a pipelined request waiting for the current object to complete
+         unsigned parsed_ok:1; ///&lt; Was this parsed correctly?
+@@ -159,8 +158,6 @@ class Stream : public RefCountable
+ 
+     bool mayUseConnection_; /* This request may use the connection. Don&#39;t read anymore requests for now */
+     bool connRegistered_;
+-
+-    MemBlob::Pointer requestBuffer;
+ };
+ 
+ } // namespace Http
+----++++src/servers/FtpServer.cc
+@@ -759,11 +759,15 @@ Ftp::Server::parseOneRequest()
+     Http::Stream *const result =
+         new Http::Stream(clientConnection, http);
+ 
++    StoreIOBuffer tempBuffer;
++    tempBuffer.data = result-&gt;reqbuf;
++    tempBuffer.length = HTTP_REQBUF_SZ;
++
+     ClientStreamData newServer = new clientReplyContext(http);
+     ClientStreamData newClient = result;
+     clientStreamInit(&amp;http-&gt;client_stream, clientGetMoreData, clientReplyDetach,
+                      clientReplyStatus, newServer, clientSocketRecipient,
+-                     clientSocketDetach, newClient, result-&gt;getClientStreamBuffer());
++                     clientSocketDetach, newClient, tempBuffer);
+ 
+     result-&gt;flags.parsed_ok = 1;
+     return result;
+----++++GitHub

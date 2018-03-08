@@ -1,0 +1,372 @@
+----++++src/SquidConfig.h
+@@ -10,6 +10,9 @@
+ #define SQUID_SQUIDCONFIG_H_
+ 
+ #include &quot;acl/forward.h&quot;
++#if USE_AUTH
++#include &quot;auth/SchemesConfig.h&quot;
++#endif
+ #include &quot;base/RefCount.h&quot;
+ #include &quot;base/YesNoNone.h&quot;
+ #include &quot;ClientDelayConfig.h&quot;
+@@ -397,6 +400,9 @@ class SquidConfig
+ 
+         acl_access *forceRequestBodyContinuation;
+         acl_access *serverPconnForNonretriable;
++#if USE_AUTH
++        acl_access *authSchemes;
++#endif
+     } accessList;
+     AclDenyInfoList *denyInfoList;
+ 
+@@ -538,6 +544,9 @@ class SquidConfig
+         ssize_t packet_max; ///&lt; maximum size EDNS advertised for DNS replies.
+     } dns;
+ 
++#if USE_AUTH
++    Auth::SchemesConfigs authSchemesConfigs;
++#endif
+ };
+ 
+ extern SquidConfig Config;
+----++++src/auth/Config.cc
+@@ -65,6 +65,15 @@ Auth::Config::Find(const char *proxy_auth)
+     return NULL;
+ }
+ 
++Auth::Config *
++Auth::Config::GetParsed(const char *proxy_auth)
++{
++    if (auto *cfg = Find(proxy_auth))
++        return cfg;
++    fatalf(&quot;auth_schemes: required authentication method &#39;%s&#39; is not configured&quot;, proxy_auth);
++    return nullptr;
++}
++
+ /** Default behaviour is to expose nothing */
+ void
+ Auth::Config::registerWithCacheManager(void)
+----++++src/auth/Config.h
+@@ -49,6 +49,9 @@ class Config
+     static UserRequest::Pointer CreateAuthUser(const char *proxy_auth, AccessLogEntry::Pointer &amp;al);
+ 
+     static Config *Find(const char *proxy_auth);
++    /// Call this method if you need a guarantee that all auth schemes has been
++    /// already configured.
++    static Config *GetParsed(const char *proxy_auth);
+     Config() : authenticateChildren(20), authenticateProgram(NULL), keyExtras(NULL) {}
+ 
+     virtual ~Config() {}
+----++++src/auth/Makefile.am
+@@ -30,6 +30,8 @@ libauth_la_SOURCES = \
+ 	QueueNode.h \
+ 	Scheme.cc \
+ 	Scheme.h \
++	SchemesConfig.h \
++	SchemesConfig.cc \
+ 	State.h \
+ 	State.cc \
+ 	User.h \
+----++++src/auth/SchemesConfig.cc
+@@ -0,0 +1,47 @@
++/*
++ * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#include &quot;squid.h&quot;
++#include &quot;auth/Config.h&quot;
++#include &quot;auth/SchemesConfig.h&quot;
++#include &quot;fatal.h&quot;
++#include &quot;parser/Tokenizer.h&quot;
++
++static void
++addUnique(const SBuf &amp;scheme, std::vector&lt;SBuf&gt; &amp;vec)
++{
++    static const SBuf all(&quot;ALL&quot;);
++    if (scheme == all) {
++        for (const auto config: Auth::TheConfig)
++            addUnique(SBuf(config-&gt;type()), vec);
++    } else if (std::find(vec.begin(), vec.end(), scheme) == vec.end())
++        vec.push_back(scheme);
++}
++
++void
++Auth::SchemesConfig::expand()
++{
++    static const CharacterSet delimiters(&quot;delimiters&quot;, &quot;,&quot;);
++    static const CharacterSet quotedDelimiters(&quot;quotedDelimiters&quot;, &quot;, &quot;);
++    const CharacterSet *resultDelimiters = quoted ? &amp;quotedDelimiters : &amp;delimiters;
++    std::vector&lt;SBuf&gt; expanded;
++    Parser::Tokenizer t(schemes);
++    SBuf scheme;
++    while (t.token(scheme, *resultDelimiters))
++        addUnique(scheme, expanded);
++    t.skipAllTrailing(CharacterSet::SP + CharacterSet::HTAB);
++    if (!t.remaining().isEmpty())
++        addUnique(t.remaining(), expanded);
++
++    authConfigs.clear();
++    transform(expanded.begin(), expanded.end(),
++    back_inserter(authConfigs), [](SBuf &amp;s) {
++        return Auth::Config::GetParsed(s.c_str());
++    });
++}
++
+----++++src/auth/SchemesConfig.h
+@@ -0,0 +1,52 @@
++/*
++ * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_SCHEMES_CONFIG_H
++#define SQUID_SCHEMES_CONFIG_H
++
++#if USE_AUTH
++
++#include &quot;auth/Config.h&quot;
++
++namespace Auth
++{
++
++/**
++ * \ingroup AuthAPI
++ * Stores authentication schemes list, configured by auth_schemes
++ * directive.
++ */
++class SchemesConfig
++{
++public:
++    SchemesConfig(const char *s, const bool q) : schemes(s), quoted(q), rawSchemes(schemes.c_str()) {}
++    /// Expands special &quot;ALL&quot; scheme name (if provided), removes
++    /// duplicates and fills authConfigs vector.
++    void expand();
++
++public:
++    /// corresponding vector of Auth::Config objects
++    ConfigVector authConfigs;
++
++private:
++    /// raw auth schemes list (may have duplicates)
++    SBuf schemes;
++    const bool quoted;
++
++public:
++    /// optimization for storing schemes.c_str()
++    const char *rawSchemes;
++};
++
++typedef std::vector&lt;SchemesConfig&gt; SchemesConfigs;
++
++} // namespace Auth
++
++#endif /* USE_AUTH */
++#endif /* SQUID_SCHEMES_CONFIG_H */
++
+----++++src/auth/UserRequest.cc
+@@ -13,8 +13,10 @@
+  * See acl.c for access control and client_side.c for auditing */
+ 
+ #include &quot;squid.h&quot;
++#include &quot;acl/FilledChecklist.h&quot;
+ #include &quot;auth/Config.h&quot;
+ #include &quot;auth/Scheme.h&quot;
++#include &quot;auth/SchemesConfig.h&quot;
+ #include &quot;auth/User.h&quot;
+ #include &quot;auth/UserRequest.h&quot;
+ #include &quot;client_side.h&quot;
+@@ -25,6 +27,7 @@
+ #include &quot;HttpReply.h&quot;
+ #include &quot;HttpRequest.h&quot;
+ #include &quot;MemBuf.h&quot;
++#include &quot;SquidConfig.h&quot;
+ 
+ /* Generic Functions */
+ 
+@@ -461,6 +464,20 @@ Auth::UserRequest::tryToAuthenticateAndSetAuthUser(Auth::UserRequest::Pointer *
+     return result;
+ }
+ 
++static Auth::ConfigVector &amp;
++schemesConfig(HttpRequest *request, HttpReply *rep)
++{
++    if (::Config.accessList.authSchemes) {
++        ACLFilledChecklist ch(NULL, request, NULL);
++        ch.reply = rep;
++        HTTPMSGLOCK(ch.reply);
++        const allow_t answer = ch.fastCheck(::Config.accessList.authSchemes);
++        if (answer == ACCESS_ALLOWED)
++            return ::Config.authSchemesConfigs.at(answer.kind).authConfigs;
++    }
++    return Auth::TheConfig;
++}
++
+ void
+ Auth::UserRequest::addReplyAuthHeader(HttpReply * rep, Auth::UserRequest::Pointer auth_user_request, HttpRequest * request, int accelerated, int internal)
+ /* send the auth types we are configured to support (and have compiled in!) */
+@@ -498,8 +515,8 @@ Auth::UserRequest::addReplyAuthHeader(HttpReply * rep, Auth::UserRequest::Pointe
+             auth_user_request-&gt;user()-&gt;config-&gt;fixHeader(auth_user_request, rep, type, request);
+         else {
+             /* call each configured &amp; running authscheme */
+-
+-            for (Auth::ConfigVector::iterator  i = Auth::TheConfig.begin(); i != Auth::TheConfig.end(); ++i) {
++            Auth::ConfigVector &amp;configs = schemesConfig(request, rep);
++            for (Auth::ConfigVector::iterator i = configs.begin(); i != configs.end(); ++i) {
+                 Auth::Config *scheme = *i;
+ 
+                 if (scheme-&gt;active()) {
+----++++src/cache_cf.cc
+@@ -80,6 +80,7 @@
+ #if USE_AUTH
+ #include &quot;auth/Config.h&quot;
+ #include &quot;auth/Scheme.h&quot;
++#include &quot;auth/SchemesConfig.h&quot;
+ #endif
+ #if USE_SQUID_ESI
+ #include &quot;esi/Parser.h&quot;
+@@ -245,6 +246,7 @@ static void free_configuration_includes_quoted_values(bool *recognizeQuotedValue
+ static void parse_on_unsupported_protocol(acl_access **access);
+ static void dump_on_unsupported_protocol(StoreEntry *entry, const char *name, acl_access *access);
+ static void free_on_unsupported_protocol(acl_access **access);
++static void ParseAclWithAction(acl_access **access, const allow_t &amp;action, const char *desc, ACL *acl = nullptr);
+ 
+ /*
+  * LegacyParser is a parser for legacy code that uses the global
+@@ -943,6 +945,14 @@ configDoConfigure(void)
+             Config.pipeline_max_prefetch = 0;
+         }
+     }
++
++    for (auto &amp;authSchemes: Config.authSchemesConfigs) {
++        authSchemes.expand();
++        if (authSchemes.authConfigs.empty()) {
++            debugs(3, DBG_CRITICAL, &quot;auth_schemes: at least one scheme name is required; got: &quot; &lt;&lt; authSchemes.rawSchemes);
++            self_destruct();
++        }
++    }
+ #endif
+ }
+ 
+@@ -1824,10 +1834,41 @@ dump_authparam(StoreEntry * entry, const char *name, Auth::ConfigVector cfg)
+     for (Auth::ConfigVector::iterator  i = cfg.begin(); i != cfg.end(); ++i)
+         (*i)-&gt;dump(entry, name, (*i));
+ }
++
++static void
++parse_AuthSchemes(acl_access **authSchemes)
++{
++    const char *tok = ConfigParser::NextQuotedToken();
++    if (!tok) {
++        debugs(29, DBG_CRITICAL, &quot;FATAL: auth_schemes missing the parameter&quot;);
++        self_destruct();
++        return;
++    }
++    Config.authSchemesConfigs.push_back(Auth::SchemesConfig(tok, ConfigParser::LastTokenWasQuoted));
++    const allow_t action = allow_t(ACCESS_ALLOWED, Config.authSchemesConfigs.size() - 1);
++    ParseAclWithAction(authSchemes, action, &quot;auth_schemes&quot;);
++}
++
++static void
++free_AuthSchemes(acl_access **authSchemes)
++{
++    Config.authSchemesConfigs.clear();
++    free_acl_access(authSchemes);
++}
++
++static void
++dump_AuthSchemes(StoreEntry *entry, const char *name, acl_access *authSchemes)
++{
++    if (authSchemes)
++        dump_SBufList(entry, authSchemes-&gt;treeDump(name, [](const allow_t &amp;action) {
++                    return Config.authSchemesConfigs.at(action.kind).rawSchemes;
++        }));
++}
++
+ #endif /* USE_AUTH */
+ 
+ static void
+-ParseAclWithAction(acl_access **access, const allow_t &amp;action, const char *desc, ACL *acl = nullptr)
++ParseAclWithAction(acl_access **access, const allow_t &amp;action, const char *desc, ACL *acl)
+ {
+     assert(access);
+     SBuf name;
+----++++src/cf.data.depend
+@@ -16,6 +16,7 @@ acl_tos			acl
+ acl_nfmark		acl
+ address
+ authparam
++AuthSchemes
+ b_int64_t
+ b_size_t
+ b_ssize_t
+----++++src/cf.data.pre
+@@ -771,6 +771,51 @@ DOC_START
+ 	environment with relatively static address assignments.
+ DOC_END
+ 
++NAME: auth_schemes
++TYPE: AuthSchemes
++IFDEF: USE_AUTH
++LOC: Config.accessList.authSchemes
++DEFAULT: none
++DEFAULT_DOC: use all auth_param schemes in their configuration order
++DOC_START
++	Use this directive to customize authentication schemes presence and
++	order in Squid&#39;s Unauthorized and Authentication Required responses.
++
++		auth_schemes scheme1,scheme2,... [!]aclname ...
++
++	where schemeN is the name of one of the authentication schemes
++	configured using auth_param directives. At least one scheme name is
++	required. Multiple scheme names are separated by commas. Either
++	avoid whitespace or quote the entire schemes list.
++
++	A special &quot;ALL&quot; scheme name expands to all auth_param-configured
++	schemes in their configuration order. This directive cannot be used
++	to configure Squid to offer no authentication schemes at all.
++
++	The first matching auth_schemes rule determines the schemes order
++	for the current Authentication Required transaction. Note that the
++	future response is not yet available during auth_schemes evaluation.
++
++	If this directive is not used or none of its rules match, then Squid
++	responds with all configured authentication schemes in the order of
++	auth_param directives in the configuration file.
++
++	This directive does not determine when authentication is used or
++	how each authentication scheme authenticates clients.
++
++	The following example sends basic and negotiate authentication
++	schemes, in that order, when requesting authentication of HTTP
++	requests matching the isIE ACL (not shown) while sending all
++	auth_param schemes in their configuration order to other clients:
++
++		auth_schemes basic,negotiate isIE
++		auth_schemes ALL all # explicit default
++
++	This directive supports fast ACLs only.
++
++	See also: auth_param.
++DOC_END
++
+ COMMENT_START
+  ACCESS CONTROLS
+  -----------------------------------------------------------------------------
+----++++src/tests/stub_libauth.cc
+@@ -74,5 +74,8 @@ Auth::Scheme::Pointer Auth::UserRequest::scheme() const STUB_RETVAL(NULL)
+ #include &quot;AuthReg.h&quot;
+ void Auth::Init() STUB_NOP
+ 
++#include &quot;auth/SchemesConfig.h&quot;
++void Auth::SchemesConfig::expand() STUB
++
+ #endif /* USE_AUTH */
+ 
+----++++GitHub

@@ -1,5 +1,3 @@
-
-import urllib2
 import os
 import re
 import csv
@@ -41,8 +39,12 @@ def analyze_commit(commit_page, record, counter, writer):
     @ involve analyze commit page and store commit record[call generate code]\n
     """
     url = MAIN_URL + commit_page
-    response = urllib2.urlopen(url)
-    commit_info = response.read()
+    commit_info = my_util.urlopen(url)
+    if commit_info is None:
+        print 'fail to fetch commit: %s; counter: %d' %(url, counter)
+        return None
+    # response = urllib2.urlopen(url)
+    # commit_info = response.read()
     commit_info = commit_info.split("\n")
     # regex parser for store [url, time, title, explain, patch_file]
     modify_pattern = r'<strong>(\d*) (?:addition|deletion)[s]*</strong>'
@@ -78,10 +80,10 @@ def analyze_commit(commit_page, record, counter, writer):
 
     return store_patch_file(patch, counter, [url] + record + [changes], writer)
 
-def analyze_html(html, counter, writer):
+def analyze_html(html, counter, writer, failure_commit=None):
     """
-    @ param html, counter and writer\n
-    @ return html/new commit list page, counter\n
+    @ param html, counter and writer, commit list page(for error handling)\n
+    @ return html/new commit list page, counter and failure commit\n
     @ involve analyze html and find first commit page\n
     """
     commit_page_begin_pattern = r'(?:href|HREF)="/(' + GIT_REPOS_NAME + r'/' + REPOS_NAME + r'/commit/\w*)" class="message"[^>]*title=\W*([^>]*$|[^>]*>).*'
@@ -92,7 +94,7 @@ def analyze_html(html, counter, writer):
     for line in html:
         # search begin of commit
         is_commit_begin = re.search(commit_page_begin_pattern, line, re.I)
-        if is_commit_begin:
+        if is_commit_begin:                    
             # retrieve title
             title = is_commit_begin.group(2)
             # search end of commit
@@ -104,7 +106,18 @@ def analyze_html(html, counter, writer):
                         is_date = re.search(date_pattern, line_commit_date, re.I)
                         if is_date:
                             date = is_date.group(1)
-                            return html[html.index(line_commit_date) + 1:], analyze_commit(is_commit_begin.group(1), [date, title[:-1]], counter, writer)
+                            # compare with the failure commit(restart point)
+                            if failure_commit is not None:
+                                # find start point and start analyze comming commit
+                                if is_commit_begin.group(1) == failure_commit:
+                                    failure_commit = None
+                                    return html[html.index(line_commit_date) + 1:], analyze_commit(is_commit_begin.group(1), [date, title[:-1]], counter, writer), failure_commit
+                                # if have not find start point, skip analyze
+                                else:
+                                    return html[html.index(line_commit_date) + 1:], counter, failure_commit
+                            # no restart point, so analyze every commit
+                            else:
+                                return html[html.index(line_commit_date) + 1:], analyze_commit(is_commit_begin.group(1), [date, title[:-1]], counter, writer), failure_commit
                 # search end of title
                 else:
                     is_commit_end = re.search(commit_page_end_pattern, line_commit, re.I)
@@ -126,29 +139,41 @@ def analyze_html(html, counter, writer):
             # call analyze commit list for analyzing the next commit list
             return is_next_list_page.group(1), counter
     
-    return None, None
+    return None, None, failure_commit
 
-def analyze_commit_list(commit_list_page, total_counter, counter, writer):
+def analyze_commit_list(commit_list_page, total_counter, counter, writer, failure_commit=None):
     """
     @ param commit list page, counter and file writer\n
     @ return nothing\n
     @ involve fetch and analyze commit list[call analyze commit]\n
     """
     # fetch commit list
-    response = urllib2.urlopen(MAIN_URL + commit_list_page)
-    html = response.read()
+    html = my_util.urlopen(MAIN_URL + commit_list_page)
+    if html is None:
+        print 'fail for commit list page fetch %s' %commit_list_page
+        return
+    # html = response.read()
     html = html.split("\n")
 
+
     # analyze html, include invokement of analyze_commit_list itself
-    html, counter = analyze_html(html, counter, writer)
-    # new commit list
-    while not isinstance(html, str):
+    html, counter, failure_commit = analyze_html(html, counter, writer, failure_commit)
+
+    # deal with the same commit list if this list is not done
+    while isinstance(html, list):
+        # html is list, then counter is the return value of analyze commit. whose none means fetch failure
+        if counter is None:
+            print 'fail for commit list page fetch %s' %commit_list_page
+            return
+        # update and print counter
         total_counter += 1
         if total_counter % 5 == 0:
             print 'have crawled %d commit, find %d log commit' %(total_counter, counter)
-        html, counter = analyze_html(html, counter, writer)
+        # analyze the lefted html
+        html, counter, failure_commit = analyze_html(html, counter, writer, failure_commit)
 
-    # analyze new commit
+
+    # analyze new commit if find next page
     if html is not None:
         analyze_commit_list(html, total_counter, counter, writer)
     # no next page

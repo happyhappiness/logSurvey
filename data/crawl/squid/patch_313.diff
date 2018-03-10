@@ -1,0 +1,2034 @@
+@@ -33,6 +33,9 @@ class SplayNode
+     SplayNode<V> * insert(Value data, SPLAYCMP * compare);
+ 
+     template <class FindValue> SplayNode<V> * splay(const FindValue &data, int( * compare)(FindValue const &a, Value const &b)) const;
++
++    /// recursively visit left nodes, this node, and then right nodes
++    template <class Visitor> void visit(Visitor &v) const;
+ };
+ 
+ typedef SplayNode<void *> splayNode;
+@@ -73,6 +76,9 @@ class Splay
+ 
+     const_iterator end() const;
+ 
++    /// recursively visit all nodes, in left-to-right order
++    template <class Visitor> void visit(Visitor &v) const;
++
+     size_t elements;
+ };
+ 
+@@ -276,6 +282,25 @@ SplayNode<V>::splay(FindValue const &dataToFind, int( * compare)(FindValue const
+     return top;
+ }
+ 
++template <class V>
++template <class Visitor>
++void
++SplayNode<V>::visit(Visitor &visitor) const {
++    if (left)
++        left->visit(visitor);
++    visitor(data);
++    if (right)
++        right->visit(visitor);
++}
++
++template <class V>
++template <class Visitor>
++void
++Splay<V>::visit(Visitor &visitor) const {
++    if (head)
++        head->visit(visitor);
++}
++
+ template <class V>
+ template <class FindValue>
+ typename Splay<V>::Value const *
+@@ -362,6 +387,7 @@ Splay<V>::end() const
+     return const_iterator(NULL);
+ }
+ 
++// XXX: This does not seem to iterate the whole thing in some cases.
+ template <class V>
+ class SplayConstIterator
+ {
+@@ -18,6 +18,7 @@
+ #include "ipc/Queue.h"
+ #include "ipc/StrandSearch.h"
+ #include "ipc/UdsOp.h"
++#include "SBuf.h"
+ #include "SquidConfig.h"
+ #include "SquidTime.h"
+ #include "StatCounters.h"
+@@ -42,8 +43,8 @@ std::auto_ptr<IpcIoFile::Queue> IpcIoFile::queue;
+ 
+ bool IpcIoFile::DiskerHandleMoreRequestsScheduled = false;
+ 
+-static bool DiskerOpen(const String &path, int flags, mode_t mode);
+-static void DiskerClose(const String &path);
++static bool DiskerOpen(const SBuf &path, int flags, mode_t mode);
++static void DiskerClose(const SBuf &path);
+ 
+ /// IpcIo wrapper for debugs() streams; XXX: find a better class name
+ struct SipcIo {
+@@ -97,7 +98,7 @@ IpcIoFile::open(int flags, mode_t mode, RefCount<IORequestor> callback)
+         queue.reset(new Queue(ShmLabel, IamWorkerProcess() ? Queue::groupA : Queue::groupB, KidIdentifier));
+ 
+     if (IamDiskProcess()) {
+-        error_ = !DiskerOpen(dbName, flags, mode);
++        error_ = !DiskerOpen(SBuf(dbName.termedBuf()), flags, mode);
+         if (error_)
+             return;
+ 
+@@ -139,7 +140,8 @@ IpcIoFile::openCompleted(const Ipc::StrandSearchResponse *const response)
+     Must(diskId < 0); // we do not know our disker yet
+ 
+     if (!response) {
+-        debugs(79, DBG_IMPORTANT, HERE << "error: timeout");
++        debugs(79, DBG_IMPORTANT, "ERROR: " << dbName << " communication " <<
++               "channel establishment timeout");
+         error_ = true;
+     } else {
+         diskId = response->strand.kidId;
+@@ -149,7 +151,8 @@ IpcIoFile::openCompleted(const Ipc::StrandSearchResponse *const response)
+             Must(inserted);
+         } else {
+             error_ = true;
+-            debugs(79, DBG_IMPORTANT, HERE << "error: no disker claimed " << dbName);
++            debugs(79, DBG_IMPORTANT, "ERROR: no disker claimed " <<
++                   "responsibility for " << dbName);
+         }
+     }
+ 
+@@ -174,7 +177,7 @@ IpcIoFile::close()
+     assert(ioRequestor != NULL);
+ 
+     if (IamDiskProcess())
+-        DiskerClose(dbName);
++        DiskerClose(SBuf(dbName.termedBuf()));
+     // XXX: else nothing to do?
+ 
+     ioRequestor->closeCompleted();
+@@ -226,10 +229,12 @@ IpcIoFile::readCompleted(ReadRequest *readRequest,
+         ioError = true; // I/O timeout does not warrant setting error_?
+     } else {
+         if (response->xerrno) {
+-            debugs(79, DBG_IMPORTANT, HERE << "error: " << xstrerr(response->xerrno));
++            debugs(79, DBG_IMPORTANT, "ERROR: " << dbName << " read: " <<
++                   xstrerr(response->xerrno));
+             ioError = error_ = true;
+         } else if (!response->page) {
+-            debugs(79, DBG_IMPORTANT, HERE << "error: run out of shared memory pages");
++            debugs(79, DBG_IMPORTANT, "ERROR: " << dbName << " read ran " <<
++                   "out of shared memory pages");
+             ioError = true;
+         } else {
+             const char *const buf = Ipc::Mem::PagePointer(response->page);
+@@ -357,14 +362,15 @@ IpcIoFile::push(IpcIoPendingRequest *const pending)
+             Notify(diskId); // must notify disker
+         trackPendingRequest(ipcIo.requestId, pending);
+     } catch (const Queue::Full &) {
+-        debugs(47, DBG_IMPORTANT, "Worker I/O push queue overflow: " <<
++        debugs(47, DBG_IMPORTANT, "ERROR: worker I/O push queue for " <<
++               dbName << " overflow: " <<
+                SipcIo(KidIdentifier, ipcIo, diskId)); // TODO: report queue len
+         // TODO: grow queue size
+ 
+         pending->completeIo(NULL);
+         delete pending;
+     } catch (const TextException &e) {
+-        debugs(47, DBG_IMPORTANT, HERE << e.what());
++        debugs(47, DBG_IMPORTANT, "ERROR: " << dbName << " exception: " << e.what());
+         pending->completeIo(NULL);
+         delete pending;
+     }
+@@ -522,15 +528,15 @@ IpcIoFile::checkTimeouts()
+ 
+     if (timeoutsBefore > timeoutsNow) { // some requests were rescued
+         // notification message lost or significantly delayed?
+-        debugs(47, DBG_IMPORTANT, "WARNING: communication with disker " <<
+-               "may be too slow or disrupted for about " <<
++        debugs(47, DBG_IMPORTANT, "WARNING: communication with " << dbName <<
++               " may be too slow or disrupted for about " <<
+                Timeout << "s; rescued " << (timeoutsBefore - timeoutsNow) <<
+                " out of " << timeoutsBefore << " I/Os");
+     }
+ 
+     if (timeoutsNow) {
+         debugs(47, DBG_IMPORTANT, "WARNING: abandoning " <<
+-               timeoutsNow << " I/Os after at least " <<
++               timeoutsNow << ' ' << dbName << " I/Os after at least " <<
+                Timeout << "s timeout");
+     }
+ 
+@@ -630,6 +636,7 @@ IpcIoPendingRequest::completeIo(IpcIoMsg *const response)
+ 
+ /* XXX: disker code that should probably be moved elsewhere */
+ 
++static SBuf DbName; ///< full db file name
+ static int TheFile = -1; ///< db file descriptor
+ 
+ static void
+@@ -681,8 +688,8 @@ diskerWriteAttempts(IpcIoMsg &ipcIo)
+         if (result < 0) {
+             ipcIo.xerrno = errno;
+             assert(ipcIo.xerrno);
+-            debugs(47, DBG_IMPORTANT,  "disker" << KidIdentifier <<
+-                   " error writing " << toWrite << '/' << ipcIo.len <<
++            debugs(47, DBG_IMPORTANT, "ERROR: " << DbName << " failure" <<
++                   " writing " << toWrite << '/' << ipcIo.len <<
+                    " at " << ipcIo.offset << '+' << wroteSoFar <<
+                    " on " << attempts << " try: " << xstrerr(ipcIo.xerrno));
+             ipcIo.len = wroteSoFar;
+@@ -711,8 +718,8 @@ diskerWriteAttempts(IpcIoMsg &ipcIo)
+         toWrite -= wroteNow;
+     }
+ 
+-    debugs(47, DBG_IMPORTANT,  "disker" << KidIdentifier <<
+-           " exhausted all " << attemptLimit << " attempts while writing " <<
++    debugs(47, DBG_IMPORTANT, "ERROR: " << DbName << " exhausted all " <<
++           attemptLimit << " attempts while writing " <<
+            toWrite << '/' << ipcIo.len << " at " << ipcIo.offset << '+' <<
+            wroteSoFar);
+     return; // not a fatal I/O error, unless the caller treats it as such
+@@ -775,9 +782,9 @@ IpcIoFile::WaitBeforePop()
+         const int64_t toSpend = balance - maxImbalance/2;
+ 
+         if (toSpend/1e3 > Timeout)
+-            debugs(47, DBG_IMPORTANT, "WARNING: Rock disker delays I/O " <<
+-                   "requests for " << (toSpend/1e3) << " seconds to obey " <<
+-                   ioRate << "/sec rate limit");
++            debugs(47, DBG_IMPORTANT, "WARNING: " << DbName << " delays " <<
++                   "I/O requests for " << (toSpend/1e3) << " seconds " <<
++                   "to obey " << ioRate << "/sec rate limit");
+ 
+         debugs(47, 3, HERE << "rate limiting by " << toSpend << " ms to get" <<
+                (1e3*maxRate) << "/sec rate");
+@@ -842,7 +849,7 @@ void
+ IpcIoFile::DiskerHandleRequest(const int workerId, IpcIoMsg &ipcIo)
+ {
+     if (ipcIo.command != IpcIo::cmdRead && ipcIo.command != IpcIo::cmdWrite) {
+-        debugs(0, DBG_CRITICAL, HERE << "disker" << KidIdentifier <<
++        debugs(0, DBG_CRITICAL, "ERROR: " << DbName <<
+                " should not receive " << ipcIo.command <<
+                " ipcIo" << workerId << '.' << ipcIo.requestId);
+         return;
+@@ -868,41 +875,44 @@ IpcIoFile::DiskerHandleRequest(const int workerId, IpcIoMsg &ipcIo)
+         // before push()ing and because if disker pops N requests at a time,
+         // we should make sure the worker pop() queue length is the worker
+         // push queue length plus N+1. XXX: implement the N+1 difference.
+-        debugs(47, DBG_IMPORTANT, "BUG: Worker I/O pop queue overflow: " <<
++        debugs(47, DBG_IMPORTANT, "BUG: Worker I/O pop queue for " <<
++               DbName << " overflow: " <<
+                SipcIo(workerId, ipcIo, KidIdentifier)); // TODO: report queue len
+ 
+         // the I/O request we could not push will timeout
+     }
+ }
+ 
+ static bool
+-DiskerOpen(const String &path, int flags, mode_t mode)
++DiskerOpen(const SBuf &path, int flags, mode_t mode)
+ {
+     assert(TheFile < 0);
+ 
+-    TheFile = file_open(path.termedBuf(), flags);
++    DbName = path;
++    TheFile = file_open(DbName.c_str(), flags);
+ 
+     if (TheFile < 0) {
+         const int xerrno = errno;
+-        debugs(47, DBG_CRITICAL, HERE << "rock db error opening " << path << ": " <<
++        debugs(47, DBG_CRITICAL, "ERROR: cannot open " << DbName << ": " <<
+                xstrerr(xerrno));
+         return false;
+     }
+ 
+     ++store_open_disk_fd;
+-    debugs(79,3, HERE << "rock db opened " << path << ": FD " << TheFile);
++    debugs(79,3, "rock db opened " << DbName << ": FD " << TheFile);
+     return true;
+ }
+ 
+ static void
+-DiskerClose(const String &path)
++DiskerClose(const SBuf &path)
+ {
+     if (TheFile >= 0) {
+         file_close(TheFile);
+         debugs(79,3, HERE << "rock db closed " << path << ": FD " << TheFile);
+         TheFile = -1;
+         --store_open_disk_fd;
+     }
++    DbName.clear();
+ }
+ 
+ /// reports our needs for shared memory pages to Ipc::Mem::Pages
+@@ -18,9 +18,11 @@
+ #include "tools.h"
+ 
+ /// shared memory segment path to use for MemStore maps
+-static const char *MapLabel = "cache_mem_map";
++static const SBuf MapLabel("cache_mem_map");
+ /// shared memory segment path to use for the free slices index
+ static const char *SpaceLabel = "cache_mem_space";
++/// shared memory segment path to use for IDs of shared pages with slice data
++static const char *ExtrasLabel = "cache_mem_ex";
+ // TODO: sync with Rock::SwapDir::*Path()
+ 
+ // We store free slot IDs (i.e., "space") as Page objects so that we can use
+@@ -61,6 +63,7 @@ MemStore::init()
+     }
+ 
+     freeSlots = shm_old(Ipc::Mem::PageStack)(SpaceLabel);
++    extras = shm_old(Extras)(ExtrasLabel);
+ 
+     Must(!map);
+     map = new MemStoreMap(MapLabel);
+@@ -91,21 +94,25 @@ MemStore::stat(StoreEntry &e) const
+                       Math::doublePercent(currentSize(), maxSize()));
+ 
+     if (map) {
+-        const int limit = map->entryLimit();
+-        storeAppendPrintf(&e, "Maximum entries: %9d\n", limit);
+-        if (limit > 0) {
++        const int entryLimit = map->entryLimit();
++        const int slotLimit = map->sliceLimit();
++        storeAppendPrintf(&e, "Maximum entries: %9d\n", entryLimit);
++        if (entryLimit > 0) {
+             storeAppendPrintf(&e, "Current entries: %" PRId64 " %.2f%%\n",
+-                              currentCount(), (100.0 * currentCount() / limit));
++                              currentCount(), (100.0 * currentCount() / entryLimit));
++        }
+ 
++        storeAppendPrintf(&e, "Maximum slots:   %9d\n", slotLimit);
++        if (slotLimit > 0) {
+             const unsigned int slotsFree =
+                 Ipc::Mem::PagesAvailable(Ipc::Mem::PageId::cachePage);
+-            if (slotsFree <= static_cast<const unsigned int>(limit)) {
+-                const int usedSlots = limit - static_cast<const int>(slotsFree);
++            if (slotsFree <= static_cast<const unsigned int>(slotLimit)) {
++                const int usedSlots = slotLimit - static_cast<const int>(slotsFree);
+                 storeAppendPrintf(&e, "Used slots:      %9d %.2f%%\n",
+-                                  usedSlots, (100.0 * usedSlots / limit));
++                                  usedSlots, (100.0 * usedSlots / slotLimit));
+             }
+ 
+-            if (limit < 100) { // XXX: otherwise too expensive to count
++            if (slotLimit < 100) { // XXX: otherwise too expensive to count
+                 Ipc::ReadWriteLockStats stats;
+                 map->updateStats(stats);
+                 stats.dump(e);
+@@ -323,15 +330,16 @@ MemStore::copyFromShm(StoreEntry &e, const sfileno index, const Ipc::StoreMapAnc
+             const size_t prefixSize = e.mem_obj->endOffset() - sliceOffset;
+             assert(prefixSize <= wasSize);
+ 
+-            const MemStoreMap::Extras &extras = map->extras(sid);
+-            char *page = static_cast<char*>(PagePointer(extras.page));
++            const MemStoreMapExtras::Item &extra = extras->items[sid];
++
++            char *page = static_cast<char*>(PagePointer(extra.page));
+             const StoreIOBuffer sliceBuf(wasSize - prefixSize,
+                                          e.mem_obj->endOffset(),
+                                          page + prefixSize);
+             if (!copyFromShmSlice(e, sliceBuf, wasEof))
+                 return false;
+             debugs(20, 9, "entry " << index << " copied slice " << sid <<
+-                   " from " << extras.page << " +" << prefixSize);
++                   " from " << extra.page << '+' << prefixSize);
+         }
+         // else skip a [possibly incomplete] slice that we copied earlier
+ 
+@@ -411,7 +419,7 @@ MemStore::copyFromShmSlice(StoreEntry &e, const StoreIOBuffer &buf, bool eof)
+ 
+ /// whether we should cache the entry
+ bool
+-MemStore::shouldCache(const StoreEntry &e) const
++MemStore::shouldCache(StoreEntry &e) const
+ {
+     if (e.mem_status == IN_MEMORY) {
+         debugs(20, 5, "already loaded from mem-cache: " << e);
+@@ -453,6 +461,11 @@ MemStore::shouldCache(const StoreEntry &e) const
+         return false; // will not cache due to cachable entry size limits
+     }
+ 
++    if (!e.mem_obj->isContiguous()) {
++        debugs(20, 5, "not contiguous");
++        return false;
++    }
++
+     if (!map) {
+         debugs(20, 5, HERE << "No map to mem-cache " << e);
+         return false;
+@@ -513,7 +526,7 @@ MemStore::copyToShm(StoreEntry &e)
+     if (anchor.start < 0) { // must allocate the very first slot for e
+         Ipc::Mem::PageId page;
+         anchor.start = reserveSapForWriting(page); // throws
+-        map->extras(anchor.start).page = page;
++        extras->items[anchor.start].page = page;
+     }
+ 
+     lastWritingSlice = anchor.start;
+@@ -533,7 +546,7 @@ MemStore::copyToShm(StoreEntry &e)
+ 
+             Ipc::Mem::PageId page;
+             slice.next = lastWritingSlice = reserveSapForWriting(page);
+-            map->extras(lastWritingSlice).page = page;
++            extras->items[lastWritingSlice].page = page;
+             debugs(20, 7, "entry " << index << " new slice: " << lastWritingSlice);
+         }
+ 
+@@ -550,7 +563,7 @@ MemStore::copyToShmSlice(StoreEntry &e, Ipc::StoreMapAnchor &anchor)
+     Ipc::StoreMap::Slice &slice =
+         map->writeableSlice(e.mem_obj->memCache.index, lastWritingSlice);
+ 
+-    Ipc::Mem::PageId page = map->extras(lastWritingSlice).page;
++    Ipc::Mem::PageId page = extras->items[lastWritingSlice].page;
+     assert(lastWritingSlice >= 0 && page);
+     debugs(20, 7, "entry " << e << " slice " << lastWritingSlice << " has " <<
+            page);
+@@ -614,9 +627,9 @@ MemStore::reserveSapForWriting(Ipc::Mem::PageId &page)
+ }
+ 
+ void
+-MemStore::noteFreeMapSlice(const sfileno sliceId)
++MemStore::noteFreeMapSlice(const Ipc::StoreMapSliceId sliceId)
+ {
+-    Ipc::Mem::PageId &pageId = map->extras(sliceId).page;
++    Ipc::Mem::PageId &pageId = extras->items[sliceId].page;
+     debugs(20, 9, "slice " << sliceId << " freed " << pageId);
+     assert(pageId);
+     Ipc::Mem::PageId slotId;
+@@ -753,7 +766,7 @@ class MemStoreRr: public Ipc::Mem::RegisteredRunner
+ {
+ public:
+     /* RegisteredRunner API */
+-    MemStoreRr(): spaceOwner(NULL), mapOwner(NULL) {}
++    MemStoreRr(): spaceOwner(NULL), mapOwner(NULL), extrasOwner(NULL) {}
+     virtual void finalizeConfig();
+     virtual void claimMemoryNeeds();
+     virtual void useConfig();
+@@ -766,6 +779,7 @@ class MemStoreRr: public Ipc::Mem::RegisteredRunner
+ private:
+     Ipc::Mem::Owner<Ipc::Mem::PageStack> *spaceOwner; ///< free slices Owner
+     MemStoreMap::Owner *mapOwner; ///< primary map Owner
++    Ipc::Mem::Owner<MemStoreMapExtras> *extrasOwner; ///< PageIds Owner
+ };
+ 
+ RunnerRegistrationEntry(MemStoreRr);
+@@ -820,14 +834,16 @@ MemStoreRr::create()
+ 
+     Must(!spaceOwner);
+     spaceOwner = shm_new(Ipc::Mem::PageStack)(SpaceLabel, SpacePoolId,
+-                 entryLimit,
+-                 sizeof(Ipc::Mem::PageId));
++                 entryLimit, 0);
+     Must(!mapOwner);
+     mapOwner = MemStoreMap::Init(MapLabel, entryLimit);
++    Must(!extrasOwner);
++    extrasOwner = shm_new(MemStoreMapExtras)(ExtrasLabel, entryLimit);
+ }
+ 
+ MemStoreRr::~MemStoreRr()
+ {
++    delete extrasOwner;
+     delete mapOwner;
+     delete spaceOwner;
+ }
+@@ -7,10 +7,11 @@
+ #include "Store.h"
+ 
+ // StoreEntry restoration info not already stored by Ipc::StoreMap
+-struct MemStoreMapExtras {
++struct MemStoreMapExtraItem {
+     Ipc::Mem::PageId page; ///< shared memory page with entry slice content
+ };
+-typedef Ipc::StoreMapWithExtras<MemStoreMapExtras> MemStoreMap;
++typedef Ipc::StoreMapItems<MemStoreMapExtraItem> MemStoreMapExtras;
++typedef Ipc::StoreMap MemStoreMap;
+ 
+ /// Stores HTTP entities in RAM. Current implementation uses shared memory.
+ /// Unlike a disk store (SwapDir), operations are synchronous (and fast).
+@@ -58,7 +59,7 @@ class MemStore: public Store, public Ipc::StoreMapCleaner
+     static int64_t EntryLimit();
+ 
+ protected:
+-    bool shouldCache(const StoreEntry &e) const;
++    bool shouldCache(StoreEntry &e) const;
+     bool startCaching(StoreEntry &e);
+ 
+     void copyToShm(StoreEntry &e);
+@@ -72,13 +73,16 @@ class MemStore: public Store, public Ipc::StoreMapCleaner
+     sfileno reserveSapForWriting(Ipc::Mem::PageId &page);
+ 
+     // Ipc::StoreMapCleaner API
+-    virtual void noteFreeMapSlice(const sfileno sliceId);
++    virtual void noteFreeMapSlice(const Ipc::StoreMapSliceId sliceId);
+ 
+ private:
+     // TODO: move freeSlots into map
+     Ipc::Mem::Pointer<Ipc::Mem::PageStack> freeSlots; ///< unused map slot IDs
+     MemStoreMap *map; ///< index of mem-cached entries
+ 
++    typedef MemStoreMapExtras Extras;
++    Ipc::Mem::Pointer<Extras> extras; ///< IDs of pages with slice data
++
+     /// the last allocate slice for writing a store entry (during copyToShm)
+     sfileno lastWritingSlice;
+ 
+@@ -120,11 +120,14 @@ class StoreEntry : public hash_link
+     bool swappingOut() const { return swap_status == SWAPOUT_WRITING; }
+     void swapOutFileClose(int how);
+     const char *url() const;
+-    int checkCachable();
++    /// Satisfies cachability requirements shared among disk and RAM caches.
++    /// Encapsulates common checks of mayStartSwapOut() and memoryCachable().
++    /// TODO: Rename and make private so only those two methods can call this.
++    bool checkCachable();
+     int checkNegativeHit() const;
+     int locked() const;
+     int validToSend() const;
+-    bool memoryCachable() const; ///< may be cached in memory
++    bool memoryCachable(); ///< checkCachable() and can be cached in memory
+ 
+     /// if needed, initialize mem_obj member w/o URI-related information
+     MemObject *makeMemObject();
+@@ -272,7 +275,7 @@ class NullStoreEntry:public StoreEntry
+     store_client_t storeClientType() const {return STORE_MEM_CLIENT;}
+ 
+     char const *getSerialisedMetaData();
+-    bool mayStartSwapout() {return false;}
++    virtual bool mayStartSwapOut() { return false; }
+ 
+     void trimMemory(const bool preserveSwappable) {}
+ 
+@@ -104,7 +104,7 @@ class StoreController : public Store
+ private:
+     void createOneStore(Store &aStore);
+     StoreEntry *find(const cache_key *key);
+-    bool keepForLocalMemoryCache(const StoreEntry &e) const;
++    bool keepForLocalMemoryCache(StoreEntry &e) const;
+     bool anchorCollapsed(StoreEntry &collapsed, bool &inSync);
+     bool anchorCollapsedOnDisk(StoreEntry &collapsed, bool &inSync);
+ 
+@@ -19,8 +19,10 @@
+ 
+ #include <limits>
+ 
+-/// shared memory segment path to use for Transients maps
+-static const char *MapLabel = "transients_map";
++/// shared memory segment path to use for Transients map
++static const SBuf MapLabel("transients_map");
++/// shared memory segment path to use for Transients map extras
++static const char *ExtrasLabel = "transients_ex";
+ 
+ Transients::Transients(): map(NULL), locals(NULL)
+ {
+@@ -43,6 +45,8 @@ Transients::init()
+     map = new TransientsMap(MapLabel);
+     map->cleaner = this;
+ 
++    extras = shm_old(TransientsMapExtras)(ExtrasLabel);
++
+     locals = new Locals(entryLimit, 0);
+ }
+ 
+@@ -177,14 +181,14 @@ Transients::get(const cache_key *key)
+ StoreEntry *
+ Transients::copyFromShm(const sfileno index)
+ {
+-    const TransientsMap::Extras &extras = map->extras(index);
++    const TransientsMapExtras::Item &extra = extras->items[index];
+ 
+     // create a brand new store entry and initialize it with stored info
+-    StoreEntry *e = storeCreatePureEntry(extras.url, extras.url,
+-                                         extras.reqFlags, extras.reqMethod);
++    StoreEntry *e = storeCreatePureEntry(extra.url, extra.url,
++                                         extra.reqFlags, extra.reqMethod);
+ 
+     assert(e->mem_obj);
+-    e->mem_obj->method = extras.reqMethod;
++    e->mem_obj->method = extra.reqMethod;
+     e->mem_obj->xitTable.io = MemObject::ioReading;
+     e->mem_obj->xitTable.index = index;
+ 
+@@ -271,24 +275,24 @@ Transients::copyToShm(const StoreEntry &e, const sfileno index,
+                       const RequestFlags &reqFlags,
+                       const HttpRequestMethod &reqMethod)
+ {
+-    TransientsMap::Extras &extras = map->extras(index);
++    TransientsMapExtras::Item &extra = extras->items[index];
+ 
+     const char *url = e.url();
+     const size_t urlLen = strlen(url);
+-    Must(urlLen < sizeof(extras.url)); // we have space to store it all, plus 0
+-    strncpy(extras.url, url, sizeof(extras.url));
+-    extras.url[urlLen] = '\0';
++    Must(urlLen < sizeof(extra.url)); // we have space to store it all, plus 0
++    strncpy(extra.url, url, sizeof(extra.url));
++    extra.url[urlLen] = '\0';
+ 
+-    extras.reqFlags = reqFlags;
++    extra.reqFlags = reqFlags;
+ 
+     Must(reqMethod != Http::METHOD_OTHER);
+-    extras.reqMethod = reqMethod.id();
++    extra.reqMethod = reqMethod.id();
+ 
+     return true;
+ }
+ 
+ void
+-Transients::noteFreeMapSlice(const sfileno sliceId)
++Transients::noteFreeMapSlice(const Ipc::StoreMapSliceId sliceId)
+ {
+     // TODO: we should probably find the entry being deleted and abort it
+ }
+@@ -383,7 +387,7 @@ class TransientsRr: public Ipc::Mem::RegisteredRunner
+ {
+ public:
+     /* RegisteredRunner API */
+-    TransientsRr(): mapOwner(NULL) {}
++    TransientsRr(): mapOwner(NULL), extrasOwner(NULL) {}
+     virtual void useConfig();
+     virtual ~TransientsRr();
+ 
+@@ -392,6 +396,7 @@ class TransientsRr: public Ipc::Mem::RegisteredRunner
+ 
+ private:
+     TransientsMap::Owner *mapOwner;
++    Ipc::Mem::Owner<TransientsMapExtras> *extrasOwner;
+ };
+ 
+ RunnerRegistrationEntry(TransientsRr);
+@@ -415,9 +420,12 @@ TransientsRr::create()
+ 
+     Must(!mapOwner);
+     mapOwner = TransientsMap::Init(MapLabel, entryLimit);
++    Must(!extrasOwner);
++    extrasOwner = shm_new(TransientsMapExtras)(ExtrasLabel, entryLimit);
+ }
+ 
+ TransientsRr::~TransientsRr()
+ {
++    delete extrasOwner;
+     delete mapOwner;
+ }
+@@ -9,12 +9,13 @@
+ #include <vector>
+ 
+ // StoreEntry restoration info not already stored by Ipc::StoreMap
+-struct TransientsMapExtras {
++struct TransientsMapExtraItem {
+     char url[MAX_URL+1]; ///< Request-URI; TODO: decrease MAX_URL by one
+     RequestFlags reqFlags; ///< request flags
+     Http::MethodType reqMethod; ///< request method; extensions are not supported
+ };
+-typedef Ipc::StoreMapWithExtras<TransientsMapExtras> TransientsMap;
++typedef Ipc::StoreMapItems<TransientsMapExtraItem> TransientsMapExtras;
++typedef Ipc::StoreMap TransientsMap;
+ 
+ /// Keeps track of store entries being delivered to clients that arrived before
+ /// those entries were [fully] cached. This shared table is necessary to sync
+@@ -73,12 +74,16 @@ class Transients: public Store, public Ipc::StoreMapCleaner
+     bool abandonedAt(const sfileno index) const;
+ 
+     // Ipc::StoreMapCleaner API
+-    virtual void noteFreeMapSlice(const sfileno sliceId);
++    virtual void noteFreeMapSlice(const Ipc::StoreMapSliceId sliceId);
+ 
+ private:
+     /// shared packed info indexed by Store keys, for creating new StoreEntries
+     TransientsMap *map;
+ 
++    /// shared packed info that standard StoreMap does not store for us
++    typedef TransientsMapExtras Extras;
++    Ipc::Mem::Pointer<Extras> extras;
++
+     typedef std::vector<StoreEntry*> Locals;
+     /// local collapsed entries indexed by transient ID, for syncing old StoreEntries
+     Locals *locals;
+@@ -180,7 +180,6 @@ static void dump_access_log(StoreEntry * entry, const char *name, CustomLog * de
+ static void free_access_log(CustomLog ** definitions);
+ static bool setLogformat(CustomLog *cl, const char *name, const bool dieWhenMissing);
+ 
+-static void update_maxobjsize(void);
+ static void configDoConfigure(void);
+ static void parse_refreshpattern(RefreshPattern **);
+ static uint64_t parseTimeUnits(const char *unit,  bool allowMsec);
+@@ -279,29 +278,6 @@ self_destruct(void)
+     LegacyParser.destruct();
+ }
+ 
+-static void
+-update_maxobjsize(void)
+-{
+-    int64_t ms = -1;
+-
+-    // determine the maximum size object that can be stored to disk
+-    for (int i = 0; i < Config.cacheSwap.n_configured; ++i) {
+-        assert (Config.cacheSwap.swapDirs[i].getRaw());
+-
+-        const int64_t storeMax = dynamic_cast<SwapDir *>(Config.cacheSwap.swapDirs[i].getRaw())->maxObjectSize();
+-        if (ms < storeMax)
+-            ms = storeMax;
+-    }
+-
+-    // Ensure that we do not discard objects which could be stored only in memory.
+-    // It is governed by maximum_object_size_in_memory (for now)
+-    // TODO: update this to check each in-memory location (SMP and local memory limits differ)
+-    if (ms < static_cast<int64_t>(Config.Store.maxInMemObjSize))
+-        ms = Config.Store.maxInMemObjSize;
+-
+-    store_maxobjsize = ms;
+-}
+-
+ static void
+ SetConfigFilename(char const *file_name, bool is_pipe)
+ {
+@@ -725,7 +701,6 @@ configDoConfigure(void)
+ #endif
+ 
+     storeConfigure();
+-    update_maxobjsize(); // check for late maximum_object_size directive
+ 
+     snprintf(ThisCache, sizeof(ThisCache), "%s (%s)",
+              uniqueHostname(),
+@@ -1937,9 +1912,6 @@ parse_cachedir(SquidConfig::_cacheSwap * swap)
+             }
+ 
+             sd->reconfigure();
+-
+-            update_maxobjsize();
+-
+             return;
+         }
+     }
+@@ -1963,9 +1935,6 @@ parse_cachedir(SquidConfig::_cacheSwap * swap)
+     sd->parse(swap->n_configured, path_str);
+ 
+     ++swap->n_configured;
+-
+-    /* Update the max object size */
+-    update_maxobjsize();
+ }
+ 
+ static const char *
+@@ -3560,6 +3560,19 @@ DOC_START
+ 	disks. This algorithm does not spread objects by size, so any
+ 	I/O loading per-disk may appear very unbalanced and volatile.
+ 
++	If several cache_dirs use similar min-size, max-size, or other
++	limits to to reject certain responses, then do not group such
++	cache_dir lines together, to avoid round-robin selection bias
++	towards the first cache_dir after the group. Instead, interleave
++	cache_dir lines from different groups. For example:
++
++		store_dir_select_algorithm round-robin
++		cache_dir rock /hdd1 ... min-size=100000
++		cache_dir rock /ssd1 ... max-size=99999
++		cache_dir rock /hdd2 ... min-size=100000
++		cache_dir rock /ssd2 ... max-size=99999
++		cache_dir rock /hdd3 ... min-size=100000
++		cache_dir rock /ssd3 ... max-size=99999
+ DOC_END
+ 
+ NAME: max_open_disk_fds
+@@ -80,13 +80,13 @@ class LoadingEntry
+     /* store entry-level information indexed by sfileno */
+     uint64_t size; ///< payload seen so far
+     uint32_t version; ///< DbCellHeader::version to distinguish same-URL chains
+-    uint32_t state:3;  ///< current entry state (one of the State values)
+-    uint32_t anchored:1;  ///< whether we loaded the inode slot for this entry
++    uint8_t state:3;  ///< current entry state (one of the State values)
++    uint8_t anchored:1;  ///< whether we loaded the inode slot for this entry
+ 
+     /* db slot-level information indexed by slotId, starting with firstSlot */
+-    uint32_t mapped:1;  ///< whether this slot was added to a mapped entry
+-    uint32_t freed:1;  ///< whether this slot was marked as free
+-    sfileno more:25; ///< another slot in some entry chain (unordered)
++    uint8_t mapped:1;  ///< whether this slot was added to a mapped entry
++    uint8_t freed:1;  ///< whether this slot was marked as free
++    Ipc::StoreMapSliceId more; ///< another slot in some entry chain (unordered)
+     bool used() const { return freed || mapped || more != -1; }
+ 
+     /// possible entry states
+@@ -99,7 +99,8 @@ Rock::Rebuild::Rebuild(SwapDir *dir): AsyncJob("Rock::Rebuild"),
+         sd(dir),
+         entries(NULL),
+         dbSize(0),
+-        dbEntrySize(0),
++        dbSlotSize(0),
++        dbSlotLimit(0),
+         dbEntryLimit(0),
+         fd(-1),
+         dbOffset(0),
+@@ -109,8 +110,10 @@ Rock::Rebuild::Rebuild(SwapDir *dir): AsyncJob("Rock::Rebuild"),
+     assert(sd);
+     memset(&counts, 0, sizeof(counts));
+     dbSize = sd->diskOffsetLimit(); // we do not care about the trailer waste
+-    dbEntrySize = sd->slotSize;
+-    dbEntryLimit = sd->entryLimit();
++    dbSlotSize = sd->slotSize;
++    dbEntryLimit = sd->entryLimitActual();
++    dbSlotLimit = sd->slotLimitActual();
++    assert(dbEntryLimit <= dbSlotLimit);
+ }
+ 
+ Rock::Rebuild::~Rebuild()
+@@ -148,9 +151,8 @@ Rock::Rebuild::start()
+     buf.init(SM_PAGE_SIZE, SM_PAGE_SIZE);
+ 
+     dbOffset = SwapDir::HeaderSize;
+-    loadingPos = 0;
+ 
+-    entries = new LoadingEntry[dbEntryLimit];
++    entries = new LoadingEntry[dbSlotLimit];
+ 
+     checkpoint();
+ }
+@@ -166,7 +168,7 @@ Rock::Rebuild::checkpoint()
+ bool
+ Rock::Rebuild::doneAll() const
+ {
+-    return dbOffset >= dbSize && validationPos >= dbEntryLimit &&
++    return loadingPos >= dbSlotLimit && validationPos >= dbSlotLimit &&
+            AsyncJob::doneAll();
+ }
+ 
+@@ -180,7 +182,7 @@ Rock::Rebuild::Steps(void *data)
+ void
+ Rock::Rebuild::steps()
+ {
+-    if (dbOffset < dbSize)
++    if (loadingPos < dbSlotLimit)
+         loadingSteps();
+     else
+         validationSteps();
+@@ -201,14 +203,14 @@ Rock::Rebuild::loadingSteps()
+     const timeval loopStart = current_time;
+ 
+     int loaded = 0;
+-    while (loaded < dbEntryLimit && dbOffset < dbSize) {
++    while (loadingPos < dbSlotLimit) {
+         loadOneSlot();
+-        dbOffset += dbEntrySize;
++        dbOffset += dbSlotSize;
+         ++loadingPos;
+         ++loaded;
+ 
+         if (counts.scancount % 1000 == 0)
+-            storeRebuildProgress(sd->index, dbEntryLimit, counts.scancount);
++            storeRebuildProgress(sd->index, dbSlotLimit, counts.scancount);
+ 
+         if (opt_foreground_rebuild)
+             continue; // skip "few entries at a time" check below
+@@ -255,7 +257,7 @@ Rock::Rebuild::loadOneSlot()
+         freeSlotIfIdle(slotId, false);
+         return;
+     }
+-    if (!header.sane(dbEntrySize, dbEntryLimit)) {
++    if (!header.sane(dbSlotSize, dbSlotLimit)) {
+         debugs(47, DBG_IMPORTANT, "WARNING: cache_dir[" << sd->index << "]: " <<
+                "Ignoring malformed cache entry meta data at " << dbOffset);
+         freeSlotIfIdle(slotId, true);
+@@ -301,7 +303,7 @@ Rock::Rebuild::validationSteps()
+     const timeval loopStart = current_time;
+ 
+     int validated = 0;
+-    while (validationPos < dbEntryLimit) {
++    while (validationPos < dbSlotLimit) {
+         validateOneEntry();
+         ++validationPos;
+         ++validated;
+@@ -55,8 +55,9 @@ class Rebuild: public AsyncJob
+     LoadingEntry *entries; ///< store entries being loaded from disk
+ 
+     int64_t dbSize;
+-    int dbEntrySize;
+-    int dbEntryLimit;
++    int dbSlotSize; ///< the size of a db cell, including the cell header
++    int dbSlotLimit; ///< total number of db cells
++    int dbEntryLimit; ///< maximum number of entries that can be stored in db
+ 
+     int fd; // store db file descriptor
+     int64_t dbOffset;
+@@ -24,6 +24,7 @@
+ 
+ #include <cstdlib>
+ #include <iomanip>
++#include <limits>
+ 
+ #if HAVE_SYS_STAT_H
+ #include <sys/stat.h>
+@@ -209,11 +210,27 @@ Rock::SwapDir::swappedOut(const StoreEntry &)
+ }
+ 
+ int64_t
+-Rock::SwapDir::entryLimitAllowed() const
++Rock::SwapDir::slotLimitAbsolute() const
+ {
+-    const int64_t eLimitLo = map ? map->entryLimit() : 0; // dynamic shrinking unsupported
+-    const int64_t eWanted = (maxSize() - HeaderSize)/slotSize;
+-    return min(max(eLimitLo, eWanted), entryLimitHigh());
++    // the max value is an invalid one; all values must be below the limit
++    assert(std::numeric_limits<Ipc::StoreMapSliceId>::max() ==
++           std::numeric_limits<SlotId>::max());
++    return std::numeric_limits<SlotId>::max();
++}
++
++int64_t
++Rock::SwapDir::slotLimitActual() const
++{
++    const int64_t sWanted = (maxSize() - HeaderSize)/slotSize;
++    const int64_t sLimitLo = map ? map->sliceLimit() : 0; // dynamic shrinking unsupported
++    const int64_t sLimitHi = slotLimitAbsolute();
++    return min(max(sLimitLo, sWanted), sLimitHi);
++}
++
++int64_t
++Rock::SwapDir::entryLimitActual() const
++{
++    return min(slotLimitActual(), entryLimitAbsolute());
+ }
+ 
+ // TODO: encapsulate as a tool
+@@ -542,20 +559,35 @@ Rock::SwapDir::validateOptions()
+     const int64_t slotSizeRoundingWaste = slotSize;
+     const int64_t maxRoundingWaste =
+         max(maxSizeRoundingWaste, slotSizeRoundingWaste);
+-    const int64_t usableDiskSize = diskOffset(entryLimitAllowed());
+-    const int64_t diskWasteSize = maxSize() - usableDiskSize;
+-    Must(diskWasteSize >= 0);
+-
+-    // warn if maximum db size is not reachable due to sfileno limit
+-    if (entryLimitAllowed() == entryLimitHigh() &&
+-            diskWasteSize >= maxRoundingWaste) {
+-        debugs(47, DBG_CRITICAL, "Rock store cache_dir[" << index << "] '" << path << "':");
+-        debugs(47, DBG_CRITICAL, "\tmaximum number of entries: " << entryLimitAllowed());
+-        debugs(47, DBG_CRITICAL, "\tdb slot size: " << slotSize << " Bytes");
+-        debugs(47, DBG_CRITICAL, "\tmaximum db size: " << maxSize() << " Bytes");
+-        debugs(47, DBG_CRITICAL, "\tusable db size:  " << usableDiskSize << " Bytes");
+-        debugs(47, DBG_CRITICAL, "\tdisk space waste: " << diskWasteSize << " Bytes");
+-        debugs(47, DBG_CRITICAL, "WARNING: Rock store config wastes space.");
++
++    // an entry consumes at least one slot; round up to reduce false warnings
++    const int64_t blockSize = static_cast<int64_t>(slotSize);
++    const int64_t maxObjSize = max(blockSize,
++                                   ((maxObjectSize()+blockSize-1)/blockSize)*blockSize);
++
++    // Does the "sfileno*max-size" limit match configured db capacity?
++    const double entriesMayOccupy = entryLimitAbsolute()*static_cast<double>(maxObjSize);
++    if (entriesMayOccupy + maxRoundingWaste < maxSize()) {
++        const int64_t diskWasteSize = maxSize() - static_cast<int64_t>(entriesMayOccupy);
++        debugs(47, DBG_CRITICAL, "WARNING: Rock cache_dir " << path << " wastes disk space due to entry limits:" <<
++               "\n\tconfigured db capacity: " << maxSize() << " bytes" <<
++               "\n\tconfigured db slot size: " << slotSize << " bytes" <<
++               "\n\tconfigured maximum entry size: " << maxObjectSize() << " bytes" <<
++               "\n\tmaximum number of cache_dir entries supported by Squid: " << entryLimitAbsolute() <<
++               "\n\tdisk space all entries may use: " << entriesMayOccupy << " bytes" <<
++               "\n\tdisk space wasted: " << diskWasteSize << " bytes");
++    }
++
++    // Does the "absolute slot count" limit match configured db capacity?
++    const double slotsMayOccupy = slotLimitAbsolute()*static_cast<double>(slotSize);
++    if (slotsMayOccupy + maxRoundingWaste < maxSize()) {
++        const int64_t diskWasteSize = maxSize() - static_cast<int64_t>(entriesMayOccupy);
++        debugs(47, DBG_CRITICAL, "WARNING: Rock cache_dir " << path << " wastes disk space due to slot limits:" <<
++               "\n\tconfigured db capacity: " << maxSize() << " bytes" <<
++               "\n\tconfigured db slot size: " << slotSize << " bytes" <<
++               "\n\tmaximum number of rock cache_dir slots supported by Squid: " << slotLimitAbsolute() <<
++               "\n\tdisk space all slots may use: " << slotsMayOccupy << " bytes" <<
++               "\n\tdisk space wasted: " << diskWasteSize << " bytes");
+     }
+ }
+ 
+@@ -634,10 +666,10 @@ Rock::SwapDir::createStoreIO(StoreEntry &e, StoreIOState::STFNCB *cbFile, StoreI
+ }
+ 
+ int64_t
+-Rock::SwapDir::diskOffset(int filen) const
++Rock::SwapDir::diskOffset(const SlotId sid) const
+ {
+-    assert(filen >= 0);
+-    return HeaderSize + slotSize*filen;
++    assert(sid >= 0);
++    return HeaderSize + slotSize*sid;
+ }
+ 
+ int64_t
+@@ -651,19 +683,7 @@ int64_t
+ Rock::SwapDir::diskOffsetLimit() const
+ {
+     assert(map);
+-    return diskOffset(map->entryLimit());
+-}
+-
+-int
+-Rock::SwapDir::entryMaxPayloadSize() const
+-{
+-    return slotSize - sizeof(DbCellHeader);
+-}
+-
+-int
+-Rock::SwapDir::entriesNeeded(const int64_t objSize) const
+-{
+-    return (objSize + entryMaxPayloadSize() - 1) / entryMaxPayloadSize();
++    return diskOffset(map->sliceLimit());
+ }
+ 
+ bool
+@@ -693,11 +713,11 @@ Rock::SwapDir::useFreeSlot(Ipc::Mem::PageId &pageId)
+ bool
+ Rock::SwapDir::validSlotId(const SlotId slotId) const
+ {
+-    return 0 <= slotId && slotId < entryLimitAllowed();
++    return 0 <= slotId && slotId < slotLimitActual();
+ }
+ 
+ void
+-Rock::SwapDir::noteFreeMapSlice(const sfileno sliceId)
++Rock::SwapDir::noteFreeMapSlice(const Ipc::StoreMapSliceId sliceId)
+ {
+     Ipc::Mem::PageId pageId;
+     pageId.pool = index+1;
+@@ -770,8 +790,9 @@ Rock::SwapDir::ioCompletedNotification()
+                xstrerror());
+ 
+     debugs(47, 2, "Rock cache_dir[" << index << "] limits: " <<
+-           std::setw(12) << maxSize() << " disk bytes and " <<
+-           std::setw(7) << map->entryLimit() << " entries");
++           std::setw(12) << maxSize() << " disk bytes, " <<
++           std::setw(7) << map->entryLimit() << " entries, and " <<
++           std::setw(7) << map->sliceLimit() << " slots");
+ 
+     rebuild();
+ }
+@@ -947,26 +968,28 @@ Rock::SwapDir::statfs(StoreEntry &e) const
+                       currentSize() / 1024.0,
+                       Math::doublePercent(currentSize(), maxSize()));
+ 
+-    if (map) {
+-        const int limit = map->entryLimit();
+-        storeAppendPrintf(&e, "Maximum entries: %9d\n", limit);
+-        if (limit > 0) {
++    const int entryLimit = entryLimitActual();
++    const int slotLimit = slotLimitActual();
++    storeAppendPrintf(&e, "Maximum entries: %9d\n", entryLimit);
++    if (map && entryLimit > 0) {
+             const int entryCount = map->entryCount();
+             storeAppendPrintf(&e, "Current entries: %9d %.2f%%\n",
+-                              entryCount, (100.0 * entryCount / limit));
++                              entryCount, (100.0 * entryCount / entryLimit));
++    }
+ 
++    storeAppendPrintf(&e, "Maximum slots:   %9d\n", slotLimit);
++    if (map && slotLimit > 0) {
+             const unsigned int slotsFree = !freeSlots ? 0 : freeSlots->size();
+-            if (slotsFree <= static_cast<const unsigned int>(limit)) {
+-                const int usedSlots = limit - static_cast<const int>(slotsFree);
++            if (slotsFree <= static_cast<const unsigned int>(slotLimit)) {
++                const int usedSlots = slotLimit - static_cast<const int>(slotsFree);
+                 storeAppendPrintf(&e, "Used slots:      %9d %.2f%%\n",
+-                                  usedSlots, (100.0 * usedSlots / limit));
++                                  usedSlots, (100.0 * usedSlots / slotLimit));
+             }
+-            if (limit < 100) { // XXX: otherwise too expensive to count
++            if (slotLimit < 100) { // XXX: otherwise too expensive to count
+                 Ipc::ReadWriteLockStats stats;
+                 map->updateStats(stats);
+                 stats.dump(e);
+             }
+-        }
+     }
+ 
+     storeAppendPrintf(&e, "Pending operations: %d out of %d\n",
+@@ -984,13 +1007,10 @@ Rock::SwapDir::statfs(StoreEntry &e) const
+ 
+ }
+ 
+-const char *
++SBuf
+ Rock::SwapDir::inodeMapPath() const
+ {
+-    static String inodesPath;
+-    inodesPath = path;
+-    inodesPath.append("_inodes");
+-    return inodesPath.termedBuf();
++    return Ipc::Mem::Segment::Name(SBuf(path), "map");
+ }
+ 
+ const char *
+@@ -1012,7 +1032,7 @@ void Rock::SwapDirRr::create()
+     Must(mapOwners.empty() && freeSlotsOwners.empty());
+     for (int i = 0; i < Config.cacheSwap.n_configured; ++i) {
+         if (const Rock::SwapDir *const sd = dynamic_cast<Rock::SwapDir *>(INDEXSD(i))) {
+-            const int64_t capacity = sd->entryLimitAllowed();
++            const int64_t capacity = sd->slotLimitActual();
+ 
+             SwapDir::DirMap::Owner *const mapOwner =
+                 SwapDir::DirMap::Init(sd->inodeMapPath(), capacity);
+@@ -1021,8 +1041,7 @@ void Rock::SwapDirRr::create()
+             // TODO: somehow remove pool id and counters from PageStack?
+             Ipc::Mem::Owner<Ipc::Mem::PageStack> *const freeSlotsOwner =
+                 shm_new(Ipc::Mem::PageStack)(sd->freeSlotsPath(),
+-                                             i+1, capacity,
+-                                             sizeof(DbCellHeader));
++                                             i+1, capacity, 0);
+             freeSlotsOwners.push_back(freeSlotsOwner);
+ 
+             // TODO: add method to initialize PageStack with no free pages
+@@ -42,12 +42,14 @@ class SwapDir: public ::SwapDir, public IORequestor, public Ipc::StoreMapCleaner
+     virtual void parse(int index, char *path);
+ 
+     // temporary path to the shared memory map of first slots of cached entries
+-    const char *inodeMapPath() const;
++    SBuf inodeMapPath() const;
+     // temporary path to the shared memory stack of free slots
+     const char *freeSlotsPath() const;
+ 
+-    int64_t entryLimitHigh() const { return SwapFilenMax; } ///< Core limit
+-    int64_t entryLimitAllowed() const;
++    int64_t entryLimitAbsolute() const { return SwapFilenMax+1; } ///< Core limit
++    int64_t entryLimitActual() const; ///< max number of possible entries in db
++    int64_t slotLimitAbsolute() const; ///< Rock store implementation limit
++    int64_t slotLimitActual() const; ///< total number of slots in this db
+ 
+     /// removes a slot from a list of free slots or returns false
+     bool useFreeSlot(Ipc::Mem::PageId &pageId);
+@@ -61,7 +63,7 @@ class SwapDir: public ::SwapDir, public IORequestor, public Ipc::StoreMapCleaner
+     void writeError(StoreEntry &e);
+ 
+     /* StoreMapCleaner API */
+-    virtual void noteFreeMapSlice(const sfileno fileno);
++    virtual void noteFreeMapSlice(const Ipc::StoreMapSliceId fileno);
+ 
+     uint64_t slotSize; ///< all db slots are of this size
+ 
+@@ -108,9 +110,6 @@ class SwapDir: public ::SwapDir, public IORequestor, public Ipc::StoreMapCleaner
+     void ignoreReferences(StoreEntry &e); ///< delete from repl policy scope
+ 
+     int64_t diskOffsetLimit() const;
+-    int entryLimit() const { return map->entryLimit(); }
+-    int entryMaxPayloadSize() const;
+-    int entriesNeeded(const int64_t objSize) const;
+ 
+     void anchorEntry(StoreEntry &e, const sfileno filen, const Ipc::StoreMapAnchor &anchor);
+     bool updateCollapsedWith(StoreEntry &collapsed, const Ipc::StoreMapAnchor &anchor);
+@@ -108,7 +108,7 @@ extern const char *SwapDirType[];
+ extern int store_swap_low;	/* 0 */
+ extern int store_swap_high;	/* 0 */
+ extern size_t store_pages_max;	/* 0 */
+-extern int64_t store_maxobjsize;	/* -1 */
++extern int64_t store_maxobjsize;	/* 0 */
+ extern hash_table *proxy_auth_username_cache;	/* NULL */
+ extern int incoming_sockets_accepted;
+ #if _SQUID_WINDOWS_
+@@ -4,38 +4,49 @@
+ 
+ #include "squid.h"
+ #include "ipc/StoreMap.h"
++#include "SBuf.h"
+ #include "Store.h"
+ #include "store_key_md5.h"
+ #include "tools.h"
+ 
+-Ipc::StoreMap::Owner *
+-Ipc::StoreMap::Init(const char *const path, const int limit, const size_t extrasSize)
++static SBuf
++StoreMapSlicesId(const SBuf &path)
+ {
+-    assert(limit > 0); // we should not be created otherwise
+-    Owner *const owner = shm_new(Shared)(path, limit, extrasSize);
+-    debugs(54, 5, HERE << "new map [" << path << "] created: " << limit);
+-    return owner;
++    return Ipc::Mem::Segment::Name(path, "slices");
+ }
+ 
+-Ipc::StoreMap::Owner *
+-Ipc::StoreMap::Init(const char *const path, const int limit)
++static SBuf
++StoreMapAnchorsId(const SBuf &path)
+ {
+-    return Init(path, limit, 0);
++    return Ipc::Mem::Segment::Name(path, "anchors");
++}
++
++Ipc::StoreMap::Owner *
++Ipc::StoreMap::Init(const SBuf &path, const int sliceLimit)
++{
++    assert(sliceLimit > 0); // we should not be created otherwise
++    const int anchorLimit = min(sliceLimit, static_cast<int>(SwapFilenMax));
++    Owner *owner = new Owner;
++    owner->anchors = shm_new(Anchors)(StoreMapAnchorsId(path).c_str(), anchorLimit);
++    owner->slices = shm_new(Slices)(StoreMapSlicesId(path).c_str(), sliceLimit);
++    debugs(54, 5, "created " << path << " with " << anchorLimit << '+' << sliceLimit);
++    return owner;
+ }
+ 
+-Ipc::StoreMap::StoreMap(const char *const aPath): cleaner(NULL), path(aPath),
+-        shared(shm_old(Shared)(aPath))
++Ipc::StoreMap::StoreMap(const SBuf &aPath): cleaner(NULL), path(aPath),
++        anchors(shm_old(Anchors)(StoreMapAnchorsId(path).c_str())),
++        slices(shm_old(Slices)(StoreMapSlicesId(path).c_str()))
+ {
+-    assert(shared->limit > 0); // we should not be created otherwise
+-    debugs(54, 5, HERE << "attached map [" << path << "] created: " <<
+-           shared->limit);
++    debugs(54, 5, "attached " << path << " with " <<
++           anchors->capacity << '+' << slices->capacity);
++    assert(entryLimit() > 0); // key-to-position mapping requires this
++    assert(entryLimit() <= sliceLimit()); // at least one slice per entry
+ }
+ 
+ int
+ Ipc::StoreMap::compareVersions(const sfileno fileno, time_t newVersion) const
+ {
+-    assert(valid(fileno));
+-    Anchor &inode = shared->slots[fileno].anchor;
++    const Anchor &inode = anchorAt(fileno);
+ 
+     // note: we do not lock, so comparison may be inacurate
+ 
+@@ -51,8 +62,7 @@ Ipc::StoreMap::compareVersions(const sfileno fileno, time_t newVersion) const
+ void
+ Ipc::StoreMap::forgetWritingEntry(sfileno fileno)
+ {
+-    assert(valid(fileno));
+-    Anchor &inode = shared->slots[fileno].anchor;
++    Anchor &inode = anchorAt(fileno);
+ 
+     assert(inode.writing());
+ 
+@@ -64,7 +74,7 @@ Ipc::StoreMap::forgetWritingEntry(sfileno fileno)
+     inode.rewind();
+ 
+     inode.lock.unlockExclusive();
+-    --shared->count;
++    --anchors->count;
+ 
+     debugs(54, 8, "closed entry " << fileno << " for writing " << path);
+ }
+@@ -87,7 +97,7 @@ Ipc::StoreMap::openForWriting(const cache_key *const key, sfileno &fileno)
+ Ipc::StoreMap::Anchor *
+ Ipc::StoreMap::openForWritingAt(const sfileno fileno, bool overwriteExisting)
+ {
+-    Anchor &s = shared->slots[fileno].anchor;
++    Anchor &s = anchorAt(fileno);
+     ReadWriteLock &lock = s.lock;
+ 
+     if (lock.lockExclusive()) {
+@@ -107,7 +117,7 @@ Ipc::StoreMap::openForWritingAt(const sfileno fileno, bool overwriteExisting)
+ 
+         assert(s.empty());
+         s.start = -1; // we have not allocated any slices yet
+-        ++shared->count;
++        ++anchors->count;
+ 
+         //s.setKey(key); // XXX: the caller should do that
+         debugs(54, 5, "opened entry " << fileno << " for writing " << path);
+@@ -122,8 +132,7 @@ Ipc::StoreMap::openForWritingAt(const sfileno fileno, bool overwriteExisting)
+ void
+ Ipc::StoreMap::startAppending(const sfileno fileno)
+ {
+-    assert(valid(fileno));
+-    Anchor &s = shared->slots[fileno].anchor;
++    Anchor &s = anchorAt(fileno);
+     assert(s.writing());
+     s.lock.startAppending();
+     debugs(54, 5, "restricted entry " << fileno << " to appending " << path);
+@@ -132,8 +141,7 @@ Ipc::StoreMap::startAppending(const sfileno fileno)
+ void
+ Ipc::StoreMap::closeForWriting(const sfileno fileno, bool lockForReading)
+ {
+-    assert(valid(fileno));
+-    Anchor &s = shared->slots[fileno].anchor;
++    Anchor &s = anchorAt(fileno);
+     assert(s.writing());
+     if (lockForReading) {
+         s.lock.switchExclusiveToShared();
+@@ -150,43 +158,38 @@ Ipc::StoreMap::closeForWriting(const sfileno fileno, bool lockForReading)
+ Ipc::StoreMap::Slice &
+ Ipc::StoreMap::writeableSlice(const AnchorId anchorId, const SliceId sliceId)
+ {
+-    assert(valid(anchorId));
+-    assert(shared->slots[anchorId].anchor.writing());
+-    assert(valid(sliceId));
+-    return shared->slots[sliceId].slice;
++    assert(anchorAt(anchorId).writing());
++    assert(validSlice(sliceId));
++    return sliceAt(sliceId);
+ }
+ 
+ const Ipc::StoreMap::Slice &
+ Ipc::StoreMap::readableSlice(const AnchorId anchorId, const SliceId sliceId) const
+ {
+-    assert(valid(anchorId));
+-    assert(shared->slots[anchorId].anchor.reading());
+-    assert(valid(sliceId));
+-    return shared->slots[sliceId].slice;
++    assert(anchorAt(anchorId).reading());
++    assert(validSlice(sliceId));
++    return sliceAt(sliceId);
+ }
+ 
+ Ipc::StoreMap::Anchor &
+ Ipc::StoreMap::writeableEntry(const AnchorId anchorId)
+ {
+-    assert(valid(anchorId));
+-    assert(shared->slots[anchorId].anchor.writing());
+-    return shared->slots[anchorId].anchor;
++    assert(anchorAt(anchorId).writing());
++    return anchorAt(anchorId);
+ }
+ 
+ const Ipc::StoreMap::Anchor &
+ Ipc::StoreMap::readableEntry(const AnchorId anchorId) const
+ {
+-    assert(valid(anchorId));
+-    assert(shared->slots[anchorId].anchor.reading());
+-    return shared->slots[anchorId].anchor;
++    assert(anchorAt(anchorId).reading());
++    return anchorAt(anchorId);
+ }
+ 
+ void
+ Ipc::StoreMap::abortWriting(const sfileno fileno)
+ {
+     debugs(54, 5, "aborting entry " << fileno << " for writing " << path);
+-    assert(valid(fileno));
+-    Anchor &s = shared->slots[fileno].anchor;
++    Anchor &s = anchorAt(fileno);
+     assert(s.writing());
+     s.lock.appending = false; // locks out any new readers
+     if (!s.lock.readers) {
+@@ -202,8 +205,7 @@ Ipc::StoreMap::abortWriting(const sfileno fileno)
+ const Ipc::StoreMap::Anchor *
+ Ipc::StoreMap::peekAtReader(const sfileno fileno) const
+ {
+-    assert(valid(fileno));
+-    const Anchor &s = shared->slots[fileno].anchor;
++    const Anchor &s = anchorAt(fileno);
+     if (s.reading())
+         return &s; // immediate access by lock holder so no locking
+     if (s.writing())
+@@ -215,17 +217,15 @@ Ipc::StoreMap::peekAtReader(const sfileno fileno) const
+ const Ipc::StoreMap::Anchor &
+ Ipc::StoreMap::peekAtEntry(const sfileno fileno) const
+ {
+-    assert(valid(fileno));
+-    return shared->slots[fileno].anchor;
++    return anchorAt(fileno);
+ }
+ 
+ void
+ Ipc::StoreMap::freeEntry(const sfileno fileno)
+ {
+     debugs(54, 5, "marking entry " << fileno << " to be freed in " << path);
+ 
+-    assert(valid(fileno));
+-    Anchor &s = shared->slots[fileno].anchor;
++    Anchor &s = anchorAt(fileno);
+ 
+     if (s.lock.lockExclusive())
+         freeChain(fileno, s, false);
+@@ -240,7 +240,7 @@ Ipc::StoreMap::freeEntryByKey(const cache_key *const key)
+            << " to be freed in " << path);
+ 
+     const int idx = anchorIndexByKey(key);
+-    Anchor &s = shared->slots[idx].anchor;
++    Anchor &s = anchorAt(idx);
+     if (s.lock.lockExclusive()) {
+         if (s.sameKey(key))
+             freeChain(idx, s, true);
+@@ -267,7 +267,7 @@ Ipc::StoreMap::freeChain(const sfileno fileno, Anchor &inode, const bool keepLoc
+         sfileno sliceId = inode.start;
+         debugs(54, 8, "first slice " << sliceId);
+         while (sliceId >= 0) {
+-            Slice &slice = shared->slots[sliceId].slice;
++            Slice &slice = sliceAt(sliceId);
+             const sfileno nextId = slice.next;
+             slice.size = 0;
+             slice.next = -1;
+@@ -282,7 +282,7 @@ Ipc::StoreMap::freeChain(const sfileno fileno, Anchor &inode, const bool keepLoc
+ 
+     if (!keepLocked)
+         inode.lock.unlockExclusive();
+-    --shared->count;
++    --anchors->count;
+     debugs(54, 5, "freed entry " << fileno << " in " << path);
+ }
+ 
+@@ -307,8 +307,7 @@ const Ipc::StoreMap::Anchor *
+ Ipc::StoreMap::openForReadingAt(const sfileno fileno)
+ {
+     debugs(54, 5, "opening entry " << fileno << " for reading " << path);
+-    assert(valid(fileno));
+-    Anchor &s = shared->slots[fileno].anchor;
++    Anchor &s = anchorAt(fileno);
+ 
+     if (!s.lock.lockShared()) {
+         debugs(54, 5, "cannot open busy entry " << fileno <<
+@@ -337,8 +336,7 @@ Ipc::StoreMap::openForReadingAt(const sfileno fileno)
+ void
+ Ipc::StoreMap::closeForReading(const sfileno fileno)
+ {
+-    assert(valid(fileno));
+-    Anchor &s = shared->slots[fileno].anchor;
++    Anchor &s = anchorAt(fileno);
+     assert(s.reading());
+     s.lock.unlockShared();
+     debugs(54, 5, "closed entry " << fileno << " for reading " << path);
+@@ -352,9 +350,8 @@ Ipc::StoreMap::purgeOne()
+     const int searchLimit = min(10000, entryLimit());
+     int tries = 0;
+     for (; tries < searchLimit; ++tries) {
+-        const sfileno fileno = static_cast<sfileno>(++shared->victim % shared->limit);
+-        assert(valid(fileno));
+-        Anchor &s = shared->slots[fileno].anchor;
++        const sfileno fileno = static_cast<sfileno>(++anchors->victim % entryLimit());
++        Anchor &s = anchorAt(fileno);
+         if (s.lock.lockExclusive()) {
+             // the caller wants a free slice; empty anchor is not enough
+             if (!s.empty() && s.start >= 0) {
+@@ -377,47 +374,81 @@ Ipc::StoreMap::importSlice(const SliceId sliceId, const Slice &slice)
+     // "get free slice" API. This is not something we can double check
+     // reliably because the anchor for the imported slice may not have been
+     // imported yet.
+-    assert(valid(sliceId));
+-    shared->slots[sliceId].slice = slice;
++    assert(validSlice(sliceId));
++    sliceAt(sliceId) = slice;
+ }
+ 
+ int
+ Ipc::StoreMap::entryLimit() const
+ {
+-    return shared->limit;
++    return min(sliceLimit(), static_cast<int>(SwapFilenMax+1));
+ }
+ 
+ int
+ Ipc::StoreMap::entryCount() const
+ {
+-    return shared->count;
++    return anchors->count;
++}
++
++int
++Ipc::StoreMap::sliceLimit() const
++{
++    return slices->capacity;
+ }
+ 
+ void
+ Ipc::StoreMap::updateStats(ReadWriteLockStats &stats) const
+ {
+-    for (int i = 0; i < shared->limit; ++i)
+-        shared->slots[i].anchor.lock.updateStats(stats);
++    for (int i = 0; i < anchors->capacity; ++i)
++        anchorAt(i).lock.updateStats(stats);
+ }
+ 
+ bool
+-Ipc::StoreMap::valid(const int pos) const
++Ipc::StoreMap::validEntry(const int pos) const
+ {
+     return 0 <= pos && pos < entryLimit();
+ }
+ 
++bool
++Ipc::StoreMap::validSlice(const int pos) const
++{
++    return 0 <= pos && pos < sliceLimit();
++}
++
++Ipc::StoreMap::Anchor&
++Ipc::StoreMap::anchorAt(const sfileno fileno) {
++    assert(validEntry(fileno));
++    return anchors->items[fileno];
++}
++
++const Ipc::StoreMap::Anchor&
++Ipc::StoreMap::anchorAt(const sfileno fileno) const {
++    return const_cast<StoreMap&>(*this).anchorAt(fileno);
++}
++
+ sfileno
+ Ipc::StoreMap::anchorIndexByKey(const cache_key *const key) const
+ {
+     const uint64_t *const k = reinterpret_cast<const uint64_t *>(key);
+     // TODO: use a better hash function
+-    return (k[0] + k[1]) % shared->limit;
++    return (k[0] + k[1]) % entryLimit();
+ }
+ 
+ Ipc::StoreMap::Anchor &
+ Ipc::StoreMap::anchorByKey(const cache_key *const key)
+ {
+-    return shared->slots[anchorIndexByKey(key)].anchor;
++    return anchorAt(anchorIndexByKey(key));
++}
++
++Ipc::StoreMap::Slice&
++Ipc::StoreMap::sliceAt(const SliceId sliceId) {
++    assert(validSlice(sliceId));
++    return slices->items[sliceId];
++}
++
++const Ipc::StoreMap::Slice&
++Ipc::StoreMap::sliceAt(const SliceId sliceId) const {
++    return const_cast<StoreMap&>(*this).sliceAt(sliceId);
+ }
+ 
+ /* Ipc::StoreMapAnchor */
+@@ -466,23 +497,35 @@ Ipc::StoreMapAnchor::rewind()
+     // but keep the lock
+ }
+ 
+-/* Ipc::StoreMap::Shared */
++Ipc::StoreMap::Owner::Owner(): anchors(NULL), slices(NULL)
++{
++}
++
++Ipc::StoreMap::Owner::~Owner()
++{
++    delete anchors;
++    delete slices;
++}
++
++/* Ipc::StoreMapAnchors */
+ 
+-Ipc::StoreMap::Shared::Shared(const int aLimit, const size_t anExtrasSize):
+-        limit(aLimit), extrasSize(anExtrasSize), count(0), victim(0),
+-        slots(aLimit)
++Ipc::StoreMapAnchors::StoreMapAnchors(const int aCapacity):
++        count(0),
++        victim(0),
++        capacity(aCapacity),
++        items(aCapacity)
+ {
+ }
+ 
+ size_t
+-Ipc::StoreMap::Shared::sharedMemorySize() const
++Ipc::StoreMapAnchors::sharedMemorySize() const
+ {
+-    return SharedMemorySize(limit, extrasSize);
++    return SharedMemorySize(capacity);
+ }
+ 
+ size_t
+-Ipc::StoreMap::Shared::SharedMemorySize(const int limit, const size_t extrasSize)
++Ipc::StoreMapAnchors::SharedMemorySize(const int capacity)
+ {
+-    return sizeof(Shared) + limit * (sizeof(StoreMapSlot) + extrasSize);
++    return sizeof(StoreMapAnchors) + capacity * sizeof(StoreMapAnchor);
+ }
+ 
+@@ -4,6 +4,7 @@
+ #include "ipc/mem/FlexibleArray.h"
+ #include "ipc/mem/Pointer.h"
+ #include "ipc/ReadWriteLock.h"
++#include "SBuf.h"
+ #include "typedefs.h"
+ 
+ namespace Ipc
+@@ -70,62 +71,80 @@ class StoreMapAnchor
+ 
+     /// where the chain of StoreEntry slices begins [app]
+     Atomic::WordT<StoreMapSliceId> start;
++};
++
++/// an array of shareable Items
++/// must be the last data member or, if used as a parent class, the last parent
++template <class C>
++class StoreMapItems
++{
++public:
++    typedef C Item;
++    typedef Ipc::Mem::Owner< StoreMapItems<Item> > Owner;
++
++    explicit StoreMapItems(const int aCapacity): capacity(aCapacity), items(aCapacity) {}
+ 
+-#if 0
+-    /// possible persistent states
+-    typedef enum {
+-        Empty, ///< ready for writing, with nothing of value
+-        Writeable, ///< transitions from Empty to Readable
+-        Readable, ///< ready for reading
+-    } State;
+-    State state; ///< current state
+-#endif
++    size_t sharedMemorySize() const { return SharedMemorySize(capacity); }
++    static size_t SharedMemorySize(const int aCapacity) { return sizeof(StoreMapItems<Item>) + aCapacity*sizeof(Item); }
++
++    const int capacity; ///< total number of items
++    Ipc::Mem::FlexibleArray<Item> items; ///< storage
+ };
+ 
+-/// A hack to allocate one shared array for both anchors and slices.
+-/// Anchors are indexed by store entry ID and are independent from each other.
+-/// Slices are indexed by slice IDs and form entry chains using slice.next.
+-class StoreMapSlot
++/// StoreMapSlices indexed by their slice ID.
++typedef StoreMapItems<StoreMapSlice> StoreMapSlices;
++
++/// StoreMapAnchors indexed by entry fileno plus
++/// sharing-safe basic housekeeping info about Store entries
++class StoreMapAnchors
+ {
+ public:
+-    StoreMapAnchor anchor; ///< information about store entry as a whole
+-    StoreMapSlice slice; ///< information about one stored entry piece
++    typedef Ipc::Mem::Owner< StoreMapAnchors > Owner;
++
++    explicit StoreMapAnchors(const int aCapacity);
++
++    size_t sharedMemorySize() const;
++    static size_t SharedMemorySize(const int anAnchorLimit);
++
++    Atomic::Word count; ///< current number of entries
++    Atomic::WordT<uint32_t> victim; ///< starting point for purge search
++    const int capacity; ///< total number of anchors
++    Ipc::Mem::FlexibleArray<StoreMapAnchor> items; ///< anchors storage
+ };
++// TODO: Find an elegant way to use StoreMapItems in StoreMapAnchors
+ 
+ class StoreMapCleaner;
+ 
+-/// map of StoreMapSlots indexed by their keys, with read/write slice locking
+-/// kids extend to store custom data
++/// Manages shared Store index (e.g., locking/unlocking/freeing entries) using
++/// StoreMapAnchors indexed by their keys and
++/// StoreMapSlices indexed by their slide ID.
+ class StoreMap
+ {
+ public:
+     typedef StoreMapAnchor Anchor;
++    typedef StoreMapAnchors Anchors;
+     typedef sfileno AnchorId;
+     typedef StoreMapSlice Slice;
++    typedef StoreMapSlices Slices;
+     typedef StoreMapSliceId SliceId;
+ 
+-    /// data shared across maps in different processes
+-    class Shared
+-    {
++public:
++    /// aggregates anchor and slice owners for Init() caller convenience
++    class Owner {
+     public:
+-        Shared(const int aLimit, const size_t anExtrasSize);
+-        size_t sharedMemorySize() const;
+-        static size_t SharedMemorySize(const int limit, const size_t anExtrasSize);
+-
+-        const int limit; ///< maximum number of store entries
+-        const size_t extrasSize; ///< size of slice extra data
+-        Atomic::Word count; ///< current number of entries
+-        Atomic::WordT<uint32_t> victim; ///< starting point for purge search
+-        Ipc::Mem::FlexibleArray<StoreMapSlot> slots; ///< storage
++        Owner();
++        ~Owner();
++        Anchors::Owner *anchors;
++        Slices::Owner *slices;
++    private:
++        Owner(const Owner &); // not implemented
++        Owner &operator =(const Owner &); // not implemented
+     };
+ 
+-public:
+-    typedef Mem::Owner<Shared> Owner;
+-
+     /// initialize shared memory
+-    static Owner *Init(const char *const path, const int limit);
++    static Owner *Init(const SBuf &path, const int slotLimit);
+ 
+-    StoreMap(const char *const aPath);
++    StoreMap(const SBuf &aPath);
+ 
+     /// computes map entry position for a given entry key
+     sfileno anchorIndexByKey(const cache_key *const key) const;
+@@ -186,97 +205,45 @@ class StoreMap
+     /// copies slice to its designated position
+     void importSlice(const SliceId sliceId, const Slice &slice);
+ 
+-    bool valid(const int n) const; ///< whether n is a valid slice coordinate
++    /* SwapFilenMax limits the number of entries, but not slices or slots */
++    bool validEntry(const int n) const; ///< whether n is a valid slice coordinate
++    bool validSlice(const int n) const; ///< whether n is a valid slice coordinate
+     int entryCount() const; ///< number of writeable and readable entries
+     int entryLimit() const; ///< maximum entryCount() possible
++    int sliceLimit() const; ///< maximum number of slices possible
+ 
+     /// adds approximate current stats to the supplied ones
+     void updateStats(ReadWriteLockStats &stats) const;
+ 
+     StoreMapCleaner *cleaner; ///< notified before a readable entry is freed
+ 
+ protected:
+-    static Owner *Init(const char *const path, const int limit, const size_t extrasSize);
+-
+-    const String path; ///< cache_dir path or similar cache name; for logging
+-    Mem::Pointer<Shared> shared;
++    const SBuf path; ///< cache_dir path or similar cache name; for logging
++    Mem::Pointer<StoreMapAnchors> anchors; ///< entry inodes (starting blocks)
++    Mem::Pointer<StoreMapSlices> slices; ///< chained entry pieces positions
+ 
+ private:
++    Anchor &anchorAt(const sfileno fileno);
++    const Anchor &anchorAt(const sfileno fileno) const;
+     Anchor &anchorByKey(const cache_key *const key);
+ 
++    Slice &sliceAt(const SliceId sliceId);
++    const Slice &sliceAt(const SliceId sliceId) const;
+     Anchor *openForReading(Slice &s);
+ 
+     void freeChain(const sfileno fileno, Anchor &inode, const bool keepLock);
+ };
+ 
+-/// StoreMap with extra slice data
+-/// Note: ExtrasT must be POD, it is initialized with zeroes, no
+-/// constructors or destructors are called
+-template <class ExtrasT>
+-class StoreMapWithExtras: public StoreMap
+-{
+-public:
+-    typedef ExtrasT Extras;
+-
+-    /// initialize shared memory
+-    static Owner *Init(const char *const path, const int limit);
+-
+-    StoreMapWithExtras(const char *const path);
+-
+-    /// write access to the extras; call openForWriting() first!
+-    ExtrasT &extras(const sfileno fileno);
+-    /// read-only access to the extras; call openForReading() first!
+-    const ExtrasT &extras(const sfileno fileno) const;
+-
+-protected:
+-
+-    ExtrasT *sharedExtras; ///< pointer to extras in shared memory
+-};
+-
+ /// API for adjusting external state when dirty map slice is being freed
+ class StoreMapCleaner
+ {
+ public:
+     virtual ~StoreMapCleaner() {}
+ 
+     /// adjust slice-linked state before a locked Readable slice is erased
+-    virtual void noteFreeMapSlice(const sfileno sliceId) = 0;
++    virtual void noteFreeMapSlice(const StoreMapSliceId sliceId) = 0;
+ };
+ 
+-// StoreMapWithExtras implementation
+-
+-template <class ExtrasT>
+-StoreMap::Owner *
+-StoreMapWithExtras<ExtrasT>::Init(const char *const path, const int limit)
+-{
+-    return StoreMap::Init(path, limit, sizeof(Extras));
+-}
+-
+-template <class ExtrasT>
+-StoreMapWithExtras<ExtrasT>::StoreMapWithExtras(const char *const aPath):
+-        StoreMap(aPath)
+-{
+-    const size_t sharedSizeWithoutExtras =
+-        Shared::SharedMemorySize(entryLimit(), 0);
+-    sharedExtras = reinterpret_cast<Extras *>(reinterpret_cast<char *>(shared.getRaw()) + sharedSizeWithoutExtras);
+-}
+-
+-template <class ExtrasT>
+-ExtrasT &
+-StoreMapWithExtras<ExtrasT>::extras(const sfileno fileno)
+-{
+-    return const_cast<ExtrasT &>(const_cast<const StoreMapWithExtras *>(this)->extras(fileno));
+-}
+-
+-template <class ExtrasT>
+-const ExtrasT &
+-StoreMapWithExtras<ExtrasT>::extras(const sfileno fileno) const
+-{
+-    assert(sharedExtras);
+-    assert(valid(fileno));
+-    return sharedExtras[fileno];
+-}
+-
+ } // namespace Ipc
+ 
+ // We do not reuse FileMap because we cannot control its size,
+@@ -9,6 +9,7 @@
+ #include "Debug.h"
+ #include "fatal.h"
+ #include "ipc/mem/Segment.h"
++#include "SBuf.h"
+ #include "tools.h"
+ 
+ #include <fcntl.h>
+@@ -33,6 +34,15 @@ Ipc::Mem::Segment::reserve(size_t chunkSize)
+     return result;
+ }
+ 
++SBuf
++Ipc::Mem::Segment::Name(const SBuf &prefix, const char *suffix)
++{
++    SBuf result = prefix;
++    result.append("_");
++    result.append(suffix);
++    return result;
++}
++
+ #if HAVE_SHM
+ 
+ Ipc::Mem::Segment::Segment(const char *const id):
+@@ -7,6 +7,8 @@
+ #include "base/RunnersRegistry.h"
+ #include "SquidString.h"
+ 
++class SBuf;
++
+ namespace Ipc
+ {
+ 
+@@ -36,6 +38,9 @@ class Segment
+     /// common path of all segment names in path-based environments
+     static const char *BasePath;
+ 
++    /// concatenates parts of a name to form a complete name (or its prefix)
++    static SBuf Name(const SBuf &prefix, const char *suffix);
++
+ private:
+ 
+     // not implemented
+@@ -95,6 +95,7 @@ mem_hdr::unlink(mem_node *aNode)
+         return false;
+     }
+ 
++    debugs(19, 8, this << " removing " << aNode);
+     nodes.remove (aNode, NodeCompare);
+     delete aNode;
+     return true;
+@@ -103,6 +104,7 @@ mem_hdr::unlink(mem_node *aNode)
+ int64_t
+ mem_hdr::freeDataUpto(int64_t target_offset)
+ {
++    debugs(19, 8, this << " up to " << target_offset);
+     /* keep the last one to avoid change to other part of code */
+     SplayNode<mem_node*> const * theStart;
+ 
+@@ -232,7 +234,7 @@ mem_hdr::debugDump() const
+     debugs (19, 0, "mem_hdr::debugDump: lowest offset: " << lowestOffset() << " highest offset + 1: " << endOffset() << ".");
+     std::ostringstream result;
+     PointerPrinter<mem_node *> foo(result, " - ");
+-    for_each (getNodes().begin(), getNodes().end(), foo);
++    getNodes().visit(foo);
+     debugs (19, 0, "mem_hdr::debugDump: Current available data is: " << result.str() << ".");
+ }
+ 
+@@ -269,7 +271,7 @@ mem_hdr::copy(StoreIOBuffer const &target) const
+         debugs(19, DBG_IMPORTANT, "memCopy: could not find start of " << target.range() <<
+                " in memory.");
+         debugDump();
+-        fatal("Squid has attempted to read data from memory that is not present. This is an indication of of (pre-3.0) code that hasn't been updated to deal with sparse objects in memory. Squid should coredump.allowing to review the cause. Immediately preceding this message is a dump of the available data in the format [start,end). The [ means from the value, the ) means up to the value. I.e. [1,5) means that there are 4 bytes of data, at offsets 1,2,3,4.\n");
++        fatal_dump("Squid has attempted to read data from memory that is not present. This is an indication of of (pre-3.0) code that hasn't been updated to deal with sparse objects in memory. Squid should coredump.allowing to review the cause. Immediately preceding this message is a dump of the available data in the format [start,end). The [ means from the value, the ) means up to the value. I.e. [1,5) means that there are 4 bytes of data, at offsets 1,2,3,4.\n");
+         return 0;
+     }
+ 
+@@ -368,7 +370,7 @@ mem_hdr::write (StoreIOBuffer const &writeBuffer)
+     if (unionNotEmpty(writeBuffer)) {
+         debugs(19, DBG_CRITICAL, "mem_hdr::write: writeBuffer: " << writeBuffer.range());
+         debugDump();
+-        fatal("Attempt to overwrite already in-memory data. Preceeding this there should be a mem_hdr::write output that lists the attempted write, and the currently present data. Please get a 'backtrace full' from this error - using the generated core, and file a bug report with the squid developers including the last 10 lines of cache.log and the backtrace.\n");
++        fatal_dump("Attempt to overwrite already in-memory data. Preceeding this there should be a mem_hdr::write output that lists the attempted write, and the currently present data. Please get a 'backtrace full' from this error - using the generated core, and file a bug report with the squid developers including the last 10 lines of cache.log and the backtrace.\n");
+         PROF_stop(mem_hdr_write);
+         return false;
+     }
+@@ -950,11 +950,23 @@ StoreEntry::checkTooSmall()
+     return 0;
+ }
+ 
+-// TODO: remove checks already performed by swapoutPossible()
+ // TODO: move "too many open..." checks outside -- we are called too early/late
+-int
++bool
+ StoreEntry::checkCachable()
+ {
++    // XXX: This method is used for both memory and disk caches, but some
++    // checks are specific to disk caches. Move them to mayStartSwapOut().
++
++    // XXX: This method may be called several times, sometimes with different
++    // outcomes, making store_check_cachable_hist counters misleading.
++
++    // check this first to optimize handling of repeated calls for uncachables
++    if (EBIT_TEST(flags, RELEASE_REQUEST)) {
++        debugs(20, 2, "StoreEntry::checkCachable: NO: not cachable");
++        ++store_check_cachable_hist.no.not_entry_cachable; // TODO: rename?
++        return 0; // avoid rerequesting release below
++    }
++
+ #if CACHE_ALL_METHODS
+ 
+     if (mem_obj->method != Http::METHOD_GET) {
+@@ -965,9 +977,6 @@ StoreEntry::checkCachable()
+         if (store_status == STORE_OK && EBIT_TEST(flags, ENTRY_BAD_LENGTH)) {
+             debugs(20, 2, "StoreEntry::checkCachable: NO: wrong content-length");
+             ++store_check_cachable_hist.no.wrong_content_length;
+-        } else if (EBIT_TEST(flags, RELEASE_REQUEST)) {
+-            debugs(20, 2, "StoreEntry::checkCachable: NO: not cachable");
+-            ++store_check_cachable_hist.no.not_entry_cachable; // TODO: rename?
+         } else if (EBIT_TEST(flags, ENTRY_NEGCACHED)) {
+             debugs(20, 3, "StoreEntry::checkCachable: NO: negative cached");
+             ++store_check_cachable_hist.no.negative_cached;
+@@ -1390,6 +1399,30 @@ storeInit(void)
+     storeRegisterWithCacheManager();
+ }
+ 
++/// computes maximum size of a cachable object
++/// larger objects are rejected by all (disk and memory) cache stores
++static int64_t
++storeCalcMaxObjSize()
++{
++    int64_t ms = 0; // nothing can be cached without at least one store consent
++
++    // global maximum is at least the disk store maximum
++    for (int i = 0; i < Config.cacheSwap.n_configured; ++i) {
++        assert (Config.cacheSwap.swapDirs[i].getRaw());
++        const int64_t storeMax = dynamic_cast<SwapDir *>(Config.cacheSwap.swapDirs[i].getRaw())->maxObjectSize();
++        if (ms < storeMax)
++            ms = storeMax;
++    }
++
++    // global maximum is at least the memory store maximum
++    // TODO: move this into a memory cache class when we have one
++    const int64_t memMax = static_cast<int64_t>(min(Config.Store.maxInMemObjSize, Config.memMaxSize));
++    if (ms < memMax)
++        ms = memMax;
++
++    return ms;
++}
++
+ void
+ storeConfigure(void)
+ {
+@@ -1398,11 +1431,16 @@ storeConfigure(void)
+     store_swap_low = (long) (((float) Store::Root().maxSize() *
+                               (float) Config.Swap.lowWaterMark) / (float) 100);
+     store_pages_max = Config.memMaxSize / sizeof(mem_node);
++
++    store_maxobjsize = storeCalcMaxObjSize();
+ }
+ 
+ bool
+-StoreEntry::memoryCachable() const
++StoreEntry::memoryCachable()
+ {
++    if (!checkCachable())
++        return 0;
++
+     if (mem_obj == NULL)
+         return 0;
+ 
+@@ -1499,15 +1537,20 @@ StoreEntry::validToSend() const
+     if (!mem_obj) // not backed by a memory cache and not collapsed
+         return 0;
+ 
+-    if (mem_obj->memCache.index >= 0) // backed by a shared memory cache
+-        return 0;
+-
+     // StoreEntry::storeClientType() assumes DISK_CLIENT here, but there is no
+-    // disk cache backing so we should not rely on the store cache at all. This
+-    // is wrong for range requests that could feed off nibbled memory (XXX).
+-    if (mem_obj->inmem_lo) // in local memory cache, but got nibbled at
++    // disk cache backing that store_client constructor will assert. XXX: This
++    // is wrong for range requests (that could feed off nibbled memory) and for
++    // entries backed by the shared memory cache (that could, in theory, get
++    // nibbled bytes from that cache, but there is no such "memoryIn" code).
++    if (mem_obj->inmem_lo) // in memory cache, but got nibbled at
+         return 0;
+ 
++    // The following check is correct but useless at this position. TODO: Move
++    // it up when the shared memory cache can either replenish locally nibbled
++    // bytes or, better, does not use local RAM copy at all.
++    // if (mem_obj->memCache.index >= 0) // backed by a shared memory cache
++    //    return 1;
++
+     return 1;
+ }
+ 
+@@ -207,22 +207,22 @@ SwapDir::objectSizeIsAcceptable(int64_t objsize) const
+ static int
+ storeDirSelectSwapDirRoundRobin(const StoreEntry * e)
+ {
+-    static int dirn = 0;
+-    int i;
+-    int load;
+-    RefCount<SwapDir> sd;
+-
+     // e->objectLen() is negative at this point when we are still STORE_PENDING
+     ssize_t objsize = e->mem_obj->expectedReplySize();
+     if (objsize != -1)
+         objsize += e->mem_obj->swap_hdr_sz;
+ 
+-    for (i = 0; i < Config.cacheSwap.n_configured; ++i) {
+-        if (++dirn >= Config.cacheSwap.n_configured)
+-            dirn = 0;
++    // Increment the first candidate once per selection (not once per
++    // iteration) to reduce bias when some disk(s) attract more entries.
++    static int firstCandidate = 0;
++    if (++firstCandidate >= Config.cacheSwap.n_configured)
++        firstCandidate = 0;
+ 
+-        sd = dynamic_cast<SwapDir *>(INDEXSD(dirn));
++    for (int i = 0; i < Config.cacheSwap.n_configured; ++i) {
++        const int dirn = (firstCandidate + i) % Config.cacheSwap.n_configured;
++        const SwapDir *sd = dynamic_cast<SwapDir*>(INDEXSD(dirn));
+ 
++        int load = 0;
+         if (!sd->canStore(*e, objsize, load))
+             continue;
+ 
+@@ -865,7 +865,7 @@ void StoreController::markForUnlink(StoreEntry &e)
+ // move this into [non-shared] memory cache class when we have one
+ /// whether e should be kept in local RAM for possible future caching
+ bool
+-StoreController::keepForLocalMemoryCache(const StoreEntry &e) const
++StoreController::keepForLocalMemoryCache(StoreEntry &e) const
+ {
+     if (!e.memoryCachable())
+         return false;
+@@ -423,8 +423,8 @@ StoreEntry::mayStartSwapOut()
+         return false;
+     }
+ 
+-    // check cache_dir max-size limit if all cache_dirs have it
+-    if (store_maxobjsize >= 0) {
++    // handle store_maxobjsize limit
++    {
+         // TODO: add estimated store metadata size to be conservative
+ 
+         // use guaranteed maximum if it is known
+@@ -18,7 +18,7 @@ void MemStore::unlink(StoreEntry &e) STUB
+ void MemStore::disconnect(StoreEntry &e) STUB
+ void MemStore::reference(StoreEntry &) STUB
+ void MemStore::maintain() STUB
+-void MemStore::noteFreeMapSlice(const sfileno) STUB
++void MemStore::noteFreeMapSlice(const Ipc::StoreMapSliceId) STUB
+ void MemStore::get(String const, STOREGETCLIENT, void *) STUB
+ void MemStore::init() STUB
+ void MemStore::getStats(StoreInfoStats&) const STUB
+@@ -46,11 +46,11 @@ void StoreEntry::purgeMem() STUB
+ void StoreEntry::swapOut() STUB
+ void StoreEntry::swapOutFileClose(int how) STUB
+ const char *StoreEntry::url() const STUB_RETVAL(NULL)
+-int StoreEntry::checkCachable() STUB_RETVAL(0)
++bool StoreEntry::checkCachable() STUB_RETVAL(false)
+ int StoreEntry::checkNegativeHit() const STUB_RETVAL(0)
+ int StoreEntry::locked() const STUB_RETVAL(0)
+ int StoreEntry::validToSend() const STUB_RETVAL(0)
+-bool StoreEntry::memoryCachable() const STUB_RETVAL(false)
++bool StoreEntry::memoryCachable() STUB_RETVAL(false)
+ MemObject *StoreEntry::makeMemObject() STUB_RETVAL(NULL)
+ void StoreEntry::createMemObject(const char *, const char *, const HttpRequestMethod &aMethod) STUB
+ void StoreEntry::dump(int debug_lvl) const STUB

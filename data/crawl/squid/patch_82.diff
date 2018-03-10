@@ -1,0 +1,1380 @@
+@@ -159,11 +159,14 @@ class Raw
+ {
+ public:
+     Raw(const char *label, const char *data, const size_t size):
+-        level(-1), label_(label), data_(data), size_(size) {}
++        level(-1), label_(label), data_(data), size_(size), useHex_(false) {}
+ 
+     /// limit data printing to at least the given debugging level
+     Raw &minLevel(const int aLevel) { level = aLevel; return *this; }
+ 
++    /// print data using two hex digits per byte (decoder: xxd -r -p)
++    Raw &hex() { useHex_ = true; return *this; }
++
+     /// If debugging is prohibited by the current debugs() or section level,
+     /// prints nothing. Otherwise, dumps data using one of these formats:
+     ///   " label[size]=data" if label was set and data size is positive
+@@ -178,9 +181,12 @@ class Raw
+     int level;
+ 
+ private:
++    void printHex(std::ostream &os) const;
++
+     const char *label_; ///< optional data name or ID; triggers size printing
+     const char *data_; ///< raw data to be printed
+     size_t size_; ///< data length
++    bool useHex_; ///< whether hex() has been called
+ };
+ 
+ inline
+@@ -539,7 +539,6 @@ squid_LDADD = \
+ 	ftp/libftp.la \
+ 	helper/libhelper.la \
+ 	http/libhttp.la \
+-	parser/libparser.la \
+ 	dns/libdns.la \
+ 	base/libbase.la \
+ 	libsquid.la \
+@@ -552,6 +551,7 @@ squid_LDADD = \
+ 	anyp/libanyp.la \
+ 	comm/libcomm.la \
+ 	security/libsecurity.la \
++	parser/libparser.la \
+ 	eui/libeui.la \
+ 	icmp/libicmp.la \
+ 	log/liblog.la \
+@@ -3171,7 +3171,7 @@ clientPeekAndSpliceSSL(int fd, void *data)
+         return;
+     }
+ 
+-    if (bio->rBufData().contentSize() > 0)
++    if (!bio->rBufData().isEmpty() > 0)
+         conn->receivedFirstByte();
+ 
+     if (bio->gotHello()) {
+@@ -3259,8 +3259,8 @@ ConnStateData::splice()
+ 
+     BIO *b = SSL_get_rbio(ssl);
+     Ssl::ClientBio *bio = static_cast<Ssl::ClientBio *>(b->ptr);
+-    MemBuf const &rbuf = bio->rBufData();
+-    debugs(83,5, "Bio for  " << clientConnection << " read " << rbuf.contentSize() << " helo bytes");
++    SBuf const &rbuf = bio->rBufData();
++    debugs(83,5, "Bio for  " << clientConnection << " read " << rbuf.length() << " helo bytes");
+     // Do splice:
+     fd_table[clientConnection->fd].read_method = &default_read_method;
+     fd_table[clientConnection->fd].write_method = &default_write_method;
+@@ -3270,16 +3270,14 @@ ConnStateData::splice()
+         // we are sending a faked-up HTTP/1.1 message wrapper, so go with that.
+         transferProtocol = Http::ProtocolVersion();
+         // XXX: copy from MemBuf reallocates, not a regression since old code did too
+-        SBuf temp;
+-        temp.append(rbuf.content(), rbuf.contentSize());
+-        fakeAConnectRequest("intercepted TLS spliced", temp);
++        fakeAConnectRequest("intercepted TLS spliced", rbuf);
+     } else {
+         // XXX: assuming that there was an HTTP/1.1 CONNECT to begin with...
+ 
+         // reset the current protocol to HTTP/1.1 (was "HTTPS" for the bumping process)
+         transferProtocol = Http::ProtocolVersion();
+         // inBuf still has the "CONNECT ..." request data, reset it to SSL hello message
+-        inBuf.append(rbuf.content(), rbuf.contentSize());
++        inBuf.append(rbuf);
+         Http::StreamPointer context = pipeline.front();
+         ClientHttpRequest *http = context->http;
+         tunnelStart(http);
+@@ -14,6 +14,8 @@
+ #include "SquidTime.h"
+ #include "util.h"
+ 
++#include <algorithm>
++
+ /* for shutting_down flag in xassert() */
+ #include "globals.h"
+ 
+@@ -800,6 +802,19 @@ SkipBuildPrefix(const char* path)
+     return path+BuildPrefixLength;
+ }
+ 
++/// print data bytes using hex notation
++void
++Raw::printHex(std::ostream &os) const
++{
++    const auto savedFill = os.fill('0');
++    const auto savedFlags = os.flags(); // std::ios_base::fmtflags
++    os << std::hex;
++    std::for_each(data_, data_ + size_,
++        [&os](const char &c) { os << std::setw(2) << static_cast<uint8_t>(c); });
++    os.flags(savedFlags);
++    os.fill(savedFill);
++}
++
+ std::ostream &
+ Raw::print(std::ostream &os) const
+ {
+@@ -814,10 +829,14 @@ Raw::print(std::ostream &os) const
+                            (size_ > 40 ? DBG_DATA : Debug::sectionLevel);
+     if (finalLevel <= Debug::sectionLevel) {
+         os << (label_ ? '=' : ' ');
+-        if (data_)
+-            os.write(data_, size_);
+-        else
++        if (data_) {
++            if (useHex_)
++                printHex(os);
++            else
++                os.write(data_, size_);
++        } else {
+             os << "[null]";
++        }
+     }
+ 
+     return os;
+@@ -0,0 +1,157 @@
++/*
++ * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++/* DEBUG: section 24    SBuf */
++
++#include "squid.h"
++#include "BinaryTokenizer.h"
++
++BinaryTokenizer::BinaryTokenizer(): BinaryTokenizer(SBuf())
++{
++}
++
++BinaryTokenizer::BinaryTokenizer(const SBuf &data):
++    context(""),
++    data_(data),
++    parsed_(0),
++    syncPoint_(0)
++{
++}
++
++/// debugging helper that prints a "standard" debugs() trailer
++#define BinaryTokenizer_tail(size, start) \
++    " occupying " << (size) << " bytes @" << (start) << " in " << this;
++
++/// logs and throws if fewer than size octets remain; no other side effects
++void
++BinaryTokenizer::want(uint64_t size, const char *description) const
++{
++    if (parsed_ + size > data_.length()) {
++        debugs(24, 5, (parsed_ + size - data_.length()) << " more bytes for " <<
++               context << description << BinaryTokenizer_tail(size, parsed_));
++        throw InsufficientInput();
++    }
++}
++
++/// debugging helper for parsed number fields
++void
++BinaryTokenizer::got(uint32_t value, uint64_t size, const char *description) const
++{
++    debugs(24, 7, context << description << '=' << value <<
++           BinaryTokenizer_tail(size, parsed_ - size));
++}
++
++/// debugging helper for parsed areas/blobs
++void
++BinaryTokenizer::got(const SBuf &value, uint64_t size, const char *description) const
++{
++    debugs(24, 7, context << description << '=' <<
++           Raw(nullptr, value.rawContent(), value.length()).hex() <<
++           BinaryTokenizer_tail(size, parsed_ - size));
++
++}
++
++/// debugging helper for skipped fields
++void
++BinaryTokenizer::skipped(uint64_t size, const char *description) const
++{
++    debugs(24, 7, context << description << BinaryTokenizer_tail(size, parsed_ - size));
++
++}
++
++/// Returns the next ready-for-shift byte, adjusting the number of parsed bytes.
++/// The larger 32-bit return type helps callers shift/merge octets into numbers.
++/// This internal method does not perform out-of-bounds checks.
++uint32_t
++BinaryTokenizer::octet()
++{
++    // While char may be signed, we view data characters as unsigned,
++    // which helps to arrive at the right 32-bit return value.
++    return static_cast<uint8_t>(data_[parsed_++]);
++}
++
++void
++BinaryTokenizer::reset(const SBuf &data)
++{
++    *this = BinaryTokenizer(data);
++}
++
++void
++BinaryTokenizer::rollback()
++{
++    parsed_ = syncPoint_;
++}
++
++void
++BinaryTokenizer::commit()
++{
++    if (context && *context)
++        debugs(24, 6, context << BinaryTokenizer_tail(parsed_ - syncPoint_, syncPoint_));
++    syncPoint_ = parsed_;
++}
++
++bool
++BinaryTokenizer::atEnd() const
++{
++    return parsed_ >= data_.length();
++}
++
++uint8_t
++BinaryTokenizer::uint8(const char *description)
++{
++    want(1, description);
++    const uint8_t result = octet();
++    got(result, 1, description);
++    return result;
++}
++
++uint16_t
++BinaryTokenizer::uint16(const char *description)
++{
++    want(2, description);
++    const uint16_t result = (octet() << 8) | octet();
++    got(result, 2, description);
++    return result;
++}
++
++uint32_t
++BinaryTokenizer::uint24(const char *description)
++{
++    want(3, description);
++    const uint32_t result = (octet() << 16) | (octet() << 8) | octet();
++    got(result, 3, description);
++    return result;
++}
++
++uint32_t
++BinaryTokenizer::uint32(const char *description)
++{
++    want(4, description);
++    const uint32_t result = (octet() << 24) | (octet() << 16) | (octet() << 8) | octet();
++    got(result, 4, description);
++    return result;
++}
++
++SBuf
++BinaryTokenizer::area(uint64_t size, const char *description)
++{
++    want(size, description);
++    const SBuf result = data_.substr(parsed_, size);
++    parsed_ += size;
++    got(result, size, description);
++    return result;
++}
++
++void
++BinaryTokenizer::skip(uint64_t size, const char *description)
++{
++    want(size, description);
++    parsed_ += size;
++    skipped(size, description);
++}
++
+@@ -0,0 +1,80 @@
++/*
++ * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_BINARY_TOKENIZER_H
++#define SQUID_BINARY_TOKENIZER_H
++
++#include "sbuf/SBuf.h"
++
++/// Safely extracts byte-oriented (i.e., non-textual) fields from raw input.
++/// Supports commit points for atomic incremental parsing of multi-part fields.
++/// Throws InsufficientInput when more input is needed to parse the next field.
++/// Throws on errors.
++class BinaryTokenizer
++{
++public:
++    class InsufficientInput {}; // thrown when a method runs out of data
++    typedef uint64_t size_type; // enough for the largest supported offset
++
++    BinaryTokenizer();
++    explicit BinaryTokenizer(const SBuf &data);
++
++    /// restart parsing from the very beginning
++    /// this method is for using one BinaryTokenizer to parse independent inputs
++    void reset(const SBuf &data);
++
++    /// change input without changing parsing state
++    /// this method avoids append overheads during incremental parsing
++    void reinput(const SBuf &data) { data_ = data; }
++
++    /// make progress: future parsing failures will not rollback beyond this point
++    void commit();
++
++    /// resume [incremental] parsing from the last commit point
++    void rollback();
++
++    /// no more bytes to parse or skip
++    bool atEnd() const;
++
++    /// parse a single-byte unsigned integer
++    uint8_t uint8(const char *description);
++
++    // parse a two-byte unsigned integer
++    uint16_t uint16(const char *description);
++
++    // parse a three-byte unsigned integer (returned as uint32_t)
++    uint32_t uint24(const char *description);
++
++    // parse a four-byte unsigned integer
++    uint32_t uint32(const char *description);
++
++    /// parse size consecutive bytes as an opaque blob
++    SBuf area(uint64_t size, const char *description);
++
++    /// ignore the next size bytes
++    void skip(uint64_t size, const char *description);
++
++    /// yet unparsed bytes
++    SBuf leftovers() const { return data_.substr(parsed_); }
++
++    const char *context; ///< simplifies debugging
++
++protected:
++    uint32_t octet();
++    void want(uint64_t size, const char *description) const;
++    void got(uint32_t value, uint64_t size, const char *description) const;
++    void got(const SBuf &value, uint64_t size, const char *description) const;
++    void skipped(uint64_t size, const char *description) const;
++
++private:
++    SBuf data_;
++    uint64_t parsed_; ///< number of data bytes parsed or skipped
++    uint64_t syncPoint_; ///< where to re-start the next parsing attempt
++};
++
++#endif // SQUID_BINARY_TOKENIZER_H
+@@ -11,6 +11,8 @@ include $(top_srcdir)/src/TestHeaders.am
+ noinst_LTLIBRARIES = libparser.la
+ 
+ libparser_la_SOURCES = \
++	BinaryTokenizer.h \
++	BinaryTokenizer.cc \
+ 	Tokenizer.h \
+ 	Tokenizer.cc
+ 
+@@ -0,0 +1,248 @@
++#include "squid.h"
++#include "parser/BinaryTokenizer.h"
++#include "security/Handshake.h"
++#if USE_OPENSSL
++#include "ssl/support.h"
++#endif
++
++Security::FieldGroup::FieldGroup(BinaryTokenizer &tk, const char *description) {
++    tk.context = description;
++}
++
++void
++Security::FieldGroup::commit(BinaryTokenizer &tk) {
++    tk.commit();
++    tk.context = "";
++}
++
++Security::ProtocolVersion::ProtocolVersion(BinaryTokenizer &tk):
++    vMajor(tk.uint8(".vMajor")),
++    vMinor(tk.uint8(".vMinor"))
++{
++}
++
++Security::TLSPlaintext::TLSPlaintext(BinaryTokenizer &tk):
++    FieldGroup(tk, "TLSPlaintext"),
++    type(tk.uint8(".type")),
++    version(tk),
++    length(tk.uint16(".length")),
++    fragment(tk.area(length, ".fragment"))
++{
++    commit(tk);
++}
++
++Security::Handshake::Handshake(BinaryTokenizer &tk):
++    FieldGroup(tk, "Handshake"),
++    msg_type(tk.uint8(".msg_type")),
++    length(tk.uint24(".length")),
++    body(tk.area(length, ".body"))
++{
++    commit(tk);
++}
++
++Security::Alert::Alert(BinaryTokenizer &tk):
++    FieldGroup(tk, "Alert"),
++    level(tk.uint8(".level")),
++    description(tk.uint8(".description"))
++{
++    commit(tk);
++}
++
++Security::P24String::P24String(BinaryTokenizer &tk, const char *description):
++    FieldGroup(tk, description),
++    length(tk.uint24(".length")),
++    body(tk.area(length, ".body"))
++{
++    commit(tk);
++}
++
++/// debugging helper to print various parsed records and messages
++class DebugFrame
++{
++public:
++    DebugFrame(const char *aName, uint64_t aType, uint64_t aSize):
++        name(aName), type(aType), size(aSize) {}
++
++    const char *name;
++    uint64_t type;
++    uint64_t size;
++};
++
++inline std::ostream &
++operator <<(std::ostream &os, const DebugFrame &frame)
++{
++    return os << frame.size << "-byte type-" << frame.type << ' ' << frame.name;
++}
++
++/// parses a single TLS Record Layer frame
++void
++Security::HandshakeParser::parseRecord()
++{
++    const TLSPlaintext record(tkRecords);
++
++    Must(record.length <= (1 << 14)); // RFC 5246: length MUST NOT exceed 2^14
++
++    // RFC 5246: MUST NOT send zero-length [non-application] fragments
++    Must(record.length || record.type == ContentType::ctApplicationData);
++
++    if (currentContentType != record.type) {
++        Must(tkMessages.atEnd()); // no currentContentType leftovers
++        fragments = record.fragment;
++        tkMessages.reset(fragments);
++        currentContentType = record.type;
++    } else {
++        fragments.append(record.fragment);
++        tkMessages.reinput(fragments);
++        tkMessages.rollback();
++    }
++    parseMessages();
++}
++
++/// parses one or more "higher-level protocol" frames of currentContentType
++void
++Security::HandshakeParser::parseMessages()
++{
++    debugs(83, 7, DebugFrame("fragments", currentContentType, fragments.length()));
++    while (!tkMessages.atEnd()) {
++        switch (currentContentType) {
++        case ContentType::ctChangeCipherSpec:
++            parseChangeCipherCpecMessage();
++            continue;
++        case ContentType::ctAlert:
++            parseAlertMessage();
++            continue;
++        case ContentType::ctHandshake:
++            parseHandshakeMessage();
++            continue;
++        case ContentType::ctApplicationData:
++            parseApplicationDataMessage();
++            continue;
++        }
++        skipMessage("unknown ContentType msg");
++    }
++}
++
++void
++Security::HandshakeParser::parseChangeCipherCpecMessage()
++{
++    Must(currentContentType == ContentType::ctChangeCipherSpec);
++    // we are currently ignoring Change Cipher Spec Protocol messages
++    // Everything after this message may be is encrypted
++    // The continuing parsing is pointless, abort here and set parseDone
++    skipMessage("ChangeCipherCpec msg");
++    ressumingSession = true;
++    parseDone = true;
++}
++
++void
++Security::HandshakeParser::parseAlertMessage()
++{
++    Must(currentContentType == ContentType::ctAlert);
++    const Alert alert(tkMessages);
++    debugs(83, 3, "level " << alert.level << " description " << alert.description);
++    // we are currently ignoring Alert Protocol messages
++}
++
++void
++Security::HandshakeParser::parseHandshakeMessage()
++{
++    Must(currentContentType == ContentType::ctHandshake);
++
++    const Handshake message(tkMessages);
++
++    switch (message.msg_type) {
++        case HandshakeType::hskServerHello:
++            Must(state < atHelloReceived);
++            // TODO: Parse ServerHello in message.body; extract version/session
++            // If the server is resuming a session, stop parsing w/o certificates
++            // because all subsequent [Finished] messages will be encrypted, right?
++            state = atHelloReceived;
++            return;
++        case HandshakeType::hskCertificate:
++            Must(state < atCertificatesReceived);
++            parseServerCertificates(message.body);
++            state = atCertificatesReceived;
++            return;
++        case HandshakeType::hskServerHelloDone:
++            Must(state < atHelloDoneReceived);
++            // zero-length
++            state = atHelloDoneReceived;
++            parseDone = true;
++            return;
++    }
++    debugs(83, 5, "ignoring " <<
++           DebugFrame("handshake msg", message.msg_type, message.length));
++}
++
++void
++Security::HandshakeParser::parseApplicationDataMessage()
++{
++    Must(currentContentType == ContentType::ctApplicationData);
++    skipMessage("app data");
++}
++
++void
++Security::HandshakeParser::skipMessage(const char *description)
++{
++    // tkMessages/fragments can only contain messages of the same ContentType.
++    // To skip a message, we can and should skip everything we have [left]. If
++    // we have partial messages, debugging will mislead about their boundaries.
++    tkMessages.skip(tkMessages.leftovers().length(), description);
++    tkMessages.commit();
++}
++
++/// parseServerHelloTry() wrapper that maintains parseDone/parseError state
++bool
++Security::HandshakeParser::parseServerHello(const SBuf &data)
++{
++    try {
++        tkRecords.reinput(data); // data contains _everything_ read so far
++        tkRecords.rollback();
++        while (!tkRecords.atEnd() && !parseDone)
++            parseRecord();
++        debugs(83, 7, "success; done: " << parseDone);
++        return parseDone;
++    }
++    catch (const BinaryTokenizer::InsufficientInput &) {
++        debugs(83, 5, "need more data");
++        Must(!parseError);
++    }
++    catch (const std::exception &ex) {
++        debugs(83, 2, "parsing error: " << ex.what());
++        parseError = true;
++    }
++    return false;
++}
++
++#if USE_OPENSSL
++X509 *
++Security::HandshakeParser::ParseCertificate(const SBuf &raw)
++{
++    typedef const unsigned char *x509Data;
++    const x509Data x509Start = reinterpret_cast<x509Data>(raw.rawContent());
++    x509Data x509Pos = x509Start;
++    X509 *x509 = d2i_X509(nullptr, &x509Pos, raw.length());
++    Must(x509); // successfully parsed
++    Must(x509Pos == x509Start + raw.length()); // no leftovers
++    return x509;
++}
++
++void
++Security::HandshakeParser::parseServerCertificates(const SBuf &raw)
++{
++    BinaryTokenizer tkList(raw);
++    const P24String list(tkList, "CertificateList");
++    Must(tkList.atEnd()); // no leftovers after all certificates
++
++    BinaryTokenizer tkItems(list.body);
++    while (!tkItems.atEnd()) {
++        const P24String item(tkItems, "Certificate");
++        X509 *cert = ParseCertificate(item.body);
++        if (!serverCertificates.get())
++            serverCertificates.reset(sk_X509_new_null());
++        sk_X509_push(serverCertificates.get(), cert);
++        debugs(83, 7, "parsed " << sk_X509_num(serverCertificates.get()) << " certificates so far");
++    }
++
++}
++#endif
+@@ -0,0 +1,157 @@
++/*
++ * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_SECURITY_HANDSHAKE_H
++#define SQUID_SECURITY_HANDSHAKE_H
++
++#include "fd.h"
++#include "parser/BinaryTokenizer.h"
++#include "sbuf/SBuf.h"
++#if USE_OPENSSL
++#include "ssl/gadgets.h"
++#endif
++
++namespace Security
++{
++
++// The Transport Layer Security (TLS) Protocol, Version 1.2
++
++/// Helper class to debug parsing of various TLS structures
++class FieldGroup
++{
++public:
++    FieldGroup(BinaryTokenizer &tk, const char *description); ///< starts parsing
++
++    void commit(BinaryTokenizer &tk); ///< commits successful parsing results
++};
++
++/// TLS Record Layer's content types from RFC 5246 Section 6.2.1
++enum ContentType {
++    ctChangeCipherSpec = 20,
++    ctAlert = 21,
++    ctHandshake = 22,
++    ctApplicationData = 23
++};
++
++/// TLS Record Layer's protocol version from RFC 5246 Section 6.2.1
++struct ProtocolVersion
++{
++    explicit ProtocolVersion(BinaryTokenizer &tk);
++
++    // the "v" prefix works around environments that #define major and minor
++    uint8_t vMajor;
++    uint8_t vMinor;
++};
++
++/// TLS Record Layer's frame from RFC 5246 Section 6.2.1.
++struct TLSPlaintext: public FieldGroup
++{
++    explicit TLSPlaintext(BinaryTokenizer &tk);
++
++    uint8_t type; ///< Rfc5246::ContentType
++    ProtocolVersion version;
++    uint16_t length;
++    SBuf fragment; ///< exactly length bytes
++};
++
++/// TLS Handshake protocol's handshake types from RFC 5246 Section 7.4
++enum HandshakeType {
++    hskServerHello = 2,
++    hskCertificate = 11,
++    hskServerHelloDone = 14
++};
++
++/// TLS Handshake Protocol frame from RFC 5246 Section 7.4.
++struct Handshake: public FieldGroup
++{
++    explicit Handshake(BinaryTokenizer &tk);
++
++    uint32_t msg_type: 8; ///< HandshakeType
++    uint32_t length: 24;
++    SBuf body; ///< Handshake Protocol message, exactly length bytes
++};
++
++/// TLS Alert protocol frame from RFC 5246 Section 7.2.
++struct Alert: public FieldGroup
++{
++    explicit Alert(BinaryTokenizer &tk);
++    uint8_t level; ///< warning or fatal
++    uint8_t description; ///< close_notify, unexpected_message, etc.
++};
++
++/// Like a Pascal "length-first" string but with a 3-byte length field.
++/// Used for (undocumented in RRC 5246?) Certificate and ASN1.Cert encodings.
++struct P24String: public FieldGroup
++{
++    explicit P24String(BinaryTokenizer &tk, const char *description);
++
++    uint32_t length;  // bytes in body (stored using 3 bytes, not 4!)
++    SBuf body; ///< exactly length bytes
++};
++
++/// Incremental SSL Handshake parser.
++class HandshakeParser {
++public:
++    /// The parsing states
++    typedef enum {atHelloNone = 0, atHelloStarted, atHelloReceived, atCertificatesReceived, atHelloDoneReceived, atNstReceived, atCcsReceived, atFinishReceived} ParserState;
++
++    HandshakeParser(): state(atHelloNone), ressumingSession(false), parseDone(false), parseError(false), currentContentType(0), unParsedContent(0), parsingPos(0), currentMsg(0), currentMsgSize(0), certificatesMsgPos(0), certificatesMsgSize(0) {}
++
++    /// Parses the initial sequence of raw bytes sent by the SSL server.
++    /// Returns true upon successful completion (HelloDone or Finished received).
++    /// Otherwise, returns false (and sets parseError to true on errors).
++    bool parseServerHello(const SBuf &data);
++
++#if USE_OPENSSL
++    Ssl::X509_STACK_Pointer serverCertificates; ///< parsed certificates chain
++#endif
++
++    ParserState state; ///< current parsing state.
++
++    bool ressumingSession; ///< True if this is a resumming session
++
++    bool parseDone; ///< The parser finishes its job
++    bool parseError; ///< Set to tru by parse on parse error.
++
++private:
++    unsigned int currentContentType; ///< The current SSL record content type
++    size_t unParsedContent; ///< The size of current SSL record, which is not parsed yet
++    size_t parsingPos; ///< The parsing position from the beginning of parsed data
++    size_t currentMsg; ///< The current handshake message possition from the beginning of parsed data
++    size_t currentMsgSize; ///< The current handshake message size.
++
++    size_t certificatesMsgPos; ///< The possition of certificates message from the beggining of parsed data
++    size_t certificatesMsgSize; ///< The size of certificates message
++
++private:
++    void parseServerHelloTry();
++
++    void parseRecord();
++    void parseMessages();
++
++    void parseChangeCipherCpecMessage();
++    void parseAlertMessage();
++    void parseHandshakeMessage();
++    void parseApplicationDataMessage();
++    void skipMessage(const char *msgType);
++
++    void parseServerCertificates(const SBuf &raw);
++#if USE_OPENSSL
++    static X509 *ParseCertificate(const SBuf &raw);
++#endif
++
++    /// concatenated TLSPlaintext.fragments of TLSPlaintext.type
++    SBuf fragments;
++
++    BinaryTokenizer tkRecords; // TLS record layer (parsing uninterpreted data)
++    BinaryTokenizer tkMessages; // TLS message layer (parsing fragments)
++};
++
++}
++
++#endif // SQUID_SECURITY_HANDSHAKE_H
+@@ -16,6 +16,8 @@ libsecurity_la_SOURCES= \
+ 	Context.h \
+ 	EncryptorAnswer.cc \
+ 	EncryptorAnswer.h \
++	Handshake.cc \
++	Handshake.h \
+ 	forward.h \
+ 	KeyData.h \
+ 	LockingPointer.h \
+@@ -15,9 +15,11 @@
+ #if USE_OPENSSL
+ 
+ #include "comm.h"
++#include "fd.h"
+ #include "fde.h"
+ #include "globals.h"
+ #include "ip/Address.h"
++#include "parser/BinaryTokenizer.h"
+ #include "ssl/bio.h"
+ 
+ #if HAVE_OPENSSL_SSL_H
+@@ -55,6 +57,8 @@ static BIO_METHOD SquidMethods = {
+     NULL // squid_callback_ctrl not supported
+ };
+ 
++/* Ssl:Bio */
++
+ BIO *
+ Ssl::Bio::Create(const int fd, Ssl::Bio::Type type)
+ {
+@@ -128,19 +132,11 @@ Ssl::Bio::read(char *buf, int size, BIO *table)
+ }
+ 
+ int
+-Ssl::Bio::readAndBuffer(char *buf, int size, BIO *table, const char *description)
++Ssl::Bio::readAndBuffer(BIO *table, const char *description)
+ {
+-    prepReadBuf();
+-
+-    size = min((int)rbuf.potentialSpaceSize(), size);
+-    if (size <= 0) {
+-        debugs(83, DBG_IMPORTANT, "Not enough space to hold " <<
+-               rbuf.contentSize() << "+ byte " << description);
+-        return -1;
+-    }
+-
+-    const int bytes = Ssl::Bio::read(buf, size, table);
+-    debugs(83, 5, "read " << bytes << " out of " << size << " bytes"); // move to Ssl::Bio::read()
++    char buf[SQUID_TCP_SO_RCVBUF ];
++    const int bytes = Ssl::Bio::read(buf, sizeof(buf), table);
++    debugs(83, 5, "read " << bytes << " bytes"); // move to Ssl::Bio::read()
+ 
+     if (bytes > 0) {
+         rbuf.append(buf, bytes);
+@@ -167,13 +163,6 @@ Ssl::Bio::stateChanged(const SSL *ssl, int where, int ret)
+            SSL_state_string(ssl) << " (" << SSL_state_string_long(ssl) << ")");
+ }
+ 
+-void
+-Ssl::Bio::prepReadBuf()
+-{
+-    if (rbuf.isNull())
+-        rbuf.init(4096, 65536);
+-}
+-
+ bool
+ Ssl::ClientBio::isClientHello(int state)
+ {
+@@ -203,23 +192,11 @@ Ssl::ClientBio::write(const char *buf, int size, BIO *table)
+     return Ssl::Bio::write(buf, size, table);
+ }
+ 
+-const char *objToString(unsigned char const *bytes, int len)
+-{
+-    static std::string buf;
+-    buf.clear();
+-    for (int i = 0; i < len; i++ ) {
+-        char tmp[3];
+-        snprintf(tmp, sizeof(tmp), "%.2x", bytes[i]);
+-        buf.append(tmp);
+-    }
+-    return buf.c_str();
+-}
+-
+ int
+ Ssl::ClientBio::read(char *buf, int size, BIO *table)
+ {
+     if (helloState < atHelloReceived) {
+-        int bytes = readAndBuffer(buf, size, table, "TLS client Hello");
++        int bytes = readAndBuffer(table, "TLS client Hello");
+         if (bytes <= 0)
+             return bytes;
+     }
+@@ -239,11 +216,9 @@ Ssl::ClientBio::read(char *buf, int size, BIO *table)
+     }
+ 
+     if (helloState == atHelloStarted) {
+-        const unsigned char *head = (const unsigned char *)rbuf.content();
+-        const char *s = objToString(head, rbuf.contentSize());
+-        debugs(83, 7, "SSL Header: " << s);
++        debugs(83, 7, "SSL Header: " << Raw(nullptr, rbuf.rawContent(), rbuf.length()).hex());
+ 
+-        if (helloSize > rbuf.contentSize()) {
++        if (helloSize > (int)rbuf.length()) {
+             BIO_set_retry_read(table);
+             return -1;
+         }
+@@ -258,9 +233,9 @@ Ssl::ClientBio::read(char *buf, int size, BIO *table)
+     }
+ 
+     if (helloState == atHelloReceived) {
+-        if (rbuf.hasContent()) {
+-            int bytes = (size <= rbuf.contentSize() ? size : rbuf.contentSize());
+-            memcpy(buf, rbuf.content(), bytes);
++        if (!rbuf.isEmpty()) {
++            int bytes = (size <= (int)rbuf.length() ? size : rbuf.length());
++            memcpy(buf, rbuf.rawContent(), bytes);
+             rbuf.consume(bytes);
+             return bytes;
+         } else
+@@ -282,11 +257,51 @@ Ssl::ServerBio::setClientFeatures(const Ssl::Bio::sslFeatures &features)
+     clientFeatures = features;
+ };
+ 
++int
++Ssl::ServerBio::readAndBufferServerHelloMsg(BIO *table, const char *description)
++{
++
++    int ret = readAndBuffer(table, description);
++    if (ret <= 0)
++        return ret;
++
++    if (!parser_.parseServerHello(rbuf)) {
++        if (!parser_.parseError) 
++            BIO_set_retry_read(table);
++        return -1;
++    }
++
++    return 1;
++}
++
+ int
+ Ssl::ServerBio::read(char *buf, int size, BIO *table)
+ {
+-    return record_ ?
+-           readAndBuffer(buf, size, table, "TLS server Hello") : Ssl::Bio::read(buf, size, table);
++    if (!parser_.parseDone || record_) {
++        int ret = readAndBufferServerHelloMsg(table, "TLS server Hello");
++        if (!rbuf.length() && parser_.parseDone && ret <= 0)
++            return ret;
++    }
++
++    if (holdRead_) {
++        debugs(83, 7, "Hold flag is set on ServerBio, retry latter. (Hold " << size << "bytes)");
++        BIO_set_retry_read(table);
++        return -1;
++    }
++
++    if (parser_.parseDone && !parser_.parseError) {
++        int unsent = rbuf.length() - rbufConsumePos;
++        if (unsent > 0) {
++            int bytes = (size <= unsent ? size : unsent);
++            memcpy(buf, rbuf.rawContent() + rbufConsumePos, bytes);
++            rbufConsumePos += bytes;
++            debugs(83, 7, "Pass " << bytes << " bytes to openSSL as read");
++            return bytes;
++        } else
++            return Ssl::Bio::read(buf, size, table);
++    }
++
++    return -1;
+ }
+ 
+ // This function makes the required checks to examine if the client hello
+@@ -512,20 +527,10 @@ Ssl::ServerBio::extractHelloFeatures()
+ bool
+ Ssl::ServerBio::resumingSession()
+ {
+-    extractHelloFeatures();
+-
+-    if (!clientFeatures.sessionId.isEmpty() && !receivedHelloFeatures_.sessionId.isEmpty())
+-        return clientFeatures.sessionId == receivedHelloFeatures_.sessionId;
+-
+-    // is this a session resuming attempt using TLS tickets?
+-    if (clientFeatures.hasTlsTicket &&
+-            receivedHelloFeatures_.tlsTicketsExtension &&
+-            receivedHelloFeatures_.hasCcsOrNst)
+-        return true;
+-
+-    return false;
++    return parser_.ressumingSession;
+ }
+ 
++
+ /// initializes BIO table after allocation
+ static int
+ squid_bio_create(BIO *bi)
+@@ -655,7 +660,6 @@ Ssl::Bio::sslFeatures::sslFeatures():
+     tlsTicketsExtension(false),
+     hasTlsTicket(false),
+     tlsStatusRequest(false),
+-    hasCcsOrNst(false),
+     initialized_(false)
+ {
+     memset(client_random, 0, SSL3_RANDOM_SIZE);
+@@ -720,67 +724,22 @@ Ssl::Bio::sslFeatures::get(const SSL *ssl)
+         memcpy(client_random, ssl->s3->client_random, SSL3_RANDOM_SIZE);
+     }
+ 
+-#if 0 /* XXX: OpenSSL 0.9.8k lacks at least some of these tlsext_* fields */
+-    //The following extracted for logging purpuses:
+-    // TLSEXT_TYPE_ec_point_formats
+-    unsigned char *p;
+-    int len;
+-    if (ssl->server) {
+-        p = ssl->session->tlsext_ecpointformatlist;
+-        len = ssl->session->tlsext_ecpointformatlist_length;
+-    } else {
+-        p = ssl->tlsext_ecpointformatlist;
+-        len = ssl->tlsext_ecpointformatlist_length;
+-    }
+-    if (p) {
+-        ecPointFormatList = objToString(p, len);
+-        debugs(83, 7, "tlsExtension ecPointFormatList of length " << len << " :" << ecPointFormatList);
+-    }
+-
+-    // TLSEXT_TYPE_elliptic_curves
+-    if (ssl->server) {
+-        p = ssl->session->tlsext_ellipticcurvelist;
+-        len = ssl->session->tlsext_ellipticcurvelist_length;
+-    } else {
+-        p = ssl->tlsext_ellipticcurvelist;
+-        len = ssl->tlsext_ellipticcurvelist_length;
+-    }
+-    if (p) {
+-        ellipticCurves = objToString(p, len);
+-        debugs(83, 7, "tlsExtension ellipticCurveList of length " <<  len <<" :" << ellipticCurves);
+-    }
+-    // TLSEXT_TYPE_opaque_prf_input
+-    p = NULL;
+-    if (ssl->server) {
+-        if (ssl->s3 &&  ssl->s3->client_opaque_prf_input) {
+-            p = (unsigned char *)ssl->s3->client_opaque_prf_input;
+-            len = ssl->s3->client_opaque_prf_input_len;
+-        }
+-    } else {
+-        p = (unsigned char *)ssl->tlsext_opaque_prf_input;
+-        len = ssl->tlsext_opaque_prf_input_len;
+-    }
+-    if (p) {
+-        debugs(83, 7, "tlsExtension client-opaque-prf-input of length " << len);
+-        opaquePrf = objToString(p, len);
+-    }
+-#endif
+     initialized_ = true;
+     return true;
+ }
+ 
+ int
+-Ssl::Bio::sslFeatures::parseMsgHead(const MemBuf &buf)
++Ssl::Bio::sslFeatures::parseMsgHead(const SBuf &buf)
+ {
+-    const unsigned char *head = (const unsigned char *)buf.content();
+-    const char *s = objToString(head, buf.contentSize());
+-    debugs(83, 7, "SSL Header: " << s);
+-    if (buf.contentSize() < 5)
++    debugs(83, 7, "SSL Header: " << Raw(nullptr, buf.rawContent(), buf.length()).hex());
++
++    if (buf.length() < 5)
+         return 0;
+ 
+     if (helloMsgSize > 0)
+         return helloMsgSize;
+ 
++    const unsigned char *head = (const unsigned char *)buf.rawContent();
+     // Check for SSLPlaintext/TLSPlaintext record
+     // RFC6101 section 5.2.1
+     // RFC5246 section 6.2.1
+@@ -812,73 +771,35 @@ Ssl::Bio::sslFeatures::parseMsgHead(const MemBuf &buf)
+ }
+ 
+ bool
+-Ssl::Bio::sslFeatures::checkForCcsOrNst(const unsigned char *msg, size_t size)
+-{
+-    while (size > 5) {
+-        const int msgType = msg[0];
+-        const int msgSslVersion = (msg[1] << 8) | msg[2];
+-        debugs(83, 7, "SSL Message Version :" << std::hex << std::setw(8) << std::setfill('0') << msgSslVersion);
+-        // Check for Change Cipher Spec message
+-        // RFC5246 section 6.2.1
+-        if (msgType == 0x14) {// Change Cipher Spec message found
+-            debugs(83, 7, "SSL  Change Cipher Spec message found");
+-            return true;
+-        }
+-        // Check for New Session Ticket message
+-        // RFC5077 section 3.3
+-        if (msgType == 0x04) {// New Session Ticket message found
+-            debugs(83, 7, "TLS  New Session Ticket message found");
+-            return true;
+-        }
+-        // The hello message size exist in 4th and 5th bytes
+-        size_t msgLength = (msg[3] << 8) + msg[4];
+-        debugs(83, 7, "SSL Message Size: " << msgLength);
+-        msgLength += 5;
+-
+-        if (msgLength <= size) {
+-            msg += msgLength;
+-            size -= msgLength;
+-        } else
+-            size = 0;
+-    }
+-    return false;
+-}
+-
+-bool
+-Ssl::Bio::sslFeatures::get(const MemBuf &buf, bool record)
++Ssl::Bio::sslFeatures::get(const SBuf &buf, bool record)
+ {
+     int msgSize;
+     if ((msgSize = parseMsgHead(buf)) <= 0) {
+         debugs(83, 7, "Not a known SSL handshake message");
+         return false;
+     }
+ 
+-    if (msgSize > buf.contentSize()) {
++    if (msgSize > (int)buf.length()) {
+         debugs(83, 2, "Partial SSL handshake message, can not parse!");
+         return false;
+     }
+ 
+-    if (record) {
+-        helloMessage.clear();
+-        helloMessage.append(buf.content(), buf.contentSize());
+-    }
++    if (record)
++        helloMessage = buf;
+ 
+-    const unsigned char *msg = (const unsigned char *)buf.content();
++    const unsigned char *msg = (const unsigned char *)buf.rawContent();
+     if (msg[0] & 0x80)
+         return parseV23Hello(msg, (size_t)msgSize);
+     else {
+         // Hello messages require 5 bytes header + 1 byte Msg type + 3 bytes for Msg size
+-        if (buf.contentSize() < 9)
++        if (buf.length() < 9)
+             return false;
+ 
+         // Check for the Handshake/Message type
+         // The type 2 is a ServerHello, the type 1 is a ClientHello
+         // RFC5246 section 7.4
+         if (msg[5] == 0x2) { // ServerHello message
+-            if (parseV3ServerHello(msg, (size_t)msgSize)) {
+-                hasCcsOrNst = checkForCcsOrNst(msg + msgSize,  buf.contentSize() - msgSize);
+-                return true;
+-            }
++            return parseV3ServerHello(msg, (size_t)msgSize);
+         } else if (msg[5] == 0x1) // ClientHello message,
+             return parseV3Hello(msg, (size_t)msgSize);
+     }
+@@ -993,7 +914,7 @@ Ssl::Bio::sslFeatures::parseV3Hello(const unsigned char *messageContainer, size_
+     sslVersion = (clientHello[4] << 8) | clientHello[5];
+     //Get Client Random number. It starts on the position 6 of clientHello message
+     memcpy(client_random, clientHello + 6, SSL3_RANDOM_SIZE);
+-    debugs(83, 7, "Client random: " <<  objToString(client_random, SSL3_RANDOM_SIZE));
++    debugs(83, 7, "Client random: " <<  Raw(nullptr, (char *)client_random, SSL3_RANDOM_SIZE).hex());
+ 
+     // At the position 38 (6+SSL3_RANDOM_SIZE)
+     const size_t sessIDLen = static_cast<size_t>(clientHello[38]);
+@@ -1212,10 +1133,7 @@ Ssl::Bio::sslFeatures::print(std::ostream &os) const
+            " SNI:" << (serverName.isEmpty() ? SBuf("-") : serverName) <<
+            " comp:" << compressMethod <<
+            " Ciphers:" << clientRequestedCiphers <<
+-           " Random:" << objToString(client_random, SSL3_RANDOM_SIZE) <<
+-           " ecPointFormats:" << ecPointFormatList <<
+-           " ec:" << ellipticCurves <<
+-           " opaquePrf:" << opaquePrf;
++           " Random:" << Raw(nullptr, (char *)client_random, SSL3_RANDOM_SIZE).hex();
+ }
+ 
+ #endif /* USE_SSL */
+@@ -11,13 +11,15 @@
+ 
+ #include "fd.h"
+ #include "sbuf/SBuf.h"
++#include "security/Handshake.h"
+ 
+ #include <iosfwd>
+ #include <list>
+ #if HAVE_OPENSSL_BIO_H
+ #include <openssl/bio.h>
+ #endif
+ #include <string>
++#include <type_traits>
+ 
+ namespace Ssl
+ {
+@@ -39,7 +41,7 @@ class Bio
+         bool get(const SSL *ssl); ///< Retrieves the features from SSL object
+         /// Retrieves features from raw SSL Hello message.
+         /// \param record  whether to store Message to the helloMessage member
+-        bool get(const MemBuf &, bool record = true);
++        bool get(const SBuf &, bool record = true);
+         /// Parses a v3 ClientHello message
+         bool parseV3Hello(const unsigned char *hello, size_t helloSize);
+         /// Parses a v23 ClientHello message
+@@ -56,10 +58,7 @@ class Bio
+         /// \retval >0 if the hello size is retrieved
+         /// \retval 0 if the contents of the buffer are not enough
+         /// \retval <0 if the contents of buf are not SSLv3 or TLS hello message
+-        int parseMsgHead(const MemBuf &);
+-        /// Parses msg buffer and return true if one of the Change Cipher Spec
+-        /// or New Session Ticket messages found
+-        bool checkForCcsOrNst(const unsigned char *msg, size_t size);
++        int parseMsgHead(const SBuf &);
+     public:
+         int sslHelloVersion; ///< The SSL hello message version
+         int sslVersion; ///< The requested/used SSL version
+@@ -68,17 +67,11 @@ class Bio
+         mutable SBuf serverName; ///< The SNI hostname, if any
+         std::string clientRequestedCiphers; ///< The client requested ciphers
+         bool unknownCiphers; ///< True if one or more ciphers are unknown
+-        std::string ecPointFormatList;///< tlsExtension ecPointFormatList
+-        std::string ellipticCurves; ///< tlsExtension ellipticCurveList
+-        std::string opaquePrf; ///< tlsExtension opaquePrf
+         bool doHeartBeats;
+         bool tlsTicketsExtension; ///< whether TLS tickets extension is enabled
+         bool hasTlsTicket; ///< whether a TLS ticket is included
+         bool tlsStatusRequest; ///< whether the TLS status request extension is set
+         SBuf tlsAppLayerProtoNeg; ///< The value of the TLS application layer protocol extension if it is enabled
+-        /// whether Change Cipher Spec message included in ServerHello
+-        /// handshake message
+-        bool hasCcsOrNst;
+         /// The client random number
+         unsigned char client_random[SSL3_RANDOM_SIZE];
+         SBuf sessionId;
+@@ -111,19 +104,16 @@ class Bio
+     /// Tells ssl connection to use BIO and monitor state via stateChanged()
+     static void Link(SSL *ssl, BIO *bio);
+ 
+-    /// Prepare the rbuf buffer to accept hello data
+-    void prepReadBuf();
+-
+     /// Reads data from socket and record them to a buffer
+-    int readAndBuffer(char *buf, int size, BIO *table, const char *description);
++    int readAndBuffer(BIO *table, const char *description);
+ 
+     /// Return the TLS features requested by TLS client
+     const Bio::sslFeatures &receivedHelloFeatures() const {return receivedHelloFeatures_;}
+ 
+-    const MemBuf &rBufData() {return rbuf;}
++    const SBuf &rBufData() {return rbuf;}
+ protected:
+     const int fd_; ///< the SSL socket we are reading and writing
+-    MemBuf rbuf;  ///< Used to buffer input data.
++    SBuf rbuf;  ///< Used to buffer input data.
+     /// The features retrieved from client or Server TLS hello message
+     Bio::sslFeatures receivedHelloFeatures_;
+ };
+@@ -182,7 +172,7 @@ class ClientBio: public Bio
+ class ServerBio: public Bio
+ {
+ public:
+-    explicit ServerBio(const int anFd): Bio(anFd), helloMsgSize(0), helloBuild(false), allowSplice(false), allowBump(false), holdWrite_(false), record_(false), bumpMode_(bumpNone) {}
++    explicit ServerBio(const int anFd): Bio(anFd), helloMsgSize(0), helloBuild(false), allowSplice(false), allowBump(false), holdWrite_(false), holdRead_(true), record_(false), bumpMode_(bumpNone), rbufConsumePos(0) {}
+     /// The ServerBio version of the Ssl::Bio::stateChanged method
+     virtual void stateChanged(const SSL *ssl, int where, int ret);
+     /// The ServerBio version of the Ssl::Bio::write method
+@@ -204,10 +194,19 @@ class ServerBio: public Bio
+     void extractHelloFeatures();
+ 
+     bool resumingSession();
++
++    /// Reads Server hello message+certificates+ServerHelloDone message sent
++    /// by server and buffer it to rbuf member
++    int readAndBufferServerHelloMsg(BIO *table, const char *description);
++
+     /// The write hold state
+     bool holdWrite() const {return holdWrite_;}
+     /// Enables or disables the write hold state
+     void holdWrite(bool h) {holdWrite_ = h;}
++    /// The read hold state
++    bool holdRead() const {return holdRead_;}
++    /// Enables or disables the read hold state
++    void holdRead(bool h) {holdRead_ = h;}
+     /// Enables or disables the input data recording, for internal analysis.
+     void recordInput(bool r) {record_ = r;}
+     /// Whether we can splice or not the SSL stream
+@@ -217,6 +216,15 @@ class ServerBio: public Bio
+     /// The bumping mode
+     void mode(Ssl::BumpMode m) {bumpMode_ = m;}
+     Ssl::BumpMode bumpMode() {return bumpMode_;} ///< return the bumping mode
++
++    /// Return true if the Server hello message received
++    bool gotHello() const { return (parser_.parseDone && !parser_.parseError); }
++
++    /// Return true if the Server Hello parsing failed
++    bool gotHelloFailed() const { return (parser_.parseDone && parser_.parseError); }
++
++    const Ssl::X509_STACK_Pointer &serverCertificatesIfAny() { return parser_.serverCertificates; } /* XXX: may be nil */
++
+ private:
+     sslFeatures clientFeatures; ///< SSL client features extracted from ClientHello message or SSL object
+     SBuf helloMsg; ///< Used to buffer output data.
+@@ -225,8 +233,13 @@ class ServerBio: public Bio
+     bool allowSplice; ///< True if the SSL stream can be spliced
+     bool allowBump;  ///< True if the SSL stream can be bumped
+     bool holdWrite_;  ///< The write hold state of the bio.
++    bool holdRead_;  ///< The read hold state of the bio.
+     bool record_; ///< If true the input data recorded to rbuf for internal use
+     Ssl::BumpMode bumpMode_;
++
++    ///< The size of data stored in rbuf which passed to the openSSL
++    size_t rbufConsumePos;
++    Security::HandshakeParser parser_; ///< The SSL messages parser.
+ };
+ 
+ inline
+@@ -21,6 +21,7 @@
+ #include "comm/Read.h"
+ #include "comm/Write.h"
+ #include "errorpage.h"
++#include "fd.h"
+ #include "fde.h"
+ #include "FwdState.h"
+ #include "globals.h"
+@@ -164,6 +165,7 @@ class TunnelStateData
+     MemBuf *connectRespBuf; ///< accumulates peer CONNECT response when we need it
+     bool connectReqWriting; ///< whether we are writing a CONNECT request to a peer
+     SBuf preReadClientData;
++    SBuf preReadServerData;
+     time_t started;         ///< when this tunnel was initiated.
+ 
+     void copyRead(Connection &from, IOCB *completion);
+@@ -214,6 +216,7 @@ class TunnelStateData
+     static void ReadConnectResponseDone(const Comm::ConnectionPointer &, char *buf, size_t len, Comm::Flag errcode, int xerrno, void *data);
+     void readConnectResponseDone(char *buf, size_t len, Comm::Flag errcode, int xerrno);
+     void copyClientBytes();
++    void copyServerBytes();
+ };
+ 
+ static const char *const conn_established = "HTTP/1.1 200 Connection established\r\n\r\n";
+@@ -737,7 +740,7 @@ TunnelStateData::writeClientDone(char *, size_t len, Comm::Flag flag, int xerrno
+     CbcPointer<TunnelStateData> safetyLock(this);   /* ??? should be locked by the caller... */
+ 
+     if (cbdataReferenceValid(this))
+-        copyRead(server, ReadServer);
++        copyServerBytes();
+ }
+ 
+ static void
+@@ -829,6 +832,20 @@ TunnelStateData::copyClientBytes()
+         copyRead(client, ReadClient);
+ }
+ 
++void
++TunnelStateData::copyServerBytes()
++{
++    if (preReadServerData.length()) {
++        size_t copyBytes = preReadServerData.length() > SQUID_TCP_SO_RCVBUF ? SQUID_TCP_SO_RCVBUF : preReadServerData.length();
++        memcpy(server.buf, preReadServerData.rawContent(), copyBytes);
++        preReadServerData.consume(copyBytes);
++        server.bytesIn(copyBytes);
++        if (keepGoingAfterRead(copyBytes, Comm::OK, 0, server, client))
++            copy(copyBytes, server, client, TunnelStateData::WriteClientDone);
++    } else
++        copyRead(server, ReadServer);
++}
++
+ /**
+  * Set the HTTP status for this request and sets the read handlers for client
+  * and server side connections.
+@@ -844,7 +861,7 @@ tunnelStartShoveling(TunnelStateData *tunnelState)
+ 
+         // Shovel any payload already pushed into reply buffer by the server response
+         if (!tunnelState->server.len)
+-            tunnelState->copyRead(tunnelState->server, TunnelStateData::ReadServer);
++            tunnelState->copyServerBytes();
+         else {
+             debugs(26, DBG_DATA, "Tunnel server PUSH Payload: \n" << Raw("", tunnelState->server.buf, tunnelState->server.len) << "\n----------");
+             tunnelState->copy(tunnelState->server.len, tunnelState->server, tunnelState->client, TunnelStateData::WriteClientDone);
+@@ -1301,11 +1318,8 @@ switchToTunnel(HttpRequest *request, Comm::ConnectionPointer &clientConn, Comm::
+     assert(ssl);
+     BIO *b = SSL_get_rbio(ssl);
+     Ssl::ServerBio *srvBio = static_cast<Ssl::ServerBio *>(b->ptr);
+-    const MemBuf &buf = srvBio->rBufData();
+-
+-    AsyncCall::Pointer call = commCbCall(5,5, "tunnelConnectedWriteDone",
+-                                         CommIoCbPtrFun(tunnelConnectedWriteDone, tunnelState));
+-    tunnelState->client.write(buf.content(), buf.contentSize(), call, NULL);
++    tunnelState->preReadServerData = srvBio->rBufData();
++    tunnelStartShoveling(tunnelState);
+ }
+ #endif //USE_OPENSSL
+ 

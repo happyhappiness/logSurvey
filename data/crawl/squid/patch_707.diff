@@ -1,0 +1,536 @@
+@@ -7,72 +7,46 @@
+ #include "squid.h"
+ #include "fs/rock/RockDirMap.h"
+ 
+-Rock::DirMap::DirMap(const int aLimit): hintPast(-1), hintNext(0),
+-    limit(aLimit), count(0), slots(NULL)
+-{
+-    allocate();
+-}
+-
+-Rock::DirMap::DirMap(const DirMap &m):
+-    hintPast(m.hintPast), hintNext(m.hintNext),
+-    limit(m.limit), count(m.count),
+-    slots(NULL)
+-{
+-    copyFrom(m);
+-}
++static const char SharedMemoryName[] = "RockDirMap";
+ 
+-Rock::DirMap::~DirMap()
++Rock::DirMap::DirMap(const int id, const int limit):
++    shm(SharedMemoryName, id)
+ {
+-    deallocate();
++    shm.create(limit);
++    assert(shm.mem());
++    shared = new (shm.mem()) Shared(limit);
+ }
+ 
+-Rock::DirMap &Rock::DirMap::operator =(const DirMap &m)
++Rock::DirMap::DirMap(const int id):
++    shm(SharedMemoryName, id)
+ {
+-    deallocate();
+-
+-    hintPast = m.hintPast;
+-    hintNext = m.hintNext;
+-    limit = m.limit;
+-    count = m.count;
+-
+-    copyFrom(m);
+-    return *this;
+-}
+-
+-void
+-Rock::DirMap::resize(const int newLimit)
+-{
+-    // TODO: optimize?
+-    if (newLimit != limit) {
+-        DirMap old(*this);
+-        deallocate();
+-        limit = newLimit;
+-        copyFrom(old);
+-	}
++    shm.open();
++    assert(shm.mem());
++    shared = reinterpret_cast<Shared *>(shm.mem());
+ }
+ 
+ int
+ Rock::DirMap::entryLimit() const
+ {
+-    return limit;
++    return shared->limit;
+ }
+ 
+ int
+ Rock::DirMap::entryCount() const
+ {
+-    return count;
++    return shared->count;
+ }
+ 
+ bool
+ Rock::DirMap::full() const
+ {
+-    return count >= limit;
++    return entryCount() >= entryLimit();
+ }
+ 
+ bool
+ Rock::DirMap::valid(const int pos) const
+ {
+-    return 0 <= pos && pos < limit;
++    return 0 <= pos && pos < entryLimit();
+ }
+ 
+ int
+@@ -85,39 +59,6 @@ Rock::DirMap::useNext()
+     return next;
+ }
+ 
+-/// allocation, assumes limit is set
+-void
+-Rock::DirMap::allocate()
+-{
+-    assert(!slots);
+-    slots = new uint8_t[limit];
+-    memset(slots, 0, ramSize());
+-}
+-
+-/// deallocation; may place the object in an inconsistent state
+-void
+-Rock::DirMap::deallocate()
+-{
+-    delete [] slots;
+-    slots = NULL;
+-}
+-
+-/// low-level copy; assumes all counts have been setup
+-void
+-Rock::DirMap::copyFrom(const DirMap &m)
+-{
+-    allocate();
+-    if (m.limit)
+-        memcpy(slots, m.slots, min(ramSize(), m.ramSize()));
+-}
+-
+-/// low-level ram size calculation for mem*() calls
+-int
+-Rock::DirMap::ramSize() const
+-{
+-    return sizeof(*slots) * limit;
+-}
+-
+ int
+ Rock::DirMap::AbsoluteEntryLimit()
+ {
+@@ -130,27 +71,27 @@ Rock::DirMap::use(const int pos)
+ {
+     if (!has(pos)) {
+         assert(valid(pos));
+-        slots[pos] = 1;
+-        ++count;
++        shared->slots[pos] = 1;
++        ++shared->count;
+         debugs(8, 6, HERE << pos);
+-	} else {
++    } else {
+         debugs(8, 3, HERE << pos << " in vain");
+-	}
++    }
+ }
+ 
+ void
+ Rock::DirMap::clear(const int pos)
+ {
+     if (has(pos)) {
+-        slots[pos] = 0;
+-        --count;
++        shared->slots[pos] = 0;
++        --shared->count;
+         debugs(8, 6, HERE << pos);
+-	} else {
++    } else {
+         debugs(8, 3, HERE << pos << " in vain");
+         assert(valid(pos));
+-	}
+-    if (hintPast < 0)
+-        hintPast = pos; // remember cleared slot
++    }
++    if (shared->hintPast < 0)
++        shared->hintPast = pos; // remember cleared slot
+ }
+ 
+ bool
+@@ -159,32 +100,43 @@ Rock::DirMap::has(const int pos) const
+     if (!valid(pos)) // the only place where we are forgiving
+         return false;
+ 
+-    return slots[pos];
++    return shared->slots[pos];
+ }
+ 
+ /// low-level empty-slot search routine, uses and updates hints
+ int
+ Rock::DirMap::findNext() const
+ {
+     // try the clear-based hint, if any
+-    if (hintPast >= 0) {
+-        const int result = hintPast;
+-        hintPast = -1; // assume used; or we could update it in set()
++    if (shared->hintPast >= 0) {
++        const int result = shared->hintPast;
++        shared->hintPast = -1; // assume used; or we could update it in set()
+         if (valid(result) && !has(result))
+             return result;
+-	}
++    }
+ 
+     // adjust and try the scan-based hint
+-    if (!valid(hintNext))
+-        hintNext = 0;
++    if (!valid(shared->hintNext))
++        shared->hintNext = 0;
+ 
+-    for (int i = 0; i < limit; ++i) {
+-        if (!has(hintNext))
+-            return hintNext++;
++    for (int i = 0; i < shared->limit; ++i) {
++        if (!has(shared->hintNext))
++            return shared->hintNext++;
+ 
+-        hintNext = (hintNext + 1) % limit;
++        shared->hintNext = (shared->hintNext + 1) % shared->limit;
+     }
+ 
+     // the map is full
+     return -1;
+ }
++
++int
++Rock::DirMap::SharedSize(const int limit)
++{
++    return sizeof(Shared) + limit * sizeof(Slot);
++}
++
++Rock::DirMap::Shared::Shared(const int aLimit):
++    hintPast(-1), hintNext(0), limit(aLimit), count(0)
++{
++}
+@@ -1,19 +1,18 @@
+ #ifndef SQUID_FS_ROCK_DIR_MAP_H
+ #define SQUID_FS_ROCK_DIR_MAP_H
+ 
++#include "ipc/AtomicWord.h"
++#include "ipc/SharedMemory.h"
++
+ namespace Rock {
+ 
+ /// \ingroup Rock
+ /// map of used db slots indexed by sfileno
+ class DirMap
+ {
+ public:
+-    DirMap(const int aLimit = 0);
+-    DirMap(const DirMap &map);
+-    ~DirMap();
+-
+-    DirMap &operator =(const DirMap &map);
+-    void resize(const int newLimit); ///< forgets higher slots or appends zeros
++    DirMap(const int id, const int limit); ///< create a new shared DirMap
++    DirMap(const int id); ///< open an existing shared DirMap
+ 
+     bool full() const; ///< there are no empty slots left
+     bool has(int n) const; ///< whether slot n is occupied
+@@ -28,22 +27,27 @@ class DirMap
+     static int AbsoluteEntryLimit(); ///< maximum entryLimit() possible
+ 
+ private:
+-    /// unreliable next empty slot suggestion #1 (clear based)
+-    mutable int hintPast;
+-    ///< unreliable next empty slot suggestion #2 (scan based)
+-    mutable int hintNext;
++    int findNext() const;
+ 
+-    int limit; ///< maximum number of map slots
+-    int count; ///< current number of map slots
++    static int SharedSize(const int limit);
+ 
+-    typedef uint8_t Slot;
+-    Slot *slots; ///< slots storage
++    SharedMemory shm; ///< shared memory segment
+ 
+-    int ramSize() const;
+-    void allocate();
+-    void deallocate();
+-    void copyFrom(const DirMap &map);
+-    int findNext() const;
++    typedef AtomicWordT<uint8_t> Slot;
++    struct Shared {
++        Shared(const int aLimit);
++
++        /// unreliable next empty slot suggestion #1 (clear based)
++        mutable AtomicWord hintPast;
++        ///< unreliable next empty slot suggestion #2 (scan based)
++        mutable AtomicWord hintNext;
++
++        AtomicWord limit; ///< maximum number of map slots
++        AtomicWord count; ///< current number of map slots
++
++        Slot slots[]; ///< slots storage
++    };
++    Shared *shared; ///< pointer to shared memory
+ };
+ 
+ } // namespace Rock
+@@ -20,7 +20,7 @@
+ // must be divisible by 1024 due to cur_size and max_size KB madness
+ const int64_t Rock::SwapDir::HeaderSize = 16*1024;
+ 
+-Rock::SwapDir::SwapDir(): ::SwapDir("rock"), filePath(NULL), io(NULL)
++Rock::SwapDir::SwapDir(): ::SwapDir("rock"), filePath(NULL), io(NULL), map(0)
+ {
+ }
+ 
+@@ -173,14 +173,14 @@ Rock::SwapDir::validateOptions()
+     static const int ps = getpagesize();
+     if (ps > 0 && (max_objsize % ps != 0))
+         fatal("Rock store max-size should be a multiple of page size");
+-
++    /*
+     const int64_t eLimitHi = 0xFFFFFF; // Core sfileno maximum
+     const int64_t eLimitLo = map.entryLimit(); // dynamic shrinking unsupported
+     const int64_t eWanted = (maximumSize() - HeaderSize)/max_objsize;
+     const int64_t eAllowed = min(max(eLimitLo, eWanted), eLimitHi);
+ 
+     map.resize(eAllowed); // the map may decide to use an even lower limit
+-
++    */
+     // Note: We could try to shrink max_size now. It is stored in KB so we
+     // may not be able to make it match the end of the last entry exactly.
+     const int64_t mapRoundWasteMx = max_objsize*sizeof(long)*8;
+@@ -0,0 +1,35 @@
++/*
++ * $Id$
++ *
++ */
++
++#ifndef SQUID_IPC_ATOMIC_WORD_H
++#define SQUID_IPC_ATOMIC_WORD_H
++
++template <class Value>
++class AtomicWordT {
++public:
++    AtomicWordT() {} // leave value unchanged
++    AtomicWordT(Value aValue): value(aValue) {} // XXX: unsafe
++
++    Value operator +=(int delta) { return __sync_add_and_fetch(&value, delta); }
++    Value operator ++() { return *this += 1; }
++    Value operator --() { return *this += -1; }
++    Value operator ++(int) { return __sync_fetch_and_add(&value, 1); }
++    Value operator --(int) { return __sync_fetch_and_add(&value, -1); }
++
++    bool swap_if(const int comparand, const int replacement) { return __sync_bool_compare_and_swap(&value, comparand, replacement); }
++
++    // TODO: no need for __sync_bool_compare_and_swap here?
++    bool operator ==(int v2) { return __sync_bool_compare_and_swap(&value, v2, value); }
++
++    // TODO: no need for __sync_fetch_and_add here?
++    operator Value () const { return __sync_fetch_and_add(const_cast<Value*>(&value), 0); }
++
++private:
++    Value value;
++};
++
++typedef AtomicWordT<int> AtomicWord;
++
++#endif // SQUID_IPC_ATOMIC_WORD_H
+@@ -4,6 +4,7 @@ include $(top_srcdir)/src/TestHeaders.am
+ noinst_LTLIBRARIES = libipc.la
+ 
+ libipc_la_SOURCES = \
++	AtomicWord.h \
+ 	FdNotes.cc \
+ 	FdNotes.h \
+ 	Kid.cc \
+@@ -18,6 +19,8 @@ libipc_la_SOURCES = \
+ 	StrandCoords.h \
+ 	SharedListen.cc \
+ 	SharedListen.h \
++	SharedMemory.cc \
++	SharedMemory.h \
+ 	TypedMsgHdr.cc \
+ 	TypedMsgHdr.h \
+ 	Coordinator.cc \
+@@ -0,0 +1,128 @@
++/*
++ * $Id$
++ *
++ * DEBUG: section 54    Interprocess Communication
++ *
++ */
++
++#include "config.h"
++
++#include "ipc/SharedMemory.h"
++#include "protos.h"
++
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++SharedMemory::SharedMemory(const String &id, const int magic):
++    theName(GenerateName(id, magic)), theFD(-1), theSize(-1), theMem(NULL)
++{
++}
++
++SharedMemory::~SharedMemory() {
++    if (theFD >= 0) {
++        detach();
++        if (close(theFD))
++            debugs(54, 5, "SharedMemory::~SharedMemory: close: " << xstrerror());
++    }
++}
++
++void
++SharedMemory::create(const int aSize)
++{
++    assert(aSize > 0);
++    assert(theFD < 0);
++
++    theFD = shm_open(theName.termedBuf(), O_CREAT | O_EXCL | O_RDWR,
++                     S_IRUSR | S_IWUSR);
++    if (theFD < 0) {
++        debugs(54, 5, "SharedMemory::create: shm_open: " << xstrerror());
++        fatal("SharedMemory::create failed");
++    }
++
++    if (ftruncate(theFD, aSize)) {
++        debugs(54, 5, "SharedMemory::create: ftruncate: " << xstrerror());
++        fatal("SharedMemory::create failed");
++    }
++
++    theSize = aSize;
++
++    attach();
++}
++
++void
++SharedMemory::open()
++{
++    assert(theFD < 0);
++
++    theFD = shm_open(theName.termedBuf(), O_RDWR, 0);
++    if (theFD < 0) {
++        debugs(54, 5, "SharedMemory::open: shm_open: " << xstrerror());
++        fatal("SharedMemory::open failed");
++    }
++
++    {
++        struct stat s;
++        memset(&s, 0, sizeof(s));
++        if (fstat(theFD, &s)) {
++            debugs(54, 5, "SharedMemory::open: fstat: " << xstrerror());
++            fatal("SharedMemory::open failed");
++        }
++
++        theSize = s.st_size;
++    }
++
++    attach();
++}
++
++/// Map the shared memory segment to the process memory space.
++void
++SharedMemory::attach()
++{
++    assert(theFD >= 0);
++    assert(theSize >= 0);
++    assert(!theMem);
++
++    void *const p =
++        mmap(NULL, theSize, PROT_READ | PROT_WRITE, MAP_SHARED, theFD, 0);
++    if (p == MAP_FAILED) {
++        debugs(54, 5, "SharedMemory::mmap: mmap: " << xstrerror());
++        fatal("SharedMemory::mmap failed");
++    }
++    theMem = p;
++}
++
++/// Unmap the shared memory segment from the process memory space.
++void
++SharedMemory::detach()
++{
++    if (!theMem)
++        return;
++
++    if (munmap(theMem, theSize)) {
++        debugs(54, 5, "SharedMemory::munmap: munmap: " << xstrerror());
++        fatal("SharedMemory::munmap failed");
++    }
++    theMem = 0;
++}
++
++/// Generate name for shared memory segment. Uses the master process
++/// PID to avoid conflicts with other Squid instances.
++String
++SharedMemory::GenerateName(const String &id, const int magic)
++{
++    String name("/squid-");
++    name.append(id);
++    name.append('-');
++    {
++        const int pid = IamMasterProcess() ? getpid() : getppid();
++        name.append(pid);
++    }
++    if (magic) {
++        name.append('-');
++        name.append(magic);
++    }
++    return name;
++}
+@@ -0,0 +1,40 @@
++/*
++ * $Id$
++ *
++ */
++
++#ifndef SQUID_IPC_SHARED_MEMORY_H
++#define SQUID_IPC_SHARED_MEMORY_H
++
++#include "SquidString.h"
++
++/// POSIX shared memory segment
++class SharedMemory {
++public:
++    /// Create a shared memory segment. Id is a human-readable name,
++    /// optional magic is unique key (e.g. kid id).
++    SharedMemory(const String &id, const int magic = 0);
++    ~SharedMemory();
++
++    /// Create a new shared memory segment. Fails if a segment with
++    /// the same name already exists.
++    void create(const int aSize);
++    void open(); ///< Open an existing shared memory segment.
++
++    const String &name() { return theName; } ///< shared memory segment name
++    int size() { return theSize; } ///< shared memory segment size
++    void *mem() { return theMem; } ///< pointer to mmapped shared memory segment
++
++private:
++    void attach();
++    void detach();
++
++    static String GenerateName(const String &id, const int magic);
++
++    const String theName; ///< shared memory segment file name
++    int theFD; ///< shared memory segment file descriptor
++    int theSize; ///< shared memory segment size
++    void *theMem; ///< pointer to mmapped shared memory segment
++};
++
++#endif /* SQUID_IPC_SHARED_MEMORY_H */

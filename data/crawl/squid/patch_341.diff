@@ -1,0 +1,1243 @@
+@@ -30,6 +30,7 @@
+  */
+ 
+ #include "acl/forward.h"
++#include "base/CbcPointer.h"
+ #include "enums.h"
+ #include "icp_opcode.h"
+ #include "ip/Address.h"
+@@ -43,7 +44,9 @@
+ 
+ class CachePeerDomainList;
+ class NeighborTypeDomainList;
++class PconnPool;
+ class PeerDigest;
++class PeerPoolMgr;
+ 
+ // currently a POD
+ class CachePeer
+@@ -186,6 +189,12 @@ class CachePeer
+     time_t connect_timeout;
+     int connect_fail_limit;
+     int max_conn;
++    struct {
++        PconnPool *pool; ///< idle connection pool for this peer
++        CbcPointer<PeerPoolMgr> mgr; ///< pool manager
++        int limit; ///< the limit itself
++        bool waitingForClose; ///< a conn must close before we open a standby conn
++    } standby; ///< optional "cache_peer standby=limit" feature
+     char *domain;       /* Forced domain */
+ #if USE_OPENSSL
+ 
+@@ -65,6 +65,7 @@
+ #include "neighbors.h"
+ #include "pconn.h"
+ #include "PeerSelectState.h"
++#include "PeerPoolMgr.h"
+ #include "SquidConfig.h"
+ #include "SquidTime.h"
+ #include "Store.h"
+@@ -93,7 +94,7 @@ static OBJH fwdStats;
+ #define MAX_FWD_STATS_IDX 9
+ static int FwdReplyCodes[MAX_FWD_STATS_IDX + 1][Http::scInvalidHeader + 1];
+ 
+-static PconnPool *fwdPconnPool = new PconnPool("server-side");
++static PconnPool *fwdPconnPool = new PconnPool("server-side", NULL);
+ CBDATA_CLASS_INIT(FwdState);
+ 
+ #if USE_OPENSSL
+@@ -129,17 +130,23 @@ FwdState::abort(void* d)
+     Pointer tmp = fwd; // Grab a temporary pointer to keep the object alive during our scope.
+ 
+     if (Comm::IsConnOpen(fwd->serverConnection())) {
+-        comm_remove_close_handler(fwd->serverConnection()->fd, fwdServerClosedWrapper, fwd);
+-        debugs(17, 3, HERE << "store entry aborted; closing " <<
+-               fwd->serverConnection());
+-        fwd->serverConnection()->close();
++        fwd->closeServerConnection("store entry aborted");
+     } else {
+         debugs(17, 7, HERE << "store entry aborted; no connection to close");
+     }
+     fwd->serverDestinations.clear();
+     fwd->self = NULL;
+ }
+ 
++void
++FwdState::closeServerConnection(const char *reason)
++{
++    debugs(17, 3, "because " << reason << "; " << serverConn);
++    comm_remove_close_handler(serverConn->fd, fwdServerClosedWrapper, this);
++    fwdPconnPool->noteUses(fd_table[serverConn->fd].pconn.uses);
++    serverConn->close();
++}
++
+ /**** PUBLIC INTERFACE ********************************************************/
+ 
+ FwdState::FwdState(const Comm::ConnectionPointer &client, StoreEntry * e, HttpRequest * r, const AccessLogEntryPointer &alp):
+@@ -295,11 +302,8 @@ FwdState::~FwdState()
+         calls.connector = NULL;
+     }
+ 
+-    if (Comm::IsConnOpen(serverConn)) {
+-        comm_remove_close_handler(serverConnection()->fd, fwdServerClosedWrapper, this);
+-        debugs(17, 3, HERE << "closing FD " << serverConnection()->fd);
+-        serverConn->close();
+-    }
++    if (Comm::IsConnOpen(serverConn))
++        closeServerConnection("~FwdState");
+ 
+     serverDestinations.clear();
+ 
+@@ -615,7 +619,10 @@ FwdState::checkRetriable()
+ void
+ FwdState::serverClosed(int fd)
+ {
+-    debugs(17, 2, HERE << "FD " << fd << " " << entry->url());
++    debugs(17, 2, "FD " << fd << " " << entry->url() << " after " <<
++           fd_table[fd].pconn.uses << " requests");
++    if (serverConnection()->fd == fd) // should be, but not critical to assert
++        fwdPconnPool->noteUses(fd_table[fd].pconn.uses);
+     retryOrBail();
+ }
+ 
+@@ -833,7 +840,7 @@ FwdState::connectStart()
+     // This does not increase the total number of connections because we just
+     // closed the connection that failed the race. And re-pinning assumes this.
+     if (pconnRace != raceHappened)
+-        temp = fwdPconnPool->pop(serverDestinations[0], host, checkRetriable());
++        temp = pconnPop(serverDestinations[0], host);
+ 
+     const bool openedPconn = Comm::IsConnOpen(temp);
+     pconnRace = openedPconn ? racePossible : raceImpossible;
+@@ -895,7 +902,7 @@ FwdState::dispatch()
+ 
+     fd_note(serverConnection()->fd, entry->url());
+ 
+-    fd_table[serverConnection()->fd].noteUse(fwdPconnPool);
++    fd_table[serverConnection()->fd].noteUse();
+ 
+     /*assert(!EBIT_TEST(entry->flags, ENTRY_DISPATCHED)); */
+     assert(entry->ping_status != PING_WAITING);
+@@ -1128,6 +1135,22 @@ FwdState::pconnPush(Comm::ConnectionPointer &conn, const char *domain)
+     }
+ }
+ 
++Comm::ConnectionPointer
++FwdState::pconnPop(const Comm::ConnectionPointer &dest, const char *domain)
++{
++    // always call shared pool first because we need to close an idle
++    // connection there if we have to use a standby connection.
++    Comm::ConnectionPointer conn = fwdPconnPool->pop(dest, domain, checkRetriable());
++    if (!Comm::IsConnOpen(conn)) {
++        // either there was no pconn to pop or this is not a retriable xaction
++        if (CachePeer *peer = dest->getPeer()) {
++            if (peer->standby.pool)
++                conn = peer->standby.pool->pop(dest, domain, true);
++        }
++    }
++    return conn; // open, closed, or nil
++}
++
+ void
+ FwdState::initModule()
+ {
+@@ -16,6 +16,8 @@
+ 
+ class AccessLogEntry;
+ typedef RefCount<AccessLogEntry> AccessLogEntryPointer;
++class PconnPool;
++typedef RefCount<PconnPool> PconnPoolPointer;
+ class ErrorState;
+ class HttpRequest;
+ 
+@@ -76,6 +78,9 @@ class FwdState : public RefCountable
+     bool checkRetry();
+     bool checkRetriable();
+     void dispatch();
++    /// Pops a connection from connection pool if available. If not
++    /// checks the peer stand-by connection pool for available connection.
++    Comm::ConnectionPointer pconnPop(const Comm::ConnectionPointer &dest, const char *domain);
+     void pconnPush(Comm::ConnectionPointer & conn, const char *domain);
+ 
+     bool dontRetry() { return flags.dont_retry; }
+@@ -103,6 +108,9 @@ class FwdState : public RefCountable
+ #endif
+     static void RegisterWithCacheManager(void);
+ 
++    /// stops monitoring server connection for closure and updates pconn stats
++    void closeServerConnection(const char *reason);
++
+ public:
+     StoreEntry *entry;
+     HttpRequest *request;
+@@ -472,6 +472,8 @@ squid_SOURCES = \
+ 	peer_sourcehash.cc \
+ 	peer_userhash.h \
+ 	peer_userhash.cc \
++	PeerPoolMgr.h \
++	PeerPoolMgr.cc \
+ 	PeerSelectState.h \
+ 	PingData.h \
+ 	protos.h \
+@@ -1518,6 +1520,8 @@ tests_testCacheManager_SOURCES = \
+ 	peer_sourcehash.cc \
+ 	peer_userhash.h \
+ 	peer_userhash.cc \
++	PeerPoolMgr.h \
++	PeerPoolMgr.cc \
+ 	redirect.h \
+ 	tests/stub_redirect.cc \
+ 	refresh.h \
+@@ -1744,6 +1748,7 @@ tests_testDiskIO_SOURCES = \
+ 	tests/stub_MemStore.cc \
+ 	mime.h \
+ 	tests/stub_mime.cc \
++	tests/stub_neighbors.cc \
+ 	tests/stub_pconn.cc \
+ 	tests/stub_Port.cc \
+ 	tests/stub_stat.cc \
+@@ -1899,6 +1904,8 @@ tests_testEvent_SOURCES = \
+ 	HttpParser.cc \
+ 	HttpParser.h \
+ 	HttpReply.cc \
++	PeerPoolMgr.h \
++	PeerPoolMgr.cc \
+ 	RequestFlags.h \
+ 	RequestFlags.cc \
+ 	HttpRequest.cc \
+@@ -2147,6 +2154,8 @@ tests_testEventLoop_SOURCES = \
+ 	HttpParser.cc \
+ 	HttpParser.h \
+ 	HttpReply.cc \
++	PeerPoolMgr.h \
++	PeerPoolMgr.cc \
+ 	RequestFlags.h \
+ 	RequestFlags.cc \
+ 	HttpRequest.cc \
+@@ -2391,6 +2400,8 @@ tests_test_http_range_SOURCES = \
+ 	HttpParser.cc \
+ 	HttpParser.h \
+ 	HttpReply.cc \
++	PeerPoolMgr.h \
++	PeerPoolMgr.cc \
+ 	RequestFlags.h \
+ 	RequestFlags.cc \
+ 	HttpRequest.cc \
+@@ -2731,6 +2742,8 @@ tests_testHttpRequest_SOURCES = \
+ 	peer_sourcehash.cc \
+ 	peer_userhash.h \
+ 	peer_userhash.cc \
++	PeerPoolMgr.h \
++	PeerPoolMgr.cc \
+ 	redirect.h \
+ 	tests/stub_libauth_acls.cc \
+ 	tests/stub_redirect.cc \
+@@ -3081,6 +3094,7 @@ tests_testUfs_SOURCES = \
+ 	tests/stub_libeui.cc \
+ 	tests/stub_libicmp.cc \
+ 	tests/stub_MemStore.cc \
++	tests/stub_neighbors.cc \
+ 	tests/stub_pconn.cc \
+ 	tests/stub_Port.cc \
+ 	tests/stub_UdsOp.cc \
+@@ -3373,6 +3387,7 @@ tests_testRock_SOURCES = \
+ 	tests/stub_MemStore.cc \
+ 	mime.h \
+ 	tests/stub_mime.cc \
++	tests/stub_neighbors.cc \
+ 	tests/stub_Port.cc \
+ 	tests/stub_pconn.cc \
+ 	tests/stub_store_client.cc \
+@@ -3513,6 +3528,8 @@ tests_testURL_SOURCES = \
+ 	HttpParser.cc \
+ 	HttpParser.h \
+ 	HttpReply.cc \
++	PeerPoolMgr.h \
++	PeerPoolMgr.cc \
+ 	RequestFlags.h \
+ 	RequestFlags.cc \
+ 	HttpRequest.cc \
+@@ -0,0 +1,283 @@
++#include "squid.h"
++#include "base/AsyncJobCalls.h"
++#include "base/RunnersRegistry.h"
++#include "CachePeer.h"
++#include "comm/Connection.h"
++#include "comm/ConnOpener.h"
++#include "Debug.h"
++#include "fd.h"
++#include "FwdState.h"
++#include "globals.h"
++#include "HttpRequest.h"
++#include "neighbors.h"
++#include "pconn.h"
++#include "PeerPoolMgr.h"
++#include "SquidConfig.h"
++#if USE_OPENSSL
++#include "ssl/PeerConnector.h"
++#endif
++
++CBDATA_CLASS_INIT(PeerPoolMgr);
++
++#if USE_OPENSSL
++/// Gives Ssl::PeerConnector access to Answer in the PeerPoolMgr callback dialer.
++class MyAnswerDialer: public UnaryMemFunT<PeerPoolMgr, Ssl::PeerConnectorAnswer, Ssl::PeerConnectorAnswer&>,
++        public Ssl::PeerConnector::CbDialer
++{
++public:
++    MyAnswerDialer(const JobPointer &aJob, Method aMethod):
++                   UnaryMemFunT<PeerPoolMgr, Ssl::PeerConnectorAnswer, Ssl::PeerConnectorAnswer&>(aJob, aMethod, Ssl::PeerConnectorAnswer()) {}
++
++    /* Ssl::PeerConnector::CbDialer API */
++    virtual Ssl::PeerConnectorAnswer &answer() { return arg1; }
++};
++#endif
++
++PeerPoolMgr::PeerPoolMgr(CachePeer *aPeer): AsyncJob("PeerPoolMgr"),
++        peer(cbdataReference(aPeer)),
++        request(),
++        opener(),
++        securer(),
++        closer(),
++        addrUsed(0)
++{
++}
++
++PeerPoolMgr::~PeerPoolMgr()
++{
++    cbdataReferenceDone(peer);
++}
++
++void
++PeerPoolMgr::start()
++{
++    AsyncJob::start();
++
++    // ErrorState, getOutgoingAddress(), and other APIs may require a request.
++    // We fake one. TODO: Optionally send this request to peers?
++    request = new HttpRequest(Http::METHOD_OPTIONS, AnyP::PROTO_HTTP, "*");
++    request->SetHost(peer->host);
++
++    checkpoint("peer initialized");
++}
++
++void
++PeerPoolMgr::swanSong()
++{
++    AsyncJob::swanSong();
++}
++
++bool
++PeerPoolMgr::validPeer() const {
++    return peer && cbdataReferenceValid(peer) && peer->standby.pool;
++}
++
++bool
++PeerPoolMgr::doneAll() const
++{
++    return !(validPeer() && peer->standby.limit) && AsyncJob::doneAll();
++}
++
++void
++PeerPoolMgr::handleOpenedConnection(const CommConnectCbParams &params)
++{
++    opener = NULL;
++
++    if (!validPeer()) {
++        debugs(48, 3, "peer gone");
++        if (params.conn != NULL)
++            params.conn->close();
++        return;
++    }
++
++    if (params.flag != COMM_OK) {
++        /* it might have been a timeout with a partially open link */
++        if (params.conn != NULL)
++            params.conn->close();
++        peerConnectFailed(peer);
++        checkpoint("conn opening failure"); // may retry
++        return;
++    }
++
++    Must(params.conn != NULL);
++
++#if USE_OPENSSL
++    // Handle SSL peers.
++    if (peer->use_ssl) {
++        typedef CommCbMemFunT<PeerPoolMgr, CommCloseCbParams> CloserDialer;
++        closer = JobCallback(48, 3, CloserDialer, this,
++                             PeerPoolMgr::handleSecureClosure);
++        comm_add_close_handler(params.conn->fd, closer);
++
++        securer = asyncCall(48, 4, "PeerPoolMgr::handleSecuredPeer",
++                            MyAnswerDialer(this, &PeerPoolMgr::handleSecuredPeer));
++        Ssl::PeerConnector *connector =
++            new Ssl::PeerConnector(request, params.conn, securer);
++        AsyncJob::Start(connector); // will call our callback
++        return;
++    }
++#endif
++
++    pushNewConnection(params.conn);
++}
++
++void
++PeerPoolMgr::pushNewConnection(const Comm::ConnectionPointer &conn)
++{
++    Must(validPeer());
++    Must(Comm::IsConnOpen(conn));
++    peer->standby.pool->push(conn, NULL /* domain */);
++    // push() will trigger a checkpoint()
++}
++
++#if USE_OPENSSL
++void
++PeerPoolMgr::handleSecuredPeer(Ssl::PeerConnectorAnswer &answer)
++{
++    Must(securer != NULL);
++    securer = NULL;
++
++    if (closer != NULL) {
++        if (answer.conn != NULL)
++            comm_remove_close_handler(answer.conn->fd, closer);
++        else
++            closer->cancel("securing completed");
++        closer = NULL;
++    }
++
++    if (!validPeer()) {
++        debugs(48, 3, "peer gone");
++        if (answer.conn != NULL)
++            answer.conn->close();
++        return;
++    }
++
++    if (answer.error.get()) {
++        if (answer.conn != NULL)
++            answer.conn->close();
++        // PeerConnector calls peerConnectFailed() for us;
++        checkpoint("conn securing failure"); // may retry
++        return;
++    }
++
++    pushNewConnection(answer.conn);
++}
++
++void
++PeerPoolMgr::handleSecureClosure(const CommCloseCbParams &params)
++{
++    Must(closer != NULL);
++    Must(securer != NULL);
++    securer->cancel("conn closed by a 3rd party");
++    securer = NULL;
++    closer = NULL;
++    // allow the closing connection to fully close before we check again
++    Checkpoint(this, "conn closure while securing");
++}
++#endif
++
++void
++PeerPoolMgr::openNewConnection()
++{
++    // KISS: Do nothing else when we are already doing something.
++    if (opener != NULL || securer != NULL || shutting_down) {
++        debugs(48, 7, "busy: " << opener << '|' << securer << '|' << shutting_down);
++        return; // there will be another checkpoint when we are done opening/securing
++    }
++
++    // Do not talk to a peer until it is ready.
++    if (!neighborUp(peer)) // provides debugging
++        return; // there will be another checkpoint when peer is up
++
++    // Do not violate peer limits.
++    if (!peerCanOpenMore(peer)) { // provides debugging
++        peer->standby.waitingForClose = true; // may already be true
++        return; // there will be another checkpoint when a peer conn closes
++    }
++
++    // Do not violate global restrictions.
++    if (fdUsageHigh()) {
++        debugs(48, 7, "overwhelmed");
++        peer->standby.waitingForClose = true; // may already be true
++        // There will be another checkpoint when a peer conn closes OR when
++        // a future pop() fails due to an empty pool. See PconnPool::pop().
++        return;
++    }
++
++    peer->standby.waitingForClose = false;
++
++    Comm::ConnectionPointer conn = new Comm::Connection;
++    Must(peer->n_addresses); // guaranteed by neighborUp() above
++    // cycle through all available IP addresses
++    conn->remote = peer->addresses[addrUsed++ % peer->n_addresses];
++    conn->remote.port(peer->http_port);
++    conn->peerType = STANDBY_POOL; // should be reset by peerSelect()
++    conn->setPeer(peer);
++    getOutgoingAddress(request.getRaw(), conn);
++    GetMarkingsToServer(request.getRaw(), *conn);
++
++    const int ctimeout = peer->connect_timeout > 0 ?
++                         peer->connect_timeout : Config.Timeout.peer_connect;
++    typedef CommCbMemFunT<PeerPoolMgr, CommConnectCbParams> Dialer;
++    opener = JobCallback(48, 5, Dialer, this, PeerPoolMgr::handleOpenedConnection);
++    Comm::ConnOpener *cs = new Comm::ConnOpener(conn, opener, ctimeout);
++    AsyncJob::Start(cs);
++}
++
++void
++PeerPoolMgr::closeOldConnections(const int howMany)
++{
++    debugs(48, 8, howMany);
++    peer->standby.pool->closeN(howMany);
++}
++
++void
++PeerPoolMgr::checkpoint(const char *reason)
++{
++    if (!validPeer()) {
++        debugs(48, 3, reason << " and peer gone");
++        return; // nothing to do after our owner dies; the job will quit
++    }
++
++    const int count = peer->standby.pool->count();
++    const int limit = peer->standby.limit;
++    debugs(48, 7, reason << " with " << count << " ? " << limit);
++
++    if (count < limit)
++        openNewConnection();
++    else if (count > limit)
++        closeOldConnections(count - limit);
++}
++
++void
++PeerPoolMgr::Checkpoint(const Pointer &mgr, const char *reason)
++{
++    CallJobHere1(48, 5, mgr, PeerPoolMgr, checkpoint, reason);
++}
++
++/// launches PeerPoolMgrs for peers configured with standby.limit
++class PeerPoolMgrsRr: public RegisteredRunner
++{
++public:
++    /* RegisteredRunner API */
++    virtual void useConfig() { syncConfig(); }
++    virtual void syncConfig();
++};
++
++RunnerRegistrationEntry(PeerPoolMgrsRr);
++
++void
++PeerPoolMgrsRr::syncConfig()
++{
++    for (CachePeer *p = Config.peers; p; p = p->next) {
++        // On reconfigure, Squid deletes the old config (and old peers in it),
++        // so should always be dealing with a brand new configuration.
++        assert(!p->standby.mgr);
++        assert(!p->standby.pool);
++        if (p->standby.limit) {
++            p->standby.mgr = new PeerPoolMgr(p);
++            p->standby.pool = new PconnPool(p->name, p->standby.mgr);
++            AsyncJob::Start(p->standby.mgr.get());
++        }
++    }
++}
+@@ -0,0 +1,68 @@
++#ifndef SQUID_PEERPOOLMGR_H
++#define SQUID_PEERPOOLMGR_H
++
++#include "base/AsyncJob.h"
++#include "comm/forward.h"
++
++class HttpRequest;
++class CachePeer;
++class CommConnectCbParams;
++
++#if USE_OPENSSL
++namespace Ssl {
++    class PeerConnectorAnswer;
++}
++#endif
++
++/// Maintains an fixed-size "standby" PconnPool for a single CachePeer.
++class PeerPoolMgr: public AsyncJob
++{
++public:
++    typedef CbcPointer<PeerPoolMgr> Pointer;
++
++    // syncs mgr state whenever connection-related peer or pool state changes
++    static void Checkpoint(const Pointer &mgr, const char *reason);
++
++    explicit PeerPoolMgr(CachePeer *aPeer);
++    virtual ~PeerPoolMgr();
++
++protected:
++    /* AsyncJob API */
++    virtual void start();
++    virtual void swanSong();
++    virtual bool doneAll() const;
++
++    /// whether the peer is still out there and in a valid state we can safely use
++    bool validPeer() const;
++
++    /// Starts new connection, or closes the excess connections
++    /// according pool configuration
++    void checkpoint(const char *reason);
++    /// starts the process of opening a new standby connection (if possible)
++    void openNewConnection();
++    /// closes 'howMany' standby connections
++    void closeOldConnections(const int howMany);
++
++    /// Comm::ConnOpener calls this when done opening a connection for us
++    void handleOpenedConnection(const CommConnectCbParams &params);
++#if USE_OPENSSL
++    /// Ssl::PeerConnector callback
++    void handleSecuredPeer(Ssl::PeerConnectorAnswer &answer);
++    /// called when the connection we are trying to secure is closed by a 3rd party
++    void handleSecureClosure(const CommCloseCbParams &params);
++#endif
++    /// the final step in connection opening (and, optionally, securing) sequence
++    void pushNewConnection(const Comm::ConnectionPointer &conn);
++
++private:
++    CachePeer *peer; ///< the owner of the pool we manage
++    RefCount<HttpRequest> request; ///< fake HTTP request for conn opening code
++    AsyncCall::Pointer opener; ///< whether we are opening a connection
++    AsyncCall::Pointer securer; ///< whether we are securing a connection
++    AsyncCall::Pointer closer; ///< monitors conn while we are securing it
++    unsigned int addrUsed; ///< counter for cycling through peer addresses
++
++    CBDATA_CLASS2(PeerPoolMgr);
++};
++
++#endif /* SQUID_PEERPOOLMGR_H */
+@@ -147,7 +147,7 @@ void Adaptation::Icap::ServiceRep::putConnection(const Comm::ConnectionPointer &
+ void Adaptation::Icap::ServiceRep::noteConnectionUse(const Comm::ConnectionPointer &conn)
+ {
+     Must(Comm::IsConnOpen(conn));
+-    fd_table[conn->fd].noteUse(NULL); // pconn re-use but not via PconnPool API
++    fd_table[conn->fd].noteUse(); // pconn re-use, albeit not via PconnPool API
+ }
+ 
+ void Adaptation::Icap::ServiceRep::noteConnectionFailed(const char *comment)
+@@ -69,7 +69,9 @@
+ #include "neighbors.h"
+ #include "NeighborTypeDomainList.h"
+ #include "Parsing.h"
++#include "pconn.h"
+ #include "PeerDigest.h"
++#include "PeerPoolMgr.h"
+ #include "RefreshPattern.h"
+ #include "rfc1738.h"
+ #include "SBufList.h"
+@@ -2267,6 +2269,8 @@ parse_peer(CachePeer ** head)
+             p->options.allow_miss = true;
+         } else if (!strncmp(token, "max-conn=", 9)) {
+             p->max_conn = xatoi(token + 9);
++        } else if (!strncmp(token, "standby=", 8)) {
++            p->standby.limit = xatoi(token + 8);
+         } else if (!strcmp(token, "originserver")) {
+             p->options.originserver = true;
+         } else if (!strncmp(token, "name=", 5)) {
+@@ -2340,6 +2344,9 @@ parse_peer(CachePeer ** head)
+     if (peerFindByName(p->name))
+         fatalf("ERROR: cache_peer %s specified twice\n", p->name);
+ 
++    if (p->max_conn > 0 && p->max_conn < p->standby.limit)
++        fatalf("ERROR: cache_peer %s max-conn=%d is lower than its standby=%d\n", p->host, p->max_conn, p->standby.limit);
++
+     if (p->weight < 1)
+         p->weight = 1;
+ 
+@@ -2384,6 +2391,9 @@ free_peer(CachePeer ** P)
+         cbdataReferenceDone(p->digest);
+ #endif
+ 
++        // the mgr job will notice that its owner is gone and stop
++        PeerPoolMgr::Checkpoint(p->standby.mgr, "peer gone");
++        delete p->standby.pool;
+         cbdataFree(p);
+     }
+ 
+@@ -3086,7 +3086,8 @@ DOC_START
+ 	
+ 	connect-fail-limit=N
+ 			How many times connecting to a peer must fail before
+-			it is marked as down. Default is 10.
++			it is marked as down. Standby connection failures
++			count towards this limit. Default is 10.
+ 	
+ 	allow-miss	Disable Squid's use of only-if-cached when forwarding
+ 			requests to siblings. This is primarily useful when
+@@ -3096,8 +3097,50 @@ DOC_START
+ 			For example to deny peer usage on requests from peer
+ 			by denying cache_peer_access if the source is a peer.
+ 	
+-	max-conn=N	Limit the amount of connections Squid may open to this
+-			peer. see also 
++	max-conn=N 	Limit the number of concurrent connections the Squid
++			may open to this peer, including already opened idle
++			and standby connections. There is no peer-specific
++			connection limit by default.
++	
++			A peer exceeding the limit is not used for new
++			requests unless a standby connection is available.
++	
++			max-conn currently works poorly with idle persistent
++			connections: When a peer reaches its max-conn limit,
++			and there are idle persistent connections to the peer,
++			the peer may not be selected because the limiting code
++			does not know whether Squid can reuse those idle
++			connections.
++	
++	standby=N	Maintain a pool of N "hot standby" connections to an
++			UP peer, available for requests when no idle
++			persistent connection is available (or safe) to use.
++			By default and with zero N, no such pool is maintained.
++			N must not exceed the max-conn limit (if any).
++	
++			At start or after reconfiguration, Squid opens new TCP
++			standby connections until there are N connections
++			available and then replenishes the standby pool as
++			opened connections are used up for requests. A used
++			connection never goes back to the standby pool, but
++			may go to the regular idle persistent connection pool
++			shared by all peers and origin servers.
++	
++			Squid never opens multiple new standby connections
++			concurrently.  This one-at-a-time approach minimizes
++			flooding-like effect on peers. Furthermore, just a few
++			standby connections should be sufficient in most cases
++			to supply most new requests with a ready-to-use
++			connection.
++	
++			Standby connections obey server_idle_pconn_timeout.
++			For the feature to work as intended, the peer must be
++			configured to accept and keep them open longer than
++			the idle timeout at the connecting Squid, to minimize
++			race conditions typical to idle used persistent
++			connections. Default request_timeout and
++			server_idle_pconn_timeout values ensure such a
++			configuration.
+ 	
+ 	name=xxx	Unique name for the peer.
+ 			Required if you have multiple peers on the same host
+@@ -1180,9 +1180,6 @@ _comm_close(int fd, char const *file, int line)
+ 
+     commCallCloseHandlers(fd);
+ 
+-    if (F->pconn.uses && F->pconn.pool)
+-        F->pconn.pool->noteUses(F->pconn.uses);
+-
+     comm_empty_os_read_buffers(fd);
+ 
+     AsyncCall::Pointer completeCall=commCbCall(5,4, "comm_close_complete",
+@@ -4,6 +4,7 @@
+ #include "comm.h"
+ #include "comm/Connection.h"
+ #include "fde.h"
++#include "neighbors.h"
+ #include "SquidTime.h"
+ 
+ class CachePeer;
+@@ -66,7 +67,7 @@ Comm::Connection::close()
+         comm_close(fd);
+         fd = -1;
+         if (CachePeer *p=getPeer())
+-            -- p->stats.conn_open;
++            peerConnClosed(p);
+     }
+ }
+ 
+@@ -122,8 +122,7 @@ fde::remoteAddr() const
+ }
+ 
+ void
+-fde::noteUse(PconnPool *pool)
++fde::noteUse()
+ {
+     ++ pconn.uses;
+-    pconn.pool = pool;
+ }
+@@ -42,7 +42,6 @@
+ class ClientInfo;
+ #endif
+ 
+-class PconnPool;
+ class dwrite_q;
+ class _fde_disk
+ {
+@@ -70,7 +69,7 @@ class fde
+     char const *remoteAddr() const;
+     void dumpStats (StoreEntry &, int);
+     bool readPending(int);
+-    void noteUse(PconnPool *);
++    void noteUse();
+ 
+ public:
+ 
+@@ -110,7 +109,6 @@ class fde
+ 
+     struct {
+         int uses;                   /* ie # req's over persistent conn */
+-        PconnPool *pool;
+     } pconn;
+ 
+ #if USE_DELAY_POOLS
+@@ -167,7 +165,6 @@ class fde
+         bytes_read = 0;
+         bytes_written = 0;
+         pconn.uses = 0;
+-        pconn.pool = NULL;
+ #if USE_DELAY_POOLS
+         clientInfo = NULL;
+ #endif
+@@ -26,6 +26,7 @@ typedef enum {
+     SOURCEHASH_PARENT,
+     PINNED,
+     ORIGINAL_DST,
++    STANDBY_POOL,
+     HIER_MAX
+ } hier_code;
+ 
+@@ -54,7 +54,9 @@
+ #include "multicast.h"
+ #include "neighbors.h"
+ #include "NeighborTypeDomainList.h"
++#include "pconn.h"
+ #include "PeerDigest.h"
++#include "PeerPoolMgr.h"
+ #include "PeerSelectState.h"
+ #include "RequestFlags.h"
+ #include "SquidConfig.h"
+@@ -246,13 +248,46 @@ peerWouldBePinged(const CachePeer * p, HttpRequest * request)
+     return 1;
+ }
+ 
++bool
++peerCanOpenMore(const CachePeer *p)
++{
++    const int effectiveLimit = p->max_conn <= 0 ? Squid_MaxFD : p->max_conn;
++    const int remaining = effectiveLimit - p->stats.conn_open;
++    debugs(15, 7, remaining << '=' << effectiveLimit << '-' << p->stats.conn_open);
++    return remaining > 0;
++}
++
++bool
++peerHasConnAvailable(const CachePeer *p)
++{
++    // Standby connections can be used without opening new connections.
++    const int standbys = p->standby.pool ? p->standby.pool->count() : 0;
++
++    // XXX: Some idle pconns can be used without opening new connections.
++    // Complication: Idle pconns cannot be reused for some requests.
++    const int usableIdles = 0;
++
++    const int available = standbys + usableIdles;
++    debugs(15, 7, available << '=' << standbys << '+' << usableIdles);
++    return available > 0;
++}
++
++void
++peerConnClosed(CachePeer *p)
++{
++    --p->stats.conn_open;
++    if (p->standby.waitingForClose && peerCanOpenMore(p)) {
++        p->standby.waitingForClose = false;
++        PeerPoolMgr::Checkpoint(p->standby.mgr, "conn closed");
++    }
++}
++
+ /* Return TRUE if it is okay to send an HTTP request to this CachePeer. */
+ int
+ peerHTTPOkay(const CachePeer * p, HttpRequest * request)
+ {
+-    if (p->max_conn)
+-        if (p->stats.conn_open >= p->max_conn)
+-            return 0;
++    if (!peerCanOpenMore(p) && !peerHasConnAvailable(p))
++        return 0;
+ 
+     if (!peerAllowedToUse(p, request))
+         return 0;
+@@ -446,6 +481,8 @@ peerAlive(CachePeer *p)
+         debugs(15, DBG_IMPORTANT, "Detected REVIVED " << neighborTypeStr(p) << ": " << p->name);
+         p->stats.logged_state = PEER_ALIVE;
+         peerClearRR();
++        if (p->standby.mgr.valid())
++            PeerPoolMgr::Checkpoint(p->standby.mgr, "revived peer");
+     }
+ 
+     p->stats.last_reply = squid_curtime;
+@@ -1190,6 +1227,9 @@ peerNoteDigestGone(CachePeer * p)
+ static void
+ peerDNSConfigure(const ipcache_addrs *ia, const DnsLookupDetails &, void *data)
+ {
++    // TODO: connections to no-longer valid IP addresses should be
++    // closed when we can detect such IP addresses.
++
+     CachePeer *p = (CachePeer *)data;
+ 
+     int j;
+@@ -1234,6 +1274,8 @@ peerDNSConfigure(const ipcache_addrs *ia, const DnsLookupDetails &, void *data)
+             eventAddIsh("netdbExchangeStart", netdbExchangeStart, p, 30.0, 1);
+ #endif
+ 
++    if (p->standby.mgr.valid())
++        PeerPoolMgr::Checkpoint(p->standby.mgr, "resolved peer");
+ }
+ 
+ static void
+@@ -1565,6 +1607,8 @@ dump_peer_options(StoreEntry * sentry, CachePeer * p)
+ 
+     if (p->max_conn > 0)
+         storeAppendPrintf(sentry, " max-conn=%d", p->max_conn);
++    if (p->standby.limit > 0)
++        storeAppendPrintf(sentry, " standby=%d", p->standby.limit);
+ 
+     if (p->options.originserver)
+         storeAppendPrintf(sentry, " originserver");
+@@ -81,6 +81,13 @@ void peerConnectSucceded(CachePeer *);
+ void dump_peer_options(StoreEntry *, CachePeer *);
+ int peerHTTPOkay(const CachePeer *, HttpRequest *);
+ 
++/// Whether we can open new connections to the peer (e.g., despite max-conn)
++bool peerCanOpenMore(const CachePeer *p);
++/// Whether the peer has idle or standby connections that can be used now
++bool peerHasConnAvailable(const CachePeer *p);
++/// Notifies peer of an associated connection closure.
++void peerConnClosed(CachePeer *p);
++
+ CachePeer *whichPeer(const Ip::Address &from);
+ 
+ #endif /* SQUID_NEIGHBORS_H_ */
+@@ -31,13 +31,16 @@
+  */
+ 
+ #include "squid.h"
++#include "CachePeer.h"
+ #include "comm.h"
+ #include "comm/Connection.h"
+ #include "fd.h"
+ #include "fde.h"
+ #include "globals.h"
+ #include "mgr/Registration.h"
++#include "neighbors.h"
+ #include "pconn.h"
++#include "PeerPoolMgr.h"
+ #include "SquidConfig.h"
+ #include "Store.h"
+ 
+@@ -64,6 +67,11 @@ IdleConnList::~IdleConnList()
+     if (parent_)
+         parent_->unlinkList(this);
+ 
++    if (size_) {
++        parent_ = NULL; // prevent reentrant notifications and deletions
++        closeN(size_);
++    }
++
+     delete[] theList_;
+ 
+     xfree(hash.key);
+@@ -292,6 +300,8 @@ IdleConnList::findAndClose(const Comm::ConnectionPointer &conn)
+ {
+     const int index = findIndexOf(conn);
+     if (index >= 0) {
++        if (parent_)
++            parent_->notifyManager("idle conn closure");
+         /* might delete this */
+         removeAt(index);
+         clearHandlers(conn);
+@@ -366,15 +376,17 @@ PconnPool::dumpHash(StoreEntry *e) const
+     hash_first(hid);
+ 
+     int i = 0;
+-    for (hash_link *walker = hid->next; walker; walker = hash_next(hid)) {
++    for (hash_link *walker = hash_next(hid); walker; walker = hash_next(hid)) {
+         storeAppendPrintf(e, "\t item %d:\t%s\n", i, (char *)(walker->key));
+         ++i;
+     }
+ }
+ 
+ /* ========== PconnPool PUBLIC FUNCTIONS ============================================ */
+ 
+-PconnPool::PconnPool(const char *aDescr) : table(NULL), descr(aDescr),
++PconnPool::PconnPool(const char *aDescr, const CbcPointer<PeerPoolMgr> &aMgr):
++        table(NULL), descr(aDescr),
++        mgr(aMgr),
+         theCount(0)
+ {
+     int i;
+@@ -386,10 +398,18 @@ PconnPool::PconnPool(const char *aDescr) : table(NULL), descr(aDescr),
+     PconnModule::GetInstance()->add(this);
+ }
+ 
++static void
++DeleteIdleConnList(void *hashItem)
++{
++    delete reinterpret_cast<IdleConnList*>(hashItem);
++}
++
+ PconnPool::~PconnPool()
+ {
+-    descr = NULL;
++    PconnModule::GetInstance()->remove(this);
++    hashFreeItems(table, &DeleteIdleConnList);
+     hashFreeMemory(table);
++    descr = NULL;
+ }
+ 
+ void
+@@ -404,6 +424,7 @@ PconnPool::push(const Comm::ConnectionPointer &conn, const char *domain)
+         debugs(48, 3, HERE << "Squid is shutting down. Refusing to do anything");
+         return;
+     }
++    // TODO: also close used pconns if we exceed peer max-conn limit
+ 
+     const char *aKey = key(conn, domain);
+     IdleConnList *list = (IdleConnList *) hash_lookup(table, aKey);
+@@ -423,35 +444,64 @@ PconnPool::push(const Comm::ConnectionPointer &conn, const char *domain)
+     snprintf(desc, FD_DESC_SZ, "Idle server: %s", aKey);
+     fd_note(conn->fd, desc);
+     debugs(48, 3, HERE << "pushed " << conn << " for " << aKey);
++
++    // successful push notifications resume multi-connection opening sequence
++    notifyManager("push");
+ }
+ 
+ Comm::ConnectionPointer
+-PconnPool::pop(const Comm::ConnectionPointer &destLink, const char *domain, bool isRetriable)
++PconnPool::pop(const Comm::ConnectionPointer &dest, const char *domain, bool keepOpen)
+ {
+-    const char * aKey = key(destLink, domain);
++
++    const char * aKey = key(dest, domain);
+ 
+     IdleConnList *list = (IdleConnList *)hash_lookup(table, aKey);
+     if (list == NULL) {
+         debugs(48, 3, HERE << "lookup for key {" << aKey << "} failed.");
++        // failure notifications resume standby conn creation after fdUsageHigh
++        notifyManager("pop failure");
+         return Comm::ConnectionPointer();
+     } else {
+-        debugs(48, 3, HERE << "found " << hashKeyStr(&list->hash) << (isRetriable?"(to use)":"(to kill)") );
++        debugs(48, 3, HERE << "found " << hashKeyStr(&list->hash) <<
++               (keepOpen ? " to use" : " to kill"));
+     }
+ 
+     /* may delete list */
+-    Comm::ConnectionPointer temp = list->findUseable(destLink);
+-    if (!isRetriable && Comm::IsConnOpen(temp))
+-        temp->close();
++    Comm::ConnectionPointer popped = list->findUseable(dest);
++    if (!keepOpen && Comm::IsConnOpen(popped))
++        popped->close();
++
++    // successful pop notifications replenish standby connections pool
++    notifyManager("pop");
++    return popped;
++}
+ 
+-    return temp;
++void
++PconnPool::notifyManager(const char *reason)
++{
++    if (mgr.valid())
++        PeerPoolMgr::Checkpoint(mgr, reason);
+ }
+ 
+ void
+-PconnPool::closeN(int n, const Comm::ConnectionPointer &destLink, const char *domain)
++PconnPool::closeN(int n)
+ {
+-    // TODO: optimize: we can probably do hash_lookup just once
+-    for (int i = 0; i < n; ++i)
+-        pop(destLink, domain, false); // may fail!
++    hash_table *hid = table;
++    hash_first(hid);
++
++    // close N connections, one per list, to treat all lists "fairly"
++    for (int i = 0; i < n && count(); ++i) {
++
++        hash_link *current = hash_next(hid);
++        if (!current) {
++            hash_first(hid);
++            current = hash_next(hid);
++            Must(current); // must have one because the count() was positive
++        }
++
++        // may delete current
++        reinterpret_cast<IdleConnList*>(current)->closeN(1);
++    }
+ }
+ 
+ void
+@@ -477,11 +527,8 @@ PconnPool::noteUses(int uses)
+  * This simple class exists only for the cache manager
+  */
+ 
+-PconnModule::PconnModule() : pools(NULL), poolCount(0)
++PconnModule::PconnModule(): pools()
+ {
+-    pools = (PconnPool **) xcalloc(MAX_NUM_PCONN_POOLS, sizeof(*pools));
+-//TODO: re-link to MemPools. WAS:    pconn_fds_pool = memPoolCreate("pconn_fds", PCONN_FDS_SZ * sizeof(int));
+-    debugs(48, DBG_CRITICAL, "persistent connection module initialized");
+     registerWithCacheManager();
+ }
+ 
+@@ -505,21 +552,26 @@ PconnModule::registerWithCacheManager(void)
+ void
+ PconnModule::add(PconnPool *aPool)
+ {
+-    assert(poolCount < MAX_NUM_PCONN_POOLS);
+-    *(pools+poolCount) = aPool;
+-    ++poolCount;
++    pools.insert(aPool);
+ }
+ 
+ void
+-PconnModule::dump(StoreEntry *e)
++PconnModule::remove(PconnPool *aPool)
+ {
+-    int i;
++    pools.erase(aPool);
++}
+ 
+-    for (i = 0; i < poolCount; ++i) {
++void
++PconnModule::dump(StoreEntry *e)
++{
++    typedef Pools::const_iterator PCI;
++    int i = 0; // TODO: Why number pools if they all have names?
++    for (PCI p = pools.begin(); p != pools.end(); ++p, ++i) {
++        // TODO: Let each pool dump itself the way it wants to.
+         storeAppendPrintf(e, "\n Pool %d Stats\n", i);
+-        (*(pools+i))->dumpHist(e);
++        (*p)->dumpHist(e);
+         storeAppendPrintf(e, "\n Pool %d Hash Table\n",i);
+-        (*(pools+i))->dumpHash(e);
++        (*p)->dumpHash(e);
+     }
+ }
+ 
+@@ -1,6 +1,9 @@
+ #ifndef SQUID_PCONN_H
+ #define SQUID_PCONN_H
+ 
++#include "base/CbcPointer.h"
++#include <set>
++
+ /**
+  \defgroup PConnAPI Persistent Connection API
+  \ingroup Component
+@@ -9,6 +12,7 @@
+  */
+ 
+ class PconnPool;
++class PeerPoolMgr;
+ 
+ /* for CBDATA_CLASS2() macros */
+ #include "cbdata.h"
+@@ -17,9 +21,6 @@ class PconnPool;
+ /* for IOCB */
+ #include "comm.h"
+ 
+-/// \ingroup PConnAPI
+-#define MAX_NUM_PCONN_POOLS 10
+-
+ /// \ingroup PConnAPI
+ #define PCONN_HIST_SZ (1<<16)
+ 
+@@ -106,38 +107,46 @@ class PconnPool
+ {
+ 
+ public:
+-    PconnPool(const char *);
++    PconnPool(const char *aDescription, const CbcPointer<PeerPoolMgr> &aMgr);
+     ~PconnPool();
+ 
+     void moduleInit();
+     void push(const Comm::ConnectionPointer &serverConn, const char *domain);
+ 
+     /**
+-     * Updates destLink to point at an existing open connection if available and retriable.
+-     * Otherwise, return false.
++     * Returns either a pointer to a popped connection to dest or nil.
++     * Closes the connection before returning its pointer unless keepOpen.
+      *
+-     * We close available persistent connection if the caller transaction is not
+-     * retriable to avoid having a growing number of open connections when many
+-     * transactions create persistent connections but are not retriable.
++     * A caller with a non-retriable transaction should set keepOpen to false
++     * and call pop() anyway, even though the caller does not want a pconn.
++     * This forces us to close an available persistent connection, avoiding
++     * creating a growing number of open connections when many transactions 
++     * create (and push) persistent connections but are not retriable and,
++     * hence, do not need to pop a connection.
+      */
+-    Comm::ConnectionPointer pop(const Comm::ConnectionPointer &destLink, const char *domain, bool retriable);
++    Comm::ConnectionPointer pop(const Comm::ConnectionPointer &dest, const char *domain, bool keepOpen);
+     void count(int uses);
+     void dumpHist(StoreEntry *e) const;
+     void dumpHash(StoreEntry *e) const;
+     void unlinkList(IdleConnList *list);
+     void noteUses(int uses);
+-    void closeN(int n, const Comm::ConnectionPointer &destLink, const char *domain);
++    /// closes any n connections, regardless of their destination
++    void closeN(int n);
+     int count() const { return theCount; }
+     void noteConnectionAdded() { ++theCount; }
+     void noteConnectionRemoved() { assert(theCount > 0); --theCount; }
+ 
++    // sends an async message to the pool manager, if any
++    void notifyManager(const char *reason);
++
+ private:
+ 
+     static const char *key(const Comm::ConnectionPointer &destLink, const char *domain);
+ 
+     int hist[PCONN_HIST_SZ];
+     hash_table *table;
+     const char *descr;
++    CbcPointer<PeerPoolMgr> mgr; ///< optional pool manager (for notifications)
+     int theCount; ///< the number of pooled connections
+ };
+ 
+@@ -162,15 +171,15 @@ class PconnModule
+     void registerWithCacheManager(void);
+ 
+     void add(PconnPool *);
++    void remove(PconnPool *); ///< unregister and forget about this pool object
+ 
+     OBJH dump;
+ 
+ private:
+-    PconnPool **pools;
++    typedef std::set<PconnPool*> Pools; ///< unordered PconnPool collection
++    Pools pools; ///< all live pools
+ 
+     static PconnModule * instance;
+-
+-    int poolCount;
+ };
+ 
+ #endif /* SQUID_PCONN_H */
+@@ -0,0 +1,9 @@
++#include "squid.h"
++
++#define STUB_API "neighbors.cc"
++#include "tests/STUB.h"
++
++#include "neighbors.h"
++
++void
++peerConnClosed(CachePeer *p) STUB
+@@ -13,7 +13,7 @@ IdleConnList::~IdleConnList() STUB
+ void IdleConnList::push(const Comm::ConnectionPointer &conn) STUB
+ Comm::ConnectionPointer IdleConnList::findUseable(const Comm::ConnectionPointer &key) STUB_RETVAL(Comm::ConnectionPointer())
+ void IdleConnList::clearHandlers(const Comm::ConnectionPointer &conn) STUB
+-PconnPool::PconnPool(const char *) STUB
++PconnPool::PconnPool(const char *, const CbcPointer<PeerPoolMgr>&) STUB
+ PconnPool::~PconnPool() STUB
+ void PconnPool::moduleInit() STUB
+ void PconnPool::push(const Comm::ConnectionPointer &serverConn, const char *domain) STUB

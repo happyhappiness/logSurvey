@@ -1,21 +1,2531 @@
-----++++src/client_side.cc
-@@ -1313,10 +1313,14 @@ parseHttpRequest(ConnStateData *csd, const Http1::RequestParserPointer &amp;hp)
+@@ -1,51 +0,0 @@
+-/*
+- * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+- *
+- * Squid software is distributed under GPLv2+ license and includes
+- * contributions from numerous individuals and organizations.
+- * Please see the COPYING and CONTRIBUTORS files for details.
+- */
+-
+-/**
+-\defgroup AuthAPIBasic Basic Authentication
+-\ingroup AuthAPI
+-
+-\par
+-Basic authentication provides a username and password.  These
+-are written to the authentication module processes on a single
+-line, separated by a space:
+-\code
+-<USERNAME> <PASSWORD>
+-\endcode
+-
+-\par
+-	The authentication module process reads username, password pairs
+-	on stdin and returns either "OK" or "ERR" on stdout for
+-	each input line.
+-
+-\par
+-	The following simple perl script demonstrates how the
+-	authentication module works.  This script allows any
+-	user named "Dirk" (without checking the password)
+-	and allows any user that uses the password "Sekrit":
+-
+-\code
+-#!/usr/bin/perl -w
+-$|=1;		# no buffering, important!
+-while (<>) {
+-        chop;
+-        ($u,$p) = split;
+-        $ans = &amp;check($u,$p);
+-        print "$ans\n";
+-}
+-
+-sub check {
+-        local($u,$p) = @_;
+-        return 'ERR' unless (defined $p &amp;&amp; defined $u);
+-        return 'OK' if ('Dirk' eq $u);
+-        return 'OK' if ('Sekrit' eq $p);
+-        return 'ERR';
+-}
+-\endcode
+-
+- */
+@@ -10,9 +10,6 @@
+ #define SQUID_SQUIDCONFIG_H_
+ 
+ #include "acl/forward.h"
+-#if USE_AUTH
+-#include "auth/SchemesConfig.h"
+-#endif
+ #include "base/RefCount.h"
+ #include "base/YesNoNone.h"
+ #include "ClientDelayConfig.h"
+@@ -201,9 +198,6 @@ class SquidConfig
+ 
+     Helper::ChildConfig redirectChildren;
+     Helper::ChildConfig storeIdChildren;
+-    time_t authenticateGCInterval;
+-    time_t authenticateTTL;
+-    time_t authenticateIpTTL;
+ 
+     struct {
+         char *surrogate_id;
+@@ -400,9 +394,6 @@ class SquidConfig
+ 
+         acl_access *forceRequestBodyContinuation;
+         acl_access *serverPconnForNonretriable;
+-#if USE_AUTH
+-        acl_access *authSchemes;
+-#endif
+     } accessList;
+     AclDenyInfoList *denyInfoList;
+ 
+@@ -543,10 +534,6 @@ class SquidConfig
+         int v4_first;       ///< Place IPv4 first in the order of DNS results.
+         ssize_t packet_max; ///< maximum size EDNS advertised for DNS replies.
+     } dns;
+-
+-#if USE_AUTH
+-    Auth::SchemesConfigs authSchemesConfigs;
+-#endif
+ };
+ 
+ extern SquidConfig Config;
+@@ -9,160 +9,8 @@
+ /* DEBUG: section 29    Authenticator */
+ 
+ #include "squid.h"
++#include "acl/Tree.h"
+ #include "auth/Config.h"
+-#include "auth/Gadgets.h"
+-#include "auth/UserRequest.h"
+-#include "cache_cf.h"
+-#include "ConfigParser.h"
+-#include "Debug.h"
+-#include "format/Format.h"
+-#include "globals.h"
+-#include "Store.h"
+-#include "wordlist.h"
+ 
+-Auth::ConfigVector Auth::TheConfig;
+-
+-/**
+- * Get an User credentials object filled out for the given Proxy- or WWW-Authenticate header.
+- * Any decoding which needs to be done will be done.
+- *
+- * It may be a cached AuthUser or a new Unauthenticated object.
+- * It may also be NULL reflecting that no user could be created.
+- */
+-Auth::UserRequest::Pointer
+-Auth::Config::CreateAuthUser(const char *proxy_auth, AccessLogEntry::Pointer &al)
+-{
+-    assert(proxy_auth != NULL);
+-    debugs(29, 9, HERE << "header = '" << proxy_auth << "'");
+-
+-    Auth::Config *config = Find(proxy_auth);
+-
+-    if (config == NULL || !config->active()) {
+-        debugs(29, (shutting_down?3:DBG_IMPORTANT), (shutting_down?"":"WARNING: ") <<
+-               "Unsupported or unconfigured/inactive proxy-auth scheme, '" << proxy_auth << "'");
+-        return NULL;
+-    }
+-    static MemBuf rmb;
+-    rmb.reset();
+-    if (config->keyExtras) {
+-        // %credentials and %username, which normally included in
+-        // request_format, are - at this time, but that is OK
+-        // because user name is added to key explicitly, and we do
+-        // not want to store authenticated credentials at all.
+-        config->keyExtras->assemble(rmb, al, 0);
+-    }
+-
+-    return config->decode(proxy_auth, rmb.hasContent() ? rmb.content() : NULL);
+-}
+-
+-Auth::Config *
+-Auth::Config::Find(const char *proxy_auth)
+-{
+-    for (Auth::ConfigVector::iterator  i = Auth::TheConfig.begin(); i != Auth::TheConfig.end(); ++i)
+-        if (strncasecmp(proxy_auth, (*i)->type(), strlen((*i)->type())) == 0)
+-            return *i;
+-
+-    return NULL;
+-}
+-
+-Auth::Config *
+-Auth::Config::GetParsed(const char *proxy_auth)
+-{
+-    if (auto *cfg = Find(proxy_auth))
+-        return cfg;
+-    fatalf("auth_schemes: required authentication method '%s' is not configured", proxy_auth);
+-    return nullptr;
+-}
+-
+-/** Default behaviour is to expose nothing */
+-void
+-Auth::Config::registerWithCacheManager(void)
+-{}
+-
+-void
+-Auth::Config::parse(Auth::Config * scheme, int, char *param_str)
+-{
+-    if (strcmp(param_str, "program") == 0) {
+-        if (authenticateProgram)
+-            wordlistDestroy(&authenticateProgram);
+-
+-        parse_wordlist(&authenticateProgram);
+-
+-        requirePathnameExists("Authentication helper program", authenticateProgram->key);
+-
+-    } else if (strcmp(param_str, "realm") == 0) {
+-        realm.clear();
+-
+-        char *token = ConfigParser::NextQuotedOrToEol();
+-
+-        while (token && *token && xisspace(*token))
+-            ++token;
+-
+-        if (!token || !*token) {
+-            debugs(29, DBG_PARSE_NOTE(DBG_IMPORTANT), "ERROR: Missing auth_param " << scheme->type() << " realm");
+-            self_destruct();
+-            return;
+-        }
+-
+-        realm = token;
+-
+-    } else if (strcmp(param_str, "children") == 0) {
+-        authenticateChildren.parseConfig();
+-
+-    } else if (strcmp(param_str, "key_extras") == 0) {
+-        keyExtrasLine = ConfigParser::NextQuotedToken();
+-        Format::Format *nlf =  new ::Format::Format(scheme->type());
+-        if (!nlf->parse(keyExtrasLine.termedBuf())) {
+-            debugs(29, DBG_CRITICAL, "FATAL: Failed parsing key_extras formatting value");
+-            self_destruct();
+-            return;
+-        }
+-        if (keyExtras)
+-            delete keyExtras;
+-
+-        keyExtras = nlf;
+-
+-        if (char *t = strtok(NULL, w_space)) {
+-            debugs(29, DBG_CRITICAL, "FATAL: Unexpected argument '" << t << "' after request_format specification");
+-            self_destruct();
+-        }
+-    } else {
+-        debugs(29, DBG_CRITICAL, "Unrecognised " << scheme->type() << " auth scheme parameter '" << param_str << "'");
+-    }
+-}
+-
+-bool
+-Auth::Config::dump(StoreEntry *entry, const char *name, Auth::Config *scheme) const
+-{
+-    if (!authenticateProgram)
+-        return false; // not configured
+-
+-    wordlist *list = authenticateProgram;
+-    storeAppendPrintf(entry, "%s %s", name, scheme->type());
+-    while (list != NULL) {
+-        storeAppendPrintf(entry, " %s", list->key);
+-        list = list->next;
+-    }
+-    storeAppendPrintf(entry, "\n");
+-
+-    storeAppendPrintf(entry, "%s %s realm " SQUIDSBUFPH "\n", name, scheme->type(), SQUIDSBUFPRINT(realm));
+-
+-    storeAppendPrintf(entry, "%s %s children %d startup=%d idle=%d concurrency=%d\n",
+-                      name, scheme->type(),
+-                      authenticateChildren.n_max, authenticateChildren.n_startup,
+-                      authenticateChildren.n_idle, authenticateChildren.concurrency);
+-
+-    if (keyExtrasLine.size() > 0)
+-        storeAppendPrintf(entry, "%s %s key_extras \"%s\"\n", name, scheme->type(), keyExtrasLine.termedBuf());
+-
+-    return true;
+-}
+-
+-void
+-Auth::Config::done()
+-{
+-    delete keyExtras;
+-    keyExtras = NULL;
+-    keyExtrasLine.clean();
+-}
++Auth::Config Auth::TheConfig;
+ 
+@@ -6,140 +6,53 @@
+  * Please see the COPYING and CONTRIBUTORS files for details.
+  */
+ 
+-#ifndef SQUID_AUTH_CONFIG_H
+-#define SQUID_AUTH_CONFIG_H
++#ifndef SQUID_SRC_AUTH_CONFIG_H
++#define SQUID_SRC_AUTH_CONFIG_H
+ 
+ #if USE_AUTH
+ 
+-#include "AccessLogEntry.h"
+-#include "auth/UserRequest.h"
+-#include "helper/ChildConfig.h"
+-
+-class StoreEntry;
+-class HttpReply;
+-class HttpRequest;
+-class wordlist;
+-
+-/* for Http::HdrType parameters-by-value */
+-#include "HttpHeader.h"
+-
+-namespace Format
+-{
+-class Format;
+-}
++#include "acl/forward.h"
++#include "auth/SchemeConfig.h"
++#include "auth/SchemesConfig.h"
+ 
+ namespace Auth
+ {
+ 
+-/**
+- * \ingroup AuthAPI
+- * \par
+- * I am the configuration for an auth scheme.
+- * Currently each scheme has only one instance of me,
+- * but this may change.
+- * \par
+- * This class is treated like a ref counted class.
+- * If the children ever stop being singletons, implement the
+- * ref counting...
+- */
+ class Config
+ {
++    explicit Config(const Config &) = delete;
++    explicit Config(const Config *) = delete;
+ 
+ public:
+-    static UserRequest::Pointer CreateAuthUser(const char *proxy_auth, AccessLogEntry::Pointer &al);
+-
+-    static Config *Find(const char *proxy_auth);
+-    /// Call this method if you need a guarantee that all auth schemes has been
+-    /// already configured.
+-    static Config *GetParsed(const char *proxy_auth);
+-    Config() : authenticateChildren(20), authenticateProgram(NULL), keyExtras(NULL) {}
+-
+-    virtual ~Config() {}
+-
+-    /**
+-     * Used by squid to determine whether the auth module has successfully initialised itself with the current configuration.
+-     *
+-     \retval true   Authentication Module loaded and running.
+-     \retval false  No Authentication Module loaded.
+-     */
+-    virtual bool active() const = 0;
+-
+-    /**
+-     * new decode API: virtual factory pattern
+-     \par
+-     * Responsible for decoding the passed authentication header, creating or
+-     * linking to a AuthUser object and for storing any needed details to complete
+-     * authentication in Auth::UserRequest::authenticate().
+-     *
+-     \param proxy_auth  Login Pattern to parse.
+-     \retval *      Details needed to authenticate.
+-     */
+-    virtual UserRequest::Pointer decode(char const *proxy_auth, const char *requestRealm) = 0;
+-
+-    /**
+-     * squid is finished with this config, release any unneeded resources.
+-     * If a singleton, delete will not occur. if not a singleton (future),
+-     * delete will occur when no references are held.
+-     *
+-     \todo we need a 'done for reconfigure' and a 'done permanently' concept.
+-     */
+-    virtual void done();
+-
+-    /**
+-     * The configured function is used to see if the auth module has been given valid
+-     * parameters and is able to handle authentication requests.
+-     *
+-     \retval true   Authentication Module configured ready for use.
+-     \retval false  Not configured or Configuration Error.
+-     *          No other module functions except Shutdown/Dump/Parse/FreeConfig will be called by Squid.
+-     */
+-    virtual bool configured() const = 0;
+-
+-    /**
+-     * Shutdown just the auth helpers.
+-     * For use by log rotate etc. where auth needs to stay running, with the helpers restarted.
+-     */
+-    virtual void rotateHelpers(void) = 0;
+-
+-    /**
+-     * Responsible for writing to the StoreEntry the configuration parameters that a user
+-     * would put in a config file to recreate the running configuration.
+-     * Returns whether the scheme is configured.
+-     */
+-    virtual bool dump(StoreEntry *, const char *, Config *) const;
+-
+-    /** add headers as needed when challenging for auth */
+-    virtual void fixHeader(UserRequest::Pointer, HttpReply *, Http::HdrType, HttpRequest *) = 0;
+-
+-    /** prepare to handle requests */
+-    virtual void init(Config *) = 0;
+-
+-    /** expose any/all statistics to a CacheManager */
+-    virtual void registerWithCacheManager(void);
+-
+-    /** parse config options */
+-    virtual void parse(Config *, int, char *);
+-
+-    /** the http string id */
+-    virtual const char * type() const = 0;
++    Config() = default;
++    explicit Config(Config &&) = default;
++    ~Config() { assert(!schemeAccess); }
+ 
+-public:
+-    Helper::ChildConfig authenticateChildren;
+-    wordlist *authenticateProgram; ///< Helper program to run, includes all parameters
+-    String keyExtrasLine;  ///< The format of the request to the auth helper
+-    Format::Format *keyExtras; ///< The compiled request format
+-
+-protected:
+-    /// RFC 7235 section 2.2 - Protection Space (Realm)
+-    SBuf realm;
+-};
++    /// set of auth_params directives
++    Auth::ConfigVector schemes;
++
++    /// set of auth_schemes directives
++    std::vector<Auth::SchemesConfig> schemeLists;
++
++    /// the ACL list for auth_schemes directives
++    acl_access *schemeAccess = nullptr;
+ 
+-typedef std::vector<Config *> ConfigVector;
++    /// the authenticate_cache_garbage_interval
++    time_t garbageCollectInterval = 0;
++
++    // TODO replace this directive with per-Scheme 'credentialsttl'
++    //      and make Scheme::expirestime the real time-when-expires.
++    /// the authenticate_ttl
++    time_t credentialsTtl = 0;
++
++    /// the authenticate_ip_ttl
++    time_t ipTtl = 0;
++};
+ 
+-extern ConfigVector TheConfig;
++extern Auth::Config TheConfig;
+ 
+ } // namespace Auth
+ 
+ #endif /* USE_AUTH */
+-#endif /* SQUID_AUTHCONFIG_H */
++#endif /* SQUID_SRC_AUTH_CONFIG_H */
+ 
+@@ -10,12 +10,11 @@
+ 
+ #include "squid.h"
+ #include "acl/Gadgets.h"
++#include "auth/Config.h"
+ #include "auth/CredentialsCache.h"
+ #include "base/RunnersRegistry.h"
+ #include "Debug.h"
+ #include "event.h"
+-#include "SquidConfig.h"
+-#include "SquidTime.h"
+ 
+ namespace Auth {
+ 
+@@ -85,7 +84,7 @@ void
+ CredentialsCache::cleanup()
+ {
+     // cache entries with expiretime <= expirationTime are to be evicted
+-    const time_t expirationTime =  current_time.tv_sec - ::Config.authenticateTTL;
++    const time_t expirationTime =  current_time.tv_sec - Auth::TheConfig.credentialsTtl;
+ 
+     const auto end = store_.end();
+     for (auto i = store_.begin(); i != end;) {
+@@ -133,7 +132,7 @@ CredentialsCache::scheduleCleanup()
+     if (!gcScheduled_ && store_.size()) {
+         gcScheduled_ = true;
+         eventAdd(cacheCleanupEventName, &CredentialsCache::Cleanup,
+-                 this, ::Config.authenticateGCInterval, 1);
++                 this, Auth::TheConfig.garbageCollectInterval, 1);
+     }
+ }
+ 
+@@ -39,9 +39,10 @@ authenticateActiveSchemeCount(void)
+ {
+     int rv = 0;
+ 
+-    for (Auth::ConfigVector::iterator i = Auth::TheConfig.begin(); i != Auth::TheConfig.end(); ++i)
+-        if ((*i)->configured())
++    for (const auto *scheme : Auth::TheConfig.schemes) {
++        if (scheme->configured())
+             ++rv;
++    }
+ 
+     debugs(29, 9, HERE << rv << " active.");
+ 
+@@ -61,10 +62,8 @@ authenticateSchemeCount(void)
+ static void
+ authenticateRegisterWithCacheManager(Auth::ConfigVector * config)
+ {
+-    for (Auth::ConfigVector::iterator i = config->begin(); i != config->end(); ++i) {
+-        Auth::Config *scheme = *i;
++    for (auto *scheme : *config)
+         scheme->registerWithCacheManager();
+-    }
+ }
+ 
+ void
+@@ -74,11 +73,9 @@ authenticateInit(Auth::ConfigVector * config)
+     if (!config)
+         return;
+ 
+-    for (Auth::ConfigVector::iterator i = config->begin(); i != config->end(); ++i) {
+-        Auth::Config *schemeCfg = *i;
+-
+-        if (schemeCfg->configured())
+-            schemeCfg->init(schemeCfg);
++    for (auto *scheme : *config) {
++        if (scheme->configured())
++            scheme->init(scheme);
+     }
+ 
+     authenticateRegisterWithCacheManager(config);
+@@ -87,9 +84,10 @@ authenticateInit(Auth::ConfigVector * config)
+ void
+ authenticateRotate(void)
+ {
+-    for (Auth::ConfigVector::iterator i = Auth::TheConfig.begin(); i != Auth::TheConfig.end(); ++i)
+-        if ((*i)->configured())
+-            (*i)->rotateHelpers();
++    for (auto *scheme : Auth::TheConfig.schemes) {
++        if (scheme->configured())
++            scheme->rotateHelpers();
++    }
+ }
+ 
+ void
+@@ -103,7 +101,7 @@ authenticateReset(void)
+     authenticateRotate();
+ 
+     /* free current global config details too. */
+-    Auth::TheConfig.clear();
++    Auth::TheConfig.schemes.clear();
+ }
+ 
+ std::vector<Auth::User::Pointer>
+@@ -114,11 +112,11 @@ authenticateCachedUsersList()
+     };
+     std::vector<Auth::User::Pointer> v1, v2, rv, u1, u2;
+ #if HAVE_AUTH_MODULE_BASIC
+-    if (Auth::Config::Find("basic") != nullptr)
++    if (Auth::SchemeConfig::Find("basic"))
+         u1 = Auth::Basic::User::Cache()->sortedUsersList();
+ #endif
+ #if HAVE_AUTH_MODULE_DIGEST
+-    if (Auth::Config::Find("digest") != nullptr)
++    if (Auth::SchemeConfig::Find("digest"))
+         u2 = Auth::Digest::User::Cache()->sortedUsersList();
+ #endif
+     if (u1.size() > 0 || u2.size() > 0) {
+@@ -129,11 +127,11 @@ authenticateCachedUsersList()
+         u2.clear();
+     }
+ #if HAVE_AUTH_MODULE_NEGOTIATE
+-    if (Auth::Config::Find("negotiate") != nullptr)
++    if (Auth::SchemeConfig::Find("negotiate"))
+         u1 = Auth::Negotiate::User::Cache()->sortedUsersList();
+ #endif
+ #if HAVE_AUTH_MODULE_NTLM
+-    if (Auth::Config::Find("ntlm") != nullptr)
++    if (Auth::SchemeConfig::Find("ntlm"))
+         u2 = Auth::Ntlm::User::Cache()->sortedUsersList();
+ #endif
+     if (u1.size() > 0 || u2.size() > 0) {
+@@ -11,21 +11,13 @@
+ 
+ #if USE_AUTH
+ 
+-#include "auth/Config.h"
+ #include "auth/User.h"
+ #include "hash.h"
+ 
+-namespace Auth
+-{
+-class Scheme;
+-}
+ class ConnStateData;
+ class StoreEntry;
+ 
+-/**
+- \ingroup AuthAPI
+- \todo this should be a generic cachemgr API type ?
+- */
++// TODO this should be a generic cachemgr API type ?
+ typedef void AUTHSSTATS(StoreEntry *);
+ 
+ /// \ingroup AuthAPI
+@@ -25,11 +25,14 @@ libauth_la_SOURCES = \
+ 	CredentialsCache.cc \
+ 	CredentialState.cc \
+ 	CredentialState.h \
++	forward.h \
+ 	Gadgets.cc \
+ 	Gadgets.h \
+ 	QueueNode.h \
+ 	Scheme.cc \
+ 	Scheme.h \
++	SchemeConfig.cc \
++	SchemeConfig.h \
+ 	SchemesConfig.h \
+ 	SchemesConfig.cc \
+ 	State.h \
+@@ -9,6 +9,7 @@
+ #ifndef SQUID_SRC_AUTH_QUEUENODE_H
+ #define SQUID_SRC_AUTH_QUEUENODE_H
+ 
++#include "auth/forward.h"
+ #include "cbdata.h"
+ 
+ namespace Auth
+@@ -9,9 +9,9 @@
+ /* DEBUG: section 29    Authenticator */
+ 
+ #include "squid.h"
+-#include "auth/Config.h"
+ #include "auth/Gadgets.h"
+ #include "auth/Scheme.h"
++#include "auth/SchemeConfig.h"
+ #include "globals.h"
+ 
+ std::vector<Auth::Scheme::Pointer> *Auth::Scheme::_Schemes = NULL;
+@@ -11,27 +11,16 @@
+ 
+ #if USE_AUTH
+ 
++#include "auth/forward.h"
+ #include "base/RefCount.h"
+ 
+-#include <vector>
+-
+-/**
+- \defgroup AuthSchemeAPI    Authentication Scheme API
+- \ingroup AuthAPI
+- */
+-
+ namespace Auth
+ {
+ 
+-class Config;
+-
+ /**
+- * \ingroup AuthAPI
+- * \ingroup AuthSchemeAPI
+- * \par
+  * I represent an authentication scheme. For now my children
+  * store the scheme metadata.
+- * \par
++ *
+  * Should we need multiple configs of a single scheme,
+  * a new class should be made, and the config specific calls on Auth::Scheme moved to it.
+  */
+@@ -66,7 +55,7 @@ class Scheme : public RefCountable
+     /* per scheme methods */
+     virtual char const *type() const = 0;
+     virtual void shutdownCleanup() = 0;
+-    virtual Auth::Config *createConfig() = 0;
++    virtual Auth::SchemeConfig *createConfig() = 0;
+ 
+     // Not implemented
+     Scheme(Scheme const &);
+@@ -0,0 +1,180 @@
++/*
++ * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++/* DEBUG: section 29    Authenticator */
++
++#include "squid.h"
++#include "auth/Config.h"
++#include "auth/forward.h"
++#include "auth/Gadgets.h"
++#include "auth/UserRequest.h"
++#include "cache_cf.h"
++#include "ConfigParser.h"
++#include "Debug.h"
++#include "format/Format.h"
++#include "globals.h"
++#include "Store.h"
++#include "wordlist.h"
++
++/**
++ * Get an User credentials object filled out for the given Proxy- or WWW-Authenticate header.
++ * Any decoding which needs to be done will be done.
++ *
++ * It may be a cached AuthUser or a new Unauthenticated object.
++ * It may also be NULL reflecting that no user could be created.
++ */
++Auth::UserRequest::Pointer
++Auth::SchemeConfig::CreateAuthUser(const char *proxy_auth, AccessLogEntry::Pointer &al)
++{
++    assert(proxy_auth != NULL);
++    debugs(29, 9, HERE << "header = '" << proxy_auth << "'");
++
++    Auth::SchemeConfig *config = Find(proxy_auth);
++
++    if (config == NULL || !config->active()) {
++        debugs(29, (shutting_down?3:DBG_IMPORTANT), (shutting_down?"":"WARNING: ") <<
++               "Unsupported or unconfigured/inactive proxy-auth scheme, '" << proxy_auth << "'");
++        return NULL;
++    }
++    static MemBuf rmb;
++    rmb.reset();
++    if (config->keyExtras) {
++        // %credentials and %username, which normally included in
++        // request_format, are - at this time, but that is OK
++        // because user name is added to key explicitly, and we do
++        // not want to store authenticated credentials at all.
++        config->keyExtras->assemble(rmb, al, 0);
++    }
++
++    return config->decode(proxy_auth, rmb.hasContent() ? rmb.content() : NULL);
++}
++
++Auth::SchemeConfig *
++Auth::SchemeConfig::Find(const char *proxy_auth)
++{
++    for (auto *scheme : Auth::TheConfig.schemes) {
++        if (strncasecmp(proxy_auth, scheme->type(), strlen(scheme->type())) == 0)
++            return scheme;
++    }
++
++    return NULL;
++}
++
++Auth::SchemeConfig *
++Auth::SchemeConfig::GetParsed(const char *proxy_auth)
++{
++    if (auto *cfg = Find(proxy_auth))
++        return cfg;
++    fatalf("auth_schemes: required authentication method '%s' is not configured", proxy_auth);
++    return nullptr;
++}
++
++/** Default behaviour is to expose nothing */
++void
++Auth::SchemeConfig::registerWithCacheManager(void)
++{}
++
++void
++Auth::SchemeConfig::parse(Auth::SchemeConfig * scheme, int, char *param_str)
++{
++    if (strcmp(param_str, "program") == 0) {
++        if (authenticateProgram)
++            wordlistDestroy(&authenticateProgram);
++
++        parse_wordlist(&authenticateProgram);
++
++        requirePathnameExists("Authentication helper program", authenticateProgram->key);
++
++    } else if (strcmp(param_str, "realm") == 0) {
++        realm.clear();
++
++        char *token = ConfigParser::NextQuotedOrToEol();
++
++        while (token && *token && xisspace(*token))
++            ++token;
++
++        if (!token || !*token) {
++            debugs(29, DBG_PARSE_NOTE(DBG_IMPORTANT), "ERROR: Missing auth_param " << scheme->type() << " realm");
++            self_destruct();
++            return;
++        }
++
++        realm = token;
++
++    } else if (strcmp(param_str, "children") == 0) {
++        authenticateChildren.parseConfig();
++
++    } else if (strcmp(param_str, "key_extras") == 0) {
++        keyExtrasLine = ConfigParser::NextQuotedToken();
++        Format::Format *nlf =  new ::Format::Format(scheme->type());
++        if (!nlf->parse(keyExtrasLine.termedBuf())) {
++            debugs(29, DBG_CRITICAL, "FATAL: Failed parsing key_extras formatting value");
++            self_destruct();
++            return;
++        }
++        if (keyExtras)
++            delete keyExtras;
++
++        keyExtras = nlf;
++
++        if (char *t = strtok(NULL, w_space)) {
++            debugs(29, DBG_CRITICAL, "FATAL: Unexpected argument '" << t << "' after request_format specification");
++            self_destruct();
++        }
++    } else if (strcmp(param_str, "keep_alive") == 0) {
++        parse_onoff(&keep_alive);
++    } else if (strcmp(param_str, "utf8") == 0) {
++        parse_onoff(&utf8);
++    } else {
++        debugs(29, DBG_CRITICAL, "Unrecognised " << scheme->type() << " auth scheme parameter '" << param_str << "'");
++    }
++}
++
++bool
++Auth::SchemeConfig::dump(StoreEntry *entry, const char *name, Auth::SchemeConfig *scheme) const
++{
++    if (!authenticateProgram)
++        return false; // not configured
++
++    const char *schemeType = scheme->type();
++
++    wordlist *list = authenticateProgram;
++    storeAppendPrintf(entry, "%s %s", name, schemeType);
++    while (list != NULL) {
++        storeAppendPrintf(entry, " %s", list->key);
++        list = list->next;
++    }
++    storeAppendPrintf(entry, "\n");
++
++    storeAppendPrintf(entry, "%s %s realm " SQUIDSBUFPH "\n", name, schemeType, SQUIDSBUFPRINT(realm));
++
++    storeAppendPrintf(entry, "%s %s children %d startup=%d idle=%d concurrency=%d\n",
++                      name, schemeType,
++                      authenticateChildren.n_max, authenticateChildren.n_startup,
++                      authenticateChildren.n_idle, authenticateChildren.concurrency);
++
++    if (keyExtrasLine.size() > 0) // default is none
++        storeAppendPrintf(entry, "%s %s key_extras \"%s\"\n", name, schemeType, keyExtrasLine.termedBuf());
++
++    if (!keep_alive) // default is on
++        storeAppendPrintf(entry, "%s %s keep_alive off\n", name, schemeType);
++
++    if (utf8) // default is off
++        storeAppendPrintf(entry, "%s %s utf8 on\n", name, schemeType);
++
++    return true;
++}
++
++void
++Auth::SchemeConfig::done()
++{
++    delete keyExtras;
++    keyExtras = NULL;
++    keyExtrasLine.clean();
++}
++
+@@ -0,0 +1,144 @@
++/*
++ * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_SRC_AUTH_SCHEMECONFIG_H
++#define SQUID_SRC_AUTH_SCHEMECONFIG_H
++
++#if USE_AUTH
++
++#include "AccessLogEntry.h"
++#include "auth/forward.h"
++#include "auth/UserRequest.h"
++#include "helper/ChildConfig.h"
++
++class StoreEntry;
++class HttpReply;
++class HttpRequest;
++class wordlist;
++
++/* for Http::HdrType parameters-by-value */
++#include "HttpHeader.h"
++
++namespace Format
++{
++class Format;
++}
++
++namespace Auth
++{
++
++/**
++ * \ingroup AuthAPI
++ * \par
++ * I am the configuration for an auth scheme.
++ * Currently each scheme has only one instance of me,
++ * but this may change.
++ * \par
++ * This class is treated like a ref counted class.
++ * If the children ever stop being singletons, implement the
++ * ref counting...
++ */
++class SchemeConfig
++{
++
++public:
++    static UserRequest::Pointer CreateAuthUser(const char *proxy_auth, AccessLogEntry::Pointer &al);
++
++    static SchemeConfig *Find(const char *proxy_auth);
++    /// Call this method if you need a guarantee that all auth schemes has been
++    /// already configured.
++    static SchemeConfig *GetParsed(const char *proxy_auth);
++    SchemeConfig() : authenticateChildren(20) {}
++
++    virtual ~SchemeConfig() {}
++
++    /**
++     * Used by squid to determine whether the auth module has successfully initialised itself with the current configuration.
++     *
++     \retval true   Authentication Module loaded and running.
++     \retval false  No Authentication Module loaded.
++     */
++    virtual bool active() const = 0;
++
++    /**
++     * new decode API: virtual factory pattern
++     \par
++     * Responsible for decoding the passed authentication header, creating or
++     * linking to a AuthUser object and for storing any needed details to complete
++     * authentication in Auth::UserRequest::authenticate().
++     *
++     \param proxy_auth  Login Pattern to parse.
++     \retval *      Details needed to authenticate.
++     */
++    virtual UserRequest::Pointer decode(char const *proxy_auth, const char *requestRealm) = 0;
++
++    /**
++     * squid is finished with this config, release any unneeded resources.
++     * If a singleton, delete will not occur. if not a singleton (future),
++     * delete will occur when no references are held.
++     *
++     \todo we need a 'done for reconfigure' and a 'done permanently' concept.
++     */
++    virtual void done();
++
++    /**
++     * The configured function is used to see if the auth module has been given valid
++     * parameters and is able to handle authentication requests.
++     *
++     \retval true   Authentication Module configured ready for use.
++     \retval false  Not configured or Configuration Error.
++     *          No other module functions except Shutdown/Dump/Parse/FreeConfig will be called by Squid.
++     */
++    virtual bool configured() const = 0;
++
++    /**
++     * Shutdown just the auth helpers.
++     * For use by log rotate etc. where auth needs to stay running, with the helpers restarted.
++     */
++    virtual void rotateHelpers(void) = 0;
++
++    /**
++     * Responsible for writing to the StoreEntry the configuration parameters that a user
++     * would put in a config file to recreate the running configuration.
++     * Returns whether the scheme is configured.
++     */
++    virtual bool dump(StoreEntry *, const char *, SchemeConfig *) const;
++
++    /** add headers as needed when challenging for auth */
++    virtual void fixHeader(UserRequest::Pointer, HttpReply *, Http::HdrType, HttpRequest *) = 0;
++
++    /** prepare to handle requests */
++    virtual void init(SchemeConfig *) = 0;
++
++    /** expose any/all statistics to a CacheManager */
++    virtual void registerWithCacheManager(void);
++
++    /** parse config options */
++    virtual void parse(SchemeConfig *, int, char *);
++
++    /** the http string id */
++    virtual const char * type() const = 0;
++
++public:
++    Helper::ChildConfig authenticateChildren;
++    wordlist *authenticateProgram = nullptr; ///< Helper program to run, includes all parameters
++    String keyExtrasLine;  ///< The format of the request to the auth helper
++    Format::Format *keyExtras = nullptr; ///< The compiled request format
++    int keep_alive = 1; ///< whether to close the connection on auth challenges. default: on
++    int utf8 = 0; ///< wheter to accept UTF-8 characterset instead of ASCII. default: off
++
++protected:
++    /// RFC 7235 section 2.2 - Protection Space (Realm)
++    SBuf realm;
++};
++
++} // namespace Auth
++
++#endif /* USE_AUTH */
++#endif /* SQUID_SRC_AUTH_SCHEMECONFIG_H */
++
+@@ -8,7 +8,6 @@
+ 
+ #include "squid.h"
+ #include "auth/Config.h"
+-#include "auth/SchemesConfig.h"
+ #include "fatal.h"
+ #include "parser/Tokenizer.h"
+ 
+@@ -17,7 +16,7 @@ addUnique(const SBuf &scheme, std::vector<SBuf> &vec)
+ {
+     static const SBuf all("ALL");
+     if (scheme == all) {
+-        for (const auto config: Auth::TheConfig)
++        for (const auto config: Auth::TheConfig.schemes)
+             addUnique(SBuf(config->type()), vec);
+     } else if (std::find(vec.begin(), vec.end(), scheme) == vec.end())
+         vec.push_back(scheme);
+@@ -41,7 +40,7 @@ Auth::SchemesConfig::expand()
+     authConfigs.clear();
+     transform(expanded.begin(), expanded.end(),
+     back_inserter(authConfigs), [](SBuf &s) {
+-        return Auth::Config::GetParsed(s.c_str());
++        return Auth::SchemeConfig::GetParsed(s.c_str());
+     });
+ }
+ 
+@@ -11,13 +11,12 @@
+ 
+ #if USE_AUTH
+ 
+-#include "auth/Config.h"
++#include "auth/SchemeConfig.h"
+ 
+ namespace Auth
+ {
+ 
+ /**
+- * \ingroup AuthAPI
+  * Stores authentication schemes list, configured by auth_schemes
+  * directive.
+  */
+@@ -31,7 +30,7 @@ class SchemesConfig
+ 
+ public:
+     /// corresponding vector of Auth::Config objects
+-    ConfigVector authConfigs;
++    Auth::ConfigVector authConfigs;
+ 
+ private:
+     /// raw auth schemes list (may have duplicates)
+@@ -43,8 +42,6 @@ class SchemesConfig
+     const char *rawSchemes;
+ };
+ 
+-typedef std::vector<SchemesConfig> SchemesConfigs;
+-
+ } // namespace Auth
+ 
+ #endif /* USE_AUTH */
+@@ -18,11 +18,10 @@
+ #include "auth/UserRequest.h"
+ #include "event.h"
+ #include "globals.h"
+-#include "SquidConfig.h"
+ #include "SquidTime.h"
+ #include "Store.h"
+ 
+-Auth::User::User(Auth::Config *aConfig, const char *aRequestRealm) :
++Auth::User::User(Auth::SchemeConfig *aConfig, const char *aRequestRealm) :
+     auth_type(Auth::AUTH_UNKNOWN),
+     config(aConfig),
+     ipcount(0),
+@@ -201,7 +200,7 @@ Auth::User::addIp(Ip::Address ipaddr)
+             /* This ip has already been seen. */
+             found = 1;
+             /* update IP ttl */
+-            ipdata->ip_expiretime = squid_curtime + ::Config.authenticateIpTTL;
++            ipdata->ip_expiretime = squid_curtime + Auth::TheConfig.ipTtl;
+         } else if (ipdata->ip_expiretime <= squid_curtime) {
+             /* This IP has expired - remove from the seen list */
+             dlinkDelete(&ipdata->node, &ip_list);
+@@ -218,7 +217,7 @@ Auth::User::addIp(Ip::Address ipaddr)
+         return;
+ 
+     /* This ip is not in the seen list */
+-    ipdata = new AuthUserIP(ipaddr, squid_curtime + ::Config.authenticateIpTTL);
++    ipdata = new AuthUserIP(ipaddr, squid_curtime + Auth::TheConfig.ipTtl);
+ 
+     dlinkAddTail(ipdata, &ipdata->node, &ip_list);
+ 
+@@ -258,7 +257,7 @@ Auth::User::CredentialsCacheStats(StoreEntry *output)
+                           Auth::Type_str[auth_user->auth_type],
+                           CredentialState_str[auth_user->credentials()],
+                           auth_user->ttl(),
+-                          static_cast<int32_t>(auth_user->expiretime - squid_curtime + ::Config.authenticateTTL),
++                          static_cast<int32_t>(auth_user->expiretime - squid_curtime + Auth::TheConfig.credentialsTtl),
+                           auth_user->username(),
+                           SQUIDSBUFPRINT(auth_user->userKey())
+                          );
+@@ -12,6 +12,7 @@
+ #if USE_AUTH
+ 
+ #include "auth/CredentialState.h"
++#include "auth/forward.h"
+ #include "auth/Type.h"
+ #include "base/CbcPointer.h"
+ #include "base/RefCount.h"
+@@ -25,9 +26,6 @@ class StoreEntry;
+ namespace Auth
+ {
+ 
+-class Config;
+-class CredentialsCache;
+-
+ /**
+  * This is the main user related structure. It stores user-related data,
+  * and is persistent across requests. It can even persist across
+@@ -41,15 +39,15 @@ class User : public RefCountable
+     typedef RefCount<User> Pointer;
+ 
+ protected:
+-    User(Auth::Config *, const char *requestRealm);
++    User(Auth::SchemeConfig *, const char *requestRealm);
+ public:
+     virtual ~User();
+ 
+     /* extra fields for proxy_auth */
+     /** \deprecated this determines what scheme owns the user data. */
+     Auth::Type auth_type;
+     /** the config for this user */
+-    Auth::Config *config;
++    Auth::SchemeConfig *config;
+     dlink_list proxy_match_cache;
+     size_t ipcount;
+     long expiretime;
+@@ -15,10 +15,6 @@
+ #include "squid.h"
+ #include "acl/FilledChecklist.h"
+ #include "auth/Config.h"
+-#include "auth/Scheme.h"
+-#include "auth/SchemesConfig.h"
+-#include "auth/User.h"
+-#include "auth/UserRequest.h"
+ #include "client_side.h"
+ #include "comm/Connection.h"
+ #include "fatal.h"
+@@ -27,7 +23,6 @@
+ #include "HttpReply.h"
+ #include "HttpRequest.h"
+ #include "MemBuf.h"
+-#include "SquidConfig.h"
+ 
+ /* Generic Functions */
+ 
+@@ -338,7 +333,7 @@ Auth::UserRequest::authenticate(Auth::UserRequest::Pointer * auth_user_request,
          }
  
-         if (!parsedOk) {
--            if (hp-&gt;parseStatusCode == Http::scRequestHeaderFieldsTooLarge || hp-&gt;parseStatusCode == Http::scUriTooLong)
--                return csd-&gt;abortRequestParsing(&quot;error:request-too-large&quot;);
+         if (proxy_auth && request->auth_user_request == NULL && conn != NULL && conn->getAuth() != NULL) {
+-            Auth::Config * scheme = Auth::Config::Find(proxy_auth);
++            Auth::SchemeConfig * scheme = Auth::SchemeConfig::Find(proxy_auth);
+ 
+             if (conn->getAuth()->user() == NULL || conn->getAuth()->user()->config != scheme) {
+                 debugs(29, DBG_IMPORTANT, "WARNING: Unexpected change of authentication scheme from '" <<
+@@ -354,7 +349,7 @@ Auth::UserRequest::authenticate(Auth::UserRequest::Pointer * auth_user_request,
+             /* beginning of a new request check */
+             debugs(29, 4, HERE << "No connection authentication type");
+ 
+-            *auth_user_request = Auth::Config::CreateAuthUser(proxy_auth, al);
++            *auth_user_request = Auth::SchemeConfig::CreateAuthUser(proxy_auth, al);
+             if (*auth_user_request == NULL)
+                 return AUTH_ACL_CHALLENGE;
+             else if (!(*auth_user_request)->valid()) {
+@@ -467,15 +462,15 @@ Auth::UserRequest::tryToAuthenticateAndSetAuthUser(Auth::UserRequest::Pointer *
+ static Auth::ConfigVector &
+ schemesConfig(HttpRequest *request, HttpReply *rep)
+ {
+-    if (::Config.accessList.authSchemes) {
++    if (!Auth::TheConfig.schemeLists.empty() && Auth::TheConfig.schemeAccess) {
+         ACLFilledChecklist ch(NULL, request, NULL);
+         ch.reply = rep;
+         HTTPMSGLOCK(ch.reply);
+-        const allow_t answer = ch.fastCheck(::Config.accessList.authSchemes);
++        const allow_t answer = ch.fastCheck(Auth::TheConfig.schemeAccess);
+         if (answer == ACCESS_ALLOWED)
+-            return ::Config.authSchemesConfigs.at(answer.kind).authConfigs;
++            return Auth::TheConfig.schemeLists.at(answer.kind).authConfigs;
+     }
+-    return Auth::TheConfig;
++    return Auth::TheConfig.schemes;
+ }
+ 
+ void
+@@ -514,11 +509,9 @@ Auth::UserRequest::addReplyAuthHeader(HttpReply * rep, Auth::UserRequest::Pointe
+             /* add the scheme specific challenge header to the response */
+             auth_user_request->user()->config->fixHeader(auth_user_request, rep, type, request);
+         else {
+-            /* call each configured & running authscheme */
++            /* call each configured & running auth scheme */
+             Auth::ConfigVector &configs = schemesConfig(request, rep);
+-            for (Auth::ConfigVector::iterator i = configs.begin(); i != configs.end(); ++i) {
+-                Auth::Config *scheme = *i;
 -
--            return csd-&gt;abortRequestParsing(&quot;error:invalid-request&quot;);
-+            const bool tooBig =
-+                hp-&gt;parseStatusCode == Http::scRequestHeaderFieldsTooLarge ||
-+                hp-&gt;parseStatusCode == Http::scUriTooLong;
-+            auto result = csd-&gt;abortRequestParsing(
-+                              tooBig ? &quot;error:request-too-large&quot; : &quot;error:invalid-request&quot;);
-+            // assume that remaining leftovers belong to this bad request
-+            csd-&gt;consumeInput(csd-&gt;inBuf.length());
-+            return result;
++            for (auto *scheme : configs) {
+                 if (scheme->active()) {
+                     if (auth_user_request != NULL && auth_user_request->scheme()->type() == scheme->type())
+                         scheme->fixHeader(auth_user_request, rep, type, request);
+@@ -96,7 +96,7 @@ Auth::Basic::Config::rotateHelpers()
+ void
+ Auth::Basic::Config::done()
+ {
+-    Auth::Config::done();
++    Auth::SchemeConfig::done();
+ 
+     authbasic_initialised = 0;
+ 
+@@ -112,37 +112,33 @@ Auth::Basic::Config::done()
+ }
+ 
+ bool
+-Auth::Basic::Config::dump(StoreEntry * entry, const char *name, Auth::Config * scheme) const
++Auth::Basic::Config::dump(StoreEntry * entry, const char *name, Auth::SchemeConfig * scheme) const
+ {
+-    if (!Auth::Config::dump(entry, name, scheme))
++    if (!Auth::SchemeConfig::dump(entry, name, scheme))
+         return false; // not configured
+ 
+     storeAppendPrintf(entry, "%s basic credentialsttl %d seconds\n", name, (int) credentialsTTL);
+     storeAppendPrintf(entry, "%s basic casesensitive %s\n", name, casesensitive ? "on" : "off");
+-    storeAppendPrintf(entry, "%s basic utf8 %s\n", name, utf8 ? "on" : "off");
+     return true;
+ }
+ 
+ Auth::Basic::Config::Config() :
+     credentialsTTL( 2*60*60 ),
+-    casesensitive(0),
+-    utf8(0)
++    casesensitive(0)
+ {
+     static const SBuf defaultRealm("Squid proxy-caching web server");
+     realm = defaultRealm;
+ }
+ 
+ void
+-Auth::Basic::Config::parse(Auth::Config * scheme, int n_configured, char *param_str)
++Auth::Basic::Config::parse(Auth::SchemeConfig * scheme, int n_configured, char *param_str)
+ {
+     if (strcmp(param_str, "credentialsttl") == 0) {
+         parse_time_t(&credentialsTTL);
+     } else if (strcmp(param_str, "casesensitive") == 0) {
+         parse_onoff(&casesensitive);
+-    } else if (strcmp(param_str, "utf8") == 0) {
+-        parse_onoff(&utf8);
+     } else
+-        Auth::Config::parse(scheme, n_configured, param_str);
++        Auth::SchemeConfig::parse(scheme, n_configured, param_str);
+ }
+ 
+ static void
+@@ -279,7 +275,7 @@ Auth::Basic::Config::decode(char const *proxy_auth, const char *aRequestRealm)
+ /** Initialize helpers and the like for this auth scheme. Called AFTER parsing the
+  * config file */
+ void
+-Auth::Basic::Config::init(Auth::Config *)
++Auth::Basic::Config::init(Auth::SchemeConfig *)
+ {
+     if (authenticateProgram) {
+         authbasic_initialised = 1;
+@@ -11,8 +11,8 @@
+ 
+ #if HAVE_AUTH_MODULE_BASIC
+ 
+-#include "auth/Config.h"
+ #include "auth/Gadgets.h"
++#include "auth/SchemeConfig.h"
+ #include "auth/UserRequest.h"
+ #include "helper/forward.h"
+ 
+@@ -22,7 +22,7 @@ namespace Basic
+ {
+ 
+ /** Basic authentication configuration data */
+-class Config : public Auth::Config
++class Config : public Auth::SchemeConfig
+ {
+ public:
+     Config();
+@@ -31,18 +31,17 @@ class Config : public Auth::Config
+     virtual Auth::UserRequest::Pointer decode(char const *proxy_auth, const char *requestRealm);
+     virtual void done();
+     virtual void rotateHelpers();
+-    virtual bool dump(StoreEntry *, const char *, Auth::Config *) const;
++    virtual bool dump(StoreEntry *, const char *, Auth::SchemeConfig *) const;
+     virtual void fixHeader(Auth::UserRequest::Pointer, HttpReply *, Http::HdrType, HttpRequest *);
+-    virtual void init(Auth::Config *);
+-    virtual void parse(Auth::Config *, int, char *);
++    virtual void init(Auth::SchemeConfig *);
++    virtual void parse(Auth::SchemeConfig *, int, char *);
+     void decode(char const *httpAuthHeader, Auth::UserRequest::Pointer);
+     virtual void registerWithCacheManager(void);
+     virtual const char * type() const;
+ 
+ public:
+     time_t credentialsTTL;
+     int casesensitive;
+-    int utf8;
+ 
+ private:
+     char * decodeCleartext(const char *httpAuthHeader);
+@@ -40,10 +40,10 @@ Auth::Basic::Scheme::shutdownCleanup()
+     debugs(29, DBG_CRITICAL, "Shutdown: Basic authentication.");
+ }
+ 
+-Auth::Config *
++Auth::SchemeConfig *
+ Auth::Basic::Scheme::createConfig()
+ {
+     Auth::Basic::Config *newCfg = new Auth::Basic::Config;
+-    return dynamic_cast<Auth::Config*>(newCfg);
++    return dynamic_cast<Auth::SchemeConfig*>(newCfg);
+ }
+ 
+@@ -19,7 +19,6 @@ namespace Basic
+ {
+ 
+ /// \ingroup AuthAPI
+-/// \ingroup AuthSchemeAPI
+ class Scheme : public Auth::Scheme
+ {
+ 
+@@ -31,7 +30,7 @@ class Scheme : public Auth::Scheme
+     /* per scheme */
+     virtual char const *type() const;
+     virtual void shutdownCleanup();
+-    virtual Auth::Config *createConfig();
++    virtual Auth::SchemeConfig *createConfig();
+     /* Not implemented */
+     Scheme(Scheme const &);
+     Scheme &operator=(Scheme const &);
+@@ -9,12 +9,11 @@
+ #include "squid.h"
+ #include "auth/basic/Config.h"
+ #include "auth/basic/User.h"
++#include "auth/Config.h"
+ #include "auth/CredentialsCache.h"
+ #include "Debug.h"
+-#include "SquidConfig.h"
+-#include "SquidTime.h"
+ 
+-Auth::Basic::User::User(Auth::Config *aConfig, const char *aRequestRealm) :
++Auth::Basic::User::User(Auth::SchemeConfig *aConfig, const char *aRequestRealm) :
+     Auth::User(aConfig, aRequestRealm),
+     passwd(NULL),
+     queue(NULL),
+@@ -33,7 +32,7 @@ Auth::Basic::User::ttl() const
+         return -1; // TTL is obsolete NOW.
+ 
+     int32_t basic_ttl = expiretime - squid_curtime + static_cast<Auth::Basic::Config*>(config)->credentialsTTL;
+-    int32_t global_ttl = static_cast<int32_t>(expiretime - squid_curtime + ::Config.authenticateTTL);
++    int32_t global_ttl = static_cast<int32_t>(expiretime - squid_curtime + Auth::TheConfig.credentialsTtl);
+ 
+     return min(basic_ttl, global_ttl);
+ }
+@@ -17,7 +17,7 @@
+ namespace Auth
+ {
+ 
+-class Config;
++class SchemeConfig;
+ class QueueNode;
+ 
+ namespace Basic
+@@ -29,7 +29,7 @@ class User : public Auth::User
+     MEMPROXY_CLASS(Auth::Basic::User);
+ 
+ public:
+-    User(Auth::Config *, const char *requestRealm);
++    User(Auth::SchemeConfig *, const char *requestRealm);
+     virtual ~User();
+     bool authenticated() const;
+     bool valid() const;
+@@ -59,7 +59,7 @@ Auth::Basic::UserRequest::authenticate(HttpRequest *, ConnStateData *, Http::Hdr
+         return;
+ 
+     /* are we about to recheck the credentials externally? */
+-    if ((user()->expiretime + static_cast<Auth::Basic::Config*>(Auth::Config::Find("basic"))->credentialsTTL) <= squid_curtime) {
++    if ((user()->expiretime + static_cast<Auth::Basic::Config*>(Auth::SchemeConfig::Find("basic"))->credentialsTTL) <= squid_curtime) {
+         debugs(29, 4, HERE << "credentials expired - rechecking");
+         return;
+     }
+@@ -86,7 +86,7 @@ Auth::Basic::UserRequest::module_direction()
+         return Auth::CRED_LOOKUP;
+ 
+     case Auth::Ok:
+-        if (user()->expiretime + static_cast<Auth::Basic::Config*>(Auth::Config::Find("basic"))->credentialsTTL <= squid_curtime)
++        if (user()->expiretime + static_cast<Auth::Basic::Config*>(Auth::SchemeConfig::Find("basic"))->credentialsTTL <= squid_curtime)
+             return Auth::CRED_LOOKUP;
+         return Auth::CRED_VALID;
+ 
+@@ -107,7 +107,7 @@ Auth::Basic::UserRequest::startHelperLookup(HttpRequest *request, AccessLogEntry
+     assert(basic_auth != NULL);
+     debugs(29, 9, HERE << "'" << basic_auth->username() << ":" << basic_auth->passwd << "'");
+ 
+-    if (static_cast<Auth::Basic::Config*>(Auth::Config::Find("basic"))->authenticateProgram == NULL) {
++    if (static_cast<Auth::Basic::Config*>(Auth::SchemeConfig::Find("basic"))->authenticateProgram == NULL) {
+         debugs(29, DBG_CRITICAL, "ERROR: No Basic authentication program configured.");
+         handler(data);
+         return;
+@@ -215,7 +215,7 @@ authenticateDigestNonceSetup(void)
+     if (!digest_nonce_cache) {
+         digest_nonce_cache = hash_create((HASHCMP *) strcmp, 7921, hash_string);
+         assert(digest_nonce_cache);
+-        eventAdd("Digest nonce cache maintenance", authenticateDigestNonceCacheCleanup, NULL, static_cast<Auth::Digest::Config*>(Auth::Config::Find("digest"))->nonceGCInterval, 1);
++        eventAdd("Digest nonce cache maintenance", authenticateDigestNonceCacheCleanup, NULL, static_cast<Auth::Digest::Config*>(Auth::SchemeConfig::Find("digest"))->nonceGCInterval, 1);
+     }
+ }
+ 
+@@ -278,8 +278,8 @@ authenticateDigestNonceCacheCleanup(void *)
+ 
+     debugs(29, 3, "Finished cleaning the nonce cache.");
+ 
+-    if (static_cast<Auth::Digest::Config*>(Auth::Config::Find("digest"))->active())
+-        eventAdd("Digest nonce cache maintenance", authenticateDigestNonceCacheCleanup, NULL, static_cast<Auth::Digest::Config*>(Auth::Config::Find("digest"))->nonceGCInterval, 1);
++    if (static_cast<Auth::Digest::Config*>(Auth::SchemeConfig::Find("digest"))->active())
++        eventAdd("Digest nonce cache maintenance", authenticateDigestNonceCacheCleanup, NULL, static_cast<Auth::Digest::Config*>(Auth::SchemeConfig::Find("digest"))->nonceGCInterval, 1);
+ }
+ 
+ static void
+@@ -366,12 +366,12 @@ authDigestNonceIsValid(digest_nonce_h * nonce, char nc[9])
+     }
+ 
+     /* is the nonce-count ok ? */
+-    if (!static_cast<Auth::Digest::Config*>(Auth::Config::Find("digest"))->CheckNonceCount) {
++    if (!static_cast<Auth::Digest::Config*>(Auth::SchemeConfig::Find("digest"))->CheckNonceCount) {
+         /* Ignore client supplied NC */
+         intnc = nonce->nc + 1;
+     }
+ 
+-    if ((static_cast<Auth::Digest::Config*>(Auth::Config::Find("digest"))->NonceStrictness && intnc != nonce->nc + 1) ||
++    if ((static_cast<Auth::Digest::Config*>(Auth::SchemeConfig::Find("digest"))->NonceStrictness && intnc != nonce->nc + 1) ||
+             intnc < nonce->nc + 1) {
+         debugs(29, 4, "Nonce count doesn't match");
+         nonce->flags.valid = false;
+@@ -399,10 +399,10 @@ authDigestNonceIsStale(digest_nonce_h * nonce)
+         return -1;
+ 
+     /* has it's max duration expired? */
+-    if (nonce->noncedata.creationtime + static_cast<Auth::Digest::Config*>(Auth::Config::Find("digest"))->noncemaxduration < current_time.tv_sec) {
++    if (nonce->noncedata.creationtime + static_cast<Auth::Digest::Config*>(Auth::SchemeConfig::Find("digest"))->noncemaxduration < current_time.tv_sec) {
+         debugs(29, 4, "Nonce is too old. " <<
+                nonce->noncedata.creationtime << " " <<
+-               static_cast<Auth::Digest::Config*>(Auth::Config::Find("digest"))->noncemaxduration << " " <<
++               static_cast<Auth::Digest::Config*>(Auth::SchemeConfig::Find("digest"))->noncemaxduration << " " <<
+                current_time.tv_sec);
+ 
+         nonce->flags.valid = false;
+@@ -415,7 +415,7 @@ authDigestNonceIsStale(digest_nonce_h * nonce)
+         return -1;
+     }
+ 
+-    if (nonce->nc > static_cast<Auth::Digest::Config*>(Auth::Config::Find("digest"))->noncemaxuses) {
++    if (nonce->nc > static_cast<Auth::Digest::Config*>(Auth::SchemeConfig::Find("digest"))->noncemaxuses) {
+         debugs(29, 4, "Nonce count over user limit");
+         nonce->flags.valid = false;
+         return -1;
+@@ -440,7 +440,7 @@ authDigestNonceLastRequest(digest_nonce_h * nonce)
+         return -1;
+     }
+ 
+-    if (nonce->nc >= static_cast<Auth::Digest::Config*>(Auth::Config::Find("digest"))->noncemaxuses - 1) {
++    if (nonce->nc >= static_cast<Auth::Digest::Config*>(Auth::SchemeConfig::Find("digest"))->noncemaxuses - 1) {
+         debugs(29, 4, "Nonce count about to hit user limit");
+         return -1;
+     }
+@@ -478,16 +478,15 @@ Auth::Digest::Config::rotateHelpers()
+ }
+ 
+ bool
+-Auth::Digest::Config::dump(StoreEntry * entry, const char *name, Auth::Config * scheme) const
++Auth::Digest::Config::dump(StoreEntry * entry, const char *name, Auth::SchemeConfig * scheme) const
+ {
+-    if (!Auth::Config::dump(entry, name, scheme))
++    if (!Auth::SchemeConfig::dump(entry, name, scheme))
+         return false;
+ 
+     storeAppendPrintf(entry, "%s %s nonce_max_count %d\n%s %s nonce_max_duration %d seconds\n%s %s nonce_garbage_interval %d seconds\n",
+                       name, "digest", noncemaxuses,
+                       name, "digest", (int) noncemaxduration,
+                       name, "digest", (int) nonceGCInterval);
+-    storeAppendPrintf(entry, "%s digest utf8 %s\n", name, utf8 ? "on" : "off");
+     return true;
+ }
+ 
+@@ -546,7 +545,7 @@ Auth::Digest::Config::fixHeader(Auth::UserRequest::Pointer auth_user_request, Ht
+ /* Initialize helpers and the like for this auth scheme. Called AFTER parsing the
+  * config file */
+ void
+-Auth::Digest::Config::init(Auth::Config *)
++Auth::Digest::Config::init(Auth::SchemeConfig *)
+ {
+     if (authenticateProgram) {
+         authenticateDigestNonceSetup();
+@@ -577,7 +576,7 @@ Auth::Digest::Config::registerWithCacheManager(void)
+ void
+ Auth::Digest::Config::done()
+ {
+-    Auth::Config::done();
++    Auth::SchemeConfig::done();
+ 
+     authdigest_initialised = 0;
+ 
+@@ -600,21 +599,13 @@ Auth::Digest::Config::Config() :
+     noncemaxuses(50),
+     NonceStrictness(0),
+     CheckNonceCount(1),
+-    PostWorkaround(0),
+-    utf8(0)
++    PostWorkaround(0)
+ {}
+ 
+ void
+-Auth::Digest::Config::parse(Auth::Config * scheme, int n_configured, char *param_str)
++Auth::Digest::Config::parse(Auth::SchemeConfig * scheme, int n_configured, char *param_str)
+ {
+-    if (strcmp(param_str, "program") == 0) {
+-        if (authenticateProgram)
+-            wordlistDestroy(&authenticateProgram);
+-
+-        parse_wordlist(&authenticateProgram);
+-
+-        requirePathnameExists("auth_param digest program", authenticateProgram->key);
+-    } else if (strcmp(param_str, "nonce_garbage_interval") == 0) {
++    if (strcmp(param_str, "nonce_garbage_interval") == 0) {
+         parse_time_t(&nonceGCInterval);
+     } else if (strcmp(param_str, "nonce_max_duration") == 0) {
+         parse_time_t(&noncemaxduration);
+@@ -626,10 +617,8 @@ Auth::Digest::Config::parse(Auth::Config * scheme, int n_configured, char *param
+         parse_onoff(&CheckNonceCount);
+     } else if (strcmp(param_str, "post_workaround") == 0) {
+         parse_onoff(&PostWorkaround);
+-    } else if (strcmp(param_str, "utf8") == 0) {
+-        parse_onoff(&utf8);
+     } else
+-        Auth::Config::parse(scheme, n_configured, param_str);
++        Auth::SchemeConfig::parse(scheme, n_configured, param_str);
+ }
+ 
+ const char *
+@@ -726,7 +715,7 @@ authDigestLogUsername(char *username, Auth::UserRequest::Pointer auth_user_reque
+ 
+     /* log the username */
+     debugs(29, 9, "Creating new user for logging '" << (username?username:"[no username]") << "'");
+-    Auth::User::Pointer digest_user = new Auth::Digest::User(static_cast<Auth::Digest::Config*>(Auth::Config::Find("digest")), requestRealm);
++    Auth::User::Pointer digest_user = new Auth::Digest::User(static_cast<Auth::Digest::Config*>(Auth::SchemeConfig::Find("digest")), requestRealm);
+     /* save the credentials */
+     digest_user->username(username);
+     /* set the auth_user type */
+@@ -11,8 +11,8 @@
+ 
+ #if HAVE_AUTH_MODULE_DIGEST
+ 
+-#include "auth/Config.h"
+ #include "auth/Gadgets.h"
++#include "auth/SchemeConfig.h"
+ #include "auth/UserRequest.h"
+ #include "helper/forward.h"
+ #include "rfc2617.h"
+@@ -71,7 +71,7 @@ namespace Digest
+ {
+ 
+ /** Digest Authentication configuration data */
+-class Config : public Auth::Config
++class Config : public Auth::SchemeConfig
+ {
+ public:
+     Config();
+@@ -80,10 +80,10 @@ class Config : public Auth::Config
+     virtual Auth::UserRequest::Pointer decode(char const *proxy_auth, const char *requestRealm);
+     virtual void done();
+     virtual void rotateHelpers();
+-    virtual bool dump(StoreEntry *, const char *, Auth::Config *) const;
++    virtual bool dump(StoreEntry *, const char *, Auth::SchemeConfig *) const;
+     virtual void fixHeader(Auth::UserRequest::Pointer, HttpReply *, Http::HdrType, HttpRequest *);
+-    virtual void init(Auth::Config *);
+-    virtual void parse(Auth::Config *, int, char *);
++    virtual void init(Auth::SchemeConfig *);
++    virtual void parse(Auth::SchemeConfig *, int, char *);
+     virtual void registerWithCacheManager(void);
+     virtual const char * type() const;
+ 
+@@ -94,7 +94,6 @@ class Config : public Auth::Config
+     int NonceStrictness;
+     int CheckNonceCount;
+     int PostWorkaround;
+-    int utf8;
+ };
+ 
+ } // namespace Digest
+@@ -43,10 +43,10 @@ Auth::Digest::Scheme::shutdownCleanup()
+     debugs(29, DBG_CRITICAL, "Shutdown: Digest authentication.");
+ }
+ 
+-Auth::Config *
++Auth::SchemeConfig *
+ Auth::Digest::Scheme::createConfig()
+ {
+     Auth::Digest::Config *digestCfg = new Auth::Digest::Config;
+-    return dynamic_cast<Auth::Config*>(digestCfg);
++    return dynamic_cast<Auth::SchemeConfig*>(digestCfg);
+ }
+ 
+@@ -18,7 +18,6 @@ namespace Auth
+ namespace Digest
+ {
+ 
+-/// \ingroup AuthSchemeAPI
+ /// \ingroup AuthAPI
+ class Scheme : public Auth::Scheme
+ {
+@@ -31,7 +30,7 @@ class Scheme : public Auth::Scheme
+     /* per scheme */
+     virtual char const *type () const;
+     virtual void shutdownCleanup();
+-    virtual Auth::Config *createConfig();
++    virtual Auth::SchemeConfig *createConfig();
+ 
+     /* Not implemented */
+     Scheme(Scheme const &);
+@@ -7,15 +7,14 @@
+  */
+ 
+ #include "squid.h"
++#include "auth/Config.h"
+ #include "auth/CredentialsCache.h"
+ #include "auth/digest/Config.h"
+ #include "auth/digest/User.h"
+ #include "Debug.h"
+ #include "dlink.h"
+-#include "SquidConfig.h"
+-#include "SquidTime.h"
+ 
+-Auth::Digest::User::User(Auth::Config *aConfig, const char *aRequestRealm) :
++Auth::Digest::User::User(Auth::SchemeConfig *aConfig, const char *aRequestRealm) :
+     Auth::User(aConfig, aRequestRealm),
+     HA1created(0)
+ {
+@@ -40,7 +39,7 @@ Auth::Digest::User::~User()
+ int32_t
+ Auth::Digest::User::ttl() const
+ {
+-    int32_t global_ttl = static_cast<int32_t>(expiretime - squid_curtime + ::Config.authenticateTTL);
++    int32_t global_ttl = static_cast<int32_t>(expiretime - squid_curtime + Auth::TheConfig.credentialsTtl);
+ 
+     /* find the longest lasting nonce. */
+     int32_t latest_nonce = -1;
+@@ -55,7 +54,7 @@ Auth::Digest::User::ttl() const
+     if (latest_nonce == -1)
+         return min(-1, global_ttl);
+ 
+-    int32_t nonce_ttl = latest_nonce - current_time.tv_sec + static_cast<Config*>(Auth::Config::Find("digest"))->noncemaxduration;
++    int32_t nonce_ttl = latest_nonce - current_time.tv_sec + static_cast<Config*>(Auth::SchemeConfig::Find("digest"))->noncemaxduration;
+ 
+     return min(nonce_ttl, global_ttl);
+ }
+@@ -26,7 +26,7 @@ class User : public Auth::User
+     MEMPROXY_CLASS(Auth::Digest::User);
+ 
+ public:
+-    User(Auth::Config *, const char *requestRealm);
++    User(Auth::SchemeConfig *, const char *requestRealm);
+     virtual ~User();
+     int authenticated() const;
+     virtual int32_t ttl() const override;
+@@ -127,7 +127,7 @@ Auth::Digest::UserRequest::authenticate(HttpRequest * request, ConnStateData *,
+             return;
+         }
+ 
+-        if (static_cast<Auth::Digest::Config*>(Auth::Config::Find("digest"))->PostWorkaround && request->method != Http::METHOD_GET) {
++        if (static_cast<Auth::Digest::Config*>(Auth::SchemeConfig::Find("digest"))->PostWorkaround && request->method != Http::METHOD_GET) {
+             /* Ugly workaround for certain very broken browsers using the
+              * wrong method to calculate the request-digest on POST request.
+              * This should be deleted once Digest authentication becomes more
+@@ -233,7 +233,7 @@ Auth::Digest::UserRequest::addAuthenticationInfoHeader(HttpReply * rep, int acce
+         return;
+ #endif
+ 
+-    if ((static_cast<Auth::Digest::Config*>(Auth::Config::Find("digest"))->authenticateProgram) && authDigestNonceLastRequest(nonce)) {
++    if ((static_cast<Auth::Digest::Config*>(Auth::SchemeConfig::Find("digest"))->authenticateProgram) && authDigestNonceLastRequest(nonce)) {
+         flags.authinfo_sent = true;
+         Auth::Digest::User *digest_user = dynamic_cast<Auth::Digest::User *>(user().getRaw());
+         if (!digest_user)
+@@ -291,14 +291,14 @@ Auth::Digest::UserRequest::startHelperLookup(HttpRequest *request, AccessLogEntr
+     assert(user() != NULL && user()->auth_type == Auth::AUTH_DIGEST);
+     debugs(29, 9, HERE << "'\"" << user()->username() << "\":\"" << realm << "\"'");
+ 
+-    if (static_cast<Auth::Digest::Config*>(Auth::Config::Find("digest"))->authenticateProgram == NULL) {
++    if (static_cast<Auth::Digest::Config*>(Auth::SchemeConfig::Find("digest"))->authenticateProgram == NULL) {
+         debugs(29, DBG_CRITICAL, "ERROR: No Digest authentication program configured.");
+         handler(data);
+         return;
+     }
+ 
+     const char *keyExtras = helperRequestKeyExtras(request, al);
+-    if (static_cast<Auth::Digest::Config*>(Auth::Config::Find("digest"))->utf8) {
++    if (static_cast<Auth::Digest::Config*>(Auth::SchemeConfig::Find("digest"))->utf8) {
+         char userstr[1024];
+         latin1_to_utf8(userstr, sizeof(userstr), user()->username());
+         if (keyExtras)
+@@ -0,0 +1,30 @@
++/*
++ * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_SRC_AUTH_FORWARD_H
++#define SQUID_SRC_AUTH_FORWARD_H
++
++#if USE_AUTH
++
++#include <vector>
++
++/// HTTP Authentication
++namespace Auth
++{
++
++class CredentialsCache;
++
++class Scheme;
++class SchemeConfig;
++typedef std::vector<Auth::SchemeConfig *> ConfigVector;
++
++} // namespace Auth
++
++#endif /* USE_AUTH */
++#endif /* SQUID_SRC_AUTH_FORWARD_H */
++
+@@ -31,21 +31,12 @@
+ #include "Store.h"
+ #include "wordlist.h"
+ 
+-/**
+- \defgroup AuthNegotiateInternal Negotiate Authenticator Internals
+- \ingroup AuthNegotiateAPI
+- */
+-
+-/* Negotiate Scheme */
+ static AUTHSSTATS authenticateNegotiateStats;
+ 
+-/// \ingroup AuthNegotiateInternal
+ statefulhelper *negotiateauthenticators = NULL;
+ 
+-/// \ingroup AuthNegotiateInternal
+ static int authnegotiate_initialised = 0;
+ 
+-/// \ingroup AuthNegotiateInternal
+ static hash_table *proxy_auth_cache = NULL;
+ 
+ void
+@@ -62,7 +53,7 @@ Auth::Negotiate::Config::rotateHelpers()
+ void
+ Auth::Negotiate::Config::done()
+ {
+-    Auth::Config::done();
++    Auth::SchemeConfig::done();
+ 
+     authnegotiate_initialised = 0;
+ 
+@@ -82,35 +73,6 @@ Auth::Negotiate::Config::done()
+     debugs(29, DBG_IMPORTANT, "Reconfigure: Negotiate authentication configuration cleared.");
+ }
+ 
+-bool
+-Auth::Negotiate::Config::dump(StoreEntry * entry, const char *name, Auth::Config * scheme) const
+-{
+-    if (!Auth::Config::dump(entry, name, scheme))
+-        return false;
+-
+-    storeAppendPrintf(entry, "%s negotiate keep_alive %s\n", name, keep_alive ? "on" : "off");
+-    return true;
+-}
+-
+-Auth::Negotiate::Config::Config() : keep_alive(1)
+-{ }
+-
+-void
+-Auth::Negotiate::Config::parse(Auth::Config * scheme, int n_configured, char *param_str)
+-{
+-    if (strcmp(param_str, "program") == 0) {
+-        if (authenticateProgram)
+-            wordlistDestroy(&authenticateProgram);
+-
+-        parse_wordlist(&authenticateProgram);
+-
+-        requirePathnameExists("auth_param negotiate program", authenticateProgram->key);
+-    } else if (strcmp(param_str, "keep_alive") == 0) {
+-        parse_onoff(&keep_alive);
+-    } else
+-        Auth::Config::parse(scheme, n_configured, param_str);
+-}
+-
+ const char *
+ Auth::Negotiate::Config::type() const
+ {
+@@ -122,7 +84,7 @@ Auth::Negotiate::Config::type() const
+  * Called AFTER parsing the config file
+  */
+ void
+-Auth::Negotiate::Config::init(Auth::Config *)
++Auth::Negotiate::Config::init(Auth::SchemeConfig *)
+ {
+     if (authenticateProgram) {
+ 
+@@ -172,8 +134,6 @@ Auth::Negotiate::Config::configured() const
+     return false;
+ }
+ 
+-/* Negotiate Scheme */
+-
+ void
+ Auth::Negotiate::Config::fixHeader(Auth::UserRequest::Pointer auth_user_request, HttpReply *rep, Http::HdrType reqType, HttpRequest * request)
+ {
+@@ -256,7 +216,7 @@ authenticateNegotiateStats(StoreEntry * sentry)
+ Auth::UserRequest::Pointer
+ Auth::Negotiate::Config::decode(char const *proxy_auth, const char *aRequestRealm)
+ {
+-    Auth::Negotiate::User *newUser = new Auth::Negotiate::User(Auth::Config::Find("negotiate"), aRequestRealm);
++    Auth::Negotiate::User *newUser = new Auth::Negotiate::User(Auth::SchemeConfig::Find("negotiate"), aRequestRealm);
+     Auth::UserRequest *auth_user_request = new Auth::Negotiate::UserRequest();
+     assert(auth_user_request->user() == NULL);
+ 
+@@ -11,8 +11,8 @@
+ 
+ #if HAVE_AUTH_MODULE_NEGOTIATE
+ 
+-#include "auth/Config.h"
+ #include "auth/Gadgets.h"
++#include "auth/SchemeConfig.h"
+ #include "auth/UserRequest.h"
+ #include "helper/forward.h"
+ 
+@@ -22,24 +22,18 @@ namespace Negotiate
+ {
+ 
+ /** Negotiate Authentication configuration data */
+-class Config : public Auth::Config
++class Config : public Auth::SchemeConfig
+ {
+ public:
+-    Config();
+     virtual bool active() const;
+     virtual bool configured() const;
+     virtual Auth::UserRequest::Pointer decode(char const *proxy_auth, const char *requestRealm);
+     virtual void done();
+     virtual void rotateHelpers();
+-    virtual bool dump(StoreEntry *, const char *, Auth::Config *) const;
+     virtual void fixHeader(Auth::UserRequest::Pointer, HttpReply *, Http::HdrType, HttpRequest *);
+-    virtual void init(Auth::Config *);
+-    virtual void parse(Auth::Config *, int, char *);
++    virtual void init(Auth::SchemeConfig *);
+     virtual void registerWithCacheManager(void);
+     virtual const char * type() const;
+-
+-public:
+-    int keep_alive;
+ };
+ 
+ } // namespace Negotiate
+@@ -40,10 +40,10 @@ Auth::Negotiate::Scheme::shutdownCleanup()
+     debugs(29, DBG_CRITICAL, "Shutdown: Negotiate authentication.");
+ }
+ 
+-Auth::Config *
++Auth::SchemeConfig *
+ Auth::Negotiate::Scheme::createConfig()
+ {
+     Auth::Negotiate::Config *negotiateCfg = new Auth::Negotiate::Config;
+-    return dynamic_cast<Auth::Config*>(negotiateCfg);
++    return dynamic_cast<Auth::SchemeConfig*>(negotiateCfg);
+ }
+ 
+@@ -18,7 +18,6 @@ namespace Auth
+ namespace Negotiate
+ {
+ 
+-/// \ingroup AuthSchemeAPI
+ /// \ingroup AuthAPI
+ class Scheme : public Auth::Scheme
+ {
+@@ -31,7 +30,7 @@ class Scheme : public Auth::Scheme
+     /* per scheme */
+     virtual char const *type() const;
+     virtual void shutdownCleanup();
+-    virtual Auth::Config *createConfig();
++    virtual Auth::SchemeConfig *createConfig();
+ 
+     /* Not implemented */
+     Scheme (Scheme const &);
+@@ -7,12 +7,12 @@
+  */
+ 
+ #include "squid.h"
+-#include "auth/Config.h"
+ #include "auth/CredentialsCache.h"
+ #include "auth/negotiate/User.h"
++#include "auth/SchemeConfig.h"
+ #include "Debug.h"
+ 
+-Auth::Negotiate::User::User(Auth::Config *aConfig, const char *aRequestRealm) :
++Auth::Negotiate::User::User(Auth::SchemeConfig *aConfig, const char *aRequestRealm) :
+     Auth::User(aConfig, aRequestRealm)
+ {
+ }
+@@ -16,7 +16,7 @@
+ namespace Auth
+ {
+ 
+-class Config;
++class SchemeConfig;
+ 
+ namespace Negotiate
+ {
+@@ -27,7 +27,7 @@ class User : public Auth::User
+     MEMPROXY_CLASS(Auth::Negotiate::User);
+ 
+ public:
+-    User(Auth::Config *, const char *requestRealm);
++    User(Auth::SchemeConfig *, const char *requestRealm);
+     virtual ~User();
+     virtual int32_t ttl() const override;
+ 
+@@ -128,7 +128,7 @@ Auth::Negotiate::UserRequest::startHelperLookup(HttpRequest *, AccessLogEntry::P
+     assert(user() != NULL);
+     assert(user()->auth_type == Auth::AUTH_NEGOTIATE);
+ 
+-    if (static_cast<Auth::Negotiate::Config*>(Auth::Config::Find("negotiate"))->authenticateProgram == NULL) {
++    if (static_cast<Auth::Negotiate::Config*>(Auth::SchemeConfig::Find("negotiate"))->authenticateProgram == NULL) {
+         debugs(29, DBG_CRITICAL, "ERROR: No Negotiate authentication program configured.");
+         handler(data);
+         return;
+@@ -23,7 +23,6 @@ namespace Auth
+ namespace Negotiate
+ {
+ 
+-/// \ingroup AuthNegotiateAPI
+ class UserRequest : public Auth::UserRequest
+ {
+     MEMPROXY_CLASS(Auth::Negotiate::UserRequest);
+@@ -54,7 +54,7 @@ Auth::Ntlm::Config::rotateHelpers()
+ void
+ Auth::Ntlm::Config::done()
+ {
+-    Auth::Config::done();
++    Auth::SchemeConfig::done();
+ 
+     authntlm_initialised = 0;
+ 
+@@ -74,35 +74,6 @@ Auth::Ntlm::Config::done()
+     debugs(29, DBG_IMPORTANT, "Reconfigure: NTLM authentication configuration cleared.");
+ }
+ 
+-bool
+-Auth::Ntlm::Config::dump(StoreEntry * entry, const char *name, Auth::Config * scheme) const
+-{
+-    if (!Auth::Config::dump(entry, name, scheme))
+-        return false;
+-
+-    storeAppendPrintf(entry, "%s ntlm keep_alive %s\n", name, keep_alive ? "on" : "off");
+-    return true;
+-}
+-
+-Auth::Ntlm::Config::Config() : keep_alive(1)
+-{ }
+-
+-void
+-Auth::Ntlm::Config::parse(Auth::Config * scheme, int n_configured, char *param_str)
+-{
+-    if (strcmp(param_str, "program") == 0) {
+-        if (authenticateProgram)
+-            wordlistDestroy(&authenticateProgram);
+-
+-        parse_wordlist(&authenticateProgram);
+-
+-        requirePathnameExists("auth_param ntlm program", authenticateProgram->key);
+-    } else if (strcmp(param_str, "keep_alive") == 0) {
+-        parse_onoff(&keep_alive);
+-    } else
+-        Auth::Config::parse(scheme, n_configured, param_str);
+-}
+-
+ const char *
+ Auth::Ntlm::Config::type() const
+ {
+@@ -112,7 +83,7 @@ Auth::Ntlm::Config::type() const
+ /* Initialize helpers and the like for this auth scheme. Called AFTER parsing the
+  * config file */
+ void
+-Auth::Ntlm::Config::init(Auth::Config *)
++Auth::Ntlm::Config::init(Auth::SchemeConfig *)
+ {
+     if (authenticateProgram) {
+ 
+@@ -236,7 +207,7 @@ authenticateNTLMStats(StoreEntry * sentry)
+ Auth::UserRequest::Pointer
+ Auth::Ntlm::Config::decode(char const *proxy_auth, const char *aRequestRealm)
+ {
+-    Auth::Ntlm::User *newUser = new Auth::Ntlm::User(Auth::Config::Find("ntlm"), aRequestRealm);
++    Auth::Ntlm::User *newUser = new Auth::Ntlm::User(Auth::SchemeConfig::Find("ntlm"), aRequestRealm);
+     Auth::UserRequest::Pointer auth_user_request = new Auth::Ntlm::UserRequest();
+     assert(auth_user_request->user() == NULL);
+ 
+@@ -11,8 +11,8 @@
+ 
+ #if HAVE_AUTH_MODULE_NTLM
+ 
+-#include "auth/Config.h"
+ #include "auth/Gadgets.h"
++#include "auth/SchemeConfig.h"
+ #include "auth/UserRequest.h"
+ #include "helper/forward.h"
+ 
+@@ -25,24 +25,18 @@ namespace Ntlm
+ {
+ 
+ /** NTLM Authentication configuration data */
+-class Config : public Auth::Config
++class Config : public Auth::SchemeConfig
+ {
+ public:
+-    Config();
+     virtual bool active() const;
+     virtual bool configured() const;
+     virtual Auth::UserRequest::Pointer decode(char const *proxy_auth, const char *requestRealm);
+     virtual void done();
+     virtual void rotateHelpers();
+-    virtual bool dump(StoreEntry *, const char *, Auth::Config *) const;
+     virtual void fixHeader(Auth::UserRequest::Pointer, HttpReply *, Http::HdrType, HttpRequest *);
+-    virtual void init(Auth::Config *);
+-    virtual void parse(Auth::Config *, int, char *);
++    virtual void init(Auth::SchemeConfig *);
+     virtual void registerWithCacheManager(void);
+     virtual const char * type() const;
+-
+-public:
+-    int keep_alive;
+ };
+ 
+ } // namespace Ntlm
+@@ -40,10 +40,10 @@ Auth::Ntlm::Scheme::shutdownCleanup()
+     debugs(29, DBG_CRITICAL, "Shutdown: NTLM authentication.");
+ }
+ 
+-Auth::Config *
++Auth::SchemeConfig *
+ Auth::Ntlm::Scheme::createConfig()
+ {
+     Auth::Ntlm::Config *ntlmCfg = new Auth::Ntlm::Config;
+-    return dynamic_cast<Auth::Config*>(ntlmCfg);
++    return dynamic_cast<Auth::SchemeConfig*>(ntlmCfg);
+ }
+ 
+@@ -18,7 +18,6 @@ namespace Auth
+ namespace Ntlm
+ {
+ 
+-/// \ingroup AuthSchemeAPI
+ /// \ingroup AuthAPI
+ class Scheme : public Auth::Scheme
+ {
+@@ -31,7 +30,7 @@ class Scheme : public Auth::Scheme
+     /* per scheme */
+     virtual char const *type() const;
+     virtual void shutdownCleanup();
+-    virtual Auth::Config *createConfig();
++    virtual Auth::SchemeConfig *createConfig();
+ 
+     /* Not implemented */
+     Scheme (Scheme const &);
+@@ -7,12 +7,12 @@
+  */
+ 
+ #include "squid.h"
+-#include "auth/Config.h"
+ #include "auth/CredentialsCache.h"
+ #include "auth/ntlm/User.h"
++#include "auth/SchemeConfig.h"
+ #include "Debug.h"
+ 
+-Auth::Ntlm::User::User(Auth::Config *aConfig, const char *aRequestRealm) :
++Auth::Ntlm::User::User(Auth::SchemeConfig *aConfig, const char *aRequestRealm) :
+     Auth::User(aConfig, aRequestRealm)
+ {
+ }
+@@ -16,8 +16,6 @@
+ namespace Auth
+ {
+ 
+-class Config;
+-
+ namespace Ntlm
+ {
+ 
+@@ -27,7 +25,7 @@ class User : public Auth::User
+     MEMPROXY_CLASS(Auth::Ntlm::User);
+ 
+ public:
+-    User(Auth::Config *, const char *requestRealm);
++    User(Auth::SchemeConfig *, const char *requestRealm);
+     virtual ~User();
+     virtual int32_t ttl() const override;
+ 
+@@ -124,7 +124,7 @@ Auth::Ntlm::UserRequest::startHelperLookup(HttpRequest *, AccessLogEntry::Pointe
+     assert(data);
+     assert(handler);
+ 
+-    if (static_cast<Auth::Ntlm::Config*>(Auth::Config::Find("ntlm"))->authenticateProgram == NULL) {
++    if (static_cast<Auth::Ntlm::Config*>(Auth::SchemeConfig::Find("ntlm"))->authenticateProgram == NULL) {
+         debugs(29, DBG_CRITICAL, "ERROR: NTLM Start: no NTLM program configured.");
+         handler(data);
+         return;
+@@ -18,6 +18,8 @@
+ #include "acl/Tree.h"
+ #include "anyp/PortCfg.h"
+ #include "anyp/UriScheme.h"
++#include "auth/Config.h"
++#include "auth/Scheme.h"
+ #include "AuthReg.h"
+ #include "base/RunnersRegistry.h"
+ #include "cache_cf.h"
+@@ -77,11 +79,6 @@
+ #include "ssl/Config.h"
+ #include "ssl/support.h"
+ #endif
+-#if USE_AUTH
+-#include "auth/Config.h"
+-#include "auth/Scheme.h"
+-#include "auth/SchemesConfig.h"
+-#endif
+ #if USE_SQUID_ESI
+ #include "esi/Parser.h"
+ #endif
+@@ -938,15 +935,15 @@ configDoConfigure(void)
+      * state will be preserved.
+      */
+     if (Config.pipeline_max_prefetch > 0) {
+-        Auth::Config *nego = Auth::Config::Find("Negotiate");
+-        Auth::Config *ntlm = Auth::Config::Find("NTLM");
++        Auth::SchemeConfig *nego = Auth::SchemeConfig::Find("Negotiate");
++        Auth::SchemeConfig *ntlm = Auth::SchemeConfig::Find("NTLM");
+         if ((nego && nego->active()) || (ntlm && ntlm->active())) {
+             debugs(3, DBG_PARSE_NOTE(DBG_IMPORTANT), "WARNING: pipeline_prefetch breaks NTLM and Negotiate authentication. Forced pipeline_prefetch 0.");
+             Config.pipeline_max_prefetch = 0;
          }
      }
  
-----++++GitHub
+-    for (auto &authSchemes: Config.authSchemesConfigs) {
++    for (auto &authSchemes : Auth::TheConfig.schemeLists) {
+         authSchemes.expand();
+         if (authSchemes.authConfigs.empty()) {
+             debugs(3, DBG_CRITICAL, "auth_schemes: at least one scheme name is required; got: " << authSchemes.rawSchemes);
+@@ -1792,7 +1789,7 @@ parse_authparam(Auth::ConfigVector * config)
+     }
+ 
+     /* find a configuration for the scheme in the currently parsed configs... */
+-    Auth::Config *schemeCfg = Auth::Config::Find(type_str);
++    Auth::SchemeConfig *schemeCfg = Auth::SchemeConfig::Find(type_str);
+ 
+     if (schemeCfg == NULL) {
+         /* Create a configuration based on the scheme info */
+@@ -1805,7 +1802,7 @@ parse_authparam(Auth::ConfigVector * config)
+         }
+ 
+         config->push_back(theScheme->createConfig());
+-        schemeCfg = Auth::Config::Find(type_str);
++        schemeCfg = Auth::SchemeConfig::Find(type_str);
+         if (schemeCfg == NULL) {
+             debugs(3, DBG_CRITICAL, "Parsing Config File: Corruption configuring authentication scheme '" << type_str << "'.");
+             self_destruct();
+@@ -1831,8 +1828,8 @@ free_authparam(Auth::ConfigVector * cfg)
+ static void
+ dump_authparam(StoreEntry * entry, const char *name, Auth::ConfigVector cfg)
+ {
+-    for (Auth::ConfigVector::iterator  i = cfg.begin(); i != cfg.end(); ++i)
+-        (*i)->dump(entry, name, (*i));
++    for (auto *scheme : cfg)
++        scheme->dump(entry, name, scheme);
+ }
+ 
+ static void
+@@ -1844,15 +1841,15 @@ parse_AuthSchemes(acl_access **authSchemes)
+         self_destruct();
+         return;
+     }
+-    Config.authSchemesConfigs.push_back(Auth::SchemesConfig(tok, ConfigParser::LastTokenWasQuoted()));
+-    const allow_t action = allow_t(ACCESS_ALLOWED, Config.authSchemesConfigs.size() - 1);
++    Auth::TheConfig.schemeLists.emplace_back(tok, ConfigParser::LastTokenWasQuoted());
++    const allow_t action = allow_t(ACCESS_ALLOWED, Auth::TheConfig.schemeLists.size() - 1);
+     ParseAclWithAction(authSchemes, action, "auth_schemes");
+ }
+ 
+ static void
+ free_AuthSchemes(acl_access **authSchemes)
+ {
+-    Config.authSchemesConfigs.clear();
++    Auth::TheConfig.schemeLists.clear();
+     free_acl_access(authSchemes);
+ }
+ 
+@@ -1861,7 +1858,7 @@ dump_AuthSchemes(StoreEntry *entry, const char *name, acl_access *authSchemes)
+ {
+     if (authSchemes)
+         dump_SBufList(entry, authSchemes->treeDump(name, [](const allow_t &action) {
+-        return Config.authSchemesConfigs.at(action.kind).rawSchemes;
++        return Auth::TheConfig.schemeLists.at(action.kind).rawSchemes;
+     }));
+ }
+ 
+@@ -16,7 +16,7 @@ acl_tos			acl
+ acl_nfmark		acl
+ address
+ authparam
+-AuthSchemes
++AuthSchemes		acl auth_param
+ b_int64_t
+ b_size_t
+ b_ssize_t
+@@ -481,7 +481,7 @@ COMMENT_END
+ NAME: auth_param
+ TYPE: authparam
+ IFDEF: USE_AUTH
+-LOC: Auth::TheConfig
++LOC: Auth::TheConfig.schemes
+ DEFAULT: none
+ DOC_START
+ 	This is used to define parameters for the various authentication
+@@ -617,16 +617,26 @@ DOC_START
+ 		NOTE: NTLM and Negotiate schemes do not support concurrency
+ 			in the Squid code module even though some helpers can.
+ 
++	"keep_alive" on|off
++		If you experience problems with PUT/POST requests when using
++		the NTLM or Negotiate schemes then you can try setting this
++		to off. This will cause Squid to forcibly close the connection
++		on the initial request where the browser asks which schemes
++		are supported by the proxy.
+ 
+-IF HAVE_AUTH_MODULE_BASIC
+-	=== Basic authentication parameters ===
++		For Basic and Digest this parameter is ignored.
+ 
+ 	"utf8" on|off
+ 		HTTP uses iso-latin-1 as character set, while some
+ 		authentication backends such as LDAP expects UTF-8. If this is
+ 		set to on Squid will translate the HTTP iso-latin-1 charset to
+ 		UTF-8 before sending the username and password to the helper.
+ 
++		For NTLM and Negotiate this parameter is ignored.
++
++IF HAVE_AUTH_MODULE_BASIC
++	=== Basic authentication parameters ===
++
+ 	"credentialsttl" timetolive
+ 		Specifies how long squid assumes an externally validated
+ 		username:password pair is valid for - in other words how
+@@ -650,12 +660,6 @@ ENDIF
+ IF HAVE_AUTH_MODULE_DIGEST
+ 	=== Digest authentication parameters ===
+ 
+-	"utf8" on|off
+-		HTTP uses iso-latin-1 as character set, while some
+-		authentication backends such as LDAP expects UTF-8. If this is
+-		set to on Squid will translate the HTTP iso-latin-1 charset to
+-		UTF-8 before sending the username and password to the helper.
+-
+ 	"nonce_garbage_interval" timeinterval
+ 		Specifies the interval that nonces that have been issued
+ 		to client_agent's are checked for validity.
+@@ -685,27 +689,6 @@ IF HAVE_AUTH_MODULE_DIGEST
+ 		incorrect request digest in POST requests when reusing the
+ 		same nonce as acquired earlier on a GET request.
+ 
+-ENDIF
+-IF HAVE_AUTH_MODULE_NEGOTIATE
+-	=== Negotiate authentication parameters ===
+-
+-	"keep_alive" on|off
+-		If you experience problems with PUT/POST requests when using
+-		the this authentication scheme then you can try setting this
+-		to off. This will cause Squid to forcibly close the connection
+-		on the initial request where the browser asks which schemes
+-		are supported by the proxy.
+-
+-ENDIF
+-IF HAVE_AUTH_MODULE_NTLM
+-	=== NTLM authentication parameters ===
+-
+-	"keep_alive" on|off
+-		If you experience problems with PUT/POST requests when using
+-		the this authentication scheme then you can try setting this
+-		to off. This will cause Squid to forcibly close the connection
+-		on the initial request where the browser asks which schemes
+-		are supported by the proxy.
+ ENDIF
+ 
+ 	=== Example Configuration ===
+@@ -716,7 +699,6 @@ ENDIF
+ 
+ #auth_param negotiate program <uncomment and complete this line to activate>
+ #auth_param negotiate children 20 startup=0 idle=1
+-#auth_param negotiate keep_alive on
+ #
+ #auth_param digest program <uncomment and complete this line to activate>
+ #auth_param digest children 20 startup=0 idle=1
+@@ -727,18 +709,17 @@ ENDIF
+ #
+ #auth_param ntlm program <uncomment and complete this line to activate>
+ #auth_param ntlm children 20 startup=0 idle=1
+-#auth_param ntlm keep_alive on
+ #
+ #auth_param basic program <uncomment and complete this line>
+ #auth_param basic children 5 startup=5 idle=1
+-#auth_param basic realm Squid proxy-caching web server
+ #auth_param basic credentialsttl 2 hours
+ DOC_END
+ 
+ NAME: authenticate_cache_garbage_interval
++IFDEF: USE_AUTH
+ TYPE: time_t
+ DEFAULT: 1 hour
+-LOC: Config.authenticateGCInterval
++LOC: Auth::TheConfig.garbageCollectInterval
+ DOC_START
+ 	The time period between garbage collection across the username cache.
+ 	This is a trade-off between memory utilization (long intervals - say
+@@ -747,9 +728,10 @@ DOC_START
+ DOC_END
+ 
+ NAME: authenticate_ttl
++IFDEF: USE_AUTH
+ TYPE: time_t
+ DEFAULT: 1 hour
+-LOC: Config.authenticateTTL
++LOC: Auth::TheConfig.credentialsTtl
+ DOC_START
+ 	The time a user & their credentials stay in the logged in
+ 	user cache since their last request. When the garbage
+@@ -758,8 +740,9 @@ DOC_START
+ DOC_END
+ 
+ NAME: authenticate_ip_ttl
++IFDEF: USE_AUTH
+ TYPE: time_t
+-LOC: Config.authenticateIpTTL
++LOC: Auth::TheConfig.ipTtl
+ DEFAULT: 1 second
+ DOC_START
+ 	If you use proxy authentication and the 'max_user_ip' ACL,
+@@ -771,51 +754,6 @@ DOC_START
+ 	environment with relatively static address assignments.
+ DOC_END
+ 
+-NAME: auth_schemes
+-TYPE: AuthSchemes
+-IFDEF: USE_AUTH
+-LOC: Config.accessList.authSchemes
+-DEFAULT: none
+-DEFAULT_DOC: use all auth_param schemes in their configuration order
+-DOC_START
+-	Use this directive to customize authentication schemes presence and
+-	order in Squid's Unauthorized and Authentication Required responses.
+-
+-		auth_schemes scheme1,scheme2,... [!]aclname ...
+-
+-	where schemeN is the name of one of the authentication schemes
+-	configured using auth_param directives. At least one scheme name is
+-	required. Multiple scheme names are separated by commas. Either
+-	avoid whitespace or quote the entire schemes list.
+-
+-	A special "ALL" scheme name expands to all auth_param-configured
+-	schemes in their configuration order. This directive cannot be used
+-	to configure Squid to offer no authentication schemes at all.
+-
+-	The first matching auth_schemes rule determines the schemes order
+-	for the current Authentication Required transaction. Note that the
+-	future response is not yet available during auth_schemes evaluation.
+-
+-	If this directive is not used or none of its rules match, then Squid
+-	responds with all configured authentication schemes in the order of
+-	auth_param directives in the configuration file.
+-
+-	This directive does not determine when authentication is used or
+-	how each authentication scheme authenticates clients.
+-
+-	The following example sends basic and negotiate authentication
+-	schemes, in that order, when requesting authentication of HTTP
+-	requests matching the isIE ACL (not shown) while sending all
+-	auth_param schemes in their configuration order to other clients:
+-
+-		auth_schemes basic,negotiate isIE
+-		auth_schemes ALL all # explicit default
+-
+-	This directive supports fast ACLs only.
+-
+-	See also: auth_param.
+-DOC_END
+-
+ COMMENT_START
+  ACCESS CONTROLS
+  -----------------------------------------------------------------------------
+@@ -1931,6 +1869,51 @@ DOC_START
+ 	See also: squid_error ACL
+ DOC_END
+ 
++NAME: auth_schemes
++TYPE: AuthSchemes
++IFDEF: USE_AUTH
++LOC: Auth::TheConfig.schemeAccess
++DEFAULT: none
++DEFAULT_DOC: use all auth_param schemes in their configuration order
++DOC_START
++	Use this directive to customize authentication schemes presence and
++	order in Squid's Unauthorized and Authentication Required responses.
++
++		auth_schemes scheme1,scheme2,... [!]aclname ...
++
++	where schemeN is the name of one of the authentication schemes
++	configured using auth_param directives. At least one scheme name is
++	required. Multiple scheme names are separated by commas. Either
++	avoid whitespace or quote the entire schemes list.
++
++	A special "ALL" scheme name expands to all auth_param-configured
++	schemes in their configuration order. This directive cannot be used
++	to configure Squid to offer no authentication schemes at all.
++
++	The first matching auth_schemes rule determines the schemes order
++	for the current Authentication Required transaction. Note that the
++	future response is not yet available during auth_schemes evaluation.
++
++	If this directive is not used or none of its rules match, then Squid
++	responds with all configured authentication schemes in the order of
++	auth_param directives in the configuration file.
++
++	This directive does not determine when authentication is used or
++	how each authentication scheme authenticates clients.
++
++	The following example sends basic and negotiate authentication
++	schemes, in that order, when requesting authentication of HTTP
++	requests matching the isIE ACL (not shown) while sending all
++	auth_param schemes in their configuration order to other clients:
++
++		auth_schemes basic,negotiate isIE
++		auth_schemes ALL all # explicit default
++
++	This directive supports fast ACLs only.
++
++	See also: auth_param.
++DOC_END
++
+ COMMENT_START
+  NETWORK OPTIONS
+  -----------------------------------------------------------------------------
+@@ -12,6 +12,8 @@
+ #include "AccessLogEntry.h"
+ #include "acl/Acl.h"
+ #include "acl/Asn.h"
++#include "auth/Config.h"
++#include "auth/Gadgets.h"
+ #include "AuthReg.h"
+ #include "base/RunnersRegistry.h"
+ #include "base/Subscription.h"
+@@ -87,9 +89,6 @@
+ #include "adaptation/icap/Config.h"
+ #include "adaptation/icap/icap_log.h"
+ #endif
+-#if USE_AUTH
+-#include "auth/Gadgets.h"
+-#endif
+ #if USE_DELAY_POOLS
+ #include "ClientDelayConfig.h"
+ #endif
+@@ -964,7 +963,7 @@ mainReconfigureFinish(void *)
+ 
+     redirectInit();
+ #if USE_AUTH
+-    authenticateInit(&Auth::TheConfig);
++    authenticateInit(&Auth::TheConfig.schemes);
+ #endif
+     externalAclInit();
+ 
+@@ -1031,7 +1030,7 @@ mainRotate(void)
+     icmpEngine.Open();
+     redirectInit();
+ #if USE_AUTH
+-    authenticateInit(&Auth::TheConfig);
++    authenticateInit(&Auth::TheConfig.schemes);
+ #endif
+     externalAclInit();
+ }
+@@ -1175,7 +1174,7 @@ mainInitialize(void)
+ 
+     redirectInit();
+ #if USE_AUTH
+-    authenticateInit(&Auth::TheConfig);
++    authenticateInit(&Auth::TheConfig.schemes);
+ #endif
+     externalAclInit();
+ 
+@@ -12,11 +12,14 @@
+ #include "STUB.h"
+ 
+ #if USE_AUTH
+-#include "auth/Config.h"
+-Auth::UserRequest::Pointer Auth::Config::CreateAuthUser(const char *, AccessLogEntry::Pointer &al) STUB_RETVAL(NULL)
+-Auth::Config * Auth::Config::Find(const char *) STUB_RETVAL(NULL)
+-void Auth::Config::registerWithCacheManager(void) STUB_NOP
+-Auth::ConfigVector Auth::TheConfig;
++#include "auth/SchemeConfig.h"
++namespace Auth
++{
++Auth::UserRequest::Pointer SchemeConfig::CreateAuthUser(const char *, AccessLogEntry::Pointer &al) STUB_RETVAL(NULL)
++Auth::SchemeConfig * SchemeConfig::Find(const char *) STUB_RETVAL(NULL)
++void SchemeConfig::registerWithCacheManager(void) STUB_NOP
++Auth::ConfigVector TheConfig;
++}
+ 
+ #include "auth/Gadgets.h"
+ int authenticateActiveSchemeCount(void) STUB_RETVAL(0)
+@@ -33,8 +36,11 @@ Auth::Scheme::Pointer Auth::Scheme::Find(const char *) STUB_RETVAL(NULL)
+ std::vector<Auth::Scheme::Pointer> & Auth::Scheme::GetSchemes() STUB_RETVAL(*_Schemes);
+ void Auth::Scheme::FreeAll() STUB
+ 
++#include "auth/SchemesConfig.h"
++void Auth::SchemesConfig::expand() STUB
++
+ #include "auth/User.h"
+-Auth::User::User(Auth::Config *, const char *) STUB
++Auth::User::User(Auth::SchemeConfig *, const char *) STUB
+ Auth::CredentialState Auth::User::credentials() const STUB_RETVAL(credentials_state)
+ void Auth::User::credentials(CredentialState) STUB
+ void Auth::User::absorb(Auth::User::Pointer) STUB
+@@ -74,8 +80,5 @@ Auth::Scheme::Pointer Auth::UserRequest::scheme() const STUB_RETVAL(NULL)
+ #include "AuthReg.h"
+ void Auth::Init() STUB_NOP
+ 
+-#include "auth/SchemesConfig.h"
+-void Auth::SchemesConfig::expand() STUB
+-
+ #endif /* USE_AUTH */
+ 
+@@ -12,7 +12,6 @@
+ 
+ #include "auth/Config.h"
+ #include "auth/Gadgets.h"
+-#include "auth/Scheme.h"
+ #include "auth/UserRequest.h"
+ #include "ConfigParser.h"
+ #include "testAuth.h"

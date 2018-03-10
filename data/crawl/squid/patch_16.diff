@@ -1,64 +1,386 @@
-----++++src/auth/digest/LDAP/ldap_backend.cc
-@@ -63,6 +63,7 @@ static const char *usersearchfilter = NULL;
- static const char *binddn = NULL;
- static const char *bindpasswd = NULL;
- static const char *delimiter = &quot;:&quot;;
-+static const char *frealm = &quot;&quot;;
- static int encrpass = 0;
- static int searchscope = LDAP_SCOPE_SUBTREE;
- static int persistent = 0;
-@@ -267,7 +268,7 @@ getpassword(char *login, char *realm)
-             }
-             value = values;
-             while (*value) {
--                if (encrpass) {
-+                if (encrpass &amp;&amp; *delimiter ) {
-                     const char *t = strtok(*value, delimiter);
-                     if (t &amp;&amp; strcmp(t, realm) == 0) {
-                         password = strtok(NULL, delimiter);
-@@ -451,6 +452,9 @@ LDAPArguments(int argc, char **argv)
-         case &#39;l&#39;:
-             delimiter = value;
-             break;
-+        case &#39;r&#39;:
-+            frealm = value;
-+            break;
-         case &#39;b&#39;:
-             userbasedn = value;
-             break;
-@@ -574,10 +578,11 @@ LDAPArguments(int argc, char **argv)
-     if (!ldapServer)
-         ldapServer = (char *) &quot;localhost&quot;;
+@@ -171,7 +171,7 @@ class CachePeer
+     } sourcehash;
  
--    if (!userbasedn || !passattr) {
--        fprintf(stderr, "Usage: " PROGRAM_NAME " -b basedn -f filter [options] ldap_server_name\n\n");
-+    if (!userbasedn || !passattr || (!*delimiter &amp;&amp; !*frealm)) {
-+        fprintf(stderr, "Usage: " PROGRAM_NAME " -b basedn -F filter [options] ldap_server_name\n\n");
-         fprintf(stderr, &quot;\t-A password attribute(REQUIRED)\t\tUser attribute that contains the password\n&quot;);
--        fprintf(stderr, &quot;\t-l password realm delimiter(REQUIRED)\tCharater(s) that devides the password attribute\n\t\t\t\t\t\tin realm and password tokens, default &#39;:&#39; realm:password\n&quot;);
-+        fprintf(stderr, &quot;\t-l password realm delimiter(REQUIRED)\tCharacter(s) that divides the password attribute\n\t\t\t\t\t\tin realm and password tokens, default &#39;:&#39; realm:password, could be\n\t\t\t\t\t\tempty string if the password is alone in the password attribute\n&quot;);
-+        fprintf(stderr, &quot;\t-r filtered realm\t\t\tonly honor Squid requests for this realm. Mandatory if the password is alone in\n\t\t\t\t\t\tthe password attribute, acting as the implicit realm\n&quot;);
-         fprintf(stderr, &quot;\t-b basedn (REQUIRED)\t\t\tbase dn under where to search for users\n&quot;);
-         fprintf(stderr, &quot;\t-e Encrypted passwords(REQUIRED)\tPassword are stored encrypted using HHA1\n&quot;);
-         fprintf(stderr, &quot;\t-F filter\t\t\t\tuser search filter pattern. %%s = login\n&quot;);
-@@ -644,9 +649,17 @@ readSecret(const char *filename)
+     char *login = nullptr;        /* Proxy authorization */
+-    time_t connect_timeout = 0;
++    time_t connect_timeout_raw; ///< connect_timeout; use peerConnectTimeout() instead!
+     int connect_fail_limit = 0;
+     int max_conn = 0;
+ 
+@@ -388,6 +388,29 @@ FwdState::fwdStart(const Comm::ConnectionPointer &clientConn, StoreEntry *entry,
+     Start(clientConn, entry, request, NULL);
+ }
+ 
++/// subtracts time_t values, returning zero if smaller exceeds the larger value
++/// time_t might be unsigned so we need to be careful when subtracting times...
++static inline time_t
++diffOrZero(const time_t larger, const time_t smaller)
++{
++    return (larger > smaller) ? (larger - smaller) : 0;
++}
++
++/// time left to finish the whole forwarding process (which started at fwdStart)
++time_t
++FwdState::ForwardTimeout(const time_t fwdStart)
++{
++    // time already spent on forwarding (0 if clock went backwards)
++    const time_t timeSpent = diffOrZero(squid_curtime, fwdStart);
++    return diffOrZero(Config.Timeout.forward, timeSpent);
++}
++
++bool
++FwdState::EnoughTimeToReForward(const time_t fwdStart)
++{
++    return ForwardTimeout(fwdStart) > 0;
++}
++
  void
- LDAPHHA1(RequestData * requestData)
+ FwdState::startConnectionOrFail()
  {
--    char *password;
-+    char *password = NULL;
-     ldapconnect();
--    password = getpassword(requestData-&gt;user, requestData-&gt;realm);
+@@ -565,7 +588,7 @@ FwdState::checkRetry()
+     if (n_tries > Config.forward_max_tries)
+         return false;
+ 
+-    if (squid_curtime - start_t > Config.Timeout.forward)
++    if (!EnoughTimeToReForward(start_t))
+         return false;
+ 
+     if (flags.dont_retry)
+@@ -693,7 +716,8 @@ FwdState::connectDone(const Comm::ConnectionPointer &conn, Comm::Flag status, in
+                                                     "FwdState::ConnectedToPeer",
+                                                     FwdStatePeerAnswerDialer(&FwdState::connectedToPeer, this));
+             // Use positive timeout when less than one second is left.
+-            const time_t sslNegotiationTimeout = max(static_cast<time_t>(1), timeLeft());
++            const time_t connTimeout = serverDestinations[0]->connectTimeout(start_t);
++            const time_t sslNegotiationTimeout = positiveTimeout(connTimeout);
+             Security::PeerConnector *connector = nullptr;
+ #if USE_OPENSSL
+             if (request->flags.sslPeek)
+@@ -766,29 +790,6 @@ FwdState::connectTimeout(int fd)
+     }
+ }
+ 
+-time_t
+-FwdState::timeLeft() const
+-{
+-    /* connection timeout */
+-    int ctimeout;
+-    if (serverDestinations[0]->getPeer()) {
+-        ctimeout = serverDestinations[0]->getPeer()->connect_timeout > 0 ?
+-                   serverDestinations[0]->getPeer()->connect_timeout : Config.Timeout.peer_connect;
+-    } else {
+-        ctimeout = Config.Timeout.connect;
+-    }
+-
+-    /* calculate total forwarding timeout ??? */
+-    int ftimeout = Config.Timeout.forward - (squid_curtime - start_t);
+-    if (ftimeout < 0)
+-        ftimeout = 5;
+-
+-    if (ftimeout < ctimeout)
+-        return (time_t)ftimeout;
+-    else
+-        return (time_t)ctimeout;
+-}
+-
+ /// called when serverConn is set to an _open_ to-peer connection
+ void
+ FwdState::syncWithServerConn(const char *host)
+@@ -914,7 +915,8 @@ FwdState::connectStart()
+     GetMarkingsToServer(request, *serverDestinations[0]);
+ 
+     calls.connector = commCbCall(17,3, "fwdConnectDoneWrapper", CommConnectCbPtrFun(fwdConnectDoneWrapper, this));
+-    Comm::ConnOpener *cs = new Comm::ConnOpener(serverDestinations[0], calls.connector, timeLeft());
++    const time_t connTimeout = serverDestinations[0]->connectTimeout(start_t);
++    Comm::ConnOpener *cs = new Comm::ConnOpener(serverDestinations[0], calls.connector, connTimeout);
+     if (host)
+         cs->setHost(host);
+     AsyncJob::Start(cs);
+@@ -68,6 +68,11 @@ class FwdState : public RefCountable
+     static void Start(const Comm::ConnectionPointer &client, StoreEntry *, HttpRequest *, const AccessLogEntryPointer &alp);
+     /// Same as Start() but no master xaction info (AccessLogEntry) available.
+     static void fwdStart(const Comm::ConnectionPointer &client, StoreEntry *, HttpRequest *);
++    /// time left to finish the whole forwarding process (which started at fwdStart)
++    static time_t ForwardTimeout(const time_t fwdStart);
++    /// Whether there is still time to re-try after a previous connection failure.
++    /// \param fwdStart The start time of the peer selection/connection process.
++    static bool EnoughTimeToReForward(const time_t fwdStart);
+ 
+     /// This is the real beginning of server connection. Call it whenever
+     /// the forwarding server destination has changed and a new one needs to be opened.
+@@ -85,7 +90,6 @@ class FwdState : public RefCountable
+     void connectStart();
+     void connectDone(const Comm::ConnectionPointer & conn, Comm::Flag status, int xerrno);
+     void connectTimeout(int fd);
+-    time_t timeLeft() const; ///< the time left before the forwarding timeout expired
+     bool checkRetry();
+     bool checkRetriable();
+     void dispatch();
+@@ -118,11 +118,10 @@ PeerPoolMgr::handleOpenedConnection(const CommConnectCbParams &params)
+         securer = asyncCall(48, 4, "PeerPoolMgr::handleSecuredPeer",
+                             MyAnswerDialer(this, &PeerPoolMgr::handleSecuredPeer));
+ 
+-        const int peerTimeout = peer->connect_timeout > 0 ?
+-                                peer->connect_timeout : Config.Timeout.peer_connect;
++        const int peerTimeout = peerConnectTimeout(peer);
+         const int timeUsed = squid_curtime - params.conn->startTime();
+         // Use positive timeout when less than one second is left for conn.
+-        const int timeLeft = max(1, (peerTimeout - timeUsed));
++        const int timeLeft = positiveTimeout(peerTimeout - timeUsed);
+         auto *connector = new Security::BlindPeerConnector(request, params.conn, securer, nullptr, timeLeft);
+         AsyncJob::Start(connector); // will call our callback
+         return;
+@@ -224,8 +223,7 @@ PeerPoolMgr::openNewConnection()
+     getOutgoingAddress(request.getRaw(), conn);
+     GetMarkingsToServer(request.getRaw(), *conn);
+ 
+-    const int ctimeout = peer->connect_timeout > 0 ?
+-                         peer->connect_timeout : Config.Timeout.peer_connect;
++    const int ctimeout = peerConnectTimeout(peer);
+     typedef CommCbMemFunT<PeerPoolMgr, CommConnectCbParams> Dialer;
+     opener = JobCallback(48, 5, Dialer, this, PeerPoolMgr::handleOpenedConnection);
+     Comm::ConnOpener *cs = new Comm::ConnOpener(conn, opener, ctimeout);
+@@ -2270,7 +2270,7 @@ parse_peer(CachePeer ** head)
+         } else if (!strcmp(token, "auth-no-keytab")) {
+             p->options.auth_no_keytab = 1;
+         } else if (!strncmp(token, "connect-timeout=", 16)) {
+-            p->connect_timeout = xatoi(token + 16);
++            p->connect_timeout_raw = xatoi(token + 16);
+         } else if (!strncmp(token, "connect-fail-limit=", 19)) {
+             p->connect_fail_limit = xatoi(token + 19);
+ #if USE_CACHE_DIGESTS
+@@ -39,7 +39,9 @@ Comm::ConnOpener::ConnOpener(Comm::ConnectionPointer &c, AsyncCall::Pointer &han
+     totalTries_(0),
+     failRetries_(0),
+     deadline_(squid_curtime + static_cast<time_t>(ctimeout))
+-{}
++{
++    debugs(5, 3, "will connect to " << c << " with " << ctimeout << " timeout");
++}
+ 
+ Comm::ConnOpener::~ConnOpener()
+ {
+@@ -12,6 +12,7 @@
+ #include "comm.h"
+ #include "comm/Connection.h"
+ #include "fde.h"
++#include "FwdState.h"
+ #include "neighbors.h"
+ #include "security/NegotiationHistory.h"
+ #include "SquidConfig.h"
+@@ -131,3 +132,23 @@ Comm::Connection::tlsNegotiations()
+     return tlsHistory;
+ }
+ 
++time_t
++Comm::Connection::connectTimeout(const time_t fwdStart) const
++{
++    // a connection opening timeout (ignoring forwarding time limits for now)
++    const CachePeer *peer = getPeer();
++    const time_t ctimeout = peer ? peerConnectTimeout(peer) : Config.Timeout.connect;
 +
-+    // use the -l delimiter to find realm, or
-+    // only honor the -r specified realm
-+    const bool lookup = (!*frealm &amp;&amp; *delimiter) ||
-+                        (*frealm &amp;&amp; strcmp(requestData-&gt;realm, frealm) != 0);
++    // time we have left to finish the whole forwarding process
++    const time_t fwdTimeLeft = FwdState::ForwardTimeout(fwdStart);
 +
-+    if (lookup)
-+        password = getpassword(requestData-&gt;user, requestData-&gt;realm);
++    // The caller decided to connect. If there is no time left, to protect
++    // connecting code from trying to establish a connection while a zero (i.e.,
++    // "immediate") timeout notification is firing, ensure a positive timeout.
++    // XXX: This hack gives some timed-out forwarding sequences more time than
++    // some sequences that have not quite reached the forwarding timeout yet!
++    const time_t ftimeout = fwdTimeLeft ? fwdTimeLeft : 5; // seconds
 +
-     if (password != NULL) {
-         if (encrpass)
-             xstrncpy(requestData-&gt;HHA1, password, sizeof(requestData-&gt;HHA1));
-----++++GitHub
++    return min(ctimeout, ftimeout);
++}
++
+@@ -111,6 +111,13 @@ class Connection : public RefCountable
+     /** The time left for this connection*/
+     time_t timeLeft(const time_t idleTimeout) const;
+ 
++    /// Connection establishment timeout for callers that have already decided
++    /// to connect(2), either for the first time or after checking
++    /// EnoughTimeToReForward() during any re-forwarding attempts.
++    /// \returns the time left for this connection to become connected
++    /// \param fwdStart The start time of the peer selection/connection process.
++    time_t connectTimeout(const time_t fwdStart) const;
++
+     void noteStart() {startTime_ = squid_curtime;}
+ 
+     Security::NegotiationHistory *tlsNegotiations();
+@@ -1161,6 +1161,20 @@ peerNoteDigestGone(CachePeer * p)
+ #endif
+ }
+ 
++/// \returns the effective connect timeout for this peer
++time_t
++peerConnectTimeout(const CachePeer *peer)
++{
++    return peer->connect_timeout_raw > 0 ?
++           peer->connect_timeout_raw : Config.Timeout.peer_connect;
++}
++
++time_t
++positiveTimeout(const time_t timeout)
++{
++    return max(static_cast<time_t>(1), timeout);
++}
++
+ static void
+ peerDNSConfigure(const ipcache_addrs *ia, const Dns::LookupDetails &, void *data)
+ {
+@@ -1281,7 +1295,7 @@ peerConnectSucceded(CachePeer * p)
+ static bool
+ peerProbeConnect(CachePeer * p)
+ {
+-    time_t ctimeout = p->connect_timeout > 0 ? p->connect_timeout : Config.Timeout.peer_connect;
++    const time_t ctimeout = peerConnectTimeout(p);
+     bool ret = (squid_curtime - p->stats.last_connect_failure) > (ctimeout * 10);
+ 
+     if (p->testing_now > 0)
+@@ -1527,8 +1541,8 @@ dump_peer_options(StoreEntry * sentry, CachePeer * p)
+     if (p->mcast.ttl > 0)
+         storeAppendPrintf(sentry, " ttl=%d", p->mcast.ttl);
+ 
+-    if (p->connect_timeout > 0)
+-        storeAppendPrintf(sentry, " connect-timeout=%d", (int) p->connect_timeout);
++    if (p->connect_timeout_raw > 0)
++        storeAppendPrintf(sentry, " connect-timeout=%d", (int)p->connect_timeout_raw);
+ 
+     if (p->connect_fail_limit != PEER_TCP_MAGIC_COUNT)
+         storeAppendPrintf(sentry, " connect-fail-limit=%d", p->connect_fail_limit);
+@@ -60,6 +60,13 @@ void peerConnectSucceded(CachePeer *);
+ void dump_peer_options(StoreEntry *, CachePeer *);
+ int peerHTTPOkay(const CachePeer *, HttpRequest *);
+ 
++// TODO: Consider moving this method to CachePeer class.
++/// \returns the effective connect timeout for the given peer
++time_t peerConnectTimeout(const CachePeer *peer);
++
++/// \returns max(1, timeout)
++time_t positiveTimeout(const time_t timeout);
++
+ /// Whether we can open new connections to the peer (e.g., despite max-conn)
+ bool peerCanOpenMore(const CachePeer *p);
+ /// Whether the peer has idle or standby connections that can be used now
+@@ -11,8 +11,16 @@
+ #define STUB_API "neighbors.cc"
+ #include "tests/STUB.h"
+ 
++#include "FwdState.h"
+ #include "neighbors.h"
+ 
+ void
+ peerConnClosed(CachePeer *p) STUB
+ 
++time_t
++peerConnectTimeout(const CachePeer *peer) STUB_RETVAL(0)
++time_t
++FwdState::ForwardTimeout(const time_t) STUB_RETVAL(0)
++bool
++FwdState::EnoughTimeToReForward(const time_t fwdStart) STUB_RETVAL(false)
++
+@@ -31,6 +31,7 @@
+ #include "ip/QosConfig.h"
+ #include "LogTags.h"
+ #include "MemBuf.h"
++#include "neighbors.h"
+ #include "PeerSelectState.h"
+ #include "sbuf/SBuf.h"
+ #include "security/BlindPeerConnector.h"
+@@ -121,6 +122,10 @@ class TunnelStateData
+     /// if it is waiting for Squid CONNECT response, closing connections.
+     void informUserOfPeerError(const char *errMsg, size_t);
+ 
++    /// starts connecting to the next hop, either for the first time or while
++    /// recovering from the previous connect failure
++    void startConnecting();
++
+     class Connection
+     {
+ 
+@@ -169,7 +174,7 @@ class TunnelStateData
+     bool connectReqWriting; ///< whether we are writing a CONNECT request to a peer
+     SBuf preReadClientData;
+     SBuf preReadServerData;
+-    time_t started;         ///< when this tunnel was initiated.
++    time_t startTime; ///< object creation time, before any peer selection/connection attempts
+ 
+     void copyRead(Connection &from, IOCB *completion);
+ 
+@@ -291,7 +296,7 @@ tunnelClientClosed(const CommCloseCbParams &params)
+ TunnelStateData::TunnelStateData(ClientHttpRequest *clientRequest) :
+     connectRespBuf(NULL),
+     connectReqWriting(false),
+-    started(squid_curtime)
++    startTime(squid_curtime)
+ {
+     debugs(26, 3, "TunnelStateData constructed this=" << this);
+     client.readPendingFunc = &tunnelDelayedClientRead;
+@@ -983,25 +988,21 @@ tunnelConnectDone(const Comm::ConnectionPointer &conn, Comm::Flag status, int xe
+ 
+     if (status != Comm::OK) {
+         debugs(26, 4, HERE << conn << ", comm failure recovery.");
++        {
++            assert(!tunnelState->serverDestinations.empty());
++            const Comm::Connection &failedDest = *tunnelState->serverDestinations.front();
++            if (CachePeer *peer = failedDest.getPeer())
++                peerConnectFailed(peer);
++            debugs(26, 4, "removing the failed one from " << tunnelState->serverDestinations.size() <<
++                   " destinations: " << failedDest);
++        }
+         /* At this point only the TCP handshake has failed. no data has been passed.
+          * we are allowed to re-try the TCP-level connection to alternate IPs for CONNECT.
+          */
+-        debugs(26, 4, "removing server 1 of " << tunnelState->serverDestinations.size() <<
+-               " from destinations (" << tunnelState->serverDestinations[0] << ")");
+         tunnelState->serverDestinations.erase(tunnelState->serverDestinations.begin());
+-        time_t fwdTimeout = tunnelState->started + Config.Timeout.forward;
+-        if (fwdTimeout > squid_curtime && tunnelState->serverDestinations.size() > 0) {
+-            // find remaining forward_timeout available for this attempt
+-            fwdTimeout -= squid_curtime;
+-            if (fwdTimeout > Config.Timeout.connect)
+-                fwdTimeout = Config.Timeout.connect;
+-            /* Try another IP of this destination host */
+-            GetMarkingsToServer(tunnelState->request.getRaw(), *tunnelState->serverDestinations[0]);
+-            debugs(26, 4, HERE << "retry with : " << tunnelState->serverDestinations[0]);
+-            AsyncCall::Pointer call = commCbCall(26,3, "tunnelConnectDone", CommConnectCbPtrFun(tunnelConnectDone, tunnelState));
+-            Comm::ConnOpener *cs = new Comm::ConnOpener(tunnelState->serverDestinations[0], call, fwdTimeout);
+-            cs->setHost(tunnelState->url);
+-            AsyncJob::Start(cs);
++        if (!tunnelState->serverDestinations.empty() && FwdState::EnoughTimeToReForward(tunnelState->startTime)) {
++            debugs(26, 4, "re-forwarding");
++            tunnelState->startConnecting();
+         } else {
+             debugs(26, 4, HERE << "terminate with error.");
+             ErrorState *err = new ErrorState(ERR_CONNECT_FAIL, Http::scServiceUnavailable, tunnelState->request.getRaw());
+@@ -1226,17 +1227,25 @@ tunnelPeerSelectComplete(Comm::ConnectionList *peer_paths, ErrorState *err, void
+     }
+     delete err;
+ 
+-    GetMarkingsToServer(tunnelState->request.getRaw(), *tunnelState->serverDestinations[0]);
+-
+     if (tunnelState->request != NULL)
+         tunnelState->request->hier.startPeerClock();
+ 
+-    debugs(26, 3, HERE << "paths=" << peer_paths->size() << ", p[0]={" << (*peer_paths)[0] << "}, serverDest[0]={" <<
++    debugs(26, 3, "paths=" << peer_paths->size() << ", p[0]={" << (*peer_paths)[0] << "}, serverDest[0]={" <<
+            tunnelState->serverDestinations[0] << "}");
+ 
+-    AsyncCall::Pointer call = commCbCall(26,3, "tunnelConnectDone", CommConnectCbPtrFun(tunnelConnectDone, tunnelState));
+-    Comm::ConnOpener *cs = new Comm::ConnOpener(tunnelState->serverDestinations[0], call, Config.Timeout.connect);
+-    cs->setHost(tunnelState->url);
++    tunnelState->startConnecting();
++}
++
++void
++TunnelStateData::startConnecting()
++{
++    Comm::ConnectionPointer &dest = serverDestinations.front();
++    GetMarkingsToServer(request.getRaw(), *dest);
++
++    const time_t connectTimeout = dest->connectTimeout(startTime);
++    AsyncCall::Pointer call = commCbCall(26,3, "tunnelConnectDone", CommConnectCbPtrFun(tunnelConnectDone, this));
++    Comm::ConnOpener *cs = new Comm::ConnOpener(dest, call, connectTimeout);
++    cs->setHost(url);
+     AsyncJob::Start(cs);
+ }
+ 

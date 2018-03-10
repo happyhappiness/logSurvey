@@ -1,0 +1,1945 @@
+@@ -3505,6 +3505,7 @@ AC_CONFIG_FILES([
+ 	helpers/negotiate_auth/wrapper/Makefile
+ 	helpers/external_acl/Makefile
+ 	helpers/external_acl/AD_group/Makefile
++	helpers/external_acl/delayer/Makefile
+ 	helpers/external_acl/eDirectory_userip/Makefile
+ 	helpers/external_acl/file_userip/Makefile
+ 	helpers/external_acl/kerberos_ldap_group/Makefile
+@@ -156,9 +156,11 @@ Most user-facing changes are reflected in squid.conf (see below).
+    and its helpers allowing faster transaction speeds even on sequential
+    helpers.
+ 
+-<p>The <em>storeid_file_rewrite</em> helper has been updated to support
+-   concurrency channels. It will auto-detect the <em>channel-ID</em> field
+-   on its input line and will produce the appropriate response format.
++<p>The Digest authentication, Store-ID, and URL-rewrite helpers packaged
++   with Squid have been updated to support concurrency channels. They will
++   auto-detect the <em>channel-ID</em> field and will produce the appropriate
++   response format.
++   With these helpers concurrency may now be set to 0 or any higher number as desired.
+ 
+ 
+ <sect>Changes to squid.conf since Squid-3.4
+@@ -20,6 +20,7 @@ TRANSLATE_LANGUAGES= \
+     id.lang \
+     it.lang \
+     ja.lang \
++    ka.lang \
+     ko.lang \
+     lt.lang \
+     lv.lang \
+@@ -73,7 +73,8 @@ main(int argc, char **argv)
+             /* Password incorrect */
+             printf("ERR Wrong password\n");
+ #else
+-        } else {
++        }
++        else {
+             /* Password incorrect */
+             printf("BH message=\"Missing crypto capability\"\n");
+ #endif
+@@ -1,5 +1,6 @@
+ DIST_SUBDIRS= \
+ 	AD_group \
++	delayer \
+ 	eDirectory_userip \
+ 	file_userip \
+ 	kerberos_ldap_group \
+@@ -0,0 +1,12 @@
++include $(top_srcdir)/src/Common.am
++
++libexec_SCRIPTS = ext_delayer_acl
++CLEANFILES += ext_delayer_acl ext_delayer_acl.8
++man_MANS = ext_delayer_acl.8
++EXTRA_DIST = ext_delayer_acl.pl.in ext_delayer_acl.8 required.m4
++
++ext_delayer_acl.8: ext_delayer_acl
++	pod2man ext_delayer_acl ext_delayer_acl.8
++
++ext_delayer_acl: ext_delayer_acl.pl.in
++	$(subst_perlshell)
+@@ -0,0 +1,257 @@
++#!@PERL@
++=pod
++
++=head1 NAME
++
++delayer - Squid external acl helper adding artificial delay to requests
++
++=head1 SYNOPSIS
++
++delayer [--help] [--debug] [--log file] [--wait msec]
++
++=head1 OPTIONS
++
++=over 8
++
++=item B<--help> or B<-h>
++
++Print help message to stdout
++
++=item B<--debug> or B<-d>
++
++Emit debugging output to STDERR and ultimately cache.log
++
++=item B<--log /path/to/file> or B<-l /path/to/file>
++
++Emit debugging output to specified file instead of STDERR. Also turns on debugging
++
++=item B<--wait msec> or B<-w msec>
++
++Delay each request by the specified amount of msec.
++Unless this option is specified, by default each submitted request
++will be delayed by half a second (500 msec).
++
++=back
++
++=head1 DESCRIPTION
++
++Squid external acl helper; causes squid to delay responding to HTTP requests.
++
++By carefully crafting the ACLs of a Squid setup it is possible to
++selectively delay requests received by a proxy. After the configured amount
++of time, it will always return "true".
++
++=head1 CONFIGURATION
++
++To engage it, this snippet of configuration template can be used in squid.conf:
++
++ external_acl_type delayer concurrency=100000 children-max=2 children-startup=1 children-idle=1 cache=10 %URI /path/to/delayer -w 200
++ acl delay external delayer
++ http_access allow acl1 acl2 acl3 delay !all
++
++It is important that the acl referencing the delayer be the penultimate clause in the
++http_access line. It will cause delay to all requests that match all the
++preceding acls in the line. The !all clause at the end of the line will make it
++so that no traffic is authorized by this ACL, only the delay to evaluate
++the delay clause will be inserted before evaluating following http_access lines.
++It is also important to place the http_access line carefully in the sequence
++of all http_access_lines; it should be near the beginning, but be careful
++not to insert unwanted slow acls (especially proxy_auth).
++
++It is possible to customize how delay is calculated for each request by
++modifying the "calc_delay" PERL function in the script, documentation on this
++is embedded in the source code comments.
++
++=head1 AUTHOR
++
++This software is written by Francesco Chemolli <kinkie@squid-cache.org>
++
++=head1 COPYRIGHT
++
++(C) 2014 Francesco Chemolli <kinkie@squid-cache.org>
++
++This program is free software. You may redistribute copies of it under the
++terms of the GNU General Public License version 2, or (at your opinion) any
++later version.
++
++=head1 QUESTIONS
++
++Questions on this code are best addressed on the Squid-users mailing list
++<squid-users@squid-cache.org>
++
++=head1 REPORTING BUGS
++
++Bug reports need to be made in English.
++See http://wiki.squid-cache.org/SquidFaq/BugReporting for details of what you
++need to include with your bug report.
++Report bugs or bug fixes using http://bugs.squid-cache.org/
++
++=head1 SEE ALSO
++
++B<squid>(8), B<GPL>(7), B<Squid Wiki> http://wiki.squid-cache.org/ ,
++B<Squid Configuration Manual> http://www.squid-cache.org/Doc/config/
++
++=cut
++
++use strict;
++use warnings;
++use Getopt::Long qw(:config auto_version auto_help);
++use Data::Dumper;
++use Time::HiRes qw(gettimeofday tv_interval);
++
++# options handling
++my %opts = (); #for getopt
++my $debug = 0; #debug
++my $logfile = *STDERR; #filehandle to logfile
++my $logfilename;
++my $delay = 500; #in milliseconds. Configurable with the -w option.
++#for custom delay algorithms, you can customize the dispatch_request function
++
++#calculate the delay for the request.
++# Gets as input the verbatim full line received from squid
++# (channel number and all, as configured in squid.conf) and returns
++# a floating point number >= 0 which is the delay to be applied to the request
++# in seconds.
++# Notice that in order to have efficient data structures, the delay is
++# assumed to be monotonously growing. In other words, a long-delay
++# item will stall the queue until completed. Supporting generic delays
++# requires transforming @queue from a FIFO to a priority queue.
++sub calc_delay {
++  return $delay;
++}
++
++GetOptions("debug|d" => \$debug,
++           "wait|w=i" => \$delay,
++           "log|l=s" => \$logfilename)
++or die("Error in parsing command line arguments");
++if (defined $opts{h}) {
++  HELP_MESSAGE();
++  exit 0;
++}
++$delay /= 1000.0; # transform msec into sec
++if ($logfilename) {
++  open ($logfile,">>", "$opts{l}");
++  $debug=1;
++} 
++
++my @p=split(/[\\\/]/,$0);
++my $prg_basename=pop @p;
++$prg_basename .= "[$$]";
++undef @p;
++my $reqid=0; #sequence number for requests
++
++# variables initialization for select
++my $rvec = '';
++vec($rvec,0,1) = 1; #stdin
++my ($nfound, $rd, $nread, $req);
++
++#requests queue
++my @queue = (); # array of references to hashes, with keys chan, when, req, reqid
++
++# signal handlers
++$SIG{HUP} = \&dump_state;
++
++#disable IO buffering
++$| = 1;
++my $fh=select($logfile); $|=1; select($fh); undef($fh);
++
++# takes a result from a gettimeofday call and turns it into a
++# floating-point number suitable for approximate time calculations and select
++sub fract_time {
++  return $_[0]+$_[1]/1000000;
++}
++
++sub dispatch_request {
++  my $r = $_[0];
++  chomp $r;
++  &debug("got request: '$r'");
++  my %evt = ();
++  my @fields;
++  @fields = split (/\s+/, $r);
++  $evt{when} = &calc_delay($r)+fract_time(gettimeofday());
++  $evt{reqid}=$reqid++;
++  $evt{req} = $r;
++  $evt{chan} = $fields[0];
++  &debug("Dispatching: reqid $evt{reqid}, chan $evt{chan}, when $evt{when}, raw {$evt{req}}");
++  push @queue,\%evt;
++}
++
++sub next_event {
++  my $now = fract_time(gettimeofday());
++  if (@queue) {
++    my $when = $queue[0]->{when} - $now;
++    &debug("Next event is in $when seconds");
++    return $when;
++  }
++  &debug("No events in queue");
++  return undef;
++}
++
++sub handle_events {
++  my $now = fract_time(gettimeofday());
++  while ( @queue ) {
++    &debug("Queue length is $#queue");
++    last if ($queue[0]->{when} > $now);
++    my %evt = %{shift @queue};
++    &debug("Event: reqid $evt{reqid}, chan $evt{chan}, when $evt{when}, raw {$evt{req}}");
++    print $evt{chan} , " OK\n";
++  }
++}
++
++# main loop
++while(1) {
++  &debug("selecting");
++  $nfound = select($rd = $rvec,undef,undef,&next_event());
++  &debug("found $nfound bits set");
++  if ($nfound == -1 ) {
++    next if ($!{ERESTART} || $!{EAGAIN} || $!{EINTR});
++    &debug("error in select: $!");
++    exit 1;
++  }
++  if (vec($rd,0,1)==1) { #got stuff from stdin
++    my $d; #data
++    $nread = sysread(STDIN,$d,40960); # read 40kb
++    # clear the signal-bit, stdin is special
++    vec($rd,0,1) = 0;
++    if ($nread==0) {
++      &debug("nothing read from stdin, exiting");
++      exit 0;
++    }
++    my $i;
++    while ($i = index($d,"\n")) { #BUG: assumption of no spill-over
++      last if ($i == -1);
++      &dispatch_request(substr($d,0,$i));
++      $d=substr($d,$i+1);
++    }
++  }
++  &handle_events();
++}
++
++my $doc = <<_EOF;
++delay-adding external acl helper
++authorizes all requests, adding a delay before doing so.
++supports multiplexed helper protocol.
++Options:
++  -h, --help: this help message
++  -d, --debug: enable debug output
++  -l <file>, --log <file>: log output to named file instead of stderr (implies debug)
++  -w <num>, --wait <num> delay each request by this number milliseconds
++
++AUTHOR: Francesco Chemolli <kinkie\@squid-cache.org>
++Licensed under the terms of the GNU GPL v2 or later (see source for details)
++_EOF
++our $VERSION = "1.0";
++
++sub HELP_MESSAGE {
++  print STDERR $doc;
++}
++
++sub dump_state {
++  $SIG{HUP} = \&dump_state;
++  print STDERR "Queue:\n",Dumper(\@queue),"\n";
++}
++
++sub debug {
++  return unless ($debug);
++  print $logfile $prg_basename , ": ", @_, "\n";
++}
+@@ -0,0 +1,3 @@
++if test "x$PERL" != "x" -a "x$POD2MAN" != "x"; then
++  BUILD_HELPER="delayer"
++fi
+@@ -27,6 +27,9 @@ if test "x$enable_external_acl_helpers" != "xno" ; then
+       elif test "x$helper" = "xLM_group" ; then
+         m4_include([helpers/external_acl/LM_group/required.m4])
+ 
++      elif test "x$helper" = "xdelayer" ; then
++        m4_include([helpers/external_acl/delayer/required.m4])
++
+       elif test "x$helper" = "xSQL_session" ; then
+         m4_include([helpers/external_acl/SQL_session/required.m4])
+ 
+@@ -106,20 +106,20 @@ int aioQueueSize(void);
+ class DiskThreadsIOStrategy;
+ 
+ struct AIOCounts {
+-    int open_start;
+-    int open_finish;
+-    int close_start;
+-    int close_finish;
+-    int cancel;
+-    int write_start;
+-    int write_finish;
+-    int read_start;
+-    int read_finish;
+-    int stat_start;
+-    int stat_finish;
+-    int unlink_start;
+-    int unlink_finish;
+-    int check_callback;
++    uint64_t open_start;
++    uint64_t open_finish;
++    uint64_t close_start;
++    uint64_t close_finish;
++    uint64_t cancel;
++    uint64_t write_start;
++    uint64_t write_finish;
++    uint64_t read_start;
++    uint64_t read_finish;
++    uint64_t stat_start;
++    uint64_t stat_finish;
++    uint64_t unlink_start;
++    uint64_t unlink_finish;
++    uint64_t check_callback;
+ };
+ 
+ extern AIOCounts squidaio_counts;
+@@ -196,16 +196,16 @@ void
+ DiskThreadsIOStrategy::aioStats(StoreEntry * sentry)
+ {
+     storeAppendPrintf(sentry, "ASYNC IO Counters:\n");
+-    storeAppendPrintf(sentry, "Operation\t# Requests\tNumber serviced\n");
+-    storeAppendPrintf(sentry, "open\t%d\t%d\n", squidaio_counts.open_start, squidaio_counts.open_finish);
+-    storeAppendPrintf(sentry, "close\t%d\t%d\n", squidaio_counts.close_start, squidaio_counts.close_finish);
+-    storeAppendPrintf(sentry, "cancel\t%d\t-\n", squidaio_counts.cancel);
+-    storeAppendPrintf(sentry, "write\t%d\t%d\n", squidaio_counts.write_start, squidaio_counts.write_finish);
+-    storeAppendPrintf(sentry, "read\t%d\t%d\n", squidaio_counts.read_start, squidaio_counts.read_finish);
+-    storeAppendPrintf(sentry, "stat\t%d\t%d\n", squidaio_counts.stat_start, squidaio_counts.stat_finish);
+-    storeAppendPrintf(sentry, "unlink\t%d\t%d\n", squidaio_counts.unlink_start, squidaio_counts.unlink_finish);
+-    storeAppendPrintf(sentry, "check_callback\t%d\t-\n", squidaio_counts.check_callback);
+-    storeAppendPrintf(sentry, "queue\t%d\t-\n", squidaio_get_queue_len());
++    storeAppendPrintf(sentry, "  Operation\t# Requests\tNumber serviced\n");
++    storeAppendPrintf(sentry, "  open\t%" PRIu64 "\t%" PRIu64 "\n", squidaio_counts.open_start, squidaio_counts.open_finish);
++    storeAppendPrintf(sentry, "  close\t%" PRIu64 "\t%" PRIu64 "\n", squidaio_counts.close_start, squidaio_counts.close_finish);
++    storeAppendPrintf(sentry, "  cancel\t%" PRIu64 "\t-\n", squidaio_counts.cancel);
++    storeAppendPrintf(sentry, "  write\t%" PRIu64 "\t%" PRIu64 "\n", squidaio_counts.write_start, squidaio_counts.write_finish);
++    storeAppendPrintf(sentry, "  read\t%" PRIu64 "\t%" PRIu64 "\n", squidaio_counts.read_start, squidaio_counts.read_finish);
++    storeAppendPrintf(sentry, "  stat\t%" PRIu64 "\t%" PRIu64 "\n", squidaio_counts.stat_start, squidaio_counts.stat_finish);
++    storeAppendPrintf(sentry, "  unlink\t%" PRIu64 "\t%" PRIu64 "\n", squidaio_counts.unlink_start, squidaio_counts.unlink_finish);
++    storeAppendPrintf(sentry, "  check_callback\t%" PRIu64 "\t-\n", squidaio_counts.check_callback);
++    storeAppendPrintf(sentry, "  queue\t%d\t-\n", squidaio_get_queue_len());
+     squidaio_stats(sentry);
+ }
+ 
+@@ -64,8 +64,8 @@
+ #include "mgr/Registration.h"
+ #include "neighbors.h"
+ #include "pconn.h"
+-#include "PeerSelectState.h"
+ #include "PeerPoolMgr.h"
++#include "PeerSelectState.h"
+ #include "SquidConfig.h"
+ #include "SquidTime.h"
+ #include "Store.h"
+@@ -104,13 +104,14 @@ class FwdStatePeerAnswerDialer: public CallDialer, public Ssl::PeerConnector::Cb
+     typedef void (FwdState::*Method)(Ssl::PeerConnectorAnswer &);
+ 
+     FwdStatePeerAnswerDialer(Method method, FwdState *fwd):
+-        method_(method), fwd_(fwd), answer_() {}
++            method_(method), fwd_(fwd), answer_() {}
+ 
+     /* CallDialer API */
+     virtual bool canDial(AsyncCall &call) { return fwd_.valid(); }
+     void dial(AsyncCall &call) { ((&(*fwd_))->*method_)(answer_); }
+     virtual void print(std::ostream &os) const {
+-        os << '(' << fwd_.get() << ", " << answer_ << ')'; }
++        os << '(' << fwd_.get() << ", " << answer_ << ')';
++    }
+ 
+     /* Ssl::PeerConnector::CbDialer API */
+     virtual Ssl::PeerConnectorAnswer &answer() { return answer_; }
+@@ -122,7 +123,6 @@ class FwdStatePeerAnswerDialer: public CallDialer, public Ssl::PeerConnector::Cb
+ };
+ #endif
+ 
+-
+ void
+ FwdState::abort(void* d)
+ {
+@@ -619,9 +619,10 @@ FwdState::checkRetriable()
+ void
+ FwdState::serverClosed(int fd)
+ {
++    // XXX: fd is often -1 here
+     debugs(17, 2, "FD " << fd << " " << entry->url() << " after " <<
+-           fd_table[fd].pconn.uses << " requests");
+-    if (serverConnection()->fd == fd) // should be, but not critical to assert
++           (fd >= 0 ? fd_table[fd].pconn.uses : -1) << " requests");
++    if (fd >= 0 && serverConnection()->fd == fd)
+         fwdPconnPool->noteUses(fd_table[fd].pconn.uses);
+     retryOrBail();
+ }
+@@ -707,8 +708,8 @@ FwdState::connectDone(const Comm::ConnectionPointer &conn, comm_err_t status, in
+ 
+             HttpRequest::Pointer requestPointer = request;
+             AsyncCall::Pointer callback = asyncCall(17,4,
+-                "FwdState::ConnectedToPeer",
+-                FwdStatePeerAnswerDialer(&FwdState::connectedToPeer, this));
++                                                    "FwdState::ConnectedToPeer",
++                                                    FwdStatePeerAnswerDialer(&FwdState::connectedToPeer, this));
+             Ssl::PeerConnector *connector =
+                 new Ssl::PeerConnector(requestPointer, serverConnection(), callback);
+             AsyncJob::Start(connector); // will call our callback
+@@ -26,7 +26,7 @@ class MyAnswerDialer: public UnaryMemFunT<PeerPoolMgr, Ssl::PeerConnectorAnswer,
+ {
+ public:
+     MyAnswerDialer(const JobPointer &aJob, Method aMethod):
+-                   UnaryMemFunT<PeerPoolMgr, Ssl::PeerConnectorAnswer, Ssl::PeerConnectorAnswer&>(aJob, aMethod, Ssl::PeerConnectorAnswer()) {}
++            UnaryMemFunT<PeerPoolMgr, Ssl::PeerConnectorAnswer, Ssl::PeerConnectorAnswer&>(aJob, aMethod, Ssl::PeerConnectorAnswer()) {}
+ 
+     /* Ssl::PeerConnector::CbDialer API */
+     virtual Ssl::PeerConnectorAnswer &answer() { return arg1; }
+@@ -68,7 +68,8 @@ PeerPoolMgr::swanSong()
+ }
+ 
+ bool
+-PeerPoolMgr::validPeer() const {
++PeerPoolMgr::validPeer() const
++{
+     return peer && cbdataReferenceValid(peer) && peer->standby.pool;
+ }
+ 
+@@ -9,8 +9,9 @@ class CachePeer;
+ class CommConnectCbParams;
+ 
+ #if USE_OPENSSL
+-namespace Ssl {
+-    class PeerConnectorAnswer;
++namespace Ssl
++{
++class PeerConnectorAnswer;
+ }
+ #endif
+ 
+@@ -111,7 +111,6 @@ acl_ip_data::toSBuf() const
+     return SBuf(tmpbuf);
+ }
+ 
+-
+ /*
+  * aclIpAddrNetworkCompare - The guts of the comparison for IP ACLs
+  * matching checks.  The first argument (p) is a "host" address,
+@@ -89,9 +89,9 @@ ACLMethodData::parse()
+ 
+     for (Tail = &values; *Tail; Tail = &((*Tail)->next));
+     while ((t = strtokFile())) {
+-        if (strcmp(t, "PURGE") == 0)
+-            ++ThePurgeCount; // configuration code wants to know
+         CbDataList<HttpRequestMethod> *q = new CbDataList<HttpRequestMethod> (HttpRequestMethod(t));
++        if (q->element == Http::METHOD_PURGE)
++            ++ThePurgeCount; // configuration code wants to know
+         *(Tail) = q;
+         Tail = &q->next;
+     }
+@@ -51,8 +51,8 @@ Adaptation::AccessRule::group()
+ Adaptation::AccessRules &
+ Adaptation::AllRules()
+ {
+-    static AccessRules TheRules;
+-    return TheRules;
++    static AccessRules *TheRules = new AccessRules;
++    return *TheRules;
+ }
+ 
+ // TODO: make AccessRules::find work
+@@ -54,8 +54,8 @@ Adaptation::Service::wants(const ServiceFilter &filter) const
+ Adaptation::Services &
+ Adaptation::AllServices()
+ {
+-    static Services TheServices;
+-    return TheServices;
++    static Services *TheServices = new Services;
++    return *TheServices;
+ }
+ 
+ Adaptation::ServicePointer
+@@ -315,8 +315,8 @@ Adaptation::ServicePlan::print(std::ostream &os) const
+ Adaptation::Groups &
+ Adaptation::AllGroups()
+ {
+-    static Groups TheGroups;
+-    return TheGroups;
++    static Groups *TheGroups = new Groups;
++    return *TheGroups;
+ }
+ 
+ Adaptation::ServiceGroupPointer
+@@ -4827,7 +4827,7 @@ static void parse_ftp_epsv(acl_access **ftp_epsv)
+     bool ftpEpsvIsDeprecatedRule = false;
+ 
+     char *t = ConfigParser::PeekAtToken();
+-    if (!t){
++    if (!t) {
+         self_destruct();
+         return;
+     }
+@@ -4847,7 +4847,7 @@ static void parse_ftp_epsv(acl_access **ftp_epsv)
+     //   2) if this line is "ftp_epsv on|off" and already exist rules of "ftp_epsv allow|deny ..."
+     // then abort
+     if ((!ftpEpsvIsDeprecatedRule && FtpEspvDeprecated) ||
+-        (ftpEpsvIsDeprecatedRule && !FtpEspvDeprecated && *ftp_epsv != NULL)) {
++            (ftpEpsvIsDeprecatedRule && !FtpEspvDeprecated && *ftp_epsv != NULL)) {
+         debugs(3, DBG_CRITICAL, "FATAL: do not mix \"ftp_epsv on|off\" cfg lines with \"ftp_epsv allow|deny ...\" cfg lines. Update your ftp_epsv rules.");
+         self_destruct();
+     }
+@@ -48,9 +48,9 @@
+ 
+ #include "squid.h"
+ #include "cbdata.h"
++#include "Generic.h"
+ #include "mgr/Registration.h"
+ #include "Store.h"
+-#include "Generic.h"
+ 
+ #include <climits>
+ #if USE_CBDATA_DEBUG
+@@ -3867,15 +3867,20 @@ DOC_START
+ 		[http::]ru	Request URL from client (historic, filtered for logging)
+ 		[http::]>ru	Request URL from client
+ 		[http::]<ru	Request URL sent to server or peer
++		[http::]>rs	Request URL scheme from client
++		[http::]<rs	Request URL scheme sent to server or peer
+ 		[http::]>rd	Request URL domain from client
+-		[http::]rp	Request URL-Path excluding hostname
+-		[http::]>rp	Request URL-Path excluding hostname from client
+-		[http::]<rp	Request URL-Path excluding hostname sent to server or peer
++		[http::]>rd	Request URL domain sent to server or peer
++		[http::]>rP	Request URL port from client
++		[http::]<rP	Request URL port sent to server or peer
++		[http::]rp	Request URL path excluding hostname
++		[http::]>rp	Request URL path excluding hostname from client
++		[http::]<rp	Request URL path excluding hostname sent to server or peer
+ 		[http::]rv	Request protocol version
+ 		[http::]>rv	Request protocol version from client
+ 		[http::]<rv	Request protocol version sent to server or peer
+ 
+-		[http::]>h	Original received request header. 
++		[http::]>h	Original received request header.
+ 				Usually differs from the request header sent by
+ 				Squid, although most fields are often preserved.
+ 				Accepts optional header field name/value filter
+@@ -874,11 +874,11 @@ gen_quote_escape(const std::string &var)
+ 
+     for (int i = 0; i < var.length(); ++i) {
+         switch (var[i]) {
+-            case '"':
+-            case '\\':
+-                esc += '\\';
+-            default:
+-                esc += var[i];
++        case '"':
++        case '\\':
++            esc += '\\';
++        default:
++            esc += var[i];
+         }
+     }
+ 
+@@ -573,7 +573,7 @@ ErrorState::NewForwarding(err_type type, HttpRequest *request)
+ {
+     assert(request);
+     const Http::StatusCode status = request->flags.needValidation ?
+-        Http::scGatewayTimeout : Http::scServiceUnavailable;
++                                    Http::scGatewayTimeout : Http::scServiceUnavailable;
+     return new ErrorState(type, status, request);
+ }
+ 
+@@ -950,8 +950,8 @@ ErrorState::Convert(char token, bool building_deny_info_url, bool allowRecursion
+ 
+     case 'M':
+         if (request) {
+-           const SBuf &m = request->method.image();
+-           mb.append(m.rawContent(), m.length());
++            const SBuf &m = request->method.image();
++            mb.append(m.rawContent(), m.length());
+         } else if (!building_deny_info_url)
+             p = "[unknown method]";
+         break;
+@@ -19,8 +19,8 @@ bool
+ Eui::Eui64::decode(const char *asc)
+ {
+     if (eui64_aton(asc, (struct eui64 *)eui) != 0) {
+-       debugs(28, 4, "id=" << (void*)this << " decode fail on " << asc);
+-       return false;
++        debugs(28, 4, "id=" << (void*)this << " decode fail on " << asc);
++        return false;
+     }
+ 
+     debugs(28, 4, "id=" << (void*)this << " ATON decoded " << asc);
+@@ -48,6 +48,7 @@
+ #include "ExternalACL.h"
+ #include "ExternalACLEntry.h"
+ #include "fde.h"
++#include "format/ByteCode.h"
+ #include "helper.h"
+ #include "HttpHeaderTools.h"
+ #include "HttpReply.h"
+@@ -150,55 +151,7 @@ class external_acl
+ };
+ 
+ struct _external_acl_format {
+-    enum format_type {
+-        EXT_ACL_UNKNOWN,
+-#if USE_AUTH
+-        EXT_ACL_LOGIN,
+-#endif
+-#if USE_IDENT
+-        EXT_ACL_IDENT,
+-#endif
+-        EXT_ACL_SRC,
+-        EXT_ACL_SRCPORT,
+-#if USE_SQUID_EUI
+-        EXT_ACL_SRCEUI48,
+-        EXT_ACL_SRCEUI64,
+-#endif
+-        EXT_ACL_MYADDR,
+-        EXT_ACL_MYPORT,
+-        EXT_ACL_URI,
+-        EXT_ACL_DST,
+-        EXT_ACL_PROTO,
+-        EXT_ACL_PORT,
+-        EXT_ACL_PATH,
+-        EXT_ACL_METHOD,
+-
+-        EXT_ACL_HEADER_REQUEST,
+-        EXT_ACL_HEADER_REQUEST_MEMBER,
+-        EXT_ACL_HEADER_REQUEST_ID,
+-        EXT_ACL_HEADER_REQUEST_ID_MEMBER,
+-
+-        EXT_ACL_HEADER_REPLY,
+-        EXT_ACL_HEADER_REPLY_MEMBER,
+-        EXT_ACL_HEADER_REPLY_ID,
+-        EXT_ACL_HEADER_REPLY_ID_MEMBER,
+-
+-#if USE_OPENSSL
+-        EXT_ACL_USER_CERT,
+-        EXT_ACL_USER_CA_CERT,
+-        EXT_ACL_USER_CERT_RAW,
+-        EXT_ACL_USER_CERTCHAIN_RAW,
+-#endif
+-#if USE_AUTH
+-        EXT_ACL_EXT_USER,
+-#endif
+-        EXT_ACL_EXT_LOG,
+-        EXT_ACL_TAG,
+-        EXT_ACL_ACLNAME,
+-        EXT_ACL_ACLDATA,
+-        EXT_ACL_PERCENT,
+-        EXT_ACL_END
+-    } type;
++    Format::ByteCode_t type;
+     external_acl_format *next;
+     char *header;
+     char *member;
+@@ -254,7 +207,7 @@ free_external_acl(void *data)
+  \param format   - structure to contain all the info about this format element.
+  */
+ void
+-parse_header_token(external_acl_format *format, char *header, const _external_acl_format::format_type type)
++parse_header_token(external_acl_format *format, char *header, const Format::ByteCode_t type)
+ {
+     /* header format */
+     char *member, *end;
+@@ -282,30 +235,17 @@ parse_header_token(external_acl_format *format, char *header, const _external_ac
+ 
+         format->member = xstrdup(member);
+ 
+-        if (type == _external_acl_format::EXT_ACL_HEADER_REQUEST)
+-            format->type = _external_acl_format::EXT_ACL_HEADER_REQUEST_MEMBER;
++        if (type == Format::LFT_ADAPTED_REQUEST_HEADER)
++            format->type = Format::LFT_ADAPTED_REQUEST_HEADER_ELEM;
+         else
+-            format->type = _external_acl_format::EXT_ACL_HEADER_REQUEST_MEMBER;
++            format->type = Format::LFT_REPLY_HEADER_ELEM;
++
+     } else {
+         format->type = type;
+     }
+ 
+     format->header = xstrdup(header);
+     format->header_id = httpHeaderIdByNameDef(header, strlen(header));
+-
+-    if (format->header_id != -1) {
+-        if (member) {
+-            if (type == _external_acl_format::EXT_ACL_HEADER_REQUEST)
+-                format->type = _external_acl_format::EXT_ACL_HEADER_REQUEST_ID_MEMBER;
+-            else
+-                format->type = _external_acl_format::EXT_ACL_HEADER_REPLY_ID_MEMBER;
+-        } else {
+-            if (type == _external_acl_format::EXT_ACL_HEADER_REQUEST)
+-                format->type = _external_acl_format::EXT_ACL_HEADER_REQUEST_ID;
+-            else
+-                format->type = _external_acl_format::EXT_ACL_HEADER_REPLY_ID;
+-        }
+-    }
+ }
+ 
+ void
+@@ -421,84 +361,84 @@ parse_externalAclHelper(external_acl ** list)
+         if (strncmp(token, "%{", 2) == 0) {
+             // deprecated. but assume the old configs all referred to request headers.
+             debugs(82, DBG_PARSE_NOTE(DBG_IMPORTANT), "WARNING: external_acl_type format %{...} is being replaced by %>ha{...} for : " << token);
+-            parse_header_token(format, (token+2), _external_acl_format::EXT_ACL_HEADER_REQUEST);
++            parse_header_token(format, (token+2), Format::LFT_ADAPTED_REQUEST_HEADER);
+         } else if (strncmp(token, "%>{", 3) == 0) {
+             debugs(82, DBG_PARSE_NOTE(DBG_IMPORTANT), "WARNING: external_acl_type format %>{...} is being replaced by %>ha{...} for : " << token);
+-            parse_header_token(format, (token+3), _external_acl_format::EXT_ACL_HEADER_REQUEST);
++            parse_header_token(format, (token+3), Format::LFT_ADAPTED_REQUEST_HEADER);
+         } else if (strncmp(token, "%>ha{", 5) == 0) {
+-            parse_header_token(format, (token+3), _external_acl_format::EXT_ACL_HEADER_REQUEST);
++            parse_header_token(format, (token+3), Format::LFT_ADAPTED_REQUEST_HEADER);
+         } else if (strncmp(token, "%<{", 3) == 0) {
+             debugs(82, DBG_PARSE_NOTE(DBG_IMPORTANT), "WARNING: external_acl_type format %<{...} is being replaced by %<h{...} for : " << token);
+-            parse_header_token(format, (token+3), _external_acl_format::EXT_ACL_HEADER_REPLY);
++            parse_header_token(format, (token+3), Format::LFT_REPLY_HEADER);
+         } else if (strncmp(token, "%<h{", 4) == 0) {
+-            parse_header_token(format, (token+3), _external_acl_format::EXT_ACL_HEADER_REPLY);
++            parse_header_token(format, (token+3), Format::LFT_REPLY_HEADER);
+ #if USE_AUTH
+         } else if (strcmp(token, "%LOGIN") == 0 || strcmp(token, "%ul") == 0) {
+-            format->type = _external_acl_format::EXT_ACL_LOGIN;
++            format->type = Format::LFT_USER_LOGIN;
+             a->require_auth = true;
+ #endif
+         }
+ #if USE_IDENT
+         else if (strcmp(token, "%IDENT") == 0 || strcmp(token, "%ui") == 0)
+-            format->type = _external_acl_format::EXT_ACL_IDENT;
++            format->type = Format::LFT_USER_IDENT;
+ #endif
+         else if (strcmp(token, "%SRC") == 0 || strcmp(token, "%>a") == 0)
+-            format->type = _external_acl_format::EXT_ACL_SRC;
++            format->type = Format::LFT_CLIENT_IP_ADDRESS;
+         else if (strcmp(token, "%SRCPORT") == 0 || strcmp(token, "%>p") == 0)
+-            format->type = _external_acl_format::EXT_ACL_SRCPORT;
++            format->type = Format::LFT_CLIENT_PORT;
+ #if USE_SQUID_EUI
+         else if (strcmp(token, "%SRCEUI48") == 0)
+-            format->type = _external_acl_format::EXT_ACL_SRCEUI48;
++            format->type = Format::LFT_EXT_ACL_CLIENT_EUI48;
+         else if (strcmp(token, "%SRCEUI64") == 0)
+-            format->type = _external_acl_format::EXT_ACL_SRCEUI64;
++            format->type = Format::LFT_EXT_ACL_CLIENT_EUI64;
+ #endif
+         else if (strcmp(token, "%MYADDR") == 0 || strcmp(token, "%la") == 0)
+-            format->type = _external_acl_format::EXT_ACL_MYADDR;
++            format->type = Format::LFT_LOCAL_LISTENING_IP;
+         else if (strcmp(token, "%MYPORT") == 0 || strcmp(token, "%lp") == 0)
+-            format->type = _external_acl_format::EXT_ACL_MYPORT;
++            format->type = Format::LFT_LOCAL_LISTENING_PORT;
+         else if (strcmp(token, "%URI") == 0 || strcmp(token, "%>ru") == 0)
+-            format->type = _external_acl_format::EXT_ACL_URI;
+-        else if (strcmp(token, "%DST") == 0)
+-            format->type = _external_acl_format::EXT_ACL_DST;
+-        else if (strcmp(token, "%PROTO") == 0)
+-            format->type = _external_acl_format::EXT_ACL_PROTO;
+-        else if (strcmp(token, "%PORT") == 0)
+-            format->type = _external_acl_format::EXT_ACL_PORT;
++            format->type = Format::LFT_CLIENT_REQ_URI;
++        else if (strcmp(token, "%DST") == 0 || strcmp(token, "%>rd") == 0)
++            format->type = Format::LFT_CLIENT_REQ_URLDOMAIN;
++        else if (strcmp(token, "%PROTO") == 0 || strcmp(token, "%>rs") == 0)
++            format->type = Format::LFT_CLIENT_REQ_URLSCHEME;
++        else if (strcmp(token, "%PORT") == 0) // XXX: add a logformat token
++            format->type = Format::LFT_CLIENT_REQ_URLPORT;
+         else if (strcmp(token, "%PATH") == 0 || strcmp(token, "%>rp") == 0)
+-            format->type = _external_acl_format::EXT_ACL_PATH;
++            format->type = Format::LFT_CLIENT_REQ_URLPATH;
+         else if (strcmp(token, "%METHOD") == 0 || strcmp(token, "%>rm") == 0)
+-            format->type = _external_acl_format::EXT_ACL_METHOD;
++            format->type = Format::LFT_CLIENT_REQ_METHOD;
+ #if USE_OPENSSL
+         else if (strcmp(token, "%USER_CERT") == 0)
+-            format->type = _external_acl_format::EXT_ACL_USER_CERT_RAW;
++            format->type = Format::LFT_EXT_ACL_USER_CERT_RAW;
+         else if (strcmp(token, "%USER_CERTCHAIN") == 0)
+-            format->type = _external_acl_format::EXT_ACL_USER_CERTCHAIN_RAW;
++            format->type = Format::LFT_EXT_ACL_USER_CERTCHAIN_RAW;
+         else if (strncmp(token, "%USER_CERT_", 11) == 0) {
+-            format->type = _external_acl_format::EXT_ACL_USER_CERT;
++            format->type = Format::LFT_EXT_ACL_USER_CERT;
+             format->header = xstrdup(token + 11);
+         } else if (strncmp(token, "%USER_CA_CERT_", 11) == 0) {
+-            format->type = _external_acl_format::EXT_ACL_USER_CA_CERT;
++            format->type = Format::LFT_EXT_ACL_USER_CA_CERT;
+             format->header = xstrdup(token + 11);
+         } else if (strncmp(token, "%CA_CERT_", 11) == 0) {
+             debugs(82, DBG_PARSE_NOTE(DBG_IMPORTANT), "WARNING: external_acl_type %CA_CERT_* code is obsolete. Use %USER_CA_CERT_* instead");
+-            format->type = _external_acl_format::EXT_ACL_USER_CA_CERT;
++            format->type = Format::LFT_EXT_ACL_USER_CA_CERT;
+             format->header = xstrdup(token + 11);
+         }
+ #endif
+ #if USE_AUTH
+-        else if (strcmp(token, "%EXT_USER") == 0)
+-            format->type = _external_acl_format::EXT_ACL_EXT_USER;
++        else if (strcmp(token, "%EXT_USER") == 0 || strcmp(token, "%ue") == 0)
++            format->type = Format::LFT_USER_EXTERNAL;
+ #endif
+-        else if (strcmp(token, "%EXT_LOG") == 0)
+-            format->type = _external_acl_format::EXT_ACL_EXT_LOG;
+-        else if (strcmp(token, "%TAG") == 0)
+-            format->type = _external_acl_format::EXT_ACL_TAG;
++        else if (strcmp(token, "%EXT_LOG") == 0 || strcmp(token, "%ea") == 0)
++            format->type = Format::LFT_EXT_LOG;
++        else if (strcmp(token, "%TAG") == 0  || strcmp(token, "%et") == 0)
++            format->type = Format::LFT_TAG;
+         else if (strcmp(token, "%ACL") == 0)
+-            format->type = _external_acl_format::EXT_ACL_ACLNAME;
++            format->type = Format::LFT_EXT_ACL_NAME;
+         else if (strcmp(token, "%DATA") == 0)
+-            format->type = _external_acl_format::EXT_ACL_ACLDATA;
++            format->type = Format::LFT_EXT_ACL_DATA;
+         else if (strcmp(token, "%%") == 0)
+-            format->type = _external_acl_format::EXT_ACL_PERCENT;
++            format->type = Format::LFT_PERCENT;
+         else {
+             debugs(0, DBG_CRITICAL, "ERROR: Unknown Format token " << token);
+             self_destruct();
+@@ -573,67 +513,60 @@ dump_externalAclHelper(StoreEntry * sentry, const char *name, const external_acl
+         for (format = node->format; format; format = format->next) {
+             switch (format->type) {
+ 
+-            case _external_acl_format::EXT_ACL_HEADER_REQUEST:
+-            case _external_acl_format::EXT_ACL_HEADER_REQUEST_ID:
+-                storeAppendPrintf(sentry, " %%>{%s}", format->header);
++            case Format::LFT_ADAPTED_REQUEST_HEADER:
++                storeAppendPrintf(sentry, " %%>ha{%s}", format->header);
+                 break;
+ 
+-            case _external_acl_format::EXT_ACL_HEADER_REQUEST_MEMBER:
+-            case _external_acl_format::EXT_ACL_HEADER_REQUEST_ID_MEMBER:
+-                storeAppendPrintf(sentry, " %%>{%s:%s}", format->header, format->member);
++            case Format::LFT_ADAPTED_REQUEST_HEADER_ELEM:
++                storeAppendPrintf(sentry, " %%>ha{%s:%s}", format->header, format->member);
+                 break;
+ 
+-            case _external_acl_format::EXT_ACL_HEADER_REPLY:
+-            case _external_acl_format::EXT_ACL_HEADER_REPLY_ID:
+-                storeAppendPrintf(sentry, " %%<{%s}", format->header);
++            case Format::LFT_REPLY_HEADER:
++                storeAppendPrintf(sentry, " %%<h{%s}", format->header);
+                 break;
+ 
+-            case _external_acl_format::EXT_ACL_HEADER_REPLY_MEMBER:
+-            case _external_acl_format::EXT_ACL_HEADER_REPLY_ID_MEMBER:
+-                storeAppendPrintf(sentry, " %%<{%s:%s}", format->header, format->member);
++            case Format::LFT_REPLY_HEADER_ELEM:
++                storeAppendPrintf(sentry, " %%<h{%s:%s}", format->header, format->member);
+                 break;
+-#define DUMP_EXT_ACL_TYPE(a) \
+-            case _external_acl_format::EXT_ACL_##a: \
+-                storeAppendPrintf(sentry, " %%%s", #a); \
+-                break
++
+ #define DUMP_EXT_ACL_TYPE_FMT(a, fmt, ...) \
+-            case _external_acl_format::EXT_ACL_##a: \
++            case Format::LFT_##a: \
+                 storeAppendPrintf(sentry, fmt, ##__VA_ARGS__); \
+                 break
+ #if USE_AUTH
+-                DUMP_EXT_ACL_TYPE(LOGIN);
++                DUMP_EXT_ACL_TYPE_FMT(USER_LOGIN," %%ul");
+ #endif
+ #if USE_IDENT
+ 
+-                DUMP_EXT_ACL_TYPE(IDENT);
++                DUMP_EXT_ACL_TYPE_FMT(USER_IDENT," %%ui");
+ #endif
+-
+-                DUMP_EXT_ACL_TYPE(SRC);
+-                DUMP_EXT_ACL_TYPE(SRCPORT);
++                DUMP_EXT_ACL_TYPE_FMT(CLIENT_IP_ADDRESS," %%>a");
++                DUMP_EXT_ACL_TYPE_FMT(CLIENT_PORT," %%>p");
+ #if USE_SQUID_EUI
+-                DUMP_EXT_ACL_TYPE(SRCEUI48);
+-                DUMP_EXT_ACL_TYPE(SRCEUI64);
++                DUMP_EXT_ACL_TYPE_FMT(EXT_ACL_CLIENT_EUI48," %%SRCEUI48");
++                DUMP_EXT_ACL_TYPE_FMT(EXT_ACL_CLIENT_EUI64," %%SRCEUI64");
+ #endif
+-
+-                DUMP_EXT_ACL_TYPE(MYADDR);
+-                DUMP_EXT_ACL_TYPE(MYPORT);
+-                DUMP_EXT_ACL_TYPE(URI);
+-                DUMP_EXT_ACL_TYPE(DST);
+-                DUMP_EXT_ACL_TYPE(PROTO);
+-                DUMP_EXT_ACL_TYPE(PORT);
+-                DUMP_EXT_ACL_TYPE(PATH);
+-                DUMP_EXT_ACL_TYPE(METHOD);
++                DUMP_EXT_ACL_TYPE_FMT(LOCAL_LISTENING_IP," %%>la");
++                DUMP_EXT_ACL_TYPE_FMT(LOCAL_LISTENING_PORT," %%>lp");
++                DUMP_EXT_ACL_TYPE_FMT(CLIENT_REQ_URI," %%>ru");
++                DUMP_EXT_ACL_TYPE_FMT(CLIENT_REQ_URLDOMAIN," %%>rd");
++                DUMP_EXT_ACL_TYPE_FMT(CLIENT_REQ_URLSCHEME," %%>rs");
++                DUMP_EXT_ACL_TYPE_FMT(CLIENT_REQ_URLPORT," %%>rP");
++                DUMP_EXT_ACL_TYPE_FMT(CLIENT_REQ_URLPATH," %%>rp");
++                DUMP_EXT_ACL_TYPE_FMT(CLIENT_REQ_METHOD," %%>rm");
+ #if USE_OPENSSL
+-                DUMP_EXT_ACL_TYPE_FMT(USER_CERT_RAW, " %%USER_CERT_RAW");
+-                DUMP_EXT_ACL_TYPE_FMT(USER_CERTCHAIN_RAW, " %%USER_CERTCHAIN_RAW");
+-                DUMP_EXT_ACL_TYPE_FMT(USER_CERT, " %%USER_CERT_%s", format->header);
+-                DUMP_EXT_ACL_TYPE_FMT(USER_CA_CERT, " %%USER_CA_CERT_%s", format->header);
++                DUMP_EXT_ACL_TYPE_FMT(EXT_ACL_USER_CERT_RAW, " %%USER_CERT_RAW");
++                DUMP_EXT_ACL_TYPE_FMT(EXT_ACL_USER_CERTCHAIN_RAW, " %%USER_CERTCHAIN_RAW");
++                DUMP_EXT_ACL_TYPE_FMT(EXT_ACL_USER_CERT, " %%USER_CERT_%s", format->header);
++                DUMP_EXT_ACL_TYPE_FMT(EXT_ACL_USER_CA_CERT, " %%USER_CA_CERT_%s", format->header);
+ #endif
+ #if USE_AUTH
+-                DUMP_EXT_ACL_TYPE(EXT_USER);
++                DUMP_EXT_ACL_TYPE_FMT(USER_EXTERNAL," %%ue");
+ #endif
+-                DUMP_EXT_ACL_TYPE(EXT_LOG);
+-                DUMP_EXT_ACL_TYPE(TAG);
++                DUMP_EXT_ACL_TYPE_FMT(EXT_LOG," %%ea");
++                DUMP_EXT_ACL_TYPE_FMT(TAG," %%et");
++                DUMP_EXT_ACL_TYPE_FMT(EXT_ACL_NAME," %%ACL");
++                DUMP_EXT_ACL_TYPE_FMT(EXT_ACL_DATA," %%DATA");
+                 DUMP_EXT_ACL_TYPE_FMT(PERCENT, " %%%%");
+             default:
+                 fatal("unknown external_acl format error");
+@@ -980,7 +913,7 @@ makeExternalAclKey(ACLFilledChecklist * ch, external_acl_data * acl_data)
+ 
+         switch (format->type) {
+ #if USE_AUTH
+-        case _external_acl_format::EXT_ACL_LOGIN:
++        case Format::LFT_USER_LOGIN:
+             // if this ACL line was the cause of credentials fetch
+             // they may not already be in the checklist
+             if (ch->auth_user_request == NULL && ch->request)
+@@ -991,7 +924,7 @@ makeExternalAclKey(ACLFilledChecklist * ch, external_acl_data * acl_data)
+             break;
+ #endif
+ #if USE_IDENT
+-        case _external_acl_format::EXT_ACL_IDENT:
++        case Format::LFT_USER_IDENT:
+             str = ch->rfc931;
+ 
+             if (!str || !*str) {
+@@ -1004,117 +937,105 @@ makeExternalAclKey(ACLFilledChecklist * ch, external_acl_data * acl_data)
+             break;
+ #endif
+ 
+-        case _external_acl_format::EXT_ACL_SRC:
++        case Format::LFT_CLIENT_IP_ADDRESS:
+             str = ch->src_addr.toStr(buf,sizeof(buf));
+             break;
+ 
+-        case _external_acl_format::EXT_ACL_SRCPORT:
++        case Format::LFT_CLIENT_PORT:
+             snprintf(buf, sizeof(buf), "%d", request->client_addr.port());
+             str = buf;
+             break;
+ 
+ #if USE_SQUID_EUI
+-        case _external_acl_format::EXT_ACL_SRCEUI48:
++        case Format::LFT_EXT_ACL_CLIENT_EUI48:
+             if (request->clientConnectionManager.valid() && request->clientConnectionManager->clientConnection != NULL &&
+                     request->clientConnectionManager->clientConnection->remoteEui48.encode(buf, sizeof(buf)))
+                 str = buf;
+             break;
+ 
+-        case _external_acl_format::EXT_ACL_SRCEUI64:
++        case Format::LFT_EXT_ACL_CLIENT_EUI64:
+             if (request->clientConnectionManager.valid() && request->clientConnectionManager->clientConnection != NULL &&
+                     request->clientConnectionManager->clientConnection->remoteEui64.encode(buf, sizeof(buf)))
+                 str = buf;
+             break;
+ #endif
+ 
+-        case _external_acl_format::EXT_ACL_MYADDR:
++        case Format::LFT_LOCAL_LISTENING_IP:
+             str = request->my_addr.toStr(buf, sizeof(buf));
+             break;
+ 
+-        case _external_acl_format::EXT_ACL_MYPORT:
++        case Format::LFT_LOCAL_LISTENING_PORT:
+             snprintf(buf, sizeof(buf), "%d", request->my_addr.port());
+             str = buf;
+             break;
+ 
+-        case _external_acl_format::EXT_ACL_URI:
++        case Format::LFT_CLIENT_REQ_URI:
+             str = urlCanonical(request);
+             break;
+ 
+-        case _external_acl_format::EXT_ACL_DST:
++        case Format::LFT_CLIENT_REQ_URLDOMAIN:
+             str = request->GetHost();
+             break;
+ 
+-        case _external_acl_format::EXT_ACL_PROTO:
++        case Format::LFT_CLIENT_REQ_URLSCHEME:
+             str = request->url.getScheme().c_str();
+             break;
+ 
+-        case _external_acl_format::EXT_ACL_PORT:
++        case Format::LFT_CLIENT_REQ_URLPORT:
+             snprintf(buf, sizeof(buf), "%d", request->port);
+             str = buf;
+             break;
+ 
+-        case _external_acl_format::EXT_ACL_PATH:
++        case Format::LFT_CLIENT_REQ_URLPATH:
+             str = request->urlpath.termedBuf();
+             break;
+ 
+-        case _external_acl_format::EXT_ACL_METHOD:
+-            {
+-                const SBuf &s = request->method.image();
+-                sb.append(s.rawContent(), s.length());
+-            }
+-            str = sb.termedBuf();
+-            break;
+-
+-        case _external_acl_format::EXT_ACL_HEADER_REQUEST:
+-            sb = request->header.getByName(format->header);
+-            str = sb.termedBuf();
+-            break;
+-
+-        case _external_acl_format::EXT_ACL_HEADER_REQUEST_ID:
+-            sb = request->header.getStrOrList(format->header_id);
+-            str = sb.termedBuf();
+-            break;
++        case Format::LFT_CLIENT_REQ_METHOD: {
++            const SBuf &s = request->method.image();
++            sb.append(s.rawContent(), s.length());
++        }
++        str = sb.termedBuf();
++        break;
+ 
+-        case _external_acl_format::EXT_ACL_HEADER_REQUEST_MEMBER:
+-            sb = request->header.getByNameListMember(format->header, format->member, format->separator);
++        case Format::LFT_ADAPTED_REQUEST_HEADER:
++            if (format->header_id == -1)
++                sb = request->header.getByName(format->header);
++            else
++                sb = request->header.getStrOrList(format->header_id);
+             str = sb.termedBuf();
+             break;
+ 
+-        case _external_acl_format::EXT_ACL_HEADER_REQUEST_ID_MEMBER:
+-            sb = request->header.getListMember(format->header_id, format->member, format->separator);
++        case Format::LFT_ADAPTED_REQUEST_HEADER_ELEM:
++            if (format->header_id == -1)
++                sb = request->header.getByNameListMember(format->header, format->member, format->separator);
++            else
++                sb = request->header.getListMember(format->header_id, format->member, format->separator);
+             str = sb.termedBuf();
+             break;
+ 
+-        case _external_acl_format::EXT_ACL_HEADER_REPLY:
+-            if (reply) {
+-                sb = reply->header.getByName(format->header);
+-                str = sb.termedBuf();
+-            }
+-            break;
+-
+-        case _external_acl_format::EXT_ACL_HEADER_REPLY_ID:
++        case Format::LFT_REPLY_HEADER:
+             if (reply) {
+-                sb = reply->header.getStrOrList(format->header_id);
++                if (format->header_id == -1)
++                    sb = reply->header.getByName(format->header);
++                else
++                    sb = reply->header.getStrOrList(format->header_id);
+                 str = sb.termedBuf();
+             }
+             break;
+ 
+-        case _external_acl_format::EXT_ACL_HEADER_REPLY_MEMBER:
++        case Format::LFT_REPLY_HEADER_ELEM:
+             if (reply) {
+-                sb = reply->header.getByNameListMember(format->header, format->member, format->separator);
++                if (format->header_id == -1)
++                    sb = reply->header.getByNameListMember(format->header, format->member, format->separator);
++                else
++                    sb = reply->header.getListMember(format->header_id, format->member, format->separator);
+                 str = sb.termedBuf();
+             }
+             break;
+ 
+-        case _external_acl_format::EXT_ACL_HEADER_REPLY_ID_MEMBER:
+-            if (reply) {
+-                sb = reply->header.getListMember(format->header_id, format->member, format->separator);
+-                str = sb.termedBuf();
+-            }
+-            break;
+ #if USE_OPENSSL
+ 
+-        case _external_acl_format::EXT_ACL_USER_CERT_RAW:
++        case Format::LFT_EXT_ACL_USER_CERT_RAW:
+ 
+             if (ch->conn() != NULL && Comm::IsConnOpen(ch->conn()->clientConnection)) {
+                 SSL *ssl = fd_table[ch->conn()->clientConnection->fd].ssl;
+@@ -1125,7 +1046,7 @@ makeExternalAclKey(ACLFilledChecklist * ch, external_acl_data * acl_data)
+ 
+             break;
+ 
+-        case _external_acl_format::EXT_ACL_USER_CERTCHAIN_RAW:
++        case Format::LFT_EXT_ACL_USER_CERTCHAIN_RAW:
+ 
+             if (ch->conn() != NULL && Comm::IsConnOpen(ch->conn()->clientConnection)) {
+                 SSL *ssl = fd_table[ch->conn()->clientConnection->fd].ssl;
+@@ -1136,7 +1057,7 @@ makeExternalAclKey(ACLFilledChecklist * ch, external_acl_data * acl_data)
+ 
+             break;
+ 
+-        case _external_acl_format::EXT_ACL_USER_CERT:
++        case Format::LFT_EXT_ACL_USER_CERT:
+ 
+             if (ch->conn() != NULL && Comm::IsConnOpen(ch->conn()->clientConnection)) {
+                 SSL *ssl = fd_table[ch->conn()->clientConnection->fd].ssl;
+@@ -1147,7 +1068,7 @@ makeExternalAclKey(ACLFilledChecklist * ch, external_acl_data * acl_data)
+ 
+             break;
+ 
+-        case _external_acl_format::EXT_ACL_USER_CA_CERT:
++        case Format::LFT_EXT_ACL_USER_CA_CERT:
+ 
+             if (ch->conn() != NULL && Comm::IsConnOpen(ch->conn()->clientConnection)) {
+                 SSL *ssl = fd_table[ch->conn()->clientConnection->fd].ssl;
+@@ -1159,20 +1080,20 @@ makeExternalAclKey(ACLFilledChecklist * ch, external_acl_data * acl_data)
+             break;
+ #endif
+ #if USE_AUTH
+-        case _external_acl_format::EXT_ACL_EXT_USER:
++        case Format::LFT_USER_EXTERNAL:
+             str = request->extacl_user.termedBuf();
+             break;
+ #endif
+-        case _external_acl_format::EXT_ACL_EXT_LOG:
++        case Format::LFT_EXT_LOG:
+             str = request->extacl_log.termedBuf();
+             break;
+-        case _external_acl_format::EXT_ACL_TAG:
++        case Format::LFT_TAG:
+             str = request->tag.termedBuf();
+             break;
+-        case _external_acl_format::EXT_ACL_ACLNAME:
++        case Format::LFT_EXT_ACL_NAME:
+             str = acl_data->name;
+             break;
+-        case _external_acl_format::EXT_ACL_ACLDATA:
++        case Format::LFT_EXT_ACL_DATA:
+             data_used = true;
+             for (arg = acl_data->arguments; arg; arg = arg->next) {
+                 if (!first)
+@@ -1192,13 +1113,14 @@ makeExternalAclKey(ACLFilledChecklist * ch, external_acl_data * acl_data)
+                 first = 0;
+             }
+             break;
+-        case _external_acl_format::EXT_ACL_PERCENT:
++        case Format::LFT_PERCENT:
+             str = "%";
+             break;
+-        case _external_acl_format::EXT_ACL_UNKNOWN:
+ 
+-        case _external_acl_format::EXT_ACL_END:
+-            fatal("unknown external_acl format error");
++        default:
++            // TODO: replace this function with Format::assemble()
++            // For now die on unsupported logformat codes.
++            fatalf("ERROR: unknown external_acl_type format %u", (uint8_t)format->type);
+             break;
+         }
+ 
+@@ -1607,14 +1529,16 @@ ExternalACLLookup::LookupDone(void *data, void *result)
+     checklist->extacl_entry = cbdataReference((external_acl_entry *)result);
+ 
+     // attach the helper kv-pair to the transaction
+-    if (HttpRequest * req = checklist->request) {
+-        // XXX: we have no access to the transaction / AccessLogEntry so cant SyncNotes().
+-        // workaround by using anything already set in HttpRequest
+-        // OR use new and rely on a later Sync copying these to AccessLogEntry
+-        if (!req->notes)
+-            req->notes = new NotePairs;
+-
+-        req->notes->appendNewOnly(&checklist->extacl_entry->notes);
++    if (checklist->extacl_entry) {
++        if (HttpRequest * req = checklist->request) {
++            // XXX: we have no access to the transaction / AccessLogEntry so cant SyncNotes().
++            // workaround by using anything already set in HttpRequest
++            // OR use new and rely on a later Sync copying these to AccessLogEntry
++            if (!req->notes)
++                req->notes = new NotePairs;
++
++            req->notes->appendNewOnly(&checklist->extacl_entry->notes);
++        }
+     }
+ 
+     checklist->resumeNonBlockingCheck(ExternalACLLookup::Instance());
+@@ -58,7 +58,9 @@ typedef enum {
+     /* original Request-Line details recieved from client */
+     LFT_CLIENT_REQ_METHOD,
+     LFT_CLIENT_REQ_URI,
++    LFT_CLIENT_REQ_URLSCHEME,
+     LFT_CLIENT_REQ_URLDOMAIN,
++    LFT_CLIENT_REQ_URLPORT,
+     LFT_CLIENT_REQ_URLPATH,
+     /* LFT_CLIENT_REQ_QUERY, */
+     LFT_CLIENT_REQ_VERSION,
+@@ -70,6 +72,7 @@ typedef enum {
+     /*LFT_REQUEST_QUERY, */
+     LFT_REQUEST_VERSION_OLD_2X,
+     LFT_REQUEST_VERSION,
++    LFT_REQUEST_URLGROUP_OLD_2X,
+ 
+     /* request header details pre-adaptation */
+     LFT_REQUEST_HEADER,
+@@ -84,6 +87,9 @@ typedef enum {
+     /* Request-Line details sent to the server/peer */
+     LFT_SERVER_REQ_METHOD,
+     LFT_SERVER_REQ_URI,
++    LFT_SERVER_REQ_URLSCHEME,
++    LFT_SERVER_REQ_URLDOMAIN,
++    LFT_SERVER_REQ_URLPORT,
+     LFT_SERVER_REQ_URLPATH,
+     /*LFT_SERVER_REQ_QUERY, */
+     LFT_SERVER_REQ_VERSION,
+@@ -203,7 +209,18 @@ typedef enum {
+ #endif
+ 
+     LFT_NOTE,
+-    LFT_PERCENT			/* special string cases for escaped chars */
++    LFT_PERCENT,			/* special string cases for escaped chars */
++
++    // TODO assign better bytecode names and Token strings for these
++    LFT_EXT_ACL_USER_CERT_RAW,
++    LFT_EXT_ACL_USER_CERTCHAIN_RAW,
++    LFT_EXT_ACL_USER_CERT,
++    LFT_EXT_ACL_USER_CA_CERT,
++    LFT_EXT_ACL_CLIENT_EUI48,
++    LFT_EXT_ACL_CLIENT_EUI64,
++    LFT_EXT_ACL_NAME,
++    LFT_EXT_ACL_DATA
++
+ } ByteCode_t;
+ 
+ /// Quoting style for a format output.
+@@ -475,7 +475,7 @@ Format::Format::assemble(MemBuf &mb, const AccessLogEntry::Pointer &al, int logS
+             const char *spec;
+ 
+             struct tm *t;
+-            spec = fmt->data.timespec;
++            spec = fmt->data.string;
+ 
+             if (fmt->type == LFT_TIME_LOCALTIME) {
+                 if (!spec)
+@@ -931,13 +931,27 @@ Format::Format::assemble(MemBuf &mb, const AccessLogEntry::Pointer &al, int logS
+             }
+             break;
+ 
++        case LFT_CLIENT_REQ_URLSCHEME:
++            if (al->request) {
++                out = al->request->url.getScheme().c_str();
++                quote = 1;
++            }
++            break;
++
+         case LFT_CLIENT_REQ_URLDOMAIN:
+             if (al->request) {
+                 out = al->request->GetHost();
+                 quote = 1;
+             }
+             break;
+ 
++        case LFT_CLIENT_REQ_URLPORT:
++            if (al->request) {
++                outint = al->request->port;
++                doint = 1;
++            }
++            break;
++
+         case LFT_REQUEST_URLPATH_OLD_31:
+         case LFT_CLIENT_REQ_URLPATH:
+             if (al->request) {
+@@ -991,6 +1005,27 @@ Format::Format::assemble(MemBuf &mb, const AccessLogEntry::Pointer &al, int logS
+             }
+             break;
+ 
++        case LFT_SERVER_REQ_URLSCHEME:
++            if (al->adapted_request) {
++                out = al->adapted_request->url.getScheme().c_str();
++                quote = 1;
++            }
++            break;
++
++        case LFT_SERVER_REQ_URLDOMAIN:
++            if (al->adapted_request) {
++                out = al->adapted_request->GetHost();
++                quote = 1;
++            }
++            break;
++
++        case LFT_SERVER_REQ_URLPORT:
++            if (al->adapted_request) {
++                outint = al->adapted_request->port;
++                doint = 1;
++            }
++            break;
++
+         case LFT_SERVER_REQ_URLPATH:
+             if (al->adapted_request) {
+                 out = al->adapted_request->urlpath.termedBuf();
+@@ -1101,6 +1136,9 @@ Format::Format::assemble(MemBuf &mb, const AccessLogEntry::Pointer &al, int logS
+             break;
+ #endif
+ 
++        case LFT_REQUEST_URLGROUP_OLD_2X:
++            assert(LFT_REQUEST_URLGROUP_OLD_2X == 0); // should never happen.
++
+         case LFT_NOTE:
+             tmp[0] = fmt->data.header.separator;
+             tmp[1] = '\0';
+@@ -1148,7 +1186,20 @@ Format::Format::assemble(MemBuf &mb, const AccessLogEntry::Pointer &al, int logS
+ 
+         case LFT_PERCENT:
+             out = "%";
++            break;
+ 
++            // XXX: external_acl_type format tokens which are not output by logformat.
++            // They are listed here because the switch requires
++            // every ByteCode_t to be explicitly enumerated.
++            // But do not output due to lack of access to the values.
++        case LFT_EXT_ACL_USER_CERT_RAW:
++        case LFT_EXT_ACL_USER_CERTCHAIN_RAW:
++        case LFT_EXT_ACL_USER_CERT:
++        case LFT_EXT_ACL_USER_CA_CERT:
++        case LFT_EXT_ACL_CLIENT_EUI48:
++        case LFT_EXT_ACL_CLIENT_EUI64:
++        case LFT_EXT_ACL_NAME:
++        case LFT_EXT_ACL_DATA:
+             break;
+         }
+ 
+@@ -81,7 +81,9 @@ static TokenTableEntry TokenTable2C[] = {
+ 
+     {">rm", LFT_CLIENT_REQ_METHOD},
+     {">ru", LFT_CLIENT_REQ_URI},
++    {">rs", LFT_CLIENT_REQ_URLSCHEME},
+     {">rd", LFT_CLIENT_REQ_URLDOMAIN},
++    {">rP", LFT_CLIENT_REQ_URLPORT},
+     {">rp", LFT_CLIENT_REQ_URLPATH},
+     /*{">rq", LFT_CLIENT_REQ_QUERY},*/
+     {">rv", LFT_CLIENT_REQ_VERSION},
+@@ -91,9 +93,13 @@ static TokenTableEntry TokenTable2C[] = {
+     {"rp", LFT_REQUEST_URLPATH_OLD_31},
+     /* { "rq", LFT_REQUEST_QUERY }, * /     / * the query-string, INCLUDING the leading ? */
+     {"rv", LFT_REQUEST_VERSION},
++    {"rG", LFT_REQUEST_URLGROUP_OLD_2X},
+ 
+     {"<rm", LFT_SERVER_REQ_METHOD},
+     {"<ru", LFT_SERVER_REQ_URI},
++    {"<rs", LFT_SERVER_REQ_URLSCHEME},
++    {"<rd", LFT_SERVER_REQ_URLDOMAIN},
++    {"<rP", LFT_SERVER_REQ_URLPORT},
+     {"<rp", LFT_SERVER_REQ_URLPATH},
+     /*{"<rq", LFT_SERVER_REQ_QUERY},*/
+     {"<rv", LFT_SERVER_REQ_VERSION},
+@@ -536,6 +542,12 @@ Format::Token::parse(const char *def, Quoting *quoting)
+         break;
+ #endif
+ 
++    case LFT_REQUEST_URLGROUP_OLD_2X:
++        debugs(46, DBG_PARSE_NOTE(DBG_IMPORTANT), "WARNING: The \"rG\" formatting code is deprecated. Use \"note{urlgroup}\" instead.");
++        type = LFT_NOTE;
++        data.header.header = xstrdup("urlgroup");
++        break;
++
+     default:
+         break;
+     }
+@@ -544,24 +556,22 @@ Format::Token::parse(const char *def, Quoting *quoting)
+ }
+ 
+ Format::Token::Token() : type(LFT_NONE),
+-                         label(NULL),
+-                         widthMin(-1),
+-                         widthMax(-1),
+-                         quote(LOG_QUOTE_NONE),
+-                         left(false),
+-                         space(false),
+-                         zero(false),
+-                         divisor(1),
+-                         next(NULL)
++        label(NULL),
++        widthMin(-1),
++        widthMax(-1),
++        quote(LOG_QUOTE_NONE),
++        left(false),
++        space(false),
++        zero(false),
++        divisor(1),
++        next(NULL)
+ {
+     data.string = NULL;
+-    data.header.header = NULL; 
++    data.header.header = NULL;
+     data.header.element = NULL;
+     data.header.separator = ',';
+ }
+ 
+-
+-
+ Format::Token::~Token()
+ {
+     label = NULL; // drop reference to global static.
+@@ -49,7 +49,6 @@ class Token
+             char *element;
+             char separator;
+         } header;
+-        char *timespec;
+     } data;
+     int widthMin; ///< minimum field width
+     int widthMax; ///< maximum field width
+@@ -2590,7 +2590,7 @@ ftpSendPassive(FtpStateData * ftpState)
+             }
+         }
+     }
+-        break;
++    break;
+     }
+ 
+     ftpState->writeCommand(cbuf);
+@@ -7,12 +7,12 @@ Http::StatusCodeString(const Http::StatusCode status)
+ {
+     switch (status) {
+ 
+-    // 000
++        // 000
+     case Http::scNone:
+         return "Init";		/* we init .status with code 0 */
+         break;
+ 
+-    // 100-199
++        // 100-199
+     case Http::scContinue:
+         return "Continue";
+         break;
+@@ -25,7 +25,7 @@ Http::StatusCodeString(const Http::StatusCode status)
+         return "Processing";
+         break;
+ 
+-    // 200-299
++        // 200-299
+     case Http::scOkay:
+         return "OK";
+         break;
+@@ -66,7 +66,7 @@ Http::StatusCodeString(const Http::StatusCode status)
+         return "IM Used";
+         break;
+ 
+-    // 300-399
++        // 300-399
+     case Http::scMultipleChoices:
+         return "Multiple Choices";
+         break;
+@@ -99,7 +99,7 @@ Http::StatusCodeString(const Http::StatusCode status)
+         return "Permanent Redirect";
+         break;
+ 
+-    // 400-499
++        // 400-499
+     case Http::scBadRequest:
+         return "Bad Request";
+         break;
+@@ -200,7 +200,7 @@ Http::StatusCodeString(const Http::StatusCode status)
+         return "Request Header Fields Too Large";
+         break;
+ 
+-    // 500-599
++        // 500-599
+     case Http::scInternalServerError:
+         return "Internal Server Error";
+         break;
+@@ -245,7 +245,7 @@ Http::StatusCodeString(const Http::StatusCode status)
+         return "Network Authentication Required";
+         break;
+ 
+-    // 600+
++        // 600+
+     case Http::scInvalidHeader:
+     case Http::scHeaderTooLarge:
+         // fall through to default.
+@@ -497,7 +497,7 @@ mainParseOptions(int argc, char *argv[])
+                 fatal("Need to add -DMALLOC_DBG when compiling to use -mX option");
+ #endif
+ 
+-            } 
++            }
+             break;
+ 
+         case 'n':
+@@ -120,7 +120,7 @@ class PconnPool
+      * A caller with a non-retriable transaction should set keepOpen to false
+      * and call pop() anyway, even though the caller does not want a pconn.
+      * This forces us to close an available persistent connection, avoiding
+-     * creating a growing number of open connections when many transactions 
++     * creating a growing number of open connections when many transactions
+      * create (and push) persistent connections but are not retriable and,
+      * hence, do not need to pop a connection.
+      */
+@@ -131,8 +131,7 @@ redirectHandleReply(void *data, const HelperReply &reply)
+                  * At this point altering the helper buffer in that way is not harmful, but annoying.
+                  * When Bug 1961 is resolved and urlParse has a const API, this needs to die.
+                  */
+-                const char * result = reply.other().content();
+-                const Http::StatusCode status = static_cast<Http::StatusCode>(atoi(result));
++                char * result = reply.modifiableOther().content();
+ 
+                 HelperReply newReply;
+                 // BACKWARD COMPATIBILITY 2012-06-15:
+@@ -142,6 +141,20 @@ redirectHandleReply(void *data, const HelperReply &reply)
+                 newReply.result = HelperReply::Okay;
+                 newReply.notes.append(&reply.notes);
+ 
++                // check and parse for obsoleted Squid-2 urlgroup feature
++                if (*result == '!') {
++                    static int urlgroupWarning = 0;
++                    if (!urlgroupWarning++)
++                        debugs(85, DBG_IMPORTANT, "UPGRADE WARNING: URL rewriter using obsolete Squid-2 urlgroup feature needs updating.");
++                    if (char *t = strchr(result+1, '!')) {
++                        *t = '\0';
++                        newReply.notes.add("urlgroup", result+1);
++                        result = t + 1;
++                    }
++                }
++
++                const Http::StatusCode status = static_cast<Http::StatusCode>(atoi(result));
++
+                 if (status == Http::scMovedPermanently
+                         || status == Http::scFound
+                         || status == Http::scSeeOther
+@@ -162,7 +175,8 @@ redirectHandleReply(void *data, const HelperReply &reply)
+                     // status code is not a redirect code (or does not exist)
+                     // treat as a re-write URL request
+                     // TODO: validate the URL produced here is RFC 2616 compliant URI
+-                    newReply.notes.add("rewrite-url", reply.other().content());
++                    if (*result)
++                        newReply.notes.add("rewrite-url", result);
+                 }
+ 
+                 void *cbdata;
+@@ -14,25 +14,25 @@
+ #include "globals.h"
+ #include "HttpRequest.h"
+ #include "neighbors.h"
++#include "SquidConfig.h"
+ #include "ssl/cert_validate_message.h"
+ #include "ssl/Config.h"
+ #include "ssl/ErrorDetail.h"
+ #include "ssl/helper.h"
+ #include "ssl/PeerConnector.h"
+ #include "ssl/ServerBump.h"
+ #include "ssl/support.h"
+-#include "SquidConfig.h"
+ 
+ CBDATA_NAMESPACED_CLASS_INIT(Ssl, PeerConnector);
+ 
+ Ssl::PeerConnector::PeerConnector(
+     HttpRequestPointer &aRequest,
+     const Comm::ConnectionPointer &aServerConn,
+     AsyncCall::Pointer &aCallback):
+-    AsyncJob("Ssl::PeerConnector"),
+-    request(aRequest),
+-    serverConn(aServerConn),
+-    callback(aCallback)
++        AsyncJob("Ssl::PeerConnector"),
++        request(aRequest),
++        serverConn(aServerConn),
++        callback(aCallback)
+ {
+     // if this throws, the caller's cb dialer is not our CbDialer
+     Must(dynamic_cast<CbDialer*>(callback->getDialer()));
+@@ -378,38 +378,38 @@ Ssl::PeerConnector::handleNegotiateError(const int ret)
+     int ssl_error = SSL_get_error(ssl, ret);
+ 
+ #ifdef EPROTO
+-        int sysErrNo = EPROTO;
++    int sysErrNo = EPROTO;
+ #else
+-        int sysErrNo = EACCES;
++    int sysErrNo = EACCES;
+ #endif
+ 
+-        switch (ssl_error) {
++    switch (ssl_error) {
+ 
+-        case SSL_ERROR_WANT_READ:
+-            Comm::SetSelect(fd, COMM_SELECT_READ, &NegotiateSsl, this, 0);
+-            return;
++    case SSL_ERROR_WANT_READ:
++        Comm::SetSelect(fd, COMM_SELECT_READ, &NegotiateSsl, this, 0);
++        return;
+ 
+-        case SSL_ERROR_WANT_WRITE:
+-            Comm::SetSelect(fd, COMM_SELECT_WRITE, &NegotiateSsl, this, 0);
+-            return;
++    case SSL_ERROR_WANT_WRITE:
++        Comm::SetSelect(fd, COMM_SELECT_WRITE, &NegotiateSsl, this, 0);
++        return;
+ 
+-        case SSL_ERROR_SSL:
+-        case SSL_ERROR_SYSCALL:
+-            ssl_lib_error = ERR_get_error();
++    case SSL_ERROR_SSL:
++    case SSL_ERROR_SYSCALL:
++        ssl_lib_error = ERR_get_error();
+ 
+-            // store/report errno when ssl_error is SSL_ERROR_SYSCALL, ssl_lib_error is 0, and ret is -1
+-            if (ssl_error == SSL_ERROR_SYSCALL && ret == -1 && ssl_lib_error == 0)
+-                sysErrNo = errno;
++        // store/report errno when ssl_error is SSL_ERROR_SYSCALL, ssl_lib_error is 0, and ret is -1
++        if (ssl_error == SSL_ERROR_SYSCALL && ret == -1 && ssl_lib_error == 0)
++            sysErrNo = errno;
+ 
+-            debugs(83, DBG_IMPORTANT, "Error negotiating SSL on FD " << fd <<
+-                   ": " << ERR_error_string(ssl_lib_error, NULL) << " (" <<
+-                   ssl_error << "/" << ret << "/" << errno << ")");
++        debugs(83, DBG_IMPORTANT, "Error negotiating SSL on FD " << fd <<
++               ": " << ERR_error_string(ssl_lib_error, NULL) << " (" <<
++               ssl_error << "/" << ret << "/" << errno << ")");
+ 
+-            break; // proceed to the general error handling code
++        break; // proceed to the general error handling code
+ 
+-        default:
+-            break; // no special error handling for all other errors
+-        }
++    default:
++        break; // no special error handling for all other errors
++    }
+ 
+     ErrorState *const anErr = ErrorState::NewForwarding(ERR_SECURE_CONNECT_FAIL, request.getRaw());
+     anErr->xerrno = sysErrNo;
+@@ -501,7 +501,6 @@ Ssl::PeerConnector::callBack()
+     ScheduleCallHere(cb);
+ }
+ 
+-
+ void
+ Ssl::PeerConnector::swanSong()
+ {
+@@ -29,22 +29,24 @@
+ #ifndef SQUID_SSL_PEER_CONNECTOR_H
+ #define SQUID_SSL_PEER_CONNECTOR_H
+ 
+-#include "base/AsyncJob.h"
+ #include "base/AsyncCbdataCalls.h"
++#include "base/AsyncJob.h"
+ #include "ssl/support.h"
+ #include <iosfwd>
+ 
+ class HttpRequest;
+ class ErrorState;
+ 
+-namespace Ssl {
++namespace Ssl
++{
+ 
+ class ErrorDetail;
+ class CertValidationResponse;
+ 
+ /// PeerConnector results (supplied via a callback).
+ /// The connection to peer was secured if and only if the error member is nil.
+-class PeerConnectorAnswer {
++class PeerConnectorAnswer
++{
+ public:
+     ~PeerConnectorAnswer(); ///< deletes error if it is still set
+     Comm::ConnectionPointer conn; ///< peer connection (secured on success)
+@@ -80,12 +82,13 @@ class PeerConnectorAnswer {
+  \par
+  * This job never closes the connection, even on errors. If a 3rd-party
+  * closes the connection, this job simply quits without informing the caller.
+-*/ 
++*/
+ class PeerConnector: virtual public AsyncJob
+ {
+ public:
+     /// Callback dialier API to allow PeerConnector to set the answer.
+-    class CbDialer {
++    class CbDialer
++    {
+     public:
+         virtual ~CbDialer() {}
+         /// gives PeerConnector access to the in-dialer answer
+@@ -137,7 +140,7 @@ class PeerConnector: virtual public AsyncJob
+     /// mimics FwdState to minimize changes to FwdState::initiate/negotiateSsl
+     Comm::ConnectionPointer const &serverConnection() const { return serverConn; }
+ 
+-    void bail(ErrorState *error); ///< Return an error to the PeerConnector caller 
++    void bail(ErrorState *error); ///< Return an error to the PeerConnector caller
+ 
+     /// Callback the caller class, and pass the ready to communicate secure
+     /// connection or an error if PeerConnector failed.
+@@ -54,6 +54,7 @@ STUB_SOURCE= tests/STUB.h \
+ 	tests/stub_mem.cc \
+ 	tests/stub_mem_node.cc \
+ 	tests/stub_mime.cc \
++	tests/stub_neighbors.cc \
+ 	tests/stub_pconn.cc \
+ 	tests/stub_redirect.cc \
+ 	tests/stub_stat.cc \
+@@ -175,13 +175,14 @@ class TunnelStateData
+         typedef void (TunnelStateData::*Method)(Ssl::PeerConnectorAnswer &);
+ 
+         MyAnswerDialer(Method method, TunnelStateData *tunnel):
+-                       method_(method), tunnel_(tunnel), answer_() {}
++                method_(method), tunnel_(tunnel), answer_() {}
+ 
+         /* CallDialer API */
+         virtual bool canDial(AsyncCall &call) { return tunnel_.valid(); }
+         void dial(AsyncCall &call) { ((&(*tunnel_))->*method_)(answer_); }
+         virtual void print(std::ostream &os) const {
+-            os << '(' << tunnel_.get() << ", " << answer_ << ')'; }
++            os << '(' << tunnel_.get() << ", " << answer_ << ')';
++        }
+ 
+         /* Ssl::PeerConnector::CbDialer API */
+         virtual Ssl::PeerConnectorAnswer &answer() { return answer_; }
+@@ -947,15 +948,16 @@ tunnelStart(ClientHttpRequest * http, int64_t * size_ptr, int *status_ptr, const
+ }
+ 
+ void
+-TunnelStateData::connectToPeer() {
++TunnelStateData::connectToPeer()
++{
+     const Comm::ConnectionPointer &srv = server.conn;
+ 
+ #if USE_OPENSSL
+     if (CachePeer *p = srv->getPeer()) {
+         if (p->use_ssl) {
+             AsyncCall::Pointer callback = asyncCall(5,4,
+-                "TunnelStateData::ConnectedToPeer",
+-                MyAnswerDialer(&TunnelStateData::connectedToPeer, this));
++                                                    "TunnelStateData::ConnectedToPeer",
++                                                    MyAnswerDialer(&TunnelStateData::connectedToPeer, this));
+             Ssl::PeerConnector *connector =
+                 new Ssl::PeerConnector(request, srv, callback);
+             AsyncJob::Start(connector); // will call our callback
+@@ -508,21 +508,20 @@ urlCanonical(HttpRequest * request)
+             snprintf(urlbuf, MAX_URL, "%s:%d", request->GetHost(), request->port);
+             break;
+ 
+-        default:
+-            {
+-                portbuf[0] = '\0';
+-
+-                if (request->port != urlDefaultPort(request->url.getScheme()))
+-                    snprintf(portbuf, 32, ":%d", request->port);
+-
+-                snprintf(urlbuf, MAX_URL, "%s://%s%s%s%s" SQUIDSTRINGPH,
+-                         request->url.getScheme().c_str(),
+-                         request->login,
+-                         *request->login ? "@" : null_string,
+-                         request->GetHost(),
+-                         portbuf,
+-                         SQUIDSTRINGPRINT(request->urlpath));
+-            }
++        default: {
++            portbuf[0] = '\0';
++
++            if (request->port != urlDefaultPort(request->url.getScheme()))
++                snprintf(portbuf, 32, ":%d", request->port);
++
++            snprintf(urlbuf, MAX_URL, "%s://%s%s%s%s" SQUIDSTRINGPH,
++                     request->url.getScheme().c_str(),
++                     request->login,
++                     *request->login ? "@" : null_string,
++                     request->GetHost(),
++                     portbuf,
++                     SQUIDSTRINGPRINT(request->urlpath));
++        }
+         }
+     }
+ 
+@@ -551,36 +550,35 @@ urlCanonicalClean(const HttpRequest * request)
+             snprintf(buf, MAX_URL, "%s:%d", request->GetHost(), request->port);
+             break;
+ 
+-        default:
+-            {
+-                portbuf[0] = '\0';
+-
+-                if (request->port != urlDefaultPort(request->url.getScheme()))
+-                    snprintf(portbuf, 32, ":%d", request->port);
++        default: {
++            portbuf[0] = '\0';
+ 
+-                loginbuf[0] = '\0';
++            if (request->port != urlDefaultPort(request->url.getScheme()))
++                snprintf(portbuf, 32, ":%d", request->port);
+ 
+-                if ((int) strlen(request->login) > 0) {
+-                    strcpy(loginbuf, request->login);
++            loginbuf[0] = '\0';
+ 
+-                    if ((t = strchr(loginbuf, ':')))
+-                        *t = '\0';
++            if ((int) strlen(request->login) > 0) {
++                strcpy(loginbuf, request->login);
+ 
+-                    strcat(loginbuf, "@");
+-                }
++                if ((t = strchr(loginbuf, ':')))
++                    *t = '\0';
+ 
+-                snprintf(buf, MAX_URL, "%s://%s%s%s" SQUIDSTRINGPH,
+-                         request->url.getScheme().c_str(),
+-                         loginbuf,
+-                         request->GetHost(),
+-                         portbuf,
+-                         SQUIDSTRINGPRINT(request->urlpath));
+-
+-                // strip arguments AFTER a question-mark
+-                if (Config.onoff.strip_query_terms)
+-                    if ((t = strchr(buf, '?')))
+-                        *(++t) = '\0';
++                strcat(loginbuf, "@");
+             }
++
++            snprintf(buf, MAX_URL, "%s://%s%s%s" SQUIDSTRINGPH,
++                     request->url.getScheme().c_str(),
++                     loginbuf,
++                     request->GetHost(),
++                     portbuf,
++                     SQUIDSTRINGPRINT(request->urlpath));
++
++            // strip arguments AFTER a question-mark
++            if (Config.onoff.strip_query_terms)
++                if ((t = strchr(buf, '?')))
++                    *(++t) = '\0';
++        }
+         }
+     }
+ 
+@@ -42,7 +42,7 @@ fi
+ # but skip if we have no files to remove.
+ FILECOUNT=`ls -1 | grep -c .`
+ if test "${FILECOUNT}" != "0" ; then
+-  make -k distclean || echo "distclean done. errors are unwanted but okay here."
++  ${MAKE:-make} -k distclean || echo "distclean done. errors are unwanted but okay here."
+   ls -la .
+   rm -fr ./src/fs/aufs/.deps src/fs/diskd/.deps
+ fi
+@@ -55,7 +55,7 @@ fi
+ # eval is need to correctly handle quoted arguments
+ 	eval "$base/../configure ${DISTCHECK_CONFIGURE_FLAGS} ${configcache}" \
+ 		2>&1 && \
+-	make ${pjobs} ${MAKETEST} 2>&1
++	${MAKE:-make} ${pjobs} ${MAKETEST} 2>&1
+ 
+ # Remember and then explicitly return the result of the last command
+ # to the script caller. Probably not needed on most or all platforms.
+@@ -17,12 +17,11 @@ class TheConfig
+ {
+ public:
+     TheConfig() :
+-        ioTimeout(120),
+-        localHost(NULL),
+-        port(CACHE_HTTP_PORT),
+-        tlsEnabled(false),
+-        tlsAnonymous(false)
+-    {
++            ioTimeout(120),
++            localHost(NULL),
++            port(CACHE_HTTP_PORT),
++            tlsEnabled(false),
++            tlsAnonymous(false) {
+         params = "NORMAL";
+         hostname = "localhost";
+     }
+@@ -122,13 +122,13 @@ usage(const char *progname)
+               << "Usage: " << progname << " [Basic Options] [HTTP Options]" << std::endl
+               << std::endl;
+     std::cerr
+-              << "    -s | --quiet    Silent.  Do not print response message to stdout." << std::endl
+-              << "    -v | --verbose  Verbose debugging. Repeat (-vv) to increase output level." << std::endl
+-              << "                    Levels:" << std::endl
+-              << "                      1 - Print outgoing request message to stderr." << std::endl
+-              << "                      2 - Print action trace to stderr." << std::endl
+-              << "    --help          Display this help text." << std::endl
+-              << std::endl;
++        << "    -s | --quiet    Silent.  Do not print response message to stdout." << std::endl
++        << "    -v | --verbose  Verbose debugging. Repeat (-vv) to increase output level." << std::endl
++        << "                    Levels:" << std::endl
++        << "                      1 - Print outgoing request message to stderr." << std::endl
++        << "                      2 - Print action trace to stderr." << std::endl
++        << "    --help          Display this help text." << std::endl
++        << std::endl;
+     Transport::Config.usage();
+     Ping::Config.usage();
+     std::cerr

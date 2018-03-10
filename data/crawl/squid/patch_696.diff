@@ -1,0 +1,1594 @@
+@@ -728,8 +728,9 @@ for fs in $squid_storeio_module_candidates none; do
+       STORE_TESTS="$STORE_TESTS tests/testCoss$EXEEXT"
+       ;;
+     rock)
+-	if ! test "x$squid_disk_module_candidates_IpcIo" = "xyes"; then
+-	  AC_MSG_ERROR([Storage modeule Rock requires IpcIo DiskIO module])
++	if ! test "x$squid_disk_module_candidates_IpcIo" = "xyes" -a \
++	  "x$squid_disk_module_candidates_Blocking" = "xyes"; then
++	  AC_MSG_ERROR([Storage module Rock requires IpcIo and Blocking DiskIO modules])
+ 	fi
+ 	STORE_TESTS="$STORE_TESTS tests/testRock$EXEEXT"
+ 	;;
+@@ -17,7 +17,11 @@
+ 
+ CBDATA_CLASS_INIT(IpcIoFile);
+ 
+-IpcIoFile::RequestsMap IpcIoFile::TheRequestsMap;
++IpcIoFile::RequestMap IpcIoFile::TheRequestMap1;
++IpcIoFile::RequestMap IpcIoFile::TheRequestMap2;
++IpcIoFile::RequestMap *IpcIoFile::TheOlderRequests = &IpcIoFile::TheRequestMap1;
++IpcIoFile::RequestMap *IpcIoFile::TheNewerRequests = &IpcIoFile::TheRequestMap2;
++bool IpcIoFile::TimeoutCheckScheduled = false;
+ unsigned int IpcIoFile::LastRequestId = 0;
+ 
+ static bool DiskerOpen(const String &path, int flags, mode_t mode);
+@@ -47,14 +51,13 @@ IpcIoFile::open(int flags, mode_t mode, RefCount<IORequestor> callback)
+         if (error_)
+             return;
+ 
+-        ioRequestor->ioCompletedNotification();
+-
+         Ipc::HereIamMessage ann(Ipc::StrandCoord(KidIdentifier, getpid()));
+         ann.strand.tag = dbName;
+         Ipc::TypedMsgHdr message;
+         ann.pack(message);
+         SendMessage(Ipc::coordinatorAddr, message);
+ 
++        ioRequestor->ioCompletedNotification();
+         return;
+ 	}        
+ 
+@@ -71,12 +74,16 @@ IpcIoFile::open(int flags, mode_t mode, RefCount<IORequestor> callback)
+ }
+ 
+ void
+-IpcIoFile::openCompleted(const IpcIoResponse &ipcResponse) {
+-    if (ipcResponse.xerrno) {
+-        debugs(79,1, HERE << "error: " << xstrerr(ipcResponse.xerrno));
++IpcIoFile::openCompleted(const IpcIoResponse *ipcResponse) {
++    if (!ipcResponse) {
++        debugs(79,1, HERE << "error: timeout");
++        error_ = true;
++	} else
++    if (ipcResponse->xerrno) {
++        debugs(79,1, HERE << "error: " << xstrerr(ipcResponse->xerrno));
+         error_ = true;
+ 	} else {
+-        diskId = ipcResponse.diskId;
++        diskId = ipcResponse->diskId;
+         if (diskId < 0) {
+             error_ = true;
+             debugs(79,1, HERE << "error: no disker claimed " << dbName);
+@@ -155,17 +162,22 @@ IpcIoFile::read(ReadRequest *readRequest)
+ 
+ void
+ IpcIoFile::readCompleted(ReadRequest *readRequest,
+-                         const IpcIoResponse &ipcResponse)
+-{
+-    if (ipcResponse.xerrno) {
+-        debugs(79,1, HERE << "error: " << xstrerr(ipcResponse.xerrno));
+-        error_ = true;
++                         const IpcIoResponse *ipcResponse)
++{
++    bool ioError = false;
++    if (!ipcResponse) {
++        debugs(79,1, HERE << "error: timeout");
++        ioError = true; // I/O timeout does not warrant setting error_?
++	} else
++    if (ipcResponse->xerrno) {
++        debugs(79,1, HERE << "error: " << xstrerr(ipcResponse->xerrno));
++        ioError = error_ = true;
+ 	} else {
+-        memcpy(readRequest->buf, ipcResponse.buf, ipcResponse.len);
++        memcpy(readRequest->buf, ipcResponse->buf, ipcResponse->len);
+     }
+ 
+-    const ssize_t rlen = error_ ? -1 : (ssize_t)readRequest->len;
+-    const int errflag = error_ ? DISK_ERROR : DISK_OK;
++    const ssize_t rlen = ioError ? -1 : (ssize_t)readRequest->len;
++    const int errflag = ioError ? DISK_ERROR : DISK_OK;
+     ioRequestor->readCompleted(readRequest->buf, rlen, errflag, readRequest);
+ }
+ 
+@@ -199,27 +211,32 @@ IpcIoFile::write(WriteRequest *writeRequest)
+ 
+ void
+ IpcIoFile::writeCompleted(WriteRequest *writeRequest,
+-                          const IpcIoResponse &ipcResponse)
+-{
+-    if (ipcResponse.xerrno) {
+-        debugs(79,1, HERE << "error: " << xstrerr(ipcResponse.xerrno));
++                          const IpcIoResponse *ipcResponse)
++{
++    bool ioError = false;
++    if (!ipcResponse) {
++        debugs(79,1, HERE << "error: timeout");
++        ioError = true; // I/O timeout does not warrant setting error_?
++	} else
++    if (ipcResponse->xerrno) {
++        debugs(79,1, HERE << "error: " << xstrerr(ipcResponse->xerrno));
+         error_ = true;
+     } else
+-    if (ipcResponse.len != writeRequest->len) {
+-        debugs(79,1, HERE << "problem: " << ipcResponse.len << " < " << writeRequest->len);
++    if (ipcResponse->len != writeRequest->len) {
++        debugs(79,1, HERE << "problem: " << ipcResponse->len << " < " << writeRequest->len);
+         error_ = true;
+     }
+ 
+     if (writeRequest->free_func)
+         (writeRequest->free_func)(const_cast<char*>(writeRequest->buf)); // broken API?
+ 
+-    if (!error_) {
++    if (!ioError) {
+         debugs(79,5, HERE << "wrote " << writeRequest->len << " to disker" <<
+             diskId << " at " << writeRequest->offset);
+ 	}
+ 
+-    const ssize_t rlen = error_ ? 0 : (ssize_t)writeRequest->len;
+-    const int errflag = error_ ? DISK_ERROR : DISK_OK;
++    const ssize_t rlen = ioError ? 0 : (ssize_t)writeRequest->len;
++    const int errflag = ioError ? DISK_ERROR : DISK_OK;
+     ioRequestor->writeCompleted(errflag, rlen, writeRequest);
+ }
+ 
+@@ -236,7 +253,7 @@ IpcIoFile::send(IpcIoRequest &ipcIo, IpcIoPendingRequest *pending)
+     if (++LastRequestId == 0) // don't use zero value as requestId
+         ++LastRequestId;
+     ipcIo.requestId = LastRequestId;
+-    TheRequestsMap[ipcIo.requestId] = pending;
++    TheNewerRequests->insert(std::make_pair(ipcIo.requestId, pending));
+ 
+     Ipc::TypedMsgHdr message;
+     ipcIo.pack(message);
+@@ -252,9 +269,8 @@ IpcIoFile::send(IpcIoRequest &ipcIo, IpcIoPendingRequest *pending)
+     Ipc::SendMessage(addr, message);
+     ++ioLevel;
+ 
+-    const double timeout = 10; // in seconds
+-    eventAdd("IpcIoFile::requestTimedOut", &IpcIoFile::RequestTimedOut,
+-             this, timeout, 0, false);
++    if (!TimeoutCheckScheduled)
++        ScheduleTimeoutCheck();
+ }
+ 
+ /// called when disker responds to our I/O request
+@@ -264,56 +280,56 @@ IpcIoFile::HandleResponse(const Ipc::TypedMsgHdr &raw)
+     IpcIoResponse response(raw);
+ 
+     const int requestId = response.requestId;
+-    debugs(47, 7, HERE << "disker response to " <<
+-        response.command << "; ipcIo" << KidIdentifier << '.' << requestId);
++    debugs(47, 7, HERE << "disker response to " << response.command <<
++        "; ipcIo" << KidIdentifier << '.' << requestId);
+ 
+     Must(requestId != 0);
+ 
+-    IpcIoPendingRequest *pending = DequeueRequest(requestId);
+-    Must(pending);
+-
+-    if (pending->readRequest)
+-        pending->file->readCompleted(pending->readRequest, response);
+-    else
+-    if (pending->writeRequest)
+-        pending->file->writeCompleted(pending->writeRequest, response);
+-    else
+-        pending->file->openCompleted(response);
+-
+-    // XXX: leaking if throwinig
+-    delete pending;
++    if (IpcIoPendingRequest *pending = DequeueRequest(requestId)) {
++        pending->completeIo(&response);
++        delete pending; // XXX: leaking if throwing
++    } else {
++        debugs(47, 4, HERE << "LATE disker response to " << response.command <<
++            "; ipcIo" << KidIdentifier << '.' << requestId);
++        // nothing we can do about it; completeIo() has been called already
++    }
+ }
+ 
+-
+-/// Mgr::IpcIoFile::requestTimedOut wrapper
++/// Mgr::IpcIoFile::checkTimeous wrapper
+ void
+-IpcIoFile::RequestTimedOut(void* param)
++IpcIoFile::CheckTimeouts(void*)
+ {
+-    debugs(47, 1, HERE << "bug: request timedout and we cannot handle that");
+-    Must(param != NULL);
+-    // XXX: cannot get to file because IpcIoFile is not cbdata-protected
+-    // IpcIoFile* file = static_cast<IpcIoFile*>(param);
++    TimeoutCheckScheduled = false;
+ 
+-    // TODO: notify the pending request (XXX: which one?)
++    // any old request would have timed out by now
++    typedef RequestMap::const_iterator RMCI;
++    RequestMap &elders = *TheOlderRequests;
++    for (RMCI i = elders.begin(); i != elders.end(); ++i) {
++        IpcIoPendingRequest *pending = i->second;
+ 
+-    // use async call to enable job call protection that time events lack
+-    // CallJobHere(47, 5, mgrFwdr, IpcIoFile, requestTimedOut);
+-}
++        const int requestId = i->first;
++        debugs(47, 7, HERE << "disker timeout; ipcIo" <<
++            KidIdentifier << '.' << requestId);
+ 
+-/// Called when Coordinator fails to start processing the request [in time]
+-void
+-IpcIoFile::requestTimedOut()
+-{
+-    debugs(47, 3, HERE);
+-    assert(false); // TODO: notify the pending request (XXX: which one?)
++        pending->completeIo(NULL); // no response
++        delete pending; // XXX: leaking if throwing
++	}
++    elders.clear();
++
++    swap(TheOlderRequests, TheNewerRequests); // switches pointers around
++    if (!TheOlderRequests->empty())
++        ScheduleTimeoutCheck();
+ }
+ 
+-/// called when we are no longer waiting for Coordinator to respond
++/// prepare to check for timeouts in a little while
+ void
+-IpcIoFile::removeTimeoutEvent()
++IpcIoFile::ScheduleTimeoutCheck()
+ {
+-    if (eventFind(&IpcIoFile::RequestTimedOut, this))
+-        eventDelete(&IpcIoFile::RequestTimedOut, this);
++    // we check all older requests at once so some may be wait for 2*timeout
++    const double timeout = 7; // in seconds
++    eventAdd("IpcIoFile::CheckTimeouts", &IpcIoFile::CheckTimeouts,
++             NULL, timeout, 0, false);
++    TimeoutCheckScheduled = true;
+ }
+ 
+ /// returns and forgets the right IpcIoFile pending request
+@@ -322,13 +338,24 @@ IpcIoFile::DequeueRequest(unsigned int requestId)
+ {
+     debugs(47, 3, HERE);
+     Must(requestId != 0);
+-    RequestsMap::iterator i = TheRequestsMap.find(requestId);
+-    if (i != TheRequestsMap.end()) {
+-        IpcIoPendingRequest *pending = i->second;
+-        TheRequestsMap.erase(i);
+-        return pending;
+-	}
+-    return NULL;
++
++	RequestMap *map = NULL;
++    RequestMap::iterator i = TheRequestMap1.find(requestId);
++
++    if (i != TheRequestMap1.end())
++        map = &TheRequestMap1;
++    else {
++        i = TheRequestMap2.find(requestId);
++        if (i != TheRequestMap2.end())
++            map = &TheRequestMap2;
++    }
++
++    if (!map) // not found in both maps
++        return NULL;
++
++    IpcIoPendingRequest *pending = i->second;
++    map->erase(i);
++    return pending;
+ }
+ 
+ int
+@@ -416,13 +443,28 @@ IpcIoResponse::pack(Ipc::TypedMsgHdr& msg) const
+ }
+ 
+ 
+-/* IpcIoPendingRequest: */
++/* IpcIoPendingRequest */
+ 
+ IpcIoPendingRequest::IpcIoPendingRequest(const IpcIoFile::Pointer &aFile):
+     file(aFile), readRequest(NULL), writeRequest(NULL)
+ {
+ }
+ 
++void
++IpcIoPendingRequest::completeIo(IpcIoResponse *response)
++{
++    Must(file != NULL);
++
++    if (readRequest)
++        file->readCompleted(readRequest, response);
++    else
++    if (writeRequest)
++        file->writeCompleted(writeRequest, response);
++    else
++        file->openCompleted(response);
++}
++
++
+ 
+ /* XXX: disker code that should probably be moved elsewhere */
+ 
+@@ -89,18 +89,20 @@ class IpcIoFile: public DiskFile
+     /// disker entry point for remote I/O requests
+     static void HandleRequest(const IpcIoRequest &request);
+ 
++protected:
++    friend class IpcIoPendingRequest;
++    void openCompleted(const IpcIoResponse *response);
++    void readCompleted(ReadRequest *readRequest, const IpcIoResponse *);
++    void writeCompleted(WriteRequest *writeRequest, const IpcIoResponse *);
++
+ private:
+     void send(IpcIoRequest &request, IpcIoPendingRequest *pending);
+ 
+-    void openCompleted(const IpcIoResponse &);
+-    void readCompleted(ReadRequest *readRequest, const IpcIoResponse &);
+-    void writeCompleted(WriteRequest *writeRequest, const IpcIoResponse &);
+-
+-    static void RequestTimedOut(void* param);
+-    void requestTimedOut();
+-    void removeTimeoutEvent();
+     static IpcIoPendingRequest *DequeueRequest(unsigned int requestId);
+ 
++    static void CheckTimeouts(void* param);
++    static void ScheduleTimeoutCheck();
++
+ private:
+     const String dbName; ///< the name of the file we are managing
+     int diskId; ///< the process ID of the disker we talk to
+@@ -111,8 +113,12 @@ class IpcIoFile: public DiskFile
+     bool error_; ///< whether we have seen at least one I/O error (XXX)
+ 
+     /// maps requestId to the handleResponse callback
+-    typedef std::map<unsigned int, IpcIoPendingRequest*> RequestsMap;
+-    static RequestsMap TheRequestsMap; ///< pending requests map
++    typedef std::map<unsigned int, IpcIoPendingRequest*> RequestMap;
++    static RequestMap TheRequestMap1; ///< older (or newer) pending requests
++    static RequestMap TheRequestMap2; ///< newer (or older) pending requests
++    static RequestMap *TheOlderRequests; ///< older requests (map1 or map2)
++    static RequestMap *TheNewerRequests; ///< newer requests (map2 or map1)
++    static bool TimeoutCheckScheduled; ///< we expect a CheckTimeouts() call
+ 
+     static unsigned int LastRequestId; ///< last requestId used
+ 
+@@ -126,6 +132,9 @@ class IpcIoPendingRequest
+ public:
+     IpcIoPendingRequest(const IpcIoFile::Pointer &aFile);
+ 
++    /// called when response is received and, with a nil response, on timeouts
++    void completeIo(IpcIoResponse *response);
++
+ public:
+     IpcIoFile::Pointer file; ///< the file object waiting for the response
+     ReadRequest *readRequest; ///< set if this is a read requests
+@@ -82,6 +82,7 @@ class StoreHashIndex : public Store
+ private:
+     /* migration logic */
+     StorePointer store(int const x) const;
++    SwapDir &dir(int const idx) const;
+ };
+ 
+ class StoreHashIndexEntry : public StoreEntry
+@@ -161,6 +161,25 @@ SwapDir::type() const
+     return theType;
+ }
+ 
++bool
++SwapDir::active() const
++{
++    if (IamWorkerProcess())
++        return true;
++
++    // we are inside a disker dedicated to this disk
++    if (IamDiskProcess() && index == (KidIdentifier-1 - Config.workers))
++        return true;
++
++    return false; // Coordinator, wrong disker, etc.
++}
++
++bool
++SwapDir::needsDiskStrand() const
++{
++    return false;
++}
++
+ /* NOT performance critical. Really. Don't bother optimising for speed
+  * - RBC 20030718
+  */
+@@ -118,6 +118,9 @@ class SwapDir : public Store
+     virtual void reconfigure(int, char *) = 0;
+     char const *type() const;
+ 
++    virtual bool needsDiskStrand() const; ///< needs a dedicated kid process
++    virtual bool active() const; ///< may be used in this strand
++
+     /* official Store interface functions */
+     virtual void diskFull();
+ 
+@@ -136,6 +139,9 @@ class SwapDir : public Store
+     /* migrated from store_dir.cc */
+     bool objectSizeIsAcceptable(int64_t objsize) const;
+ 
++    /// called when the entry is about to forget its association with cache_dir
++    virtual void disconnect(StoreEntry &) {}
++
+ protected:
+     void parseOptions(int reconfiguring);
+     void dumpOptions(StoreEntry * e) const;
+@@ -1884,13 +1884,6 @@ find_fstype(char *type)
+ static void
+ parse_cachedir(SquidConfig::_cacheSwap * swap)
+ {
+-    // coordinator does not need to handle cache_dir.
+-    if (IamCoordinatorProcess()) {
+-        // make sure the NumberOfKids() is correct for coordinator
+-        ++swap->n_processes; // XXX: does not work in reconfigure
+-        return;
+-    }
+-
+     char *type_str;
+     char *path_str;
+     RefCount<SwapDir> sd;
+@@ -1956,7 +1949,9 @@ parse_cachedir(SquidConfig::_cacheSwap * swap)
+     sd->parse(swap->n_configured, path_str);
+ 
+     ++swap->n_configured;
+-    ++swap->n_processes;
++
++    if (sd->needsDiskStrand())
++        ++swap->n_strands;
+ 
+     /* Update the max object size */
+     update_maxobjsize();
+@@ -1820,12 +1820,12 @@ ClientSocketContext::initiateClose(const char *reason)
+ void
+ ClientSocketContext::writeComplete(int aFileDescriptor, char *bufnotused, size_t size, comm_err_t errflag)
+ {
+-    StoreEntry *entry = http->storeEntry();
++    const StoreEntry *entry = http->storeEntry();
+     http->out.size += size;
+     assert(aFileDescriptor > -1);
+     debugs(33, 5, "clientWriteComplete: FD " << aFileDescriptor << ", sz " << size <<
+            ", err " << errflag << ", off " << http->out.size << ", len " <<
+-           entry ? entry->objectLen() : 0);
++           (entry ? entry->objectLen() : 0));
+     clientUpdateSocketStats(http->logType, size);
+     assert (this->fd() == aFileDescriptor);
+ 
+@@ -39,20 +39,23 @@ Rock::DirMap::openForWriting(const cache_key *const key, sfileno &fileno)
+     debugs(79, 5, HERE << " trying to open slot for key " << storeKeyText(key)
+            << " for writing in map [" << path << ']');
+     const int idx = slotIdx(key);
+-    free(idx);
+     Slot &s = shared->slots[idx];
+-    freeIfNeeded(s);
+-    if (s.state.swap_if(Slot::Empty, Slot::Writing)) {
+-        fileno = idx;
++
++    if (s.exclusiveLock()) {
++        assert(s.state != Slot::Writeable); // until we start breaking locks
++        if (s.state == Slot::Empty) // we may also overwrite a Readable slot
++            ++shared->count;
++        s.state = Slot::Writeable;
+         s.setKey(key);
+-        ++shared->count;
++        fileno = idx;
+         debugs(79, 5, HERE << " opened slot at " << fileno << " for key " <<
+                storeKeyText(key) << " for writing in map [" << path << ']');
+-        return &s.seBasics;
++        return &s.seBasics; // and keep the entry locked
+     }
+-    debugs(79, 5, HERE << " failed to open slot for key " << storeKeyText(key)
++
++    debugs(79, 5, HERE << " failed to open slot at " << idx << " for key " << storeKeyText(key)
+            << " for writing in map [" << path << ']');
+-    return 0;
++    return NULL;
+ }
+ 
+ void
+@@ -62,35 +65,95 @@ Rock::DirMap::closeForWriting(const sfileno fileno)
+            "openning for reading in map [" << path << ']');
+     assert(valid(fileno));
+     Slot &s = shared->slots[fileno];
+-    assert(s.state == Slot::Writing);
+-    ++s.readLevel;
+-    assert(s.state.swap_if(Slot::Writing, Slot::Usable));
++    assert(s.state.swap_if(Slot::Writeable, Slot::Readable));
++    s.switchExclusiveToSharedLock();
+ }
+ 
+-bool
+-Rock::DirMap::free(const sfileno fileno)
++/// terminate writing the entry, freeing its slot for others to use
++void
++Rock::DirMap::abortWriting(const sfileno fileno)
+ {
++    debugs(79, 5, HERE << " abort writing slot at " << fileno <<
++           " in map [" << path << ']');
+     assert(valid(fileno));
+     Slot &s = shared->slots[fileno];
+-    if (s.state.swap_if(Slot::Usable, Slot::WaitingToBeFreed)) {
+-        debugs(79, 5, HERE << " marked slot at " << fileno << " to be freed in"
+-               " map [" << path << ']');
+-        freeIfNeeded(s);
++    assert(s.state == Slot::Writeable);
++    freeLocked(s);
++}
++
++void
++Rock::DirMap::abortIo(const sfileno fileno)
++{
++    debugs(79, 5, HERE << " abort I/O for slot at " << fileno <<
++           " in map [" << path << ']');
++    assert(valid(fileno));
++    Slot &s = shared->slots[fileno];
++
++    // The caller is a lock holder. Thus, if we are Writeable, then the
++    // caller must be the writer; otherwise the caller must be the reader.
++    if (s.state == Slot::Writeable)
++        abortWriting(fileno);
++    else
++        closeForReading(fileno);
++}
++
++bool
++Rock::DirMap::putAt(const StoreEntry &e, const sfileno fileno)
++{
++    const cache_key *key = static_cast<const cache_key*>(e.key);
++    debugs(79, 5, HERE << " trying to open slot for key " << storeKeyText(key)
++           << " for putting in map [" << path << ']');
++    if (!valid(fileno)) {
++        debugs(79, 5, HERE << "failure: bad fileno: " << fileno);
++        return false;
++    }
++    
++    const int idx = slotIdx(key);
++    if (fileno != idx) {
++        debugs(79, 5, HERE << "failure: hash changed: " << idx << " vs. " <<
++            fileno);
++        return false;
++    }
++    
++    Slot &s = shared->slots[idx];
++
++    if (s.exclusiveLock()) {
++        assert(s.state != Slot::Writeable); // until we start breaking locks
++        if (s.state == Slot::Empty) // we may also overwrite a Readable slot
++            ++shared->count;
++        s.setKey(static_cast<const cache_key*>(e.key));
++        s.seBasics.set(e);
++        s.state = Slot::Readable;
++        s.releaseExclusiveLock();
++        debugs(79, 5, HERE << " put slot at " << fileno << " for key " <<
++               storeKeyText(key) << " in map [" << path << ']');
+         return true;
+     }
+-    debugs(79, 5, HERE << " failed to mark slot at " << fileno << " to be "
+-           "freed in map [" << path << ']');
++
++    debugs(79, 5, HERE << " failed to open slot for key " << storeKeyText(key)
++           << " for putting in map [" << path << ']');
+     return false;
+ }
+ 
++void
++Rock::DirMap::free(const sfileno fileno)
++{
++    debugs(79, 5, HERE << " marking slot at " << fileno << " to be freed in"
++               " map [" << path << ']');
++
++    assert(valid(fileno));
++    Slot &s = shared->slots[fileno];
++    s.waitingToBeFreed = true; // mark, regardless of whether we can free
++    freeIfNeeded(s);
++}
++
+ const StoreEntryBasics *
+ Rock::DirMap::openForReading(const cache_key *const key, sfileno &fileno)
+ {
+     debugs(79, 5, HERE << " trying to open slot for key " << storeKeyText(key)
+            << " for reading in map [" << path << ']');
+     const int idx = slotIdx(key);
+-    const StoreEntryBasics *const seBasics = openForReadingAt(idx);
+-    if (seBasics) {
++    if (const StoreEntryBasics *const seBasics = openForReadingAt(idx)) {
+         Slot &s = shared->slots[idx];
+         if (s.checkKey(key)) {
+             fileno = idx;
+@@ -99,7 +162,7 @@ Rock::DirMap::openForReading(const cache_key *const key, sfileno &fileno)
+                    ']');
+             return seBasics;
+         }
+-        --s.readLevel;
++        s.releaseSharedLock();
+         freeIfNeeded(s);
+     }
+     debugs(79, 5, HERE << " failed to open slot for key " << storeKeyText(key)
+@@ -114,13 +177,11 @@ Rock::DirMap::openForReadingAt(const sfileno fileno)
+            "reading in map [" << path << ']');
+     assert(valid(fileno));
+     Slot &s = shared->slots[fileno];
+-    ++s.readLevel;
+-    if (s.state == Slot::Usable) {
++    if (s.sharedLock()) {
+         debugs(79, 5, HERE << " opened slot at " << fileno << " for reading in"
+                " map [" << path << ']');
+         return &s.seBasics;
+     }
+-    --s.readLevel;
+     freeIfNeeded(s);
+     debugs(79, 5, HERE << " failed to open slot at " << fileno << " for "
+            "reading in map [" << path << ']');
+@@ -134,8 +195,8 @@ Rock::DirMap::closeForReading(const sfileno fileno)
+            "map [" << path << ']');
+     assert(valid(fileno));
+     Slot &s = shared->slots[fileno];
+-    assert(s.readLevel > 0);
+-    --s.readLevel;
++    assert(s.state == Slot::Readable);
++    s.releaseSharedLock();
+     freeIfNeeded(s);
+ }
+ 
+@@ -178,34 +239,38 @@ Rock::DirMap::slotIdx(const cache_key *const key) const
+     return (k[0] + k[1]) % shared->limit;
+ }
+ 
+-Rock::DirMap::Slot &
++Rock::Slot &
+ Rock::DirMap::slot(const cache_key *const key)
+ {
+     return shared->slots[slotIdx(key)];
+ }
+ 
++/// frees the slot if (b) it is waiting to be freed and (a) we can lock it
+ void
+ Rock::DirMap::freeIfNeeded(Slot &s)
+ {
+-    const int idx = &s - shared->slots;
+-    if (s.state.swap_if(Slot::WaitingToBeFreed, Slot::Freeing)) {
+-        debugs(79, 5, HERE << " trying to free slot at " << idx << " in map ["
+-               << path << ']');
+-        if (s.readLevel > 0) {
+-            assert(s.state.swap_if(Slot::Freeing, Slot::WaitingToBeFreed));
+-            debugs(79, 5, HERE << " failed to free slot at " << idx << " in "
+-                   "map [" << path << ']');
+-        } else {
+-            memset(s.key_, 0, sizeof(s.key_));
+-            memset(&s.seBasics, 0, sizeof(s.seBasics));
+-            --shared->count;
+-            assert(s.state.swap_if(Slot::Freeing, Slot::Empty));
+-            debugs(79, 5, HERE << " freed slot at " << idx << " in map [" <<
+-                   path << ']');
+-        }
++    if (s.exclusiveLock()) {
++        if (s.waitingToBeFreed == true)
++            freeLocked(s);
++        else
++            s.releaseExclusiveLock();
+     }
+ }
+ 
++/// unconditionally frees the already exclusively locked slot and releases lock
++void
++Rock::DirMap::freeLocked(Slot &s)
++{
++    memset(s.key_, 0, sizeof(s.key_));
++    memset(&s.seBasics, 0, sizeof(s.seBasics));
++    s.waitingToBeFreed = false;
++    s.state = Slot::Empty;
++    s.releaseExclusiveLock();
++    --shared->count;
++    debugs(79, 5, HERE << " freed slot at " << (&s - shared->slots) <<
++           " in map [" << path << ']');
++}
++
+ String
+ Rock::DirMap::sharedMemoryName()
+ {
+@@ -228,20 +293,64 @@ Rock::DirMap::SharedSize(const int limit)
+     return sizeof(Shared) + limit * sizeof(Slot);
+ }
+ 
++
++/* Rock::Slot */
++
+ void
+-Rock::DirMap::Slot::setKey(const cache_key *const aKey)
++Rock::Slot::setKey(const cache_key *const aKey)
+ {
+     memcpy(key_, aKey, sizeof(key_));
+ }
+ 
+ bool
+-Rock::DirMap::Slot::checkKey(const cache_key *const aKey) const
++Rock::Slot::checkKey(const cache_key *const aKey) const
+ {
+     const uint32_t *const k = reinterpret_cast<const uint32_t *>(aKey);
+     return k[0] == key_[0] && k[1] == key_[1] &&
+            k[2] == key_[2] && k[3] == key_[3];
+ }
+ 
++
++bool
++Rock::Slot::sharedLock() const
++{
++    ++readers; // this locks new writers out
++    if (state == Readable && !writers && !waitingToBeFreed)
++        return true;
++    --readers;
++    return false;
++}
++
++bool
++Rock::Slot::exclusiveLock()
++{
++    if (!writers++) { // we are the first writer (this locks new readers out)
++        if (!readers) // there are no old readers
++            return true;
++	}
++    --writers;
++    return false;
++}
++
++void
++Rock::Slot::releaseSharedLock() const
++{
++    assert(readers-- > 0);
++}
++
++void
++Rock::Slot::releaseExclusiveLock()
++{
++    assert(writers-- > 0);
++}
++
++void
++Rock::Slot::switchExclusiveToSharedLock()
++{
++    ++readers; // must be done before we release exclusive control
++    releaseExclusiveLock();
++}
++
+ Rock::DirMap::Shared::Shared(const int aLimit): limit(aLimit), count(0)
+ {
+ }
+@@ -21,6 +21,37 @@ class StoreEntryBasics {
+ 
+ namespace Rock {
+ 
++/// DirMap entry
++class Slot {
++public:
++    /// possible persistent states
++    typedef enum {
++        Empty, ///< ready for writing, with nothing of value
++        Writeable, ///< transitions from Empty to Readable
++        Readable, ///< ready for reading
++    } State;
++
++    void setKey(const cache_key *const aKey);
++    bool checkKey(const cache_key *const aKey) const;
++
++    bool sharedLock() const; ///< lock for reading or return false
++    bool exclusiveLock(); ///< lock for modification or return false
++    void releaseSharedLock() const; ///< undo successful sharedLock()
++    void releaseExclusiveLock(); ///< undo successful exclusiveLock()
++    void switchExclusiveToSharedLock(); ///< trade exclusive for shared access
++
++public:
++    // we want two uint64_t, but older GCCs lack __sync_fetch_and_add_8
++    AtomicWordT<uint32_t> key_[4]; ///< MD5 entry key
++    StoreEntryBasics seBasics; ///< basic store entry data
++    AtomicWordT<uint8_t> state; ///< current state
++    AtomicWordT<uint8_t> waitingToBeFreed; ///< a state-independent mark
++
++private:
++    mutable AtomicWord readers; ///< number of users trying to read
++    AtomicWord writers; ///< number of writers trying to modify the slot
++};
++
+ /// \ingroup Rock
+ /// map of used db slots indexed by sfileno
+ class DirMap
+@@ -29,13 +60,16 @@ class DirMap
+     DirMap(const char *const aPath, const int limit); ///< create a new shared DirMap
+     DirMap(const char *const aPath); ///< open an existing shared DirMap
+ 
+-    /// start writing a new entry
++    /// finds/reservers space for writing a new entry or returns nil
+     StoreEntryBasics *openForWriting(const cache_key *const key, sfileno &fileno);
+-    /// finish writing a new entry, leaves the entry opened for reading
++    /// successfully finish writing the entry, leaving it opened for reading
+     void closeForWriting(const sfileno fileno);
+ 
+-    /// mark slot as waiting to be freed, will be freed when no one uses it
+-    bool free(const sfileno fileno);
++    /// stores entry info at the requested slot or returns false
++    bool putAt(const StoreEntry &e, const sfileno fileno);
++
++    /// mark the slot as waiting to be freed and, if possible, free it
++    void free(const sfileno fileno);
+ 
+     /// open slot for reading, increments read level
+     const StoreEntryBasics *openForReading(const cache_key *const key, sfileno &fileno);
+@@ -44,6 +78,9 @@ class DirMap
+     /// close slot after reading, decrements read level
+     void closeForReading(const sfileno fileno);
+ 
++    /// called by lock holder to terminate either slot writing or reading
++    void abortIo(const sfileno fileno);
++
+     bool full() const; ///< there are no empty slots left
+     bool valid(int n) const; ///< whether n is a valid slot coordinate
+     int entryCount() const; ///< number of used slots
+@@ -52,27 +89,6 @@ class DirMap
+     static int AbsoluteEntryLimit(); ///< maximum entryLimit() possible
+ 
+ private:
+-    struct Slot {
+-        enum {
+-            Empty,
+-            Writing,
+-            Usable,
+-            WaitingToBeFreed,
+-            Freeing
+-        };
+-
+-        void setKey(const cache_key *const aKey);
+-        bool checkKey(const cache_key *const aKey) const;
+-
+-        AtomicWordT<uint8_t> state; ///< slot state
+-        AtomicWord readLevel; ///< read level
+-
+-        // we want two uint64_t, but older GCCs lack __sync_fetch_and_add_8
+-        AtomicWordT<uint32_t> key_[4]; ///< MD5 entry key
+-
+-        StoreEntryBasics seBasics; ///< basic store entry data
+-    };
+-
+     struct Shared {
+         Shared(const int aLimit);
+ 
+@@ -85,7 +101,9 @@ class DirMap
+     int slotIdx(const cache_key *const key) const;
+     Slot &slot(const cache_key *const key);
+     const StoreEntryBasics *openForReading(Slot &s);
++    void abortWriting(const sfileno fileno);
+     void freeIfNeeded(Slot &s);
++    void freeLocked(Slot &s);
+     String sharedMemoryName();
+ 
+     static int SharedSize(const int limit);
+@@ -9,7 +9,7 @@
+ 
+ CBDATA_NAMESPACED_CLASS_INIT(Rock, Rebuild);
+ 
+-Rock::Rebuild::Rebuild(SwapDir *dir):
++Rock::Rebuild::Rebuild(SwapDir *dir): AsyncJob("Rock::Rebuild"),
+     sd(dir),
+     dbSize(0),
+     dbEntrySize(0),
+@@ -34,6 +34,14 @@ Rock::Rebuild::~Rebuild()
+ /// prepares and initiates entry loading sequence
+ void
+ Rock::Rebuild::start() {
++    // in SMP mode, only the disker is responsible for populating the map
++    if (UsingSmp() && !IamDiskProcess()) {
++        debugs(47, 2, "Non-disker skips rebuilding of cache_dir #" <<
++           sd->index << " from " << sd->filePath);
++        mustStop("non-disker");
++        return;
++    }
++
+     debugs(47, DBG_IMPORTANT, "Loading cache_dir #" << sd->index <<
+            " from " << sd->filePath);
+ 
+@@ -51,20 +59,25 @@ Rock::Rebuild::start() {
+     checkpoint();
+ }
+ 
+-/// quits if done; otherwise continues after a pause
++/// continues after a pause if not done
+ void
+ Rock::Rebuild::checkpoint()
+ {
+-    if (dbOffset < dbSize)
++    if (!done())
+         eventAdd("Rock::Rebuild", Rock::Rebuild::Steps, this, 0.01, 1, true);
+-    else
+-        complete();
++}
++
++bool
++Rock::Rebuild::doneAll() const
++{
++    return dbOffset >= dbSize && AsyncJob::doneAll();
+ }
+ 
+ void
+ Rock::Rebuild::Steps(void *data)
+ {
+-    static_cast<Rebuild*>(data)->steps();
++    // use async call to enable job call protection that time events lack
++    CallJobHere(47, 5, static_cast<Rebuild*>(data), Rock::Rebuild, steps);
+ }
+ 
+ void
+@@ -116,12 +129,11 @@ Rock::Rebuild::doOneEntry() {
+ }
+ 
+ void
+-Rock::Rebuild::complete() {
+-    debugs(47,3, HERE << sd->index);
+-    close(fd);
+-    StoreController::store_dirs_rebuilding--;
++Rock::Rebuild::swanSong() {
++    debugs(47,3, HERE << "cache_dir #" << sd->index << " rebuild level: " <<
++        StoreController::store_dirs_rebuilding);
++    --StoreController::store_dirs_rebuilding;
+     storeRebuildComplete(&counts);
+-    delete this; // same as cbdataFree
+ }
+ 
+ void
+@@ -2,6 +2,7 @@
+ #define SQUID_FS_ROCK_REBUILD_H
+ 
+ #include "config.h"
++#include "base/AsyncJob.h"
+ #include "structs.h"
+ 
+ namespace Rock {
+@@ -10,19 +11,21 @@ class SwapDir;
+ 
+ /// \ingroup Rock
+ /// manages store rebuild process: loading meta information from db on disk
+-class Rebuild {
++class Rebuild: public AsyncJob {
+ public:
+     Rebuild(SwapDir *dir);
+     ~Rebuild();
+-    void start();
+ 
+-private:
+-    CBDATA_CLASS2(Rebuild);
++protected:
++    /* AsyncJob API */
++    virtual void start();
++    virtual bool doneAll() const;
++    virtual void swanSong();
+ 
++private:
+     void checkpoint();
+     void steps();
+     void doOneEntry();
+-    void complete();
+     void failure(const char *msg, int errNo = 0);
+ 
+     SwapDir *sd;
+@@ -38,6 +41,8 @@ class Rebuild {
+     struct _store_rebuild_data counts;
+ 
+     static void Steps(void *data);
++
++    CBDATA_CLASS2(Rebuild);
+ };
+ 
+ } // namespace Rock
+@@ -76,14 +76,21 @@ Rock::SwapDir::get(const cache_key *key)
+     // the disk entry remains open for reading, protected from modifications
+ }
+ 
+-void
+-Rock::SwapDir::closeForReading(StoreEntry &e)
++void Rock::SwapDir::disconnect(StoreEntry &e)
+ {
+-    assert(index == e.swap_dirn);
++    assert(e.swap_dirn == index);
+     assert(e.swap_filen >= 0);
+-    map->closeForReading(e.swap_filen);
++    // cannot have SWAPOUT_NONE entry with swap_filen >= 0
++    assert(e.swap_status != SWAPOUT_NONE);
++
++    // do not rely on e.swap_status here because there is an async delay
++    // before it switches from SWAPOUT_WRITING to SWAPOUT_DONE.
++
++    // since e has swap_filen, its slot is locked for either reading or writing
++    map->abortIo(e.swap_filen);
+     e.swap_dirn = -1;
+     e.swap_filen = -1;
++    e.swap_status = SWAPOUT_NONE;
+ }
+ 
+ // TODO: encapsulate as a tool; identical to CossSwapDir::create()
+@@ -173,15 +180,29 @@ Rock::SwapDir::init()
+         map = new DirMap(path, eAllowed);
+     }
+ 
+-    DiskIOModule *m = DiskIOModule::Find("IpcIo"); // TODO: configurable?
+-    assert(m);
+-    io = m->createStrategy();
+-    io->init();
++    const char *ioModule = UsingSmp() ? "IpcIo" : "Blocking";
++    if (DiskIOModule *m = DiskIOModule::Find(ioModule)) {
++        debugs(47,2, HERE << "Using DiskIO module: " << ioModule);
++        io = m->createStrategy();
++        io->init();
++    } else {
++        debugs(47,1, "Rock store is missing DiskIO module: " << ioModule);
++        fatal("Rock Store missing a required DiskIO module");
++    }
+ 
+     theFile = io->newFile(filePath);
+     theFile->open(O_RDWR, 0644, this);
+ 
+-    rebuild();
++    // Increment early. Otherwise, if one SwapDir finishes rebuild before
++    // others start, storeRebuildComplete() will think the rebuild is over!
++    // TODO: move store_dirs_rebuilding hack to store modules that need it.
++    ++StoreController::store_dirs_rebuilding;
++}
++
++bool
++Rock::SwapDir::needsDiskStrand() const
++{
++    return true;
+ }
+ 
+ void
+@@ -199,7 +220,9 @@ Rock::SwapDir::parse(int anIndex, char *aPath)
+     parseSize();
+     parseOptions(0);
+ 
+-    repl = createRemovalPolicy(Config.replPolicy);
++    // Current openForWriting() code overwrites the old slot if needed
++    // and possible, so proactively removing old slots is probably useless.
++    assert(!repl); // repl = createRemovalPolicy(Config.replPolicy);
+ 
+     validateOptions();
+ }
+@@ -229,15 +252,6 @@ Rock::SwapDir::validateOptions()
+     if (max_objsize <= 0)
+         fatal("Rock store requires a positive max-size");
+ 
+-    // Rock::IoState::startWriting() inflates write size to the end of the page
+-    // so that mmap does not have to read the tail and then write it back.
+-    // This is a weak check that the padded area will be allocated by [growing]
+-    // MemBuf and a sufficient check that inflated size will not exceed the
+-    // slot size.
+-    static const int ps = getpagesize();
+-    if (ps > 0 && (max_objsize % ps != 0))
+-        fatal("Rock store max-size should be a multiple of page size");
+-
+     /* XXX: should we support resize?
+     const int64_t eLimitHi = 0xFFFFFF; // Core sfileno maximum
+     const int64_t eLimitLo = map->entryLimit(); // dynamic shrinking unsupported
+@@ -269,55 +283,32 @@ Rock::SwapDir::validateOptions()
+ 	}
+     */
+ 
+-    if (!repl) {
+-        debugs(47,0, "ERROR: Rock cache_dir[" << index << "] " <<
+-            "lacks replacement policy and will overflow.");
+-        // not fatal because it can be added later
+-	}
+-
+     // XXX: misplaced, map is not yet created
+     //cur_size = (HeaderSize + max_objsize * map->entryCount()) >> 10;
+ }
+ 
+ void
+ Rock::SwapDir::rebuild() {
+-    // in SMP mode, only the disker is responsible for populating the map
+-    if (UsingSmp() && !IamDiskProcess())
+-        return;
+-
+-    ++StoreController::store_dirs_rebuilding;
+-    Rebuild *r = new Rebuild(this);
+-    r->start(); // will delete self when done
++    //++StoreController::store_dirs_rebuilding; // see Rock::SwapDir::init()
++    AsyncJob::Start(new Rebuild(this));
+ }
+ 
+ /* Add a new object to the cache with empty memory copy and pointer to disk
+- * use to rebuild store from disk. XXX: dupes UFSSwapDir::addDiskRestore */
++ * use to rebuild store from disk. Based on UFSSwapDir::addDiskRestore */
+ bool
+ Rock::SwapDir::addEntry(const int fileno, const StoreEntry &from)
+ {
+-    const cache_key *const key = reinterpret_cast<const cache_key *>(from.key);
+-    debugs(47, 5, HERE << &from << ' ' << storeKeyText(key)
+-       << ", fileno="<< std::setfill('0') << std::hex << std::uppercase <<
++    debugs(47, 8, HERE << &from << ' ' << from.getMD5Text() <<
++       ", fileno="<< std::setfill('0') << std::hex << std::uppercase <<
+        std::setw(8) << fileno);
+ 
+-    int idx;
+-    StoreEntryBasics *const basics = map->openForWriting(key, idx);
+-    if (!basics) {
+-        debugs(47, 5, HERE << "Rock::SwapDir::addEntry: the entry loaded from "
+-               "disk clashed with locked newer entries");
+-        return false;
+-    } else if (fileno != idx) {
+-        debugs(47, 5, HERE << "Rock::SwapDir::addEntry: the entry loaded from "
+-               "disk was hashed to a new slot");
+-        map->closeForWriting(idx);
+-        map->closeForReading(idx);
+-        map->free(idx);
+-        return false;
++    if (map->putAt(from, fileno)) {
++        // we do not add this entry to store_table so core will not updateSize
++        updateSize(from.swap_file_sz, +1);
++        return true;
+     }
+-    basics->set(from);
+-    map->closeForWriting(fileno);
+-    map->closeForReading(fileno);
+-    return true;
++
++    return false;
+ }
+ 
+ 
+@@ -358,6 +349,9 @@ Rock::SwapDir::createStoreIO(StoreEntry &e, StoreIOState::STFNCB *cbFile, StoreI
+     }
+     basics->set(e);
+ 
++    // XXX: We rely on our caller, storeSwapOutStart(), to set e->fileno.
++    // If that does not happen, the entry will not decrement the read level!
++
+     IoState *sio = new IoState(this, &e, cbFile, cbIo, data);
+ 
+     sio->swap_dirn = index;
+@@ -399,13 +393,14 @@ Rock::SwapDir::openStoreIO(StoreEntry &e, StoreIOState::STFNCB *cbFile, StoreIOS
+         return NULL;
+     }
+ 
+-    if (!map->openForReadingAt(e.swap_filen)) {
+-        debugs(47,1, HERE << "bug: dir " << index << " lost locked fileno: " <<
+-            std::setfill('0') << std::hex << std::uppercase << std::setw(8) <<
+-            e.swap_filen);
++    if (e.swap_filen < 0) { 
++        debugs(47,4, HERE << e);
+         return NULL;
+     }
+ 
++    // The only way the entry has swap_filen is if get() locked it for reading
++    // so we do not need to map->openForReadingAt(swap_filen) again here.
++
+     IoState *sio = new IoState(this, &e, cbFile, cbIo, data);
+ 
+     sio->swap_dirn = index;
+@@ -448,6 +443,8 @@ Rock::SwapDir::ioCompletedNotification()
+     debugs(47,1, "Rock cache_dir[" << index << "] limits: " << 
+         std::setw(12) << maximumSize() << " disk bytes and " <<
+         std::setw(7) << map->entryLimit() << " entries");
++
++    rebuild();
+ }
+ 
+ void
+@@ -462,7 +459,6 @@ Rock::SwapDir::readCompleted(const char *buf, int rlen, int errflag, RefCount< :
+     ReadRequest *request = dynamic_cast<Rock::ReadRequest*>(r.getRaw());
+     assert(request);
+     IoState::Pointer sio = request->sio;
+-    map->closeForReading(sio->swap_filen);
+ 
+     // do not increment sio->offset_: callers always supply relative offset
+ 
+@@ -481,10 +477,16 @@ Rock::SwapDir::writeCompleted(int errflag, size_t rlen, RefCount< ::WriteRequest
+     assert(request);
+     assert(request->sio !=  NULL);
+     IoState &sio = *request->sio;
+-    map->closeForWriting(sio.swap_filen);
+-    if (errflag != DISK_OK)
+-        map->free(sio.swap_filen); // TODO: test by forcing failure
+-    // else sio.offset_ += rlen;
++
++    if (errflag == DISK_OK) {
++        // close, assuming we only write once; the entry gets the read lock
++        map->closeForWriting(sio.swap_filen);
++        // and sio.offset_ += rlen;
++    } else {
++        // Do not abortWriting here. The entry should keep the write lock
++        // instead of losing association with the store and confusing core.
++        map->free(sio.swap_filen); // will mark as unusable, just in case
++    }
+ 
+     // TODO: always compute cur_size based on map, do not store it
+     cur_size = (HeaderSize + max_objsize * map->entryCount()) >> 10;
+@@ -525,22 +527,22 @@ Rock::SwapDir::diskFull() {
+ void
+ Rock::SwapDir::maintain()
+ {
+-    if (!map)
+-        return;
+-
+     debugs(47,3, HERE << "cache_dir[" << index << "] guards: " << 
+-        StoreController::store_dirs_rebuilding << !repl << !full());
+-
+-    // XXX: UFSSwapDir::maintain says we must quit during rebuild
+-    if (StoreController::store_dirs_rebuilding)
+-        return;
++        !repl << !map << !full() << StoreController::store_dirs_rebuilding);
+ 
+     if (!repl)
+         return; // no means (cannot find a victim)
+ 
++    if (!map)
++        return; // no victims (yet)
++
+     if (!full())
+         return; // no need (to find a victim)
+ 
++    // XXX: UFSSwapDir::maintain says we must quit during rebuild
++    if (StoreController::store_dirs_rebuilding)
++        return;
++
+     debugs(47,3, HERE << "cache_dir[" << index << "] state: " << 
+         map->full() << ' ' << currentSize() << " < " << diskOffsetLimit());
+ 
+@@ -574,39 +576,42 @@ void
+ Rock::SwapDir::reference(StoreEntry &e)
+ {
+     debugs(47, 5, HERE << &e << ' ' << e.swap_dirn << ' ' << e.swap_filen);
+-    if (repl->Referenced)
++    if (repl && repl->Referenced)
+         repl->Referenced(repl, &e, &e.repl);
+ }
+ 
+ void
+ Rock::SwapDir::dereference(StoreEntry &e)
+ {
+     debugs(47, 5, HERE << &e << ' ' << e.swap_dirn << ' ' << e.swap_filen);
+-    if (repl->Dereferenced)
++    if (repl && repl->Dereferenced)
+         repl->Dereferenced(repl, &e, &e.repl);
+ }
+ 
+ void
+ Rock::SwapDir::unlink(StoreEntry &e)
+ {
+-    debugs(47, 5, HERE << &e << ' ' << e.swap_dirn << ' ' << e.swap_filen);
++    debugs(47, 5, HERE << e);
+     ignoreReferences(e);
+     map->free(e.swap_filen);
++    disconnect(e);
+ }
+ 
+ void
+ Rock::SwapDir::trackReferences(StoreEntry &e)
+ {
+-    debugs(47, 5, HERE << &e << ' ' << e.swap_dirn << ' ' << e.swap_filen);
+-    repl->Add(repl, &e, &e.repl);
++    debugs(47, 5, HERE << e);
++    if (repl)
++        repl->Add(repl, &e, &e.repl);
+ }
+ 
+ 
+ void
+ Rock::SwapDir::ignoreReferences(StoreEntry &e)
+ {
+-    debugs(47, 5, HERE << &e << ' ' << e.swap_dirn << ' ' << e.swap_filen);
+-    repl->Remove(repl, &e, &e.repl);
++    debugs(47, 5, HERE << e);
++    if (repl)
++        repl->Remove(repl, &e, &e.repl);
+ }
+ 
+ void
+@@ -617,9 +622,13 @@ Rock::SwapDir::statfs(StoreEntry &e) const
+     storeAppendPrintf(&e, "Current Size: %"PRIu64" KB %.2f%%\n", cur_size,
+                       100.0 * cur_size / max_size);
+ 
+-    storeAppendPrintf(&e, "Maximum entries: %9d\n", map->entryLimit());
+-    storeAppendPrintf(&e, "Current entries: %9d %.2f%%\n",
+-        map->entryCount(), (100.0 * map->entryCount() / map->entryLimit()));
++    if (map) {
++        const int limit = map->entryLimit();
++        storeAppendPrintf(&e, "Maximum entries: %9d\n", limit);
++        if (limit > 0)
++            storeAppendPrintf(&e, "Current entries: %9d %.2f%%\n",
++                map->entryCount(), (100.0 * map->entryCount() / limit));
++    }    
+ 
+     storeAppendPrintf(&e, "Pending operations: %d out of %d\n",
+         store_open_disk_fd, Config.max_open_disk_fds);
+@@ -25,11 +25,11 @@ class SwapDir: public ::SwapDir, public IORequestor
+     virtual void reconfigure(int, char *);
+     virtual StoreSearch *search(String const url, HttpRequest *);
+     virtual StoreEntry *get(const cache_key *key);
+-
+-    void closeForReading(StoreEntry &e);
++    virtual void disconnect(StoreEntry &e);
+ 
+ protected:
+     /* protected ::SwapDir API */
++    virtual bool needsDiskStrand() const;
+     virtual void create();
+     virtual void init();
+     virtual int canStore(StoreEntry const &) const;
+@@ -27,14 +27,12 @@ Ipc::StrandCoord::unpack(const TypedMsgHdr &hdrMsg)
+     hdrMsg.getPod(kidId);
+     hdrMsg.getPod(pid);
+     hdrMsg.getString(tag);
+-debugs(0,0, HERE << "getting tag: " << tag);
+ }
+ 
+ void Ipc::StrandCoord::pack(TypedMsgHdr &hdrMsg) const
+ {
+     hdrMsg.putPod(kidId);
+     hdrMsg.putPod(pid);
+-debugs(0,0, HERE << "putting tag: " << tag);
+     hdrMsg.putString(tag);
+ }
+ 
+@@ -53,7 +53,6 @@
+ #include "SquidTime.h"
+ #include "swap_log_op.h"
+ #include "mgr/StoreIoAction.h"
+-#include "fs/rock/RockSwapDir.h"
+ 
+ static STMCB storeWriteComplete;
+ 
+@@ -372,6 +371,7 @@ StoreEntry::StoreEntry():
+ 
+     expires = lastmod = lastref = timestamp = -1;
+ 
++    swap_status = SWAPOUT_NONE;
+     swap_filen = -1;
+     swap_dirn = -1;
+ }
+@@ -384,17 +384,16 @@ StoreEntry::StoreEntry(const char *aUrl, const char *aLogUrl):
+ 
+     expires = lastmod = lastref = timestamp = -1;
+ 
++    swap_status = SWAPOUT_NONE;
+     swap_filen = -1;
+     swap_dirn = -1;
+ }
+ 
+ StoreEntry::~StoreEntry()
+ {
+     if (swap_filen >= 0) {
+-        // XXX: support cache types other than Rock
+-        Rock::SwapDir &rockSwapDir =
+-            dynamic_cast<Rock::SwapDir &>(*store());
+-        rockSwapDir.closeForReading(*this);
++        SwapDir &sd = dynamic_cast<SwapDir&>(*store());
++        sd.disconnect(*this);
+     }
+ }
+ 
+@@ -798,9 +797,6 @@ storeCreateEntry(const char *url, const char *log_url, request_flags flags, cons
+ 
+     e->store_status = STORE_PENDING;
+     e->setMemStatus(NOT_IN_MEMORY);
+-    e->swap_status = SWAPOUT_NONE;
+-    e->swap_filen = -1;
+-    e->swap_dirn = -1;
+     e->refcount = 0;
+     e->lastref = squid_curtime;
+     e->timestamp = -1;          /* set in StoreEntry::timestampsSet() */
+@@ -1269,31 +1265,30 @@ StoreEntry::release()
+             lock_count++;
+             setReleaseFlag();
+             LateReleaseStack.push_back(this);
+-            PROF_stop(storeRelease);
+-            return;
+         } else {
+             destroyStoreEntry(static_cast<hash_link *>(this));
++            // "this" is no longer valid
+         }
++
++        PROF_stop(storeRelease);
++        return;
+     }
+ 
+     storeLog(STORE_LOG_RELEASE, this);
+ 
+     if (swap_filen > -1) {
+-        unlink();
+ 
++        // update size before unlink() below clears swap_status
++        // TODO: the store/SwapDir::unlink should update the size!
+         if (swap_status == SWAPOUT_DONE)
+             if (EBIT_TEST(flags, ENTRY_VALIDATED))
+                 store()->updateSize(swap_file_sz, -1);
+ 
++        // log before unlink() below clears swap_filen
+         if (!EBIT_TEST(flags, KEY_PRIVATE))
+             storeDirSwapLog(this, SWAP_LOG_DEL);
+ 
+-#if 0
+-        /* From 2.4. I think we do this in storeUnlink? */
+-        storeSwapFileNumberSet(this, -1);
+-
+-#endif
+-
++        unlink();
+     }
+ 
+     setMemStatus(NOT_IN_MEMORY);
+@@ -1314,7 +1309,7 @@ storeLateRelease(void *unused)
+     }
+ 
+     for (i = 0; i < 10; i++) {
+-        e = LateReleaseStack.pop();
++        e = LateReleaseStack.count ? LateReleaseStack.pop() : NULL;
+ 
+         if (e == NULL) {
+             /* done! */
+@@ -1444,6 +1439,10 @@ StoreEntry::keepInMemory() const
+     if (!Config.onoff.memory_cache_first && swap_status == SWAPOUT_DONE && refcount == 1)
+         return 0;
+ 
++    // already kept more than allowed
++    if (mem_node::InUseCount() > store_pages_max)
++        return 0;
++
+     return 1;
+ }
+ 
+@@ -2013,7 +2012,10 @@ StoreEntry::store() const
+ void
+ StoreEntry::unlink()
+ {
+-    store()->unlink(*this);
++    store()->unlink(*this); // implies disconnect()
++    swap_filen = -1;
++    swap_dirn = -1;
++    swap_status = SWAPOUT_NONE;
+ }
+ 
+ /*
+@@ -515,6 +515,14 @@ StoreHashIndex::store(int const x) const
+     return INDEXSD(x);
+ }
+ 
++SwapDir &
++StoreHashIndex::dir(const int i) const
++{
++    SwapDir *sd = dynamic_cast<SwapDir*>(INDEXSD(i));
++    assert(sd);
++    return *sd;
++}
++
+ void
+ StoreController::sync(void)
+ {
+@@ -692,27 +700,30 @@ StoreEntry *
+ StoreController::get(const cache_key *key)
+ {
+     if (StoreEntry *e = swapDir->get(key)) {
+-        debugs(20, 1, HERE << "got in-transit entry: " << *e);
++        debugs(20, 3, HERE << "got in-transit entry: " << *e);
+         return e;
+     }
+ 
+     if (const int cacheDirs = Config.cacheSwap.n_configured) {
+         // ask each cache_dir until the entry is found; use static starting
+         // point to avoid asking the same subset of disks more often
+         // TODO: coordinate with put() to be able to guess the right disk often
++        static int idx = 0;
+         for (int n = 0; n < cacheDirs; ++n) {
+-            static int idx = 0;
++            idx = (idx + 1) % cacheDirs;
+             SwapDir *sd = dynamic_cast<SwapDir*>(INDEXSD(idx));
++            if (!sd->active())
++                continue;
++
+             if (StoreEntry *e = sd->get(key)) {
+-                debugs(20, 1, HERE << "cache_dir " << idx <<
++                debugs(20, 3, HERE << "cache_dir " << idx <<
+                     " got cached entry: " << *e);
+                 return e;
+             }
+-            idx = (idx + 1) % cacheDirs;
+         }
+     }
+ 
+-    debugs(20, 1, HERE << "none of " << Config.cacheSwap.n_configured <<
++    debugs(20, 4, HERE << "none of " << Config.cacheSwap.n_configured <<
+         " cache_dirs have " << storeKeyText(key));
+     return NULL;
+ }
+@@ -774,8 +785,10 @@ StoreHashIndex::callback()
+ void
+ StoreHashIndex::create()
+ {
+-    for (int i = 0; i < Config.cacheSwap.n_configured; i++)
+-        store(i)->create();
++    for (int i = 0; i < Config.cacheSwap.n_configured; i++) {
++        if (dir(i).active())
++            store(i)->create();
++    }
+ }
+ 
+ /* Lookup an object in the cache.
+@@ -832,13 +845,8 @@ StoreHashIndex::init()
+         *         above
+         * Step 3: have the hash index walk the searches itself.
+          */
+-        if (IamDiskProcess() &&
+-            i != KidIdentifier % Config.cacheSwap.n_configured) {
+-            debugs(20, 3, HERE << " skipping init for cache_dir " <<
+-                   dynamic_cast<const SwapDir &>(*store(i)).path);
+-            continue;
+-        }
+-        store(i)->init();
++        if (dir(i).active())
++            store(i)->init();
+     }
+ }
+ 
+@@ -97,6 +97,7 @@ storeSwapInFileNotify(void *data, int errflag, StoreIOState::Pointer self)
+            e->swap_dirn << " to " << sc->swapin_sio->swap_filen << "/" <<
+            sc->swapin_sio->swap_dirn);
+ 
++    assert(e->swap_filen < 0); // if this fails, call SwapDir::disconnect(e)
+     e->swap_filen = sc->swapin_sio->swap_filen;
+     e->swap_dirn = sc->swapin_sio->swap_dirn;
+ }
+@@ -115,6 +115,7 @@ storeSwapOutFileNotify(void *data, int errflag, StoreIOState::Pointer self)
+     assert(mem);
+     assert(mem->swapout.sio == self);
+     assert(errflag == 0);
++    assert(e->swap_filen < 0); // if this fails, call SwapDir::disconnect(e)
+     e->swap_filen = mem->swapout.sio->swap_filen;
+     e->swap_dirn = mem->swapout.sio->swap_dirn;
+ }
+@@ -324,10 +325,9 @@ storeSwapOutFileClosed(void *data, int errflag, StoreIOState::Pointer self)
+     cbdataFree(c);
+ 
+     if (errflag) {
+-        debugs(20, 1, "storeSwapOutFileClosed: dirno " << e->swap_dirn << ", swapfile " <<
++        debugs(20, 2, "storeSwapOutFileClosed: dirno " << e->swap_dirn << ", swapfile " <<
+                std::hex << std::setw(8) << std::setfill('0') << std::uppercase <<
+                e->swap_filen << ", errflag=" << errflag);
+-        debugs(20, 1, "\t" << xstrerror());
+ 
+         if (errflag == DISK_NO_SPACE_LEFT) {
+             /* FIXME: this should be handle by the link from store IO to
+@@ -337,14 +337,10 @@ storeSwapOutFileClosed(void *data, int errflag, StoreIOState::Pointer self)
+             storeConfigure();
+         }
+ 
+-        if (e->swap_filen > 0)
++        if (e->swap_filen >= 0)
+             e->unlink();
+ 
+-        e->swap_filen = -1;
+-
+-        e->swap_dirn = -1;
+-
+-        e->swap_status = SWAPOUT_NONE;
++        assert(e->swap_status == SWAPOUT_NONE);
+ 
+         e->releaseRequest();
+     } else {
+@@ -497,8 +497,8 @@ struct SquidConfig {
+         RefCount<class Store> *swapDirs;
+         int n_allocated;
+         int n_configured;
+-        ///< number of disk processes (set even when n_configured is not)
+-        int n_processes;
++        ///< number of disk processes required to support all cache_dirs
++        int n_strands;
+     } cacheSwap;
+     /*
+      * I'm sick of having to keep doing this ..
+@@ -871,8 +871,7 @@ NumberOfKids()
+ 
+     // XXX: detect and abort when called before workers/cache_dirs are parsed
+ 
+-    // XXX: this is not always the case as there are other cache_dir types
+-    const int rockDirs = Config.cacheSwap.n_processes;
++    const int rockDirs = Config.cacheSwap.n_strands;
+ 
+     const bool needCoord = Config.workers > 1 || rockDirs > 0;
+     return (needCoord ? 1 : 0) + Config.workers + rockDirs;

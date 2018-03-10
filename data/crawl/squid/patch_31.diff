@@ -1,30 +1,364 @@
-----++++src/anyp/PortCfg.cc
-@@ -44,8 +44,8 @@ AnyP::PortCfg::PortCfg() :
-     ,
-     clientca(NULL),
-     sslContextSessionId(NULL),
--    generateHostCertificates(false),
--    dynamicCertMemCacheSize(std::numeric_limits&lt;size_t&gt;::max()),
-+    generateHostCertificates(true),
-+    dynamicCertMemCacheSize(4*1024*1024), // 4 MB
-     signingCert(),
-     signPkey(),
-     certsToChain(),
-----++++src/cache_cf.cc
-@@ -3863,11 +3863,11 @@ dump_generic_port(StoreEntry * e, const char *n, const AnyP::PortCfgPointer &amp;s)
-     if (s-&gt;sslContextSessionId)
-         storeAppendPrintf(e, &quot; sslcontext=%s&quot;, s-&gt;sslContextSessionId);
- 
--    if (s-&gt;generateHostCertificates)
--        storeAppendPrintf(e, " generate-host-certificates");
-+    if (!s-&gt;generateHostCertificates)
-+        storeAppendPrintf(e, " generate-host-certificates=off");
- 
--    if (s-&gt;dynamicCertMemCacheSize != std::numeric_limits&lt;size_t&gt;::max())
--        storeAppendPrintf(e, "dynamic_cert_mem_cache_size=%lu%s\n", (unsigned long)s-&gt;dynamicCertMemCacheSize, B_BYTES_STR);
-+    if (s-&gt;dynamicCertMemCacheSize != 4*1024*1024) // 4MB default
-+        storeAppendPrintf(e, "dynamic_cert_mem_cache_size=%" PRIuSIZE "%s\n", s-&gt;dynamicCertMemCacheSize, B_BYTES_STR);
- #endif
+@@ -28,17 +28,39 @@ Security::PeerOptions::PeerOptions(const Security::PeerOptions &p) :
+     sslCipher(p.sslCipher),
+     sslFlags(p.sslFlags),
+     sslDomain(p.sslDomain),
+-    parsedOptions(p.parsedOptions),
+     parsedFlags(p.parsedFlags),
+     certs(p.certs),
+     caFiles(p.caFiles),
+     parsedCrl(p.parsedCrl),
+     sslVersion(p.sslVersion),
+     encryptTransport(p.encryptTransport)
+ {
++    if (!sslOptions.isEmpty())
++        parseOptions(parsedOptions); // re-parse after sslOptions copied.
+     memcpy(&flags, &p.flags, sizeof(flags));
  }
  
-----++++GitHub
++Security::PeerOptions &
++Security::PeerOptions::operator =(const Security::PeerOptions &p)
++{
++    sslOptions = p.sslOptions;
++    if (!sslOptions.isEmpty())
++        parseOptions(parsedOptions); // re-parse after sslOptions copied.
++    caDir = p.caDir;
++    crlFile = p.crlFile;
++    sslCipher = p.sslCipher;
++    sslFlags = p.sslFlags;
++    sslDomain = p.sslDomain;
++    parsedFlags = p.parsedFlags;
++    certs = p.certs;
++    caFiles = p.caFiles;
++    parsedCrl = p.parsedCrl;
++    sslVersion = p.sslVersion;
++    encryptTransport = p.encryptTransport;
++    memcpy(&flags, &p.flags, sizeof(flags));
++    return *this;
++}
++
+ void
+ Security::PeerOptions::parse(const char *token)
+ {
+@@ -71,7 +93,7 @@ Security::PeerOptions::parse(const char *token)
+         tlsMinVersion = SBuf(token + 12);
+     } else if (strncmp(token, "options=", 8) == 0) {
+         sslOptions = SBuf(token + 8);
+-        parsedOptions = parseOptions();
++        parseOptions(parsedOptions);
+     } else if (strncmp(token, "cipher=", 7) == 0) {
+         sslCipher = SBuf(token + 7);
+     } else if (strncmp(token, "cafile=", 7) == 0) {
+@@ -167,49 +189,85 @@ Security::PeerOptions::updateTlsVersionLimits()
+         if (tok.skip('1') && tok.skip('.') && tok.int64(v, 10, false, 1) && v <= 3) {
+             // only account for TLS here - SSL versions are handled by options= parameter
+             // avoid affecting options= parameter in cachemgr config report
++#if USE_OPENSSL
+ #if SSL_OP_NO_TLSv1
+             if (v > 0)
+-                parsedOptions |= SSL_OP_NO_TLSv1;
++                *parsedOptions |= SSL_OP_NO_TLSv1;
+ #endif
+ #if SSL_OP_NO_TLSv1_1
+             if (v > 1)
+-                parsedOptions |= SSL_OP_NO_TLSv1_1;
++                *parsedOptions |= SSL_OP_NO_TLSv1_1;
+ #endif
+ #if SSL_OP_NO_TLSv1_2
+             if (v > 2)
+-                parsedOptions |= SSL_OP_NO_TLSv1_2;
++                *parsedOptions |= SSL_OP_NO_TLSv1_2;
++#endif
++
++#elif USE_GNUTLS
++            // XXX: update parsedOptions directly to avoid polluting 'options=' dumps
++            SBuf add;
++            if (v > 0)
++                add.append(":-VERS-TLS1.0");
++            if (v > 1)
++                add.append(":-VERS-TLS1.1");
++            if (v > 2)
++                add.append(":-VERS-TLS1.2");
++
++            if (sslOptions.isEmpty())
++                add.chop(1); // remove the initial ':'
++            sslOptions.append(add);
+ #endif
+ 
+         } else {
+             debugs(0, DBG_PARSE_NOTE(1), "WARNING: Unknown TLS minimum version: " << tlsMinVersion);
+         }
+ 
+-    } else if (sslVersion > 2) {
++        return;
++    }
++
++     if (sslVersion > 2) {
+         // backward compatibility hack for sslversion= configuration
+         // only use if tls-min-version=N.N is not present
+         // values 0-2 for auto and SSLv2 are not supported any longer.
+         // Do it this way so we DO cause changes to options= in cachemgr config report
+         const char *add = NULL;
+         switch (sslVersion) {
+         case 3:
+-            add = "NO_TLSv1,NO_TLSv1_1,NO_TLSv1_2";
++#if USE_OPENSSL
++            add = ",NO_TLSv1,NO_TLSv1_1,NO_TLSv1_2";
++#elif USE_GNUTLS
++            add = ":-VERS-TLS1.0:-VERS-TLS1.1:-VERS-TLS1.2";
++#endif
+             break;
+         case 4:
+-            add = "NO_SSLv3,NO_TLSv1_1,NO_TLSv1_2";
++#if USE_OPENSSL
++            add = ",NO_SSLv3,NO_TLSv1_1,NO_TLSv1_2";
++#elif USE_GNUTLS
++            add = ":+VERS-TLS1.0:-VERS-TLS1.1:-VERS-TLS1.2";
++#endif
+             break;
+         case 5:
+-            add = "NO_SSLv3,NO_TLSv1,NO_TLSv1_2";
++#if USE_OPENSSL
++            add = ",NO_SSLv3,NO_TLSv1,NO_TLSv1_2";
++#elif USE_GNUTLS
++            add = ":-VERS-TLS1.0:+VERS-TLS1.1:-VERS-TLS1.2";
++#endif
+             break;
+         case 6:
+-            add = "NO_SSLv3,NO_TLSv1,NO_TLSv1_1";
++#if USE_OPENSSL
++            add = ",NO_SSLv3,NO_TLSv1,NO_TLSv1_1";
++#elif USE_GNUTLS
++            add = ":-VERS-TLS1.0:-VERS-TLS1.1";
++#endif
+             break;
+         default: // nothing
+             break;
+         }
+         if (add) {
+-            if (!sslOptions.isEmpty())
+-                sslOptions.append(",",1);
+-            sslOptions.append(add, strlen(add));
++            if (sslOptions.isEmpty())
++                sslOptions.append(add+1, strlen(add+1));
++            else
++                sslOptions.append(add, strlen(add));
+         }
+         sslVersion = 0; // prevent sslOptions being repeatedly appended
+     }
+@@ -257,8 +315,11 @@ Security::PeerOptions::createClientContext(bool setOptions)
+     Security::ContextPointer t(createBlankContext());
+     if (t) {
+ #if USE_OPENSSL
++        // NP: GnuTLS uses 'priorities' which are set per-session instead.
++        SSL_CTX_set_options(t.get(), (setOptions ? *parsedOptions : 0));
++
+         // XXX: temporary performance regression. c_str() data copies and prevents this being a const method
+-        Ssl::InitClientContext(t, *this, (setOptions ? parsedOptions : 0), parsedFlags);
++        Ssl::InitClientContext(t, *this, parsedFlags);
+ #endif
+         updateContextNpn(t);
+         updateContextCa(t);
+@@ -268,6 +329,7 @@ Security::PeerOptions::createClientContext(bool setOptions)
+     return t;
+ }
+ 
++#if USE_OPENSSL
+ /// set of options we can parse and what they map to
+ static struct ssl_option {
+     const char *name;
+@@ -397,16 +459,18 @@ static struct ssl_option {
+         NULL, 0
+     }
+ };
++#endif /* USE_OPENSSL */
+ 
+ /**
+  * Pre-parse TLS options= parameter to be applied when the TLS objects created.
+  * Options must not used in the case of peek or stare bump mode.
+  */
+-long
+-Security::PeerOptions::parseOptions()
++void
++Security::PeerOptions::parseOptions(Security::ParsedOptionsPointer &theOut)
+ {
+-    long op = 0;
++#if USE_OPENSSL
+     ::Parser::Tokenizer tok(sslOptions);
++    long op;
+ 
+     do {
+         enum {
+@@ -467,7 +531,19 @@ Security::PeerOptions::parseOptions()
+     // compliance with RFC 6176: Prohibiting Secure Sockets Layer (SSL) Version 2.0
+     op = op | SSL_OP_NO_SSLv2;
+ #endif
+-    return op;
++    theOut = new long(op);
++
++#elif USE_GNUTLS
++    const char *err = nullptr;
++    const char *priorities = (sslOptions.isEmpty() ? nullptr : sslOptions.c_str());
++    gnutls_priority_t op;
++    int x = gnutls_priority_init(&op, priorities, &err);
++    if (x != GNUTLS_E_SUCCESS) {
++        fatalf("Unknown TLS option '%s'", err);
++    }
++    theOut.reset(op);
++
++#endif
+ }
+ 
+ /**
+@@ -641,6 +717,26 @@ Security::PeerOptions::updateContextCrl(Security::ContextPointer &ctx)
+ #endif /* USE_OPENSSL */
+ }
+ 
++void
++Security::PeerOptions::updateSessionOptions(Security::SessionPointer &s)
++{
++    // 'options=' value being set to session is a GnuTLS specific thing.
++#if !USE_OPENSSL && USE_GNUTLS
++    int x;
++    if (!parsedOptions) {
++        debugs(83, 5, "set GnuTLS default priority/options for session=" << s);
++        x = gnutls_set_default_priority(s.get());
++    } else {
++        debugs(83, 5, "set GnuTLS options '" << sslOptions << "' for session=" << s);
++        x = gnutls_priority_set(s.get(), parsedOptions.get());
++    }
++
++    if (x != GNUTLS_E_SUCCESS) {
++        debugs(83, 1, "Failed to set TLS options. error: " << Security::ErrorString(x));
++    }
++#endif
++}
++
+ void
+ parse_securePeerOptions(Security::PeerOptions *opt)
+ {
+@@ -22,9 +22,10 @@ namespace Security
+ class PeerOptions
+ {
+ public:
+-    PeerOptions() : parsedOptions(0), parsedFlags(0), sslVersion(0), encryptTransport(false) {}
++    PeerOptions() = default;
+     PeerOptions(const PeerOptions &);
+-    virtual ~PeerOptions() = default;
++    PeerOptions &operator =(const PeerOptions &);
++    virtual ~PeerOptions() {}
+ 
+     /// parse a TLS squid.conf option
+     virtual void parse(const char *);
+@@ -50,11 +51,14 @@ class PeerOptions
+     /// setup the CRL details for the given context
+     void updateContextCrl(Security::ContextPointer &);
+ 
++    /// setup any library-specific options that can be set for the given session
++    void updateSessionOptions(Security::SessionPointer &);
++
+     /// output squid.conf syntax with 'pfx' prefix on parameters for the stored settings
+     virtual void dumpCfg(Packable *, const char *pfx) const;
+ 
+ private:
+-    long parseOptions();
++    void parseOptions(Security::ParsedOptionsPointer &); ///< parsed value of sslOptions
+     long parseFlags();
+     void loadCrlFile();
+ 
+@@ -69,15 +73,15 @@ class PeerOptions
+ 
+     SBuf tlsMinVersion;  ///< version label for minimum TLS version to permit
+ 
+-    long parsedOptions; ///< parsed value of sslOptions
+-    long parsedFlags;   ///< parsed value of sslFlags
++    Security::ParsedOptionsPointer parsedOptions; ///< parsed value of sslOptions
++    long parsedFlags = 0;   ///< parsed value of sslFlags
+ 
+     std::list<Security::KeyData> certs; ///< details from the cert= and file= config parameters
+     std::list<SBuf> caFiles;  ///< paths of files containing trusted Certificate Authority
+     Security::CertRevokeList parsedCrl; ///< CRL to use when verifying the remote end certificate
+ 
+ protected:
+-    int sslVersion;
++    int sslVersion = 0;
+ 
+     /// flags governing Squid internal TLS operations
+     struct flags_ {
+@@ -92,7 +96,7 @@ class PeerOptions
+ 
+ public:
+     /// whether transport encryption (TLS/SSL) is to be used on connections to the peer
+-    bool encryptTransport;
++    bool encryptTransport = false;
+ };
+ 
+ /// configuration options for DIRECT server access
+@@ -185,7 +185,7 @@ Ssl::PeekingPeerConnector::initialize(Security::SessionPointer &serverSession)
+             }
+         } else {
+             // Set client SSL options
+-            SSL_set_options(serverSession.get(), ::Security::ProxyOutgoingConfig.parsedOptions);
++            SSL_set_options(serverSession.get(), *::Security::ProxyOutgoingConfig.parsedOptions);
+ 
+             // Use SNI TLS extension only when we connect directly
+             // to the origin server and we know the server host name.
+@@ -494,7 +494,7 @@ static bool
+ configureSslContext(Security::ContextPointer &ctx, AnyP::PortCfg &port)
+ {
+     int ssl_error;
+-    SSL_CTX_set_options(ctx.get(), port.secure.parsedOptions);
++    SSL_CTX_set_options(ctx.get(), *port.secure.parsedOptions);
+ 
+ #if defined(SSL3_FLAGS_NO_RENEGOTIATE_CIPHERS)
+     SSL_CTX_set_info_callback(ctx.get(), ssl_info_cb);
+@@ -621,13 +621,11 @@ Ssl::InitServerContext(Security::ContextPointer &ctx, AnyP::PortCfg &port)
+ }
+ 
+ bool
+-Ssl::InitClientContext(Security::ContextPointer &ctx, Security::PeerOptions &peer, long options, long fl)
++Ssl::InitClientContext(Security::ContextPointer &ctx, Security::PeerOptions &peer, long fl)
+ {
+     if (!ctx)
+         return false;
+ 
+-    SSL_CTX_set_options(ctx.get(), options);
+-
+ #if defined(SSL3_FLAGS_NO_RENEGOTIATE_CIPHERS)
+     SSL_CTX_set_info_callback(ctx.get(), ssl_info_cb);
+ #endif
+@@ -81,7 +81,7 @@ extern const char *SessionCacheName;
+ bool InitServerContext(Security::ContextPointer &, AnyP::PortCfg &);
+ 
+ /// initialize a TLS client context with OpenSSL specific settings
+-bool InitClientContext(Security::ContextPointer &, Security::PeerOptions &, long options, long flags);
++bool InitClientContext(Security::ContextPointer &, Security::PeerOptions &, long flags);
+ 
+ #if defined(CRYPTO_LOCK_X509)
+ // portability wrapper for OpenSSL 1.0 vs 1.1
+@@ -68,15 +68,15 @@ void PeerConnector::recordNegotiationDetails() STUB
+ 
+ #include "security/PeerOptions.h"
+ Security::PeerOptions Security::ProxyOutgoingConfig;
++Security::PeerOptions &Security::PeerOptions::operator =(const Security::PeerOptions &) STUB_RETVAL(*this)
+ void Security::PeerOptions::parse(char const*) STUB
+ Security::ContextPointer Security::PeerOptions::createClientContext(bool) STUB_RETVAL(Security::ContextPointer())
+ void Security::PeerOptions::updateTlsVersionLimits() STUB
+ Security::ContextPointer Security::PeerOptions::createBlankContext() const STUB_RETVAL(Security::ContextPointer())
+ void Security::PeerOptions::updateContextCa(Security::ContextPointer &) STUB
+ void Security::PeerOptions::updateContextCrl(Security::ContextPointer &) STUB
++void Security::PeerOptions::updateSessionOptions(Security::SessionPointer &) STUB
+ void Security::PeerOptions::dumpCfg(Packable*, char const*) const STUB
+-long Security::PeerOptions::parseOptions() STUB_RETVAL(0)
+-long Security::PeerOptions::parseFlags() STUB_RETVAL(0)
+ void parse_securePeerOptions(Security::PeerOptions *) STUB
+ 
+ #include "security/ServerOptions.h"
+@@ -51,7 +51,7 @@ const String & Ssl::ErrorDetail::toString() const STUB_RETSTATREF(String)
+ namespace Ssl
+ {
+ bool InitServerContext(Security::ContextPointer &, AnyP::PortCfg &) STUB_RETVAL(false)
+-bool InitClientContext(Security::ContextPointer &, Security::PeerOptions &, long, const char *) STUB_RETVAL(false)
++bool InitClientContext(Security::ContextPointer &, Security::PeerOptions &, const char *) STUB_RETVAL(false)
+ } // namespace Ssl
+ const char *sslGetUserEmail(SSL *ssl) STUB_RETVAL(NULL)
+ const char *sslGetUserAttribute(SSL *ssl, const char *attribute_name) STUB_RETVAL(NULL)

@@ -1,92 +1,597 @@
-----++++src/client_side.h
-@@ -37,24 +37,36 @@ class PortCfg;
- 
- /**
-  * Badly named.
-- * This is in fact the processing context for a single HTTP request.
-+ * This is in fact the processing context for a single HTTP transaction.
-  *
-- * Managing what has been done, and what happens next to the data buffer
-- * holding what we hope is an HTTP request.
-+ * A context lifetime extends from directly after a request has been parsed
-+ * off the client connection buffer, until the last byte of both request
-+ * and reply payload (if any) have been written.
-  *
-- * Parsing is still a mess of global functions done in conjunction with the
-- * real socket controller which generated ClientHttpRequest.
-- * It also generates one of us and passes us control from there based on
-- * the results of the parse.
-+ * (NOTE: it is not certain yet if an early reply to a POST/PUT is sent by
-+ * the server whether the context will remain in the pipeline until its
-+ * request payload has finished being read. It is supposed to, but may not)
-  *
-- * After that all the request interpretation and adaptation is in our scope.
-- * Then finally the reply fetcher is created by this and we get the result
-- * back. Which we then have to manage writing of it to the ConnStateData.
-+ * Contexts self-register with the Pipeline being managed by the Server
-+ * for the connection on which the request was received.
-  *
-- * The socket level management is done by a ConnStateData which owns us.
-+ * When HTTP/1 pipeline is operating there may be multiple transactions using
-+ * the clientConnection. Only the back() context may read from the connection,
-+ * and only the front() context may write to it. A context which needs to read
-+ * or write to the connection but does not meet those criteria must be shifted
-+ * to the deferred state.
-+ *
-+ * When a context is completed the finished() method needs to be called which
-+ * will perform all cleanup and deregistration operations. If the reason for
-+ * finishing is an error, then notifyIoError() needs to be called prior to
-+ * the finished() method.
-+ * Alternatively the initiateClose() method can be called to terminate the
-+ * whole client connection and all other pending contexts.
-+ *
-+ * The socket level management is done by a Server which owns us.
-  * The scope of this objects control over a socket consists of the data
-- * buffer received from ConnStateData with an initially unknown length.
-- * When that length is known it sets the end bounary of our acces to the
-+ * buffer received from the Server with an initially unknown length.
-+ * When that length is known it sets the end boundary of our access to the
-  * buffer.
-  *
-  * The individual processing actions are done by other Jobs which we
-@@ -151,19 +163,30 @@ namespace Ssl
- class ServerBump;
+@@ -16,14 +16,23 @@ BinaryTokenizer::BinaryTokenizer(): BinaryTokenizer(SBuf())
  }
- #endif
-+
- /**
-- * Manages a connection to a client.
-+ * Legacy Server code managing a connection to a client.
-+ *
-+ * NP: presents AsyncJob API but does not operate autonomously as a Job.
-+ *     So Must() is not safe to use.
-+ *
-+ * Multiple requests (up to pipeline_prefetch) can be pipelined.
-+ * This object is responsible for managing which one is currently being
-+ * fulfilled and what happens to the queue if the current one causes the client
-+ * connection to be closed early.
-+ *
-+ * Act as a manager for the client connection and passes data in buffer to a
-+ * Parser relevant to the state (message headers vs body) that is being
-+ * processed.
-  *
-- * Multiple requests (up to pipeline_prefetch) can be pipelined. This object is responsible for managing
-- * which one is currently being fulfilled and what happens to the queue if the current one
-- * causes the client connection to be closed early.
-+ * Performs HTTP message processing to kick off the actual HTTP request
-+ * handling objects (ClientSocketContext, ClientHttpRequest, HttpRequest).
-  *
-- * Act as a manager for the connection and passes data in buffer to the current parser.
-- * the parser has ambiguous scope at present due to being made from global functions
-- * I believe this object uses the parser to identify boundaries and kick off the
-- * actual HTTP request handling objects (ClientSocketContext, ClientHttpRequest, HttpRequest)
-+ * Performs SSL-Bump processing for switching between HTTP and HTTPS protocols.
-  *
-- * If the above can be confirmed accurate we can call this object PipelineManager or similar
-+ * To terminate a ConnStateData close() the client Comm::Connection it is
-+ * managing, or for graceful half-close use the stopReceiving() or
-+ * stopSending() methods.
-  */
- class ConnStateData : public Server, public HttpControlMsgSink, public RegisteredRunner
+ 
+ BinaryTokenizer::BinaryTokenizer(const SBuf &data, const bool expectMore):
+-    context(""),
++    context(nullptr),
+     data_(data),
+     parsed_(0),
+     syncPoint_(0),
+     expectMore_(expectMore)
  {
-----++++GitHub
+ }
+ 
++static inline
++std::ostream &
++operator <<(std::ostream &os, const BinaryTokenizerContext *context)
++{
++    if (context)
++        os << context->parent << context->name;
++    return os;
++}
++
+ /// debugging helper that prints a "standard" debugs() trailer
+ #define BinaryTokenizer_tail(size, start) \
+     " occupying " << (size) << " bytes @" << (start) << " in " << this << \
+@@ -41,6 +50,13 @@ BinaryTokenizer::want(uint64_t size, const char *description) const
+     }
+ }
+ 
++void
++BinaryTokenizer::got(uint64_t size, const char *description) const
++{
++    debugs(24, 7, context << description <<
++           BinaryTokenizer_tail(size, parsed_ - size));
++}
++
+ /// debugging helper for parsed number fields
+ void
+ BinaryTokenizer::got(uint32_t value, uint64_t size, const char *description) const
+@@ -93,8 +109,6 @@ BinaryTokenizer::rollback()
+ void
+ BinaryTokenizer::commit()
+ {
+-    if (context && *context)
+-        debugs(24, 6, context << BinaryTokenizer_tail(parsed_ - syncPoint_, syncPoint_));
+     syncPoint_ = parsed_;
+ }
+ 
+@@ -11,6 +11,28 @@
+ 
+ #include "sbuf/SBuf.h"
+ 
++class BinaryTokenizer;
++
++/// enables efficient debugging with concise field names: Hello.version.major
++class BinaryTokenizerContext
++{
++public:
++    /// starts parsing named object
++    inline explicit BinaryTokenizerContext(BinaryTokenizer &tk, const char *aName);
++    ~BinaryTokenizerContext() { close(); }
++
++    /// ends parsing named object; repeated calls OK
++    inline void close();
++
++    /// reports successful parsing of a named object and calls close()
++    inline void success();
++
++    BinaryTokenizer &tokenizer; ///< tokenizer being used for parsing
++    const BinaryTokenizerContext *parent; ///< enclosing context or nullptr
++    const char *name; ///< this context description or nullptr
++    uint64_t start; ///< context parsing begins at this tokenizer position
++};
++
+ /// Safely extracts byte-oriented (i.e., non-textual) fields from raw input.
+ /// Supports commit points for atomic incremental parsing of multi-part fields.
+ /// Throws InsufficientInput when more input is needed to parse the next field.
+@@ -59,10 +81,16 @@ class BinaryTokenizer
+     /// ignore the next size bytes
+     void skip(uint64_t size, const char *description);
+ 
++    /// the number of already parsed bytes
++    uint64_t parsed() const { return parsed_; }
++
+     /// yet unparsed bytes
+     SBuf leftovers() const { return data_.substr(parsed_); }
+ 
+-    const char *context; ///< simplifies debugging
++    /// debugging helper for parsed multi-field structures
++    void got(uint64_t size, const char *description) const;
++
++    const BinaryTokenizerContext *context; ///< debugging: thing being parsed
+ 
+ protected:
+     uint32_t octet();
+@@ -78,4 +106,29 @@ class BinaryTokenizer
+     bool expectMore_; ///< whether more data bytes may arrive in the future
+ };
+ 
++/* BinaryTokenizerContext */
++
++inline
++BinaryTokenizerContext::BinaryTokenizerContext(BinaryTokenizer &tk, const char *aName):
++    tokenizer(tk),
++    parent(tk.context),
++    name(aName),
++    start(tk.parsed())
++{
++    tk.context = this;
++}
++
++inline
++void
++BinaryTokenizerContext::close() {
++    tokenizer.context = parent;
++}
++
++inline
++void
++BinaryTokenizerContext::success() {
++    tokenizer.got(tokenizer.parsed() - start, "");
++    close();
++}
++
+ #endif // SQUID_BINARY_TOKENIZER_H
+@@ -5,70 +5,61 @@
+ #include "ssl/support.h"
+ #endif
+ 
+-Security::FieldGroup::FieldGroup(BinaryTokenizer &tk, const char *description) {
+-    tk.context = description;
+-}
+-
+-void
+-Security::FieldGroup::commit(BinaryTokenizer &tk) {
+-    tk.commit();
+-    tk.context = "";
+-}
+-
+ Security::ProtocolVersion::ProtocolVersion(BinaryTokenizer &tk):
+-    vMajor(tk.uint8(".vMajor")),
+-    vMinor(tk.uint8(".vMinor"))
++    context(tk, ".version"),
++    vMajor(tk.uint8(".major")),
++    vMinor(tk.uint8(".minor"))
+ {
++    context.success();
+ }
+ 
+ Security::TLSPlaintext::TLSPlaintext(BinaryTokenizer &tk):
+-    FieldGroup(tk, "TLSPlaintext"),
++    context(tk, "TLSPlaintext"),
+     type(tk.uint8(".type")),
+     version(tk),
+     length(tk.uint16(".length"))
+ {
+     Must(version.vMajor == 3 && version.vMinor <= 3);
+     Must(type >= ctChangeCipherSpec && type <= ctApplicationData);
+     fragment = tk.area(length, ".fragment");
+-    commit(tk);
++    context.success();
+ }
+ 
+ Security::Handshake::Handshake(BinaryTokenizer &tk):
+-    FieldGroup(tk, "Handshake"),
++    context(tk, "Handshake"),
+     msg_type(tk.uint8(".msg_type")),
+     length(tk.uint24(".length")),
+     body(tk.area(length, ".body"))
+ {
+-    commit(tk);
++    context.success();
+ }
+ 
+ Security::Alert::Alert(BinaryTokenizer &tk):
+-    FieldGroup(tk, "Alert"),
++    context(tk, "Alert"),
+     level(tk.uint8(".level")),
+     description(tk.uint8(".description"))
+ {
+-    commit(tk);
++    context.success();
+ }
+ 
+ Security::Extension::Extension(BinaryTokenizer &tk):
+-    FieldGroup(tk, "Extension"),
++    context(tk, "Extension"),
+     type(tk.uint16(".type")),
+     length(tk.uint16(".length")),
+     body(tk.area(length, ".body"))
+ {
+-    commit(tk);
++    context.success();
+ }
+ 
+ Security::Sslv2Record::Sslv2Record(BinaryTokenizer &tk):
+-    FieldGroup(tk, "Sslv2Record")
++    context(tk, "Sslv2Record"),
++    length(0)
+ {
+-    const uint16_t head = tk.uint16(".head(Record+Length)");
++    const uint16_t head = tk.uint16(".head");
+     length = head & 0x7FFF;
+     Must((head & 0x8000) && length); // SSLv2 message [without padding]
+-    version = 0x02;
+-    // The remained message has length of length-sizeof(type)=(length-1);
+     fragment = tk.area(length, ".fragment");
+-    commit(tk);
++    context.success();
+ }
+ 
+ Security::TlsDetails::TlsDetails():
+@@ -115,28 +106,30 @@ void
+ Security::HandshakeParser::parseVersion2Record()
+ {
+     const Sslv2Record record(tkRecords);
++    tkRecords.commit();
+     Must(details);
+-    details->tlsVersion = record.version;
++    details->tlsVersion = 0x002;
+     parseVersion2HandshakeMessage(record.fragment);
+     state = atHelloReceived;
+-    done = "SSL v2 Hello";
++    done = "SSLv2";
+ }
+ 
+ /// RFC 5246. Appendix E.2. Compatibility with SSL 2.0
+-/// And draft-hickman-netscape-ssl-00. Section 4.1 SSL Record Header Format
++/// And draft-hickman-netscape-ssl-00. Section 4.1. SSL Record Header Format
+ bool
+ Security::HandshakeParser::isSslv2Record(const SBuf &raw) const
+ {
+     BinaryTokenizer tk(raw, true);
+-    const uint16_t head = tk.uint16("V2Hello.msg_length+");
+-    const uint8_t type = tk.uint8("V2Hello.msg_type");
++    const uint16_t head = tk.uint16("?v2Hello.msg_head");
++    const uint8_t type = tk.uint8("?v2Hello.msg_type");
+     const uint16_t length = head & 0x7FFF;
+     return (head & 0x8000) && length && type == 1;
+ }
+ 
+ void
+ Security::HandshakeParser::parseRecord()
+ {
++    Must(details);
+     if (expectingModernRecords)
+         parseModernRecord();
+     else
+@@ -148,13 +141,14 @@ void
+ Security::HandshakeParser::parseModernRecord()
+ {
+     const TLSPlaintext record(tkRecords);
++    tkRecords.commit();
+ 
+     Must(record.length <= (1 << 14)); // RFC 5246: length MUST NOT exceed 2^14
+ 
+     // RFC 5246: MUST NOT send zero-length [non-application] fragments
+     Must(record.length || record.type == ContentType::ctApplicationData);
+ 
+-    details->tlsVersion = ((record.version.vMajor & 0xFF) << 8) | (record.version.vMinor & 0xFF);
++    details->tlsVersion = record.version.toNumberXXX();
+ 
+     if (currentContentType != record.type) {
+         Must(tkMessages.atEnd()); // no currentContentType leftovers
+@@ -173,8 +167,7 @@ Security::HandshakeParser::parseModernRecord()
+ void
+ Security::HandshakeParser::parseMessages()
+ {
+-    debugs(83, 7, DebugFrame("fragments", currentContentType, fragments.length()));
+-    while (!tkMessages.atEnd()) {
++    for (; !tkMessages.atEnd(); tkMessages.commit()) {
+         switch (currentContentType) {
+         case ContentType::ctChangeCipherSpec:
+             parseChangeCipherCpecMessage();
+@@ -211,7 +204,9 @@ Security::HandshakeParser::parseAlertMessage()
+ {
+     Must(currentContentType == ContentType::ctAlert);
+     const Alert alert(tkMessages);
+-    debugs(83, 3, "level " << alert.level << " description " << alert.description);
++    debugs(83, (alert.fatal() ? 2:3),
++           "level " << static_cast<int>(alert.level) <<
++           " description " << static_cast<int>(alert.description));
+     // we are currently ignoring Alert Protocol messages
+ }
+ 
+@@ -260,42 +255,37 @@ Security::HandshakeParser::parseApplicationDataMessage()
+ void
+ Security::HandshakeParser::parseVersion2HandshakeMessage(const SBuf &raw)
+ {
+-    BinaryTokenizer tkHsk(raw);
+-    Must(details);
+-
+-    uint8_t type = tkHsk.uint8("type");
+-    Must(type == hskClientHello); // Only client hello supported.
+-
+-    details->tlsSupportedVersion = tkHsk.uint16("tlsSupportedVersion");
+-    uint16_t ciphersLen = tkHsk.uint16(".cipherSpecLength");
+-    uint16_t sessionIdLen = tkHsk.uint16(".sessionIdLength");
+-    tkHsk.skip(sizeof(uint16_t), ".challengeLength");
+-
+-    SBuf ciphers = tkHsk.area(ciphersLen, "Ciphers list");
+-    parseV23Ciphers(ciphers);
+-    details->sessionId = tkHsk.area(sessionIdLen, "Session Id");
+-
+-    // tkHsk.skip(challengeLen, "Challenge");
++    BinaryTokenizer tk(raw);
++    BinaryTokenizerContext hello(tk, "V2ClientHello");
++    Must(tk.uint8(".type") == hskClientHello); // Only client hello supported.
++    details->tlsSupportedVersion = parseProtocolVersion(tk);
++    const uint16_t ciphersLen = tk.uint16(".cipher_specs.length");
++    const uint16_t sessionIdLen = tk.uint16(".session_id.length");
++    const uint16_t challengeLen = tk.uint16(".challenge.length");
++    parseV23Ciphers(tk.area(ciphersLen, ".cipher_specs.body"));
++    details->sessionId = tk.area(sessionIdLen, ".session_id.body");
++    tk.skip(challengeLen, ".challenge.body");
++    hello.success();
+ }
+ 
+ void
+ Security::HandshakeParser::parseClientHelloHandshakeMessage(const SBuf &raw)
+ {
+-    BinaryTokenizer tkHsk(raw);
+-    Must(details);
+-    details->tlsSupportedVersion = tkHsk.uint16("tlsSupportedVersion");
+-    details->clientRandom = tkHsk.area(SQUID_TLS_RANDOM_SIZE, "Client Random");
+-    details->sessionId = pstring8(tkHsk, "Session ID");
+-    parseCiphers(pstring16(tkHsk, "Ciphers list"));
+-    details->compressMethod = pstring8(tkHsk, "Compression methods").length() > 0 ? 1 : 0; // Only deflate supported here.
+-    if (!tkHsk.atEnd()) // extension-free message ends here
+-        parseExtensions(pstring16(tkHsk, "Extensions List"));
++    BinaryTokenizer tk(raw);
++    BinaryTokenizerContext hello(tk, "ClientHello");
++    details->tlsSupportedVersion = parseProtocolVersion(tk);
++    details->clientRandom = tk.area(SQUID_TLS_RANDOM_SIZE, ".random");
++    details->sessionId = pstring8(tk, ".session_id");
++    parseCiphers(pstring16(tk, ".cipher_suites"));
++    details->compressMethod = pstring8(tk, ".compression_methods").length() > 0 ? 1 : 0; // Only deflate supported here.
++    if (!tk.atEnd()) // extension-free message ends here
++        parseExtensions(pstring16(tk, ".extensions"));
++    hello.success();
+ }
+ 
+ void
+ Security::HandshakeParser::parseExtensions(const SBuf &raw)
+ {
+-    Must(details);
+     BinaryTokenizer tk(raw);
+     while (!tk.atEnd()) {
+         Extension extension(tk);
+@@ -330,7 +320,6 @@ Security::HandshakeParser::parseExtensions(const SBuf &raw)
+ void
+ Security::HandshakeParser::parseCiphers(const SBuf &raw)
+ {
+-    Must(details);
+     BinaryTokenizer tk(raw);
+     while (!tk.atEnd()) {
+         const uint16_t cipher = tk.uint16("cipher");
+@@ -341,33 +330,33 @@ Security::HandshakeParser::parseCiphers(const SBuf &raw)
+ void
+ Security::HandshakeParser::parseV23Ciphers(const SBuf &raw)
+ {
+-    Must(details);
+     BinaryTokenizer tk(raw);
+     while (!tk.atEnd()) {
+         // The v2 hello messages cipher has 3 bytes.
+         // The v2 cipher has the first byte not null.
+         // We support v3 messages only so we are ignoring v2 ciphers.
++        // XXX: The above line sounds wrong -- we support v2 hello messages.
+         const uint8_t prefix = tk.uint8("prefix");
+         const uint16_t cipher = tk.uint16("cipher");
+-        if (prefix == 0)
++        if (prefix == 0) // TODO: return immediately if prefix is positive?
+             details->ciphers.push_back(cipher);
+     }
+ }
+ 
++/// RFC 5246 Section 7.4.1.3. Server Hello
+ void
+ Security::HandshakeParser::parseServerHelloHandshakeMessage(const SBuf &raw)
+ {
+-    BinaryTokenizer tkHsk(raw);
+-    Must(details);
+-    details->tlsSupportedVersion = tkHsk.uint16("tlsSupportedVersion");
+-    details->clientRandom = tkHsk.area(SQUID_TLS_RANDOM_SIZE, "Client Random");
+-    details->sessionId = pstring8(tkHsk, "Session ID");
+-    const uint16_t cipher = tkHsk.uint16("cipher");
+-    details->ciphers.push_back(cipher);
+-    const uint8_t compressionMethod = tkHsk.uint8("Compression method");
+-    details->compressMethod = compressionMethod > 0 ? 1 : 0; // Only deflate supported here.
+-    if (!tkHsk.atEnd()) // extensions present
+-        parseExtensions(pstring16(tkHsk, "Extensions List"));
++    BinaryTokenizer tk(raw);
++    BinaryTokenizerContext serverHello(tk, "ServerHello");
++    details->tlsSupportedVersion = parseProtocolVersion(tk);
++    details->clientRandom = tk.area(SQUID_TLS_RANDOM_SIZE, ".random");
++    details->sessionId = pstring8(tk, ".session_id");
++    details->ciphers.push_back(tk.uint16(".cipher_suite"));
++    details->compressMethod = tk.uint8(".compression_method") != 0; // not null
++    if (!tk.atEnd()) // extensions present
++        parseExtensions(pstring16(tk, ".extensions"));
++    serverHello.success();
+ }
+ 
+ // RFC 6066 Section 3: ServerNameList (may be sent by both clients and servers)
+@@ -383,16 +372,19 @@ Security::HandshakeParser::parseSniExtension(const SBuf &extensionData) const
+     BinaryTokenizer tkList(extensionData);
+     BinaryTokenizer tkNames(pstring16(tkList, "ServerNameList"));
+     while (!tkNames.atEnd()) {
+-        const uint8_t nameType = tkNames.uint8("ServerName.name_type");
+-        const SBuf name = pstring16(tkNames, "ServerName.name");
++        BinaryTokenizerContext serverName(tkNames, "ServerName");
++        const uint8_t nameType = tkNames.uint8(".name_type");
++        const SBuf name = pstring16(tkNames, ".name");
++        serverName.success();
++
+         if (nameType == 0) {
+             debugs(83, 3, "host_name=" << name);
+             return name; // it may be empty
+         }
+         // else we just parsed a new/unsupported NameType which,
+         // according to RFC 6066, MUST begin with a 16-bit length field
+     }
+-    return SBuf(); // SNI present but contains no names
++    return SBuf(); // SNI extension lacks host_name
+ }
+ 
+ void
+@@ -402,7 +394,6 @@ Security::HandshakeParser::skipMessage(const char *description)
+     // To skip a message, we can and should skip everything we have [left]. If
+     // we have partial messages, debugging will mislead about their boundaries.
+     tkMessages.skip(tkMessages.leftovers().length(), description);
+-    tkMessages.commit();
+ }
+ 
+ bool
+@@ -433,36 +424,41 @@ Security::HandshakeParser::parseHello(const SBuf &data)
+ SBuf
+ Security::HandshakeParser::pstring8(BinaryTokenizer &tk, const char *description) const
+ {
+-    tk.context = description;
++    BinaryTokenizerContext pstring(tk, description);
+     const uint8_t length = tk.uint8(".length");
+     const SBuf body = tk.area(length, ".body");
+-    tk.commit();
+-    tk.context = "";
++    pstring.success();
+     return body;
+ }
+ 
+ SBuf
+ Security::HandshakeParser::pstring16(BinaryTokenizer &tk, const char *description) const
+ {
+-    tk.context = description;
++    BinaryTokenizerContext pstring(tk, description);
+     const uint16_t length = tk.uint16(".length");
+     const SBuf body = tk.area(length, ".body");
+-    tk.commit();
+-    tk.context = "";
++    pstring.success();
+     return body;
+ }
+ 
+ SBuf
+ Security::HandshakeParser::pstring24(BinaryTokenizer &tk, const char *description) const
+ {
+-    tk.context = description;
++    BinaryTokenizerContext pstring(tk, description);
+     const uint32_t length = tk.uint24(".length");
+     const SBuf body = tk.area(length, ".body");
+-    tk.commit();
+-    tk.context = "";
++    pstring.success();
+     return body;
+ }
+ 
++/// Convenience helper: We parse ProtocolVersion but store "int".
++int
++Security::HandshakeParser::parseProtocolVersion(BinaryTokenizer &tk) const
++{
++    const ProtocolVersion version(tk);
++    return version.toNumberXXX();
++}
++
+ #if USE_OPENSSL
+ X509 *
+ Security::HandshakeParser::ParseCertificate(const SBuf &raw)
+@@ -24,15 +24,6 @@ namespace Security
+ 
+ // The Transport Layer Security (TLS) Protocol, Version 1.2
+ 
+-/// Helper class to debug parsing of various TLS structures
+-class FieldGroup
+-{
+-public:
+-    FieldGroup(BinaryTokenizer &tk, const char *description); ///< starts parsing
+-
+-    void commit(BinaryTokenizer &tk); ///< commits successful parsing results
+-};
+-
+ /// TLS Record Layer's content types from RFC 5246 Section 6.2.1
+ enum ContentType {
+     ctChangeCipherSpec = 20,
+@@ -46,26 +37,37 @@ struct ProtocolVersion
+ {
+     explicit ProtocolVersion(BinaryTokenizer &tk);
+ 
++    /// XXX: TlsDetails use "int" to manipulate version information.
++    /// TODO: Use ProtocolVersion in TlsDetails and printTlsVersion().
++    int toNumberXXX() const { return (vMajor << 8) | vMinor; }
++
++    BinaryTokenizerContext context; ///< parsing context for debugging
++
+     // the "v" prefix works around environments that #define major and minor
+     uint8_t vMajor;
+     uint8_t vMinor;
+ };
+ 
+ /// TLS Record Layer's frame from RFC 5246 Section 6.2.1.
+-struct TLSPlaintext: public FieldGroup
++struct TLSPlaintext
+ {
+     explicit TLSPlaintext(BinaryTokenizer &tk);
+ 
++    BinaryTokenizerContext context; ///< parsing context for debugging
++
+     uint8_t type; ///< Rfc5246::ContentType
+     ProtocolVersion version;
+     uint16_t length;
+     SBuf fragment; ///< exactly length bytes
+ };
+ 
+-struct Sslv2Record: public FieldGroup
++/// draft-hickman-netscape-ssl-00. Section 4.1. SSL Record Header Format
++struct Sslv2Record
+ {
+     explicit Sslv2Record(BinaryTokenizer &tk);
+-    uint16_t version;
++
++    BinaryTokenizerContext context; ///< parsing context for debugging
++
+     uint16_t length;
+     SBuf fragment;
+ };
+@@ -79,28 +81,40 @@ enum HandshakeType {
+ };
+ 
+ /// TLS Handshake Protocol frame from RFC 5246 Section 7.4.
+-struct Handshake: public FieldGroup
++struct Handshake
+ {
+     explicit Handshake(BinaryTokenizer &tk);
+ 
++    BinaryTokenizerContext context; ///< parsing context for debugging
++
+     uint32_t msg_type: 8; ///< HandshakeType
+     uint32_t length: 24;
+     SBuf body; ///< Handshake Protocol message, exactly length bytes
+ };
+ 
+ /// TLS Alert protocol frame from RFC 5246 Section 7.2.
+-struct Alert: public FieldGroup
++struct Alert
+ {
+     explicit Alert(BinaryTokenizer &tk);
++
++
++    bool fatal() const { return level == 2; }
++
++    BinaryTokenizerContext context; ///< parsing context for debugging
++
+     uint8_t level; ///< warning or fatal
+     uint8_t description; ///< close_notify, unexpected_message, etc.
+ };
+ 
+-struct Extension: public FieldGroup
++/// TLS Hello Extension from RFC 5246 Section 7.4.1.4.
++struct Extension
+ {
+     explicit Extension(BinaryTokenizer &tk);
++
++    BinaryTokenizerContext context; ///< parsing context for debugging
++
+     uint16_t type;
+-    uint16_t length;
++    uint16_t length; // XXX just use SBuf!
+     SBuf body;
+ };
+ 
+@@ -198,6 +212,8 @@ class HandshakeParser {
+     SBuf pstring16(BinaryTokenizer &tk, const char *description) const;
+     SBuf pstring24(BinaryTokenizer &tk, const char *description) const;
+ 
++    int parseProtocolVersion(BinaryTokenizer &tk) const;
++
+     unsigned int currentContentType; ///< The current SSL record content type
+ 
+     const char *done; ///< not nil iff we got what we were looking for

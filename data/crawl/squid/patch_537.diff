@@ -1,0 +1,526 @@
+@@ -3596,6 +3596,7 @@ AC_CONFIG_FILES([\
+ 	helpers/log_daemon/file/Makefile \
+ 	helpers/url_rewrite/Makefile \
+ 	helpers/url_rewrite/fake/Makefile \
++	helpers/ssl/Makefile \
+ 	tools/Makefile
+ 	tools/purge/Makefile
+ ])
+@@ -20,3 +20,8 @@ SUBDIRS = \
+ if ENABLE_AUTH_NTLM
+ SUBDIRS += ntlm_auth
+ endif
++
++if ENABLE_SSL
++SUBDIRS += ssl
++endif
++
+@@ -2351,6 +2351,47 @@ DOC_START
+ 	You must have at least one ssl_crtd process.
+ DOC_END
+ 
++NAME: sslcrtvalidator_program
++TYPE: eol
++IFDEF: USE_SSL
++DEFAULT: none
++LOC: Ssl::TheConfig.ssl_crt_validator
++DOC_START
++	Specify the location and options of the executable for ssl_crt_validator
++	process.
++DOC_END
++
++NAME: sslcrtvalidator_children
++TYPE: HelperChildConfig
++IFDEF: USE_SSL
++DEFAULT: 32 startup=5 idle=1
++LOC: Ssl::TheConfig.ssl_crt_validator_Children
++DOC_START
++	The maximum number of processes spawn to service ssl server.
++	The maximum this may be safely set to is 32.
++	
++	The startup= and idle= options allow some measure of skew in your
++	tuning.
++	
++		startup=N
++	
++	Sets the minimum number of processes to spawn when Squid
++	starts or reconfigures. When set to zero the first request will
++	cause spawning of the first child process to handle it.
++	
++	Starting too few children temporary slows Squid under load while it
++	tries to spawn enough additional processes to cope with traffic.
++	
++		idle=N
++	
++	Sets a minimum of how many processes Squid is to try and keep available
++	at all times. When traffic begins to rise above what the existing
++	processes can handle this many more will be spawned up to the maximum
++	configured. A minimum setting of 1 is required.
++	
++	You must have at least one ssl_crt_validator process.
++DOC_END
++
+ COMMENT_START
+  OPTIONS WHICH AFFECT THE NEIGHBOR SELECTION ALGORITHM
+  -----------------------------------------------------------------------------
+@@ -68,6 +68,9 @@
+ #include "Store.h"
+ #include "whois.h"
+ #if USE_SSL
++#include "ssl/cert_validate_message.h"
++#include "ssl/Config.h"
++#include "ssl/helper.h"
+ #include "ssl/support.h"
+ #include "ssl/ErrorDetail.h"
+ #include "ssl/ServerBump.h"
+@@ -213,6 +216,12 @@ FwdState::completed()
+             assert(err);
+             errorAppendEntry(entry, err);
+             err = NULL;
++#if USE_SSL
++            if (request->flags.sslPeek && request->clientConnectionManager.valid()) {
++                CallJobHere1(17, 4, request->clientConnectionManager, ConnStateData,
++                             ConnStateData::httpsPeeked, Comm::ConnectionPointer(NULL));
++            }
++#endif
+         } else {
+             EBIT_CLR(entry->flags, ENTRY_FWD_HDR_WAIT);
+             entry->complete();
+@@ -368,14 +377,6 @@ FwdState::startConnectionOrFail()
+             ErrorState *anErr = new ErrorState(ERR_CANNOT_FORWARD, HTTP_INTERNAL_SERVER_ERROR, request);
+             fail(anErr);
+         } // else use actual error from last connection attempt
+-#if USE_SSL
+-        if (request->flags.sslPeek && request->clientConnectionManager.valid()) {
+-            errorAppendEntry(entry, err); // will free err
+-            err = NULL;
+-            CallJobHere1(17, 4, request->clientConnectionManager, ConnStateData,
+-                         ConnStateData::httpsPeeked, Comm::ConnectionPointer(NULL));
+-        }
+-#endif
+         self = NULL;       // refcounted
+     }
+ }
+@@ -758,9 +759,150 @@ FwdState::negotiateSSL(int fd)
+         serverConnection()->getPeer()->sslSession = SSL_get1_session(ssl);
+     }
+ 
++#if 1 // USE_SSL_CERT_VALIDATOR
++    if (Ssl::TheConfig.ssl_crt_validator) {
++        Ssl::ValidateCertificate certValidate;
++        // WARNING: The STACK_OF(*) OpenSSL objects does not support locking.
++        // If we need to support locking we need to sk_X509_dup the STACK_OF(X509)
++        // list and lock all of the X509 members of the list.
++        // Currently we do not use any locking for any of the members of the 
++        // Ssl::ValidateCertificate class. If the ssl object gone, the value returned 
++        // from SSL_get_peer_cert_chain may not exist any more. In this code the
++        // Ssl::ValidateCertificate object used only to pass data to
++        // Ssl::CertValidationHelper::submit method.
++        certValidate.peerCerts = SSL_get_peer_cert_chain(ssl);
++        certValidate.domainName = request->GetHost();
++        if (Ssl::Errors *errs = static_cast<Ssl::Errors *>(SSL_get_ex_data(ssl, ssl_ex_index_ssl_errors)))
++            certValidate.errors = errs;
++        else
++            certValidate.errors = NULL;
++        try {
++            debugs(83, 5, HERE << "Sending SSL certificate for validation to ssl_crtvd.");
++            Ssl::CertValidateMessage request_message;
++            request_message.setCode(Ssl::CertValidateMessage::code_cert_validate);
++            request_message.composeRequest(certValidate);
++            debugs(83, 5, HERE << "SSL crtvd request: " << request_message.compose().c_str());
++            Ssl::CertValidationHelper::GetInstance()->sslSubmit(request_message, sslCrtvdHandleReplyWrapper, this);
++            return;
++        } catch (const std::exception &e) {
++            debugs(33, DBG_IMPORTANT, "ERROR: Failed to compose ssl_crtd " <<
++                   "request for " << certValidate.domainName <<
++                   " certificate: " << e.what() << "; will now block to " <<
++                   "validate that certificate.");
++            // fall through to do blocking in-process generation.
++        }
++    }
++#endif // USE_SSL_CERT_VALIDATOR
++
+     dispatch();
+ }
+ 
++#if 1 // USE_SSL_CERT_VALIDATOR
++void
++FwdState::sslCrtvdHandleReplyWrapper(void *data, char *reply)
++{
++    FwdState * fwd = (FwdState *)(data);
++    fwd->sslCrtvdHandleReply(reply);
++}
++
++void
++FwdState::sslCrtvdHandleReply(const char *reply)
++{
++    Ssl::Errors *errs = NULL;
++    Ssl::ErrorDetail *errDetails = NULL;
++    if (!Comm::IsConnOpen(serverConnection())) {
++        return;
++    }
++    SSL *ssl = fd_table[serverConnection()->fd].ssl;
++
++    if (!reply) {
++        debugs(83, 1, HERE << "\"ssl_crtd\" helper return <NULL> reply");
++    } else {
++        Ssl::CertValidateMessage reply_message;
++        Ssl::ValidateCertificateResponse resp;
++        std::string error;
++        if (reply_message.parse(reply, strlen(reply)) != Ssl::CrtdMessage::OK ||
++            !reply_message.parseResponse(resp, error) ) {
++            debugs(83, 5, HERE << "Reply from ssl_crtvd for " << request->GetHost() << " is incorrect");
++        } else {
++            if (reply_message.getCode() != "OK") {
++                debugs(83, 5, HERE << "Certificate for " << request->GetHost() << " cannot be validated. ssl_crtvd response: " << reply_message.getBody());
++            } else {
++                debugs(83, 5, HERE << "Certificate for " << request->GetHost() << " was successfully validated from ssl_crtvd");
++                // Copy the list of errors etc....
++                ACLFilledChecklist *check = NULL;
++                if (acl_access *acl = Config.ssl_client.cert_error) {
++                    check = new ACLFilledChecklist(acl, request, dash_str);
++                    for(std::vector<Ssl::ValidateCertificateResponse::ErrorItem>::const_iterator i = resp.errors.begin(); i != resp.errors.end(); ++i) {
++                        debugs(83, 7, "Error item: " << i->error_no << " " << i->error_reason << " " << i->certId);
++
++                        if (i->error_no == SSL_ERROR_NONE)
++                            continue; //ignore????
++
++                        if (errDetails == NULL && check) {
++                            check->sslErrors = new Ssl::Errors(i->error_no);
++                            if (check->fastCheck() == ACCESS_ALLOWED) {
++                                debugs(83, 3, "bypassing SSL error " << i->error_no << " in " << "buffer");
++                            } else {
++                                debugs(83, 5, "confirming SSL error " << i->error_no);
++                                STACK_OF(X509) *peerCerts = SSL_get_peer_cert_chain(ssl);
++                                //if i->certID is not correct sk_X509_value returns NULL
++                                X509 *brokenCert = NULL;
++                                if (i->cert != NULL)
++                                    brokenCert = i->cert;
++                                else
++                                    brokenCert = sk_X509_value(peerCerts, i->certId);
++                                X509 *peerCert = SSL_get_peer_certificate(ssl);
++                                const char *aReason = i->error_reason.empty() ? NULL : i->error_reason.c_str();
++                                errDetails = new Ssl::ErrorDetail(i->error_no, peerCert, brokenCert, aReason);
++                                X509_free(peerCert);
++                                // set error detail reason
++                            }
++                            delete check->sslErrors;
++                            check->sslErrors = NULL;
++                        }
++
++                        if (errs == NULL)
++                            errs = new Ssl::Errors(i->error_no);
++                        else 
++                            errs->push_back_unique(i->error_no);
++                    }
++
++                    if (!errDetails) {
++                        dispatch();
++                        return;
++                    }
++
++                }
++            }
++        }
++    }
++    // Check the list error with
++    if (errDetails && request->clientConnectionManager.valid()) {
++        // remember the server certificate from the ErrorDetail object
++        if (Ssl::ServerBump *serverBump = request->clientConnectionManager->serverBump()) {
++            // remember validation errors, if any
++            if (errs) {
++                if (serverBump->sslErrors)
++                    cbdataReference(serverBump->sslErrors);
++                serverBump->sslErrors = cbdataReference(errs);
++            }
++        }
++    }
++
++    ErrorState *const anErr = makeConnectingError(ERR_SECURE_CONNECT_FAIL);
++    anErr->detail = errDetails;
++    /*anErr->xerrno= Should preserved*/
++    fail(anErr);
++    if (serverConnection()->getPeer()) {
++        peerConnectFailed(serverConnection()->getPeer());
++    }
++    serverConn->close();
++    self = NULL;
++    return;
++}
++#endif // USE_SSL_CERT_VALIDATOR
++
+ void
+ FwdState::initiateSSL()
+ {
+@@ -823,13 +965,21 @@ FwdState::initiateSSL()
+             Ssl::setClientSNI(ssl, hostname);
+     }
+ 
+-    // Create the ACL check list now, while we have access to more info.
+-    // The list is used in ssl_verify_cb() and is freed in ssl_free().
+-    if (acl_access *acl = Config.ssl_client.cert_error) {
+-        ACLFilledChecklist *check = new ACLFilledChecklist(acl, request, dash_str);
+-        check->fd(fd);
+-        SSL_set_ex_data(ssl, ssl_ex_index_cert_error_check, check);
++#if 1 // USE_SSL_CERT_VALIDATOR
++    // If CertValidation Helper used do not lookup checklist for errors,
++    // but keep a list of errors to send it to CertValidator
++    if (!Ssl::TheConfig.ssl_crt_validator) {
++#endif
++        // Create the ACL check list now, while we have access to more info.
++        // The list is used in ssl_verify_cb() and is freed in ssl_free().
++        if (acl_access *acl = Config.ssl_client.cert_error) {
++            ACLFilledChecklist *check = new ACLFilledChecklist(acl, request, dash_str);
++            check->fd(fd);
++            SSL_set_ex_data(ssl, ssl_ex_index_cert_error_check, check);
++        }
++#if 1 // USE_SSL_CERT_VALIDATOR
+     }
++#endif
+ 
+     // store peeked cert to check SQUID_X509_V_ERR_CERT_CHANGE
+     X509 *peeked_cert;
+@@ -69,6 +69,10 @@ class FwdState : public RefCountable
+     /** return a ConnectionPointer to the current server connection (may or may not be open) */
+     Comm::ConnectionPointer const & serverConnection() const { return serverConn; };
+ 
++#if 1 // USE_SSL_CERT_VALIDATOR
++    static void sslCrtvdHandleReplyWrapper(void *data, char *reply);
++    void sslCrtvdHandleReply(const char *reply);
++#endif
+ private:
+     // hidden for safer management of self; use static fwdStart
+     FwdState(const Comm::ConnectionPointer &client, StoreEntry *, HttpRequest *, const AccessLogEntryPointer &alp);
+@@ -758,6 +758,7 @@ mainReconfigureStart(void)
+     Ssl::Helper::GetInstance()->Shutdown();
+ #endif
+ #if USE_SSL
++    Ssl::CertValidationHelper::GetInstance()->Shutdown();
+     Ssl::TheGlobalContextStorage.reconfigureStart();
+ #endif
+     redirectShutdown();
+@@ -840,6 +841,10 @@ mainReconfigureFinish(void *)
+ #if USE_SSL_CRTD
+     Ssl::Helper::GetInstance()->Init();
+ #endif
++#if USE_SSL
++    if (Ssl::CertValidationHelper::GetInstance())
++        Ssl::CertValidationHelper::GetInstance()->Init();
++#endif
+ 
+     redirectInit();
+ #if USE_AUTH
+@@ -1039,6 +1044,11 @@ mainInitialize(void)
+     Ssl::Helper::GetInstance()->Init();
+ #endif
+ 
++#if USE_SSL
++    if (Ssl::CertValidationHelper::GetInstance())
++        Ssl::CertValidationHelper::GetInstance()->Init();
++#endif
++
+     redirectInit();
+ #if USE_AUTH
+     authenticateInit(&Auth::TheConfig);
+@@ -1846,6 +1856,9 @@ SquidShutdown()
+     dnsShutdown();
+ #if USE_SSL_CRTD
+     Ssl::Helper::GetInstance()->Shutdown();
++#endif
++#if USE_SSL
++    Ssl::CertValidationHelper::GetInstance()->Shutdown();
+ #endif
+     redirectShutdown();
+     externalAclShutdown();
+@@ -17,6 +17,8 @@ class Config
+     char *ssl_crtd; ///< Name of external ssl_crtd application.
+     /// The number of processes spawn for ssl_crtd.
+     HelperChildConfig ssl_crtdChildren;
++    char *ssl_crt_validator;
++    HelperChildConfig ssl_crt_validator_Children;
+ #endif
+     Config();
+     ~Config();
+@@ -338,7 +338,9 @@ const char *Ssl::ErrorDetail::err_descr() const
+ 
+ const char *Ssl::ErrorDetail::err_lib_error() const
+ {
+-    if (lib_error_no != SSL_ERROR_NONE)
++    if (errReason.defined())
++        return errReason.termedBuf();
++    else if (lib_error_no != SSL_ERROR_NONE)
+         return ERR_error_string(lib_error_no, NULL);
+     else
+         return "[No Error]";
+@@ -414,7 +416,7 @@ const String &Ssl::ErrorDetail::toString() const
+     return errDetailStr;
+ }
+ 
+-Ssl::ErrorDetail::ErrorDetail( Ssl::ssl_error_t err_no, X509 *cert, X509 *broken): error_no (err_no), lib_error_no(SSL_ERROR_NONE)
++Ssl::ErrorDetail::ErrorDetail( Ssl::ssl_error_t err_no, X509 *cert, X509 *broken, const char *aReason): error_no (err_no), lib_error_no(SSL_ERROR_NONE), errReason(aReason)
+ {
+     if (cert)
+         peer_cert.resetAndLock(cert);
+@@ -49,7 +49,7 @@ class ErrorDetail
+ {
+ public:
+     // if broken certificate is nil, the peer certificate is broken
+-    ErrorDetail(ssl_error_t err_no, X509 *peer, X509 *broken);
++    ErrorDetail(ssl_error_t err_no, X509 *peer, X509 *broken, const char *aReason = NULL);
+     ErrorDetail(ErrorDetail const &);
+     const String &toString() const;  ///< An error detail string to embed in squid error pages
+     void useRequest(HttpRequest *aRequest) { if (aRequest != NULL) request = aRequest;}
+@@ -93,6 +93,7 @@ class ErrorDetail
+     unsigned long lib_error_no; ///< low-level error returned by OpenSSL ERR_get_error(3SSL)
+     X509_Pointer peer_cert; ///< A pointer to the peer certificate
+     X509_Pointer broken_cert; ///< A pointer to the broken certificate (peer or intermediate)
++    String errReason; ///< A custom reason for error, else retrieved from OpenSSL.
+     mutable ErrorDetailEntry detailEntry;
+     HttpRequest::Pointer request;
+ };
+@@ -21,6 +21,8 @@ endif
+ 
+ ## SSL stuff used by main Squid but not by ssl_crtd
+ libsslsquid_la_SOURCES = \
++	cert_validate_message.cc \
++	cert_validate_message.h \
+ 	context_storage.cc \
+ 	context_storage.h \
+ 	Config.cc \
+@@ -80,7 +80,7 @@ class CrtdMessage
+     static const std::string param_SetCommonName;
+     /// Parameter name for passing signing algorithm
+     static const std::string param_Sign;
+-private:
++protected:
+     enum ParseState {
+         BEFORE_CODE,
+         CODE,
+@@ -106,3 +106,85 @@ void Ssl::Helper::sslSubmit(CrtdMessage const & message, HLPCB * callback, void
+     msg += '\n';
+     helperSubmit(ssl_crtd, msg.c_str(), callback, data);
+ }
++
++/*ssl_crtd_validator*/
++
++Ssl::CertValidationHelper * Ssl::CertValidationHelper::GetInstance()
++{
++    static Ssl::CertValidationHelper sslHelper;
++    if (!Ssl::TheConfig.ssl_crt_validator)
++        return NULL;
++    return &sslHelper;
++}
++
++Ssl::CertValidationHelper::CertValidationHelper() : ssl_crt_validator(NULL)
++{
++}
++
++Ssl::CertValidationHelper::~CertValidationHelper()
++{
++    Shutdown();
++}
++
++void Ssl::CertValidationHelper::Init()
++{
++    assert(ssl_crt_validator == NULL);
++
++    // we need to start ssl_crtd only if some port(s) need to bump SSL
++    bool found = false;
++    for (AnyP::PortCfg *s = ::Config.Sockaddr.http; !found && s; s = s->next)
++        found = s->sslBump;
++    for (AnyP::PortCfg *s = ::Config.Sockaddr.https; !found && s; s = s->next)
++        found = s->sslBump;
++    if (!found)
++        return;
++
++    ssl_crt_validator = new helper("ssl_crt_validator");
++    ssl_crt_validator->childs.updateLimits(Ssl::TheConfig.ssl_crt_validator_Children);
++    ssl_crt_validator->ipc_type = IPC_STREAM;
++    // The crtd messages may contain the eol ('\n') character. We are
++    // going to use the '\1' char as the end-of-message mark.
++    ssl_crt_validator->eom = '\1';
++    assert(ssl_crt_validator->cmdline == NULL);
++    {
++        char *tmp = xstrdup(Ssl::TheConfig.ssl_crt_validator);
++        char *tmp_begin = tmp;
++        char * token = NULL;
++        while ((token = strwordtok(NULL, &tmp))) {
++            wordlistAdd(&ssl_crt_validator->cmdline, token);
++        }
++        safe_free(tmp_begin);
++    }
++    helperOpenServers(ssl_crt_validator);
++}
++
++void Ssl::CertValidationHelper::Shutdown()
++{
++    if (!ssl_crt_validator)
++        return;
++    helperShutdown(ssl_crt_validator);
++    wordlistDestroy(&ssl_crt_validator->cmdline);
++    delete ssl_crt_validator;
++    ssl_crt_validator = NULL;
++}
++
++void Ssl::CertValidationHelper::sslSubmit(CrtdMessage const & message, HLPCB * callback, void * data)
++{
++    static time_t first_warn = 0;
++    assert(ssl_crt_validator);
++
++    if (ssl_crt_validator->stats.queue_size >= (int)(ssl_crt_validator->childs.n_running * 2)) {
++        if (first_warn == 0)
++            first_warn = squid_curtime;
++        if (squid_curtime - first_warn > 3 * 60)
++            fatal("SSL servers not responding for 3 minutes");
++        debugs(34, 1, HERE << "Queue overload, rejecting");
++        callback(data, (char *)"error 45 Temporary network problem, please retry later");
++        return;
++    }
++
++    first_warn = 0;
++    std::string msg = message.compose();
++    msg += '\n';
++    helperSubmit(ssl_crt_validator, msg.c_str(), callback, data);
++}
+@@ -30,5 +30,20 @@ class Helper
+     helper * ssl_crtd; ///< helper for management of ssl_crtd.
+ };
+ 
++class CertValidationHelper
++{
++public:
++    static CertValidationHelper * GetInstance(); ///< Instance class.
++    void Init(); ///< Init helper structure.
++    void Shutdown(); ///< Shutdown helper structure.
++    /// Submit crtd message to external crtd server.
++    void sslSubmit(CrtdMessage const & message, HLPCB * callback, void *data);
++private:
++    CertValidationHelper();
++    ~CertValidationHelper();
++
++    helper * ssl_crt_validator; ///< helper for management of ssl_crtd.
++};
++
+ } //namespace Ssl
+ #endif // SQUID_SSL_HELPER_H
+@@ -45,6 +45,7 @@
+ #include "fde.h"
+ #include "globals.h"
+ #include "protos.h"
++#include "ssl/Config.h"
+ #include "ssl/ErrorDetail.h"
+ #include "ssl/support.h"
+ #include "ssl/gadgets.h"
+@@ -289,6 +290,12 @@ ssl_verify_cb(int ok, X509_STORE_CTX * ctx)
+             delete filledCheck->sslErrors;
+             filledCheck->sslErrors = NULL;
+         }
++#if 1 // USE_SSL_CERT_VALIDATOR
++        // If the certificate validator is used then we need to allow all errors and 
++        // pass them tp certficate validator for more processing
++        else if (Ssl::TheConfig.ssl_crt_validator)
++            ok = 1;
++#endif
+     }
+ 
+     if (!dont_verify_domain && server) {}

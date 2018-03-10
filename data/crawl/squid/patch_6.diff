@@ -1,26 +1,1916 @@
-----++++src/mime.cc
-@@ -394,6 +394,11 @@ MimeIcon::created(StoreEntry *newEntry)
-         status = Http::scNoContent;
+@@ -587,10 +587,13 @@ void
+ HttpRequest::recordLookup(const Dns::LookupDetails &dns)
+ {
+     if (dns.wait >= 0) { // known delay
+-        if (dnsWait >= 0) // have recorded DNS wait before
++        if (dnsWait >= 0) { // have recorded DNS wait before
++            debugs(78, 7, this << " " << dnsWait << " += " << dns);
+             dnsWait += dns.wait;
+-        else
++        } else {
++            debugs(78, 7, this << " " << dns);
+             dnsWait = dns.wait;
++        }
+     }
+ }
+ 
+@@ -15,6 +15,7 @@
+ #include "comm/forward.h"
+ #include "hier_code.h"
+ #include "ip/Address.h"
++#include "ipcache.h"
+ #include "mem/forward.h"
+ #include "PingData.h"
+ 
+@@ -50,13 +51,18 @@ class PeerSelectionInitiator: public CbdataParent
+ 
+ class FwdServer;
+ 
+-class ps_state
++class ps_state: public Dns::IpReceiver
+ {
+-    CBDATA_CLASS(ps_state);
++    CBDATA_CHILD(ps_state);
+ 
+ public:
+     explicit ps_state(PeerSelectionInitiator *initiator);
+-    ~ps_state();
++    virtual ~ps_state() override;
++
++    /* Dns::IpReceiver API */
++    virtual void noteIp(const Ip::Address &ip) override;
++    virtual void noteIps(const Dns::CachedIps *ips, const Dns::LookupDetails &details) override;
++    virtual void noteLookup(const Dns::LookupDetails &details) override;
+ 
+     // Produce a URL for display identifying the transaction we are
+     // trying to locate a peer for.
+@@ -593,8 +593,8 @@ ACLDestinationASNStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist
+     const ipcache_addrs *ia = ipcache_gethostbyname(checklist->request->url.host(), IP_LOOKUP_IF_MISS);
+ 
+     if (ia) {
+-        for (int k = 0; k < (int) ia->count; ++k) {
+-            if (data->match(ia->in_addrs[k]))
++        for (const auto ip: ia->goodAndBad()) {
++            if (data->match(ip))
+                 return 1;
+         }
+ 
+@@ -15,7 +15,6 @@
+ #include "acl/RegexData.h"
+ #include "fqdncache.h"
+ #include "HttpRequest.h"
+-#include "ipcache.h"
+ 
+ DestinationDomainLookup DestinationDomainLookup::instance_;
+ 
+@@ -78,14 +77,12 @@ ACLDestinationDomainStrategy::match (ACLData<MatchType> * &data, ACLFilledCheckl
      }
  
-+    const MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initIcon);
-+    HttpRequestPointer r(HttpRequest::FromUrl(url_, mx));
-+    if (!r)
-+        fatalf(&quot;mimeLoadIcon: cannot parse internal URL: %s&quot;, url_);
-+
-     // fill newEntry with a canned 2xx response object
-     RequestFlags flags;
-     flags.cachable = true;
-@@ -403,11 +408,6 @@ MimeIcon::created(StoreEntry *newEntry)
-     e-&gt;setPublicKey();
-     e-&gt;buffer();
+     /* raw IP without rDNS? look it up and wait for the result */
+-    const ipcache_addrs *ia = ipcacheCheckNumeric(checklist->request->url.host());
+-    if (!ia) {
++    if (!checklist->dst_addr.fromHost(checklist->request->url.host())) {
+         /* not a valid IPA */
+         checklist->dst_rdns = xstrdup("invalid");
+         return 0;
+     }
  
--    const MasterXaction::Pointer mx = new MasterXaction(XactionInitiator::initIcon);
--    HttpRequestPointer r(HttpRequest::FromUrl(url_, mx));
--    if (!r)
--        fatalf(&quot;mimeLoadIcon: cannot parse internal URL: %s&quot;, url_);
+-    checklist->dst_addr = ia->in_addrs[0];
+     const char *fqdn = fqdncache_gethostbyaddr(checklist->dst_addr, FQDN_LOOKUP_IF_MISS);
+ 
+     if (fqdn) {
+@@ -67,8 +67,8 @@ ACLDestinationIP::match(ACLChecklist *cl)
+     if (ia) {
+         /* Entry in cache found */
+ 
+-        for (int k = 0; k < (int) ia->count; ++k) {
+-            if (ACLIP::match(ia->in_addrs[k]))
++        for (const auto ip: ia->goodAndBad()) {
++            if (ACLIP::match(ip))
+                 return 1;
+         }
+ 
+@@ -214,10 +214,8 @@ Adaptation::Icap::Xaction::dnsLookupDone(const ipcache_addrs *ia)
+         return;
+     }
+ 
+-    assert(ia->cur < ia->count);
 -
-     e-&gt;mem_obj-&gt;request = r;
+     connection = new Comm::Connection;
+-    connection->remote = ia->in_addrs[ia->cur];
++    connection->remote = ia->current();
+     connection->remote.port(s.cfg().port);
+     getOutgoingAddress(NULL, connection);
  
-     HttpReplyPointer reply(new HttpReply);
-----++++GitHub
+@@ -516,6 +516,17 @@ cbdataDump(StoreEntry * sentry)
+     storeAppendPrintf(sentry, "\nsee also \"Memory utilization\" for detailed per type statistics\n");
+ }
+ 
++CallbackData &
++CallbackData::operator =(const CallbackData &other)
++{
++    if (data_ != other.data_) { // assignment to self and no-op assignments
++        auto old = data_;
++        data_ = cbdataReference(other.data_);
++        cbdataReferenceDone(old);
++    }
++    return *this;
++}
++
+ CBDATA_CLASS_INIT(generic_cbdata);
+ 
+ #if USE_CBDATA_DEBUG
+@@ -382,9 +382,10 @@ class CallbackData
+     CallbackData(CallbackData &&other): data_(other.data_) { other.data_ = nullptr; }
+     ~CallbackData() { cbdataReferenceDone(data_); }
+ 
+-    // implement if needed
+-    CallbackData &operator =(const CallbackData &other) = delete;
++    CallbackData &operator =(const CallbackData &other);
++    CallbackData &operator =(CallbackData &&other) { cbdataReferenceDone(data_); data_ = other.data_; other.data_ = nullptr; return *this; }
+ 
++    bool valid() const { return cbdataReferenceValid(data_); }
+     void *validDone() { void *result; return cbdataReferenceValidDone(data_, &result) ? result : nullptr; }
+ 
+ private:
+@@ -530,17 +530,12 @@ ClientRequestContext::hostHeaderIpVerify(const ipcache_addrs* ia, const Dns::Loo
+     // note the DNS details for the transaction stats.
+     http->request->recordLookup(dns);
+ 
+-    if (ia != NULL && ia->count > 0) {
+-        // Is the NAT destination IP in DNS?
+-        for (int i = 0; i < ia->count; ++i) {
+-            if (clientConn->local.matchIPAddr(ia->in_addrs[i]) == 0) {
+-                debugs(85, 3, HERE << "validate IP " << clientConn->local << " possible from Host:");
+-                http->request->flags.hostVerified = true;
+-                http->doCallouts();
+-                return;
+-            }
+-            debugs(85, 3, HERE << "validate IP " << clientConn->local << " non-match from Host: IP " << ia->in_addrs[i]);
+-        }
++    // Is the NAT destination IP in DNS?
++    if (ia && ia->have(clientConn->local)) {
++        debugs(85, 3, "validate IP " << clientConn->local << " possible from Host:");
++        http->request->flags.hostVerified = true;
++        http->doCallouts();
++        return;
+     }
+     debugs(85, 3, HERE << "FAIL: validate IP " << clientConn->local << " possible from Host:");
+     hostHeaderVerifyFailed("local IP", "any domain IP");
+@@ -13,7 +13,7 @@
+ 
+ class rfc1035_rr;
+ 
+-typedef void IDNSCB(void *, const rfc1035_rr *, int, const char *);
++typedef void IDNSCB(void *cbdata, const rfc1035_rr *answer, const int recordsInAnswer, const char *error, bool lastAnswer);
+ 
+ /// generic DNS API
+ namespace Dns
+@@ -282,6 +282,7 @@ static void idnsRcodeCount(int, int);
+ static CLCB idnsVCClosed;
+ static unsigned short idnsQueryID(void);
+ static void idnsSendSlaveAAAAQuery(idns_query *q);
++static void idnsCallbackOnEarlyError(IDNSCB *callback, void *cbdata, const char *error);
+ 
+ static void
+ idnsCheckMDNS(idns_query *q)
+@@ -1082,95 +1083,94 @@ idnsQueryID()
+     return id;
+ }
+ 
+-static void
+-idnsCallback(idns_query *q, const char *error)
++/// \returns whether master or associated queries are still waiting for replies
++static bool
++idnsStillPending(const idns_query *master)
+ {
+-    IDNSCB *callback;
+-    void *cbdata;
++    assert(!master->master); // we were given the master transaction
++    for (const idns_query *qi = master; qi; qi = qi->slave) {
++        if (qi->pending)
++            return true;
++    }
++    return false;
++}
+ 
+-    if (error)
+-        q->error = error;
++static std::ostream &
++operator <<(std::ostream &os, const idns_query &answered)
++{
++    if (answered.error)
++        os << "error \"" << answered.error << "\"";
++    else
++        os << answered.ancount << " records";
++    return os;
++}
+ 
+-    if (q->master)
+-        q = q->master;
++static void
++idnsCallbackOnEarlyError(IDNSCB *callback, void *cbdata, const char *error)
++{
++    // A cbdataReferenceValid() check asserts on unlocked cbdata: Early errors,
++    // by definition, happen before we store/cbdataReference() cbdata.
++    debugs(78, 6, "\"" << error << "\" for " << cbdata);
++    callback(cbdata, nullptr, 0, "Internal error", true); // hide error details
++}
+ 
+-    // If any of our subqueries are still pending then wait for them to complete before continuing
+-    for (idns_query *q2 = q; q2; q2 = q2->slave) {
+-        if (q2->pending) {
+-            return;
+-        }
+-    }
++/// safely sends one set of DNS records (or an error) to the caller
++static bool
++idnsCallbackOneWithAnswer(IDNSCB *callback, void *cbdata, const idns_query &answered, const bool lastAnswer)
++{
++    if (!cbdataReferenceValid(cbdata))
++        return false;
++    const rfc1035_rr *records = answered.message ? answered.message->answer : nullptr;
++    debugs(78, 6, (lastAnswer ? "last " : "") << answered << " for " << cbdata);
++    callback(cbdata, records, answered.ancount, answered.error, lastAnswer);
++    return true;
++}
+ 
+-    /* Merge results */
+-    rfc1035_message *message = q->message;
+-    q->message = NULL;
+-    int n = q->ancount;
+-    error = q->error;
+-
+-    while ( idns_query *q2 = q->slave ) {
+-        debugs(78, 6, HERE << "Merging DNS results " << q->name << " A has " << n << " RR, AAAA has " << q2->ancount << " RR");
+-        q->slave = q2->slave;
+-        q2->slave = NULL;
+-        if ( !q2->error ) {
+-            if (n > 0) {
+-                // two sets of RR need merging
+-                rfc1035_rr *result = (rfc1035_rr*) xmalloc( sizeof(rfc1035_rr)*(n + q2->ancount) );
+-                if (Config.dns.v4_first) {
+-                    memcpy(result, message->answer, (sizeof(rfc1035_rr)*n) );
+-                    memcpy(result+n, q2->message->answer, (sizeof(rfc1035_rr)*q2->ancount) );
+-                } else {
+-                    memcpy(result, q2->message->answer, (sizeof(rfc1035_rr)*q2->ancount) );
+-                    memcpy(result+q2->ancount, message->answer, (sizeof(rfc1035_rr)*n) );
+-                }
+-                n += q2->ancount;
+-                // HACK WARNING, the answer rr:s have been copied in-place to
+-                // result, do not free them here
+-                safe_free(message->answer);
+-                safe_free(q2->message->answer);
+-                message->answer = result;
+-                message->ancount += q2->message->ancount;
+-            } else {
+-                // first response empty or failed, just use the second
+-                rfc1035MessageDestroy(&message);
+-                message = q2->message;
+-                q2->message = NULL;
+-                n = q2->ancount;
+-                error = NULL;
+-            }
+-        }
+-        delete q2;
++static void
++idnsCallbackNewCallerWithOldAnswers(IDNSCB *callback, void *cbdata, const idns_query * const master)
++{
++    const bool lastAnswer = false;
++    // iterate all queries to act on answered ones
++    for (auto query = master; query; query = query->slave) {
++        if (query->pending)
++            continue; // no answer yet
++        if (!idnsCallbackOneWithAnswer(callback, cbdata, *query, lastAnswer))
++            break; // the caller disappeared
+     }
++}
+ 
+-    debugs(78, 6, HERE << "Sending " << n << " (" << (error ? error : "OK") << ") DNS results to caller.");
+-
+-    callback = q->callback;
+-    q->callback = NULL;
+-    const rfc1035_rr *answers = message ? message->answer : NULL;
+-
+-    if (cbdataReferenceValidDone(q->callback_data, &cbdata))
+-        callback(cbdata, answers, n, error);
++static void
++idnsCallbackAllCallersWithNewAnswer(const idns_query * const answered, const bool lastAnswer)
++{
++    debugs(78, 8, (lastAnswer ? "last " : "") << *answered);
++    const auto master = answered->master ? answered->master : answered;
++    // iterate all queued lookup callers
++    for (auto looker = master; looker; looker = looker->queue) {
++        (void)idnsCallbackOneWithAnswer(looker->callback, looker->callback_data,
++                                        *answered, lastAnswer);
++    }
++}
+ 
+-    while (q->queue) {
+-        idns_query *q2 = q->queue;
+-        q->queue = q2->queue;
+-        q2->queue = NULL;
++static void
++idnsCallback(idns_query *q, const char *error)
++{
++    if (error)
++        q->error = error;
+ 
+-        callback = q2->callback;
+-        q2->callback = NULL;
++    auto master = q->master ? q->master : q;
+ 
+-        if (cbdataReferenceValidDone(q2->callback_data, &cbdata))
+-            callback(cbdata, answers, n, error);
++    const bool lastAnswer = !idnsStillPending(master);
++    idnsCallbackAllCallersWithNewAnswer(q, lastAnswer);
+ 
+-        delete q2;
+-    }
++    if (!lastAnswer)
++        return; // wait for more answers
+ 
+-    if (q->hash.key) {
+-        hash_remove_link(idns_lookup_hash, &q->hash);
+-        q->hash.key = NULL;
++    if (master->hash.key) {
++        hash_remove_link(idns_lookup_hash, &master->hash);
++        master->hash.key = nullptr;
+     }
+ 
+-    rfc1035MessageDestroy(&message);
+-    delete q;
++    delete master;
+ }
+ 
+ static void
+@@ -1705,6 +1705,13 @@ idnsCachedLookup(const char *key, IDNSCB * callback, void *data)
+     q->queue = old->queue;
+     old->queue = q;
+ 
++    // This check must follow cbdataReference() above because our callback code
++    // needs a locked cbdata to call cbdataReferenceValid().
++    if (idnsStillPending(old))
++        idnsCallbackNewCallerWithOldAnswers(callback, data, old);
++    // else: idns_lookup_hash is not a cache so no pending lookups means we are
++    // in a reentrant lookup and will be called back when dequeued.
++
+     return 1;
+ }
+ 
+@@ -1754,7 +1761,7 @@ idnsALookup(const char *name, IDNSCB * callback, void *data)
+     // Prevent buffer overflow on q->name
+     if (nameLength > NS_MAXDNAME) {
+         debugs(23, DBG_IMPORTANT, "SECURITY ALERT: DNS name too long to perform lookup: '" << name << "'. see access.log for details.");
+-        callback(data, NULL, 0, "Internal error");
++        idnsCallbackOnEarlyError(callback, data, "huge name");
+         return;
+     }
+ 
+@@ -1790,7 +1797,7 @@ idnsALookup(const char *name, IDNSCB * callback, void *data)
+ 
+     if (q->sz < 0) {
+         /* problem with query data -- query not sent */
+-        callback(data, NULL, 0, "Internal error");
++        idnsCallbackOnEarlyError(callback, data, "rfc3596BuildAQuery error");
+         delete q;
+         return;
+     }
+@@ -1828,7 +1835,7 @@ idnsPTRLookup(const Ip::Address &addr, IDNSCB * callback, void *data)
+ 
+     if (q->sz < 0) {
+         /* problem with query data -- query not sent */
+-        callback(data, NULL, 0, "Internal error");
++        idnsCallbackOnEarlyError(callback, data, "rfc3596BuildPTRQuery error");
+         delete q;
+         return;
+     }
+@@ -388,8 +388,9 @@ fqdncacheParse(fqdncache_entry *f, const rfc1035_rr * answers, int nr, const cha
+  * Callback for handling DNS results.
+  */
+ static void
+-fqdncacheHandleReply(void *data, const rfc1035_rr * answers, int na, const char *error_message)
++fqdncacheHandleReply(void *data, const rfc1035_rr * answers, int na, const char *error_message, const bool lastAnswer)
+ {
++    assert(lastAnswer); // reverse DNS lookups do not generate multiple queries
+     fqdncache_entry *f;
+     static_cast<generic_cbdata *>(data)->unwrap(&f);
+     ++FqdncacheStats.replies;
+@@ -299,7 +299,7 @@ netdbSendPing(const ipcache_addrs *ia, const Dns::LookupDetails &, void *data)
+         return;
+     }
+ 
+-    addr = ia->in_addrs[ia->cur];
++    addr = ia->current();
+ 
+     if ((n = netdbLookupHost(hostname)) == NULL) {
+         n = netdbAdd(addr);
+@@ -1319,7 +1319,7 @@ netdbClosestParent(HttpRequest * request)
+         ia = ipcache_gethostbyname(request->url.host(), 0);
+ 
+         if (NULL != ia)
+-            n = netdbLookupAddr(ia->in_addrs[ia->cur]);
++            n = netdbLookupAddr(ia->current());
+     }
+ 
+     if (NULL == n)
+@@ -912,6 +912,29 @@ Ip::Address::toUrl(char* buf, unsigned int blen) const
+     return buf;
+ }
+ 
++bool
++Ip::Address::fromHost(const char *host)
++{
++    setEmpty();
++
++    if (!host || host[0] != '[')
++        return lookupHostIP(host, true); // no brackets
++
++    /* unwrap a bracketed [presumably IPv6] address, presumably without port */
++
++    const char *start = host + 1;
++    if (!*start)
++        return false; // missing address after an opening bracket
++
++    // XXX: Check that there is a closing bracket and no trailing garbage.
++
++    char *tmp = xstrdup(start); // XXX: Slow. TODO: Bail on huge strings and use an on-stack buffer.
++    tmp[strlen(tmp)-1] = '\0'; // XXX: Wasteful: xstrdup() just did strlen().
++    const bool result = lookupHostIP(tmp, true);
++    xfree(tmp);
++    return result;
++}
++
+ void
+ Ip::Address::getSockAddr(struct sockaddr_storage &addr, const int family) const
+ {
+@@ -225,6 +225,12 @@ class Address
+      */
+     unsigned int toHostStr(char *buf, const unsigned int len) const;
+ 
++    /// Empties the address and then slowly imports the IP from a possibly
++    /// [bracketed] portless host. For the semi-reverse operation, see
++    /// toHostStr() which does export the port.
++    /// \returns whether the conversion was successful
++    bool fromHost(const char *hostWithoutPort);
++
+     /**
+      *  Convert the content into a Reverse-DNS string.
+      *  The buffer sent MUST be allocated large enough to hold the resulting string.
+@@ -68,6 +68,57 @@
+  * the ipcache_high threshold.
+  */
+ 
++/// metadata for parsing DNS A and AAAA records
++template <class Content>
++class RrSpecs
++{
++public:
++    typedef Content DataType; ///< actual RR DATA type
++    const char *kind; ///< human-friendly record type description
++    int &recordCounter; ///< where this kind of records are counted (for stats)
++};
++
++/// forwards non-blocking IP cache lookup results to either IPH or IpReciever
++class IpCacheLookupForwarder
++{
++public:
++    IpCacheLookupForwarder() {}
++    explicit IpCacheLookupForwarder(const CbcPointer<Dns::IpReceiver> &receiver);
++    IpCacheLookupForwarder(IPH *fun, void *data);
++
++    /// forwards notification about the end of the lookup; last method to be called
++    void finalCallback(const Dns::CachedIps *addrs, const Dns::LookupDetails &details);
++
++    /// forwards an IP notification
++    /// \returns whether it may be possible to deliver more notifications
++    bool forwardIp(const Ip::Address &ip);
++
++    /// convenience wrapper to safely forwardIp() for each IP in the container
++    void forwardHits(const Dns::CachedIps &ips);
++
++    /// initialize lookup timestamps for Dns::LookupDetails delay calculation
++    void lookupsStarting() { firstLookupStart = lastLookupEnd = current_time; }
++
++    /// inform recipient of a finished lookup
++    void forwardLookup(const char *error);
++
++    /// \returns milliseconds since the first lookup start
++    int totalResponseTime() const { return tvSubMsec(firstLookupStart, current_time); }
++
++protected:
++    /// \returns not yet reported lookup delay in milliseconds
++    int additionalLookupDelay() const { return tvSubMsec(lastLookupEnd, current_time); }
++
++private:
++    /* receiverObj and receiverFun are mutually exclusive */
++    CbcPointer<Dns::IpReceiver> receiverObj; ///< gets incremental and final results
++    IPH *receiverFun = nullptr; ///< gets final results
++    CallbackData receiverData; ///< caller-specific data for the handler (optional)
++
++    struct timeval firstLookupStart {0,0}; ///< time of the idnsALookup() call
++    struct timeval lastLookupEnd {0,0}; ///< time of the last noteLookup() call
++};
++
+ /**
+  \ingroup IPCacheAPI
+  *
+@@ -78,7 +129,7 @@
+  */
+ class ipcache_entry
+ {
+-    MEMPROXY_CLASS(ipcache_entry);
++    CBDATA_CLASS(ipcache_entry);
+ 
+ public:
+     ipcache_entry(const char *);
+@@ -88,11 +139,9 @@ class ipcache_entry
+     time_t lastref;
+     time_t expires;
+     ipcache_addrs addrs;
+-    IPH *handler;
+-    void *handlerData;
++    IpCacheLookupForwarder handler;
+     char *error_message;
+ 
+-    struct timeval request_time;
+     dlink_node lru;
+     unsigned short locks;
+     struct Flags {
+@@ -102,7 +151,24 @@ class ipcache_entry
+         bool fromhosts;
+     } flags;
+ 
+-    int age() const; ///< time passed since request_time or -1 if unknown
++    bool sawCname = false;
++
++    const char *name() const { return static_cast<const char*>(hash.key); }
++
++    /// milliseconds since the first lookup start or -1 if there were no lookups
++    int totalResponseTime() const;
++    /// milliseconds since the last lookup start or -1 if there were no lookups
++    int additionalLookupDelay() const;
++
++    /// adds the contents of a "good" DNS A or AAAA record to stored IPs
++    template <class Specs>
++    void addGood(const rfc1035_rr &rr, Specs &specs);
++
++    /// remembers the last error seen, overwriting any previous errors
++    void latestError(const char *text, const int debugLevel = 3);
++
++protected:
++    void updateTtl(const unsigned int rrTtl);
+ };
+ 
+ /// \ingroup IPCacheInternal
+@@ -134,9 +200,9 @@ static void ipcacheLockEntry(ipcache_entry *);
+ static void ipcacheStatPrint(ipcache_entry *, StoreEntry *);
+ static void ipcacheUnlockEntry(ipcache_entry *);
+ static void ipcacheRelease(ipcache_entry *, bool dofree = true);
++static const Dns::CachedIps *ipcacheCheckNumeric(const char *name);
++static void ipcache_nbgethostbyname_(const char *name, IpCacheLookupForwarder handler);
+ 
+-/// \ingroup IPCacheInternal
+-static ipcache_addrs static_addrs;
+ /// \ingroup IPCacheInternal
+ static hash_table *ip_table = NULL;
+ 
+@@ -149,15 +215,82 @@ static long ipcache_high = 200;
+ extern int _dns_ttl_;
+ #endif
+ 
+-/// \ingroup IPCacheInternal
+-inline int ipcacheCount() { return ip_table ? ip_table->count : 0; }
++CBDATA_CLASS_INIT(ipcache_entry);
+ 
+-int
+-ipcache_entry::age() const
++IpCacheLookupForwarder::IpCacheLookupForwarder(const CbcPointer<Dns::IpReceiver> &receiver):
++    receiverObj(receiver)
++{
++}
++
++IpCacheLookupForwarder::IpCacheLookupForwarder(IPH *fun, void *data):
++    receiverFun(fun), receiverData(data)
+ {
+-    return request_time.tv_sec ? tvSubMsec(request_time, current_time) : -1;
+ }
+ 
++void
++IpCacheLookupForwarder::finalCallback(const Dns::CachedIps *addrs, const Dns::LookupDetails &details)
++{
++    debugs(14, 7, addrs << " " << details);
++    if (receiverObj.set()) {
++        if (auto receiver = receiverObj.valid())
++            receiver->noteIps(addrs, details);
++        receiverObj.clear();
++    } else if (receiverFun) {
++        if (receiverData.valid()) {
++            const Dns::CachedIps *emptyIsNil = (addrs && !addrs->empty()) ? addrs : nullptr;
++            receiverFun(emptyIsNil, details, receiverData.validDone());
++        }
++        receiverFun = nullptr;
++    }
++}
++
++/// forwards an IP notification
++/// \returns whether it may be possible to deliver more notifications
++bool
++IpCacheLookupForwarder::forwardIp(const Ip::Address &ip)
++{
++    debugs(14, 7, ip);
++    if (receiverObj.set()) {
++        if (auto receiver = receiverObj.valid()) {
++            receiver->noteIp(ip);
++            return true;
++        }
++        return false;
++    }
++    // else do nothing: ReceiverFun does not do incremental notifications
++    return false;
++}
++
++/// convenience wrapper to safely forwardIp() for each IP in the container
++void
++IpCacheLookupForwarder::forwardHits(const Dns::CachedIps &ips)
++{
++    if (receiverObj.set()) {
++        for (const auto &ip: ips.good()) {
++            if (!forwardIp(ip))
++                break; // receiver gone
++        }
++    }
++    // else do nothing: ReceiverFun does not do incremental notifications
++}
++
++void
++IpCacheLookupForwarder::forwardLookup(const char *error)
++{
++    // Lookups run concurrently, but HttpRequest::recordLookup() thinks they
++    // are sequential. Give it just the new, yet-unaccounted-for delay.
++    if (receiverObj.set()) {
++        if (auto receiver = receiverObj.valid()) {
++            receiver->noteLookup(Dns::LookupDetails(error, additionalLookupDelay()));
++            lastLookupEnd = current_time;
++        }
++    }
++    // else do nothing: ReceiverFun gets no individual lookup notifications
++}
++
++/// \ingroup IPCacheInternal
++inline int ipcacheCount() { return ip_table ? ip_table->count : 0; }
++
+ /**
+  \ingroup IPCacheInternal
+  *
+@@ -203,7 +336,7 @@ ipcacheExpiredEntry(ipcache_entry * i)
+     if (i->locks != 0)
+         return 0;
+ 
+-    if (i->addrs.count == 0)
++    if (i->addrs.empty())
+         if (0 == i->flags.negcached)
+             return 1;
+ 
+@@ -274,16 +407,12 @@ purge_entries_fromhosts(void)
+ ipcache_entry::ipcache_entry(const char *name) :
+     lastref(0),
+     expires(0),
+-    handler(nullptr),
+-    handlerData(nullptr),
+     error_message(nullptr),
+     locks(0) // XXX: use Lock type ?
+ {
+     hash.key = xstrdup(name);
+     Tolower(static_cast<char*>(hash.key));
+     expires = squid_curtime + Config.negativeDnsTtl;
+-
+-    memset(&request_time, 0, sizeof(request_time));
+ }
+ 
+ /// \ingroup IPCacheInternal
+@@ -309,168 +438,146 @@ ipcacheAddEntry(ipcache_entry * i)
+  * walks down the pending list, calling handlers
+  */
+ static void
+-ipcacheCallback(ipcache_entry *i, int wait)
++ipcacheCallback(ipcache_entry *i, const bool hit, const int wait)
+ {
+-    IPH *callback = i->handler;
+-    void *cbdata = NULL;
+     i->lastref = squid_curtime;
+ 
+-    if (!i->handler)
+-        return;
+-
+     ipcacheLockEntry(i);
+ 
+-    callback = i->handler;
+-
+-    i->handler = NULL;
+-
+-    if (cbdataReferenceValidDone(i->handlerData, &cbdata)) {
+-        const Dns::LookupDetails details(i->error_message, wait);
+-        callback((i->addrs.count ? &i->addrs : NULL), details, cbdata);
+-    }
++    if (hit)
++        i->handler.forwardHits(i->addrs);
++    const Dns::LookupDetails details(i->error_message, wait);
++    i->handler.finalCallback(&i->addrs, details);
+ 
+     ipcacheUnlockEntry(i);
+ }
+ 
++void
++ipcache_entry::latestError(const char *text, const int debugLevel)
++{
++    debugs(14, debugLevel, "DNS error while resolving " << name() << ": " << text);
++    safe_free(error_message);
++    error_message = xstrdup(text);
++}
++
+ static void
+ ipcacheParse(ipcache_entry *i, const rfc1035_rr * answers, int nr, const char *error_message)
+ {
+     int k;
+-    int j = 0;
+-    int na = 0;
+-    int ttl = 0;
+-    const char *name = (const char *)i->hash.key;
+-    int cname_found = 0;
+-
+-    i->expires = squid_curtime + Config.negativeDnsTtl;
+-    i->flags.negcached = true;
+-    safe_free(i->addrs.in_addrs);
+-    assert(i->addrs.in_addrs == NULL);
+-    safe_free(i->addrs.bad_mask);
+-    assert(i->addrs.bad_mask == NULL);
+-    safe_free(i->error_message);
+-    assert(i->error_message == NULL);
+-    i->addrs.count = 0;
+ 
++    // XXX: Callers use zero ancount instead of -1 on errors!
+     if (nr < 0) {
+-        debugs(14, 3, "Lookup failed '" << error_message << "' for '" << (const char *)i->hash.key << "'");
+-        i->error_message = xstrdup(error_message);
++        i->latestError(error_message);
+         return;
+     }
+ 
+     if (nr == 0) {
+-        debugs(14, 3, "No DNS records in response to '" << name << "'");
+-        i->error_message = xstrdup("No DNS records");
++        i->latestError("No DNS records");
+         return;
+     }
+ 
+-    debugs(14, 3, nr << " answers for '" << name << "'");
++    debugs(14, 3, nr << " answers for " << i->name());
+     assert(answers);
+ 
+     for (k = 0; k < nr; ++k) {
+ 
+         if (Ip::EnableIpv6 && answers[k].type == RFC1035_TYPE_AAAA) {
+-            if (answers[k].rdlength != sizeof(struct in6_addr)) {
+-                debugs(14, DBG_IMPORTANT, MYNAME << "Invalid IPv6 address in response to '" << name << "'");
+-                continue;
+-            }
+-            ++na;
+-            ++IpcacheStats.rr_aaaa;
++            static const RrSpecs<struct in6_addr> QuadA = { "IPv6", IpcacheStats.rr_aaaa };
++            i->addGood(answers[k], QuadA);
+             continue;
+         }
+ 
+         if (answers[k].type == RFC1035_TYPE_A) {
+-            if (answers[k].rdlength != sizeof(struct in_addr)) {
+-                debugs(14, DBG_IMPORTANT, MYNAME << "Invalid IPv4 address in response to '" << name << "'");
+-                continue;
+-            }
+-            ++na;
+-            ++IpcacheStats.rr_a;
++            static const RrSpecs<struct in_addr> SingleA = { "IPv4", IpcacheStats.rr_a };
++            i->addGood(answers[k], SingleA);
+             continue;
+         }
+ 
+         /* With A and AAAA, the CNAME does not necessarily come with additional records to use. */
+         if (answers[k].type == RFC1035_TYPE_CNAME) {
+-            cname_found=1;
++            i->sawCname = true;
+             ++IpcacheStats.rr_cname;
+             continue;
+         }
+ 
+         // otherwise its an unknown RR. debug at level 9 since we usually want to ignore these and they are common.
+         debugs(14, 9, "Unknown RR type received: type=" << answers[k].type << " starting at " << &(answers[k]) );
+     }
+-    if (na == 0) {
+-        debugs(14, DBG_IMPORTANT, MYNAME << "No Address records in response to '" << name << "'");
+-        i->error_message = xstrdup("No Address records");
+-        if (cname_found)
+-            ++IpcacheStats.cname_only;
++}
++
++template <class Specs>
++void
++ipcache_entry::addGood(const rfc1035_rr &rr, Specs &specs)
++{
++    typename Specs::DataType address;
++    if (rr.rdlength != sizeof(address)) {
++        debugs(14, DBG_IMPORTANT, "ERROR: Ignoring invalid " << specs.kind << " address record while resolving " << name());
+         return;
+     }
+ 
+-    i->addrs.in_addrs = static_cast<Ip::Address *>(xcalloc(na, sizeof(Ip::Address)));
+-    for (int l = 0; l < na; ++l)
+-        i->addrs.in_addrs[l].setEmpty(); // perform same init actions as constructor would.
+-    i->addrs.bad_mask = (unsigned char *)xcalloc(na, sizeof(unsigned char));
+-
+-    for (j = 0, k = 0; k < nr; ++k) {
+-
+-        if (answers[k].type == RFC1035_TYPE_A) {
+-            if (answers[k].rdlength != sizeof(struct in_addr))
+-                continue;
+-
+-            struct in_addr temp;
+-            memcpy(&temp, answers[k].rdata, sizeof(struct in_addr));
+-            i->addrs.in_addrs[j] = temp;
+-
+-            debugs(14, 3, name << " #" << j << " " << i->addrs.in_addrs[j]);
+-            ++j;
+-
+-        } else if (Ip::EnableIpv6 && answers[k].type == RFC1035_TYPE_AAAA) {
+-            if (answers[k].rdlength != sizeof(struct in6_addr))
+-                continue;
++    ++specs.recordCounter;
+ 
+-            struct in6_addr temp;
+-            memcpy(&temp, answers[k].rdata, sizeof(struct in6_addr));
+-            i->addrs.in_addrs[j] = temp;
++    // Do not store more than 255 addresses (TODO: Why?)
++    if (addrs.raw().size() >= 255)
++        return;
+ 
+-            debugs(14, 3, name << " #" << j << " " << i->addrs.in_addrs[j] );
+-            ++j;
+-        }
+-        if (ttl == 0 || (int) answers[k].ttl < ttl)
+-            ttl = answers[k].ttl;
++    memcpy(&address, rr.rdata, sizeof(address));
++    const Ip::Address ip = address;
++    if (addrs.have(ip)) {
++        debugs(14, 3, "refusing to add duplicate " << ip);
++        return;
+     }
++    addrs.pushUnique(address);
+ 
+-    assert(j == na);
+-
+-    if (na < 256)
+-        i->addrs.count = (unsigned char) na;
+-    else
+-        i->addrs.count = 255;
+-
+-    if (ttl > Config.positiveDnsTtl)
+-        ttl = Config.positiveDnsTtl;
++    updateTtl(rr.ttl);
+ 
+-    if (ttl < Config.negativeDnsTtl)
+-        ttl = Config.negativeDnsTtl;
+-
+-    i->expires = squid_curtime + ttl;
++    debugs(14, 3, name() << " #" << addrs.size() << " " << ip);
++    handler.forwardIp(ip); // we are only called with good IPs
++}
+ 
+-    i->flags.negcached = false;
++void
++ipcache_entry::updateTtl(const unsigned int rrTtl)
++{
++    const time_t ttl = std::min(std::max(
++                                    Config.negativeDnsTtl, // smallest value allowed
++                                    static_cast<time_t>(rrTtl)),
++                                Config.positiveDnsTtl); // largest value allowed
++
++    const time_t rrExpires = squid_curtime + ttl;
++    if (rrExpires < expires)
++        expires = rrExpires;
+ }
+ 
+ /// \ingroup IPCacheInternal
+ static void
+-ipcacheHandleReply(void *data, const rfc1035_rr * answers, int na, const char *error_message)
++ipcacheHandleReply(void *data, const rfc1035_rr * answers, int na, const char *error_message, const bool lastAnswer)
+ {
+-    ipcache_entry *i;
+-    static_cast<generic_cbdata *>(data)->unwrap(&i);
++    ipcache_entry *i = static_cast<ipcache_entry*>(data);
++
++    i->handler.forwardLookup(error_message);
++    ipcacheParse(i, answers, na, error_message);
++
++    if (!lastAnswer)
++        return;
++
+     ++IpcacheStats.replies;
+-    const int age = i->age();
++    const auto age = i->handler.totalResponseTime();
+     statCounter.dns.svcTime.count(age);
+ 
+-    ipcacheParse(i, answers, na, error_message);
++    if (i->addrs.empty()) {
++        i->flags.negcached = true;
++        i->expires = squid_curtime + Config.negativeDnsTtl;
++
++        if (!i->error_message) {
++            i->latestError("No valid address records", DBG_IMPORTANT);
++            if (i->sawCname)
++                ++IpcacheStats.cname_only;
++        }
++    }
++
++    debugs(14, 3, "done with " << i->name() << ": " << i->addrs);
+     ipcacheAddEntry(i);
+-    ipcacheCallback(i, age);
++    ipcacheCallback(i, false, age);
+ }
+ 
+ /**
+@@ -491,28 +598,39 @@ ipcacheHandleReply(void *data, const rfc1035_rr * answers, int na, const char *e
+  */
+ void
+ ipcache_nbgethostbyname(const char *name, IPH * handler, void *handlerData)
++{
++    debugs(14, 4, name);
++    ipcache_nbgethostbyname_(name, IpCacheLookupForwarder(handler, handlerData));
++}
++
++void
++Dns::nbgethostbyname(const char *name, const CbcPointer<IpReceiver> &receiver)
++{
++    debugs(14, 4, name);
++    ipcache_nbgethostbyname_(name, IpCacheLookupForwarder(receiver));
++}
++
++/// implements ipcache_nbgethostbyname() and Dns::nbgethostbyname() APIs
++static void
++ipcache_nbgethostbyname_(const char *name, IpCacheLookupForwarder handler)
+ {
+     ipcache_entry *i = NULL;
+     const ipcache_addrs *addrs = NULL;
+-    generic_cbdata *c;
+-    debugs(14, 4, "ipcache_nbgethostbyname: Name '" << name << "'.");
+     ++IpcacheStats.requests;
+ 
+     if (name == NULL || name[0] == '\0') {
+         debugs(14, 4, "ipcache_nbgethostbyname: Invalid name!");
+         ++IpcacheStats.invalid;
+         const Dns::LookupDetails details("Invalid hostname", -1); // error, no lookup
+-        if (handler)
+-            handler(NULL, details, handlerData);
++        handler.finalCallback(nullptr, details);
+         return;
+     }
+ 
+     if ((addrs = ipcacheCheckNumeric(name))) {
+         debugs(14, 4, "ipcache_nbgethostbyname: BYPASS for '" << name << "' (already numeric)");
+         ++IpcacheStats.numeric_hits;
+         const Dns::LookupDetails details; // no error, no lookup
+-        if (handler)
+-            handler(addrs, details, handlerData);
++        handler.finalCallback(addrs, details);
+         return;
+     }
+ 
+@@ -534,23 +652,18 @@ ipcache_nbgethostbyname(const char *name, IPH * handler, void *handlerData)
+         else
+             ++IpcacheStats.hits;
+ 
+-        i->handler = handler;
+-
+-        i->handlerData = cbdataReference(handlerData);
+-
+-        ipcacheCallback(i, -1); // no lookup
++        i->handler = std::move(handler);
++        ipcacheCallback(i, true, -1); // no lookup
+ 
+         return;
+     }
+ 
+     debugs(14, 5, "ipcache_nbgethostbyname: MISS for '" << name << "'");
+     ++IpcacheStats.misses;
+     i = new ipcache_entry(name);
+-    i->handler = handler;
+-    i->handlerData = cbdataReference(handlerData);
+-    i->request_time = current_time;
+-    c = new generic_cbdata(i);
+-    idnsALookup(hashKeyStr(&i->hash), ipcacheHandleReply, c);
++    i->handler = std::move(handler);
++    i->handler.lookupsStarting();
++    idnsALookup(hashKeyStr(&i->hash), ipcacheHandleReply, i);
+ }
+ 
+ /// \ingroup IPCacheInternal
+@@ -576,11 +689,7 @@ ipcache_init(void)
+     debugs(14, DBG_IMPORTANT, "Initializing IP Cache...");
+     memset(&IpcacheStats, '\0', sizeof(IpcacheStats));
+     memset(&lru_list, '\0', sizeof(lru_list));
+-    memset(&static_addrs, '\0', sizeof(ipcache_addrs));
+ 
+-    static_addrs.in_addrs = static_cast<Ip::Address *>(xcalloc(1, sizeof(Ip::Address)));
+-    static_addrs.in_addrs->setEmpty(); // properly setup the Ip::Address!
+-    static_addrs.bad_mask = (unsigned char *)xcalloc(1, sizeof(unsigned char));
+     ipcache_high = (long) (((float) Config.ipcache.size *
+                             (float) Config.ipcache.high) / (float) 100);
+     ipcache_low = (long) (((float) Config.ipcache.size *
+@@ -610,7 +719,6 @@ const ipcache_addrs *
+ ipcache_gethostbyname(const char *name, int flags)
+ {
+     ipcache_entry *i = NULL;
+-    ipcache_addrs *addrs;
+     assert(name);
+     debugs(14, 3, "ipcache_gethostbyname: '" << name  << "', flags=" << std::hex << flags);
+     ++IpcacheStats.requests;
+@@ -634,7 +742,7 @@ ipcache_gethostbyname(const char *name, int flags)
+ 
+     /* no entry [any more] */
+ 
+-    if ((addrs = ipcacheCheckNumeric(name))) {
++    if (const auto addrs = ipcacheCheckNumeric(name)) {
+         ++IpcacheStats.numeric_hits;
+         return addrs;
+     }
+@@ -651,7 +759,6 @@ ipcache_gethostbyname(const char *name, int flags)
+ static void
+ ipcacheStatPrint(ipcache_entry * i, StoreEntry * sentry)
+ {
+-    int k;
+     char buf[MAX_IPSTRLEN];
+ 
+     if (!sentry) {
+@@ -665,16 +772,14 @@ ipcacheStatPrint(ipcache_entry * i, StoreEntry * sentry)
+         return;
+     }
+ 
+-    int count = i->addrs.count;
+-
+     storeAppendPrintf(sentry, " %-32.32s %c%c %6d %6d %2d(%2d)",
+                       hashKeyStr(&i->hash),
+                       i->flags.fromhosts ? 'H' : ' ',
+                       i->flags.negcached ? 'N' : ' ',
+                       (int) (squid_curtime - i->lastref),
+                       (int) ((i->flags.fromhosts ? -1 : i->expires - squid_curtime)),
+-                      (int) i->addrs.count,
+-                      (int) i->addrs.badcount);
++                      static_cast<int>(i->addrs.size()),
++                      static_cast<int>(i->addrs.badCount()));
+ 
+     /** \par
+      * Negative-cached entries have no IPs listed. */
+@@ -685,17 +790,15 @@ ipcacheStatPrint(ipcache_entry * i, StoreEntry * sentry)
+ 
+     /** \par
+      * Cached entries have IPs listed with a BNF of:   ip-address '-' ('OK'|'BAD') */
+-    for (k = 0; k < count; ++k) {
++    bool firstLine = true;
++    for (const auto &addr: i->addrs.raw()) {
+         /* Display tidy-up: IPv6 are so big make the list vertical */
+-        if (k == 0)
+-            storeAppendPrintf(sentry, " %45.45s-%3s\n",
+-                              i->addrs.in_addrs[k].toStr(buf,MAX_IPSTRLEN),
+-                              i->addrs.bad_mask[k] ? "BAD" : "OK ");
+-        else
+-            storeAppendPrintf(sentry, "%s %45.45s-%3s\n",
+-                              "                                                         ", /* blank-space indenting IP list */
+-                              i->addrs.in_addrs[k].toStr(buf,MAX_IPSTRLEN),
+-                              i->addrs.bad_mask[k] ? "BAD" : "OK ");
++        const char *indent = firstLine ? "" : "                                                         ";
++        storeAppendPrintf(sentry, "%s %45.45s-%3s\n",
++                          indent,
++                          addr.ip.toStr(buf, MAX_IPSTRLEN),
++                          addr.bad() ? "BAD" : "OK ");
++        firstLine = false;
+     }
+ }
+ 
+@@ -710,8 +813,6 @@ stat_ipcache_get(StoreEntry * sentry)
+     dlink_node *m;
+     assert(ip_table != NULL);
+     storeAppendPrintf(sentry, "IP Cache Statistics:\n");
+-    storeAppendPrintf(sentry, "IPcache Entries In Use:  %d\n",
+-                      ipcache_entry::UseCount());
+     storeAppendPrintf(sentry, "IPcache Entries Cached:  %d\n",
+                       ipcacheCount());
+     storeAppendPrintf(sentry, "IPcache Requests: %d\n",
+@@ -785,36 +886,16 @@ ipcacheInvalidateNegative(const char *name)
+ }
+ 
+ /// \ingroup IPCacheAPI
+-ipcache_addrs *
++static const Dns::CachedIps *
+ ipcacheCheckNumeric(const char *name)
+ {
+     Ip::Address ip;
+-    /* check if it's already a IP address in text form. */
+-
+-    /* it may be IPv6-wrapped */
+-    if (name[0] == '[') {
+-        char *tmp = xstrdup(&name[1]);
+-        tmp[strlen(tmp)-1] = '\0';
+-        if (!(ip = tmp)) {
+-            delete tmp;
+-            return NULL;
+-        }
+-        delete tmp;
+-    } else if (!(ip = name))
+-        return NULL;
+-
+-    debugs(14, 4, "ipcacheCheckNumeric: HIT_BYPASS for '" << name << "' == " << ip );
+-
+-    static_addrs.count = 1;
+-
+-    static_addrs.cur = 0;
+-
+-    static_addrs.in_addrs[0] = ip;
+-
+-    static_addrs.bad_mask[0] = FALSE;
+-
+-    static_addrs.badcount = 0;
++    if (!ip.fromHost(name))
++        return nullptr;
+ 
++    debugs(14, 4, "HIT_BYPASS for " << name << "=" << ip);
++    static Dns::CachedIps static_addrs;
++    static_addrs.reset(ip);
+     return &static_addrs;
+ }
+ 
+@@ -843,138 +924,145 @@ ipcacheUnlockEntry(ipcache_entry * i)
+         ipcacheRelease(i);
+ }
+ 
+-/// \ingroup IPCacheAPI
+-void
+-ipcacheCycleAddr(const char *name, ipcache_addrs * ia)
++/// find the next good IP, wrapping if needed
++/// \returns whether the search was successful
++bool
++Dns::CachedIps::seekNewGood(const char *name)
+ {
+-    ipcache_entry *i;
+-    unsigned char k;
+-    assert(name || ia);
+-
+-    if (NULL == ia) {
+-        if ((i = ipcache_get(name)) == NULL)
+-            return;
+-
+-        if (i->flags.negcached)
+-            return;
+-
+-        ia = &i->addrs;
++    // linear search!
++    for (size_t seen = 0; seen < ips.size(); ++seen) {
++        if (++goodPosition >= ips.size())
++            goodPosition = 0;
++        if (!ips[goodPosition].bad()) {
++            debugs(14, 3, "succeeded for " << name << ": " << *this);
++            return true;
++        }
+     }
++    goodPosition = ips.size();
++    debugs(14, 3, "failed for " << name << ": " << *this);
++    return false;
++}
+ 
+-    for (k = 0; k < ia->count; ++k) {
+-        if (++ia->cur == ia->count)
+-            ia->cur = 0;
++void
++Dns::CachedIps::reset(const Ip::Address &ip)
++{
++    ips.resize(1, Dns::CachedIp(ip));
++    goodPosition = 0;
++    // Assume that the given IP is good because CachedIps are designed to never
++    // run out of good IPs.
++    badCount_ = 0;
++}
+ 
+-        if (!ia->bad_mask[ia->cur])
+-            break;
++/// makes current() calls possible after a successful markAsBad()
++void
++Dns::CachedIps::restoreGoodness(const char *name)
++{
++    if (badCount() >= size()) {
++        // There are no good IPs left. Clear all bad marks. This must help
++        // because we are called only after a good address was tested as bad.
++        for (auto &cachedIp: ips)
++            cachedIp.forgetMarking();
++        badCount_ = 0;
+     }
++    Must(seekNewGood(name));
++    debugs(14, 3, "cleared all IPs for " << name << "; now back to " << *this);
++}
+ 
+-    if (k == ia->count) {
+-        /* All bad, reset to All good */
+-        debugs(14, 3, "ipcacheCycleAddr: Changing ALL " << name << " addrs from BAD to OK");
+-
+-        for (k = 0; k < ia->count; ++k)
+-            ia->bad_mask[k] = 0;
+-
+-        ia->badcount = 0;
+-
+-        ia->cur = 0;
++bool
++Dns::CachedIps::have(const Ip::Address &ip, size_t *positionOrNil) const
++{
++    // linear search!
++    size_t pos = 0;
++    for (const auto &cachedIp: ips) {
++        if (cachedIp.ip == ip) {
++            if (auto position = positionOrNil)
++                *position = pos;
++            return true;
++        }
+     }
+-
+-    /* NP: zero-based so we increase the human-readable number of our position */
+-    debugs(14, 3, "ipcacheCycleAddr: " << name << " now at " << ia->in_addrs[ia->cur] << " (" << (ia->cur+1) << " of " << ia->count << ")");
++    // no such address; leave *position as is
++    return false;
+ }
+ 
+-/**
+- \ingroup IPCacheAPI
+- *
+- \param name    domain name to have an IP marked bad
+- \param addr    specific addres to be marked bad
+- */
+ void
+-ipcacheMarkBadAddr(const char *name, const Ip::Address &addr)
++Dns::CachedIps::pushUnique(const Ip::Address &ip)
+ {
+-    ipcache_entry *i;
+-    ipcache_addrs *ia;
+-    int k;
++    assert(!have(ip));
++    ips.emplace_back(ip);
++    assert(!raw().back().bad());
++}
+ 
+-    /** Does nothing if the domain name does not exist. */
+-    if ((i = ipcache_get(name)) == NULL)
+-        return;
++void
++Dns::CachedIps::reportCurrent(std::ostream &os) const
++{
++    if (empty())
++        os << "[no cached IPs]";
++    else if (goodPosition == size())
++        os << "[" << size() << " bad cached IPs]"; // could only be temporary
++    else
++        os << current() << " #" << (goodPosition+1) << "/" << ips.size() << "-" << badCount();
++}
+ 
+-    ia = &i->addrs;
++void
++Dns::CachedIps::markAsBad(const char *name, const Ip::Address &ip)
++{
++    size_t badPosition = 0;
++    if (!have(ip, &badPosition))
++        return; // no such address
+ 
+-    for (k = 0; k < (int) ia->count; ++k) {
+-        if (addr == ia->in_addrs[k] )
+-            break;
+-    }
++    auto &cachedIp = ips[badPosition];
++    if (cachedIp.bad())
++        return; // already marked correctly
+ 
+-    /** Does nothing if the IP does not exist for the doamin. */
+-    if (k == (int) ia->count)
+-        return;
++    cachedIp.markAsBad();
++    ++badCount_;
++    debugs(14, 2, ip << " of " << name);
+ 
+-    /** Marks the given address as BAD */
+-    if (!ia->bad_mask[k]) {
+-        ia->bad_mask[k] = TRUE;
+-        ++ia->badcount;
+-        debugs(14, 2, "ipcacheMarkBadAddr: " << name << " " << addr );
+-    }
+-
+-    /** then calls ipcacheCycleAddr() to advance the current pointer to the next OK address. */
+-    ipcacheCycleAddr(name, ia);
++    if (goodPosition == badPosition)
++        restoreGoodness(name);
++    // else nothing to do: goodPositon still points to a good IP
+ }
+ 
+-/// \ingroup IPCacheAPI
+ void
+-ipcacheMarkAllGood(const char *name)
++Dns::CachedIps::forgetMarking(const char *name, const Ip::Address &ip)
+ {
+-    ipcache_entry *i;
+-    ipcache_addrs *ia;
+-    int k;
+-
+-    if ((i = ipcache_get(name)) == NULL)
+-        return;
++    if (!badCount_)
++        return; // all IPs are already "good"
+ 
+-    ia = &i->addrs;
++    size_t badPosition = 0;
++    if (!have(ip, &badPosition))
++        return; // no such address
+ 
+-    /* All bad, reset to All good */
+-    debugs(14, 3, "ipcacheMarkAllGood: Changing ALL " << name << " addrs to OK (" << ia->badcount << "/" << ia->count << " bad)");
++    auto &cachedIp = ips[badPosition];
++    if (!cachedIp.bad())
++        return; // already marked correctly
+ 
+-    for (k = 0; k < ia->count; ++k)
+-        ia->bad_mask[k] = 0;
++    cachedIp.forgetMarking();
++    assert(!cachedIp.bad());
++    --badCount_;
++    debugs(14, 2, ip << " of " << name);
++}
+ 
+-    ia->badcount = 0;
++/**
++ * Marks the given address as BAD.
++ * Does nothing if the domain name does not exist.
++ *
++ \param name    domain name to have an IP marked bad
++ \param addr    specific addres to be marked bad
++ */
++void
++ipcacheMarkBadAddr(const char *name, const Ip::Address &addr)
++{
++    if (auto cached = ipcache_get(name))
++        cached->addrs.markAsBad(name, addr);
+ }
+ 
+ /// \ingroup IPCacheAPI
+ void
+ ipcacheMarkGoodAddr(const char *name, const Ip::Address &addr)
+ {
+-    ipcache_entry *i;
+-    ipcache_addrs *ia;
+-    int k;
+-
+-    if ((i = ipcache_get(name)) == NULL)
+-        return;
+-
+-    ia = &i->addrs;
+-
+-    for (k = 0; k < (int) ia->count; ++k) {
+-        if (addr == ia->in_addrs[k])
+-            break;
+-    }
+-
+-    if (k == (int) ia->count)   /* not found */
+-        return;
+-
+-    if (!ia->bad_mask[k])   /* already OK */
+-        return;
+-
+-    ia->bad_mask[k] = FALSE;
+-
+-    -- ia->badcount;
+-
+-    debugs(14, 2, "ipcacheMarkGoodAddr: " << name << " " << addr );
++    if (auto cached = ipcache_get(name))
++        cached->addrs.forgetMarking(name, addr);
+ }
+ 
+ /// \ingroup IPCacheInternal
+@@ -987,8 +1075,6 @@ ipcacheFreeEntry(void *data)
+ 
+ ipcache_entry::~ipcache_entry()
+ {
+-    xfree(addrs.in_addrs);
+-    xfree(addrs.bad_mask);
+     xfree(error_message);
+     xfree(hash.key);
+ }
+@@ -1047,6 +1133,11 @@ ipcacheAddEntryFromHosts(const char *name, const char *ipaddr)
+         return 1;
+     }
+ 
++    if (!Ip::EnableIpv6 && ip.isIPv6()) {
++        debugs(14, 2, "skips IPv6 address in /etc/hosts because IPv6 support was disabled: " << ip);
++        return 1;
++    }
++
+     if ((i = ipcache_get(name))) {
+         if (1 == i->flags.fromhosts) {
+             ipcacheUnlockEntry(i);
+@@ -1059,14 +1150,7 @@ ipcacheAddEntryFromHosts(const char *name, const char *ipaddr)
+     }
+ 
+     i = new ipcache_entry(name);
+-    i->addrs.count = 1;
+-    i->addrs.cur = 0;
+-    i->addrs.badcount = 0;
+-
+-    i->addrs.in_addrs = static_cast<Ip::Address *>(xcalloc(1, sizeof(Ip::Address)));
+-    i->addrs.bad_mask = (unsigned char *)xcalloc(1, sizeof(unsigned char));
+-    i->addrs.in_addrs[0] = ip;
+-    i->addrs.bad_mask[0] = FALSE;
++    i->addrs.pushUnique(ip);
+     i->flags.fromhosts = true;
+     ipcacheAddEntry(i);
+     ipcacheLockEntry(i);
+@@ -9,21 +9,212 @@
+ #ifndef _SQUID_IPCACHE_H
+ #define _SQUID_IPCACHE_H
+ 
++#include "base/CbcPointer.h"
+ #include "dns/forward.h"
+-#include "ip/forward.h"
++#include "ip/Address.h"
++#include <iosfwd>
+ 
+-class ipcache_addrs
++// The IPs the caller should not connect to are "bad". Other IPs are "good".
++
++namespace Dns {
++
++/// a CachedIps element
++class CachedIp
+ {
+ public:
+-    ipcache_addrs() : in_addrs(nullptr), bad_mask(nullptr), count(0), cur(0), badcount(0) {}
++    explicit CachedIp(const Ip::Address &anIp): ip(anIp) {}
++
++    /// whether the address is currently deemed problematic for any reason
++    bool bad() const { return bad_; }
++
++    /// mark the address as problematic; it might already be marked
++    void markAsBad() { bad_ = true; }
++
++    /// undo markAsBad()
++    void forgetMarking() { bad_ = false; }
+ 
+-    Ip::Address *in_addrs;
+-    unsigned char *bad_mask;
+-    unsigned char count;
+-    unsigned char cur;
+-    unsigned char badcount;
++    Ip::Address ip;
++
++private:
++    bool bad_ = false; ///< whether the address is currently deemed problematic
+ };
+ 
++class IpsIterator;
++class GoodIpsIterator;
++template <class Iterator>
++class IpsSelector;
++
++/// A small container of IP addresses with a "current good address" getter API.
++/// Ignores Ip::Address port.
++class CachedIps
++{
++public:
++    /// whether we have at least one of the given IP addresses (ignoring ports)
++    /// upon success, also sets *position if the `position` is not nil
++    bool have(const Ip::Address &ip, size_t *position = nullptr) const;
++
++    /// \returns a good address
++    /// does not auto-rotate IPs but calling markAsBad() may change the answer
++    const Ip::Address &current() const { return ips.at(goodPosition).ip; }
++
++    bool empty() const noexcept { return ips.empty(); } ///< whether we cached no IPs at all
++    size_t size() const noexcept { return ips.size(); } ///< all cached IPs
++    size_t badCount() const noexcept { return badCount_; } ///< bad IPs
++
++    inline IpsSelector<GoodIpsIterator> good() const; ///< good IPs
++    inline IpsSelector<IpsIterator> goodAndBad() const; ///< all IPs
++
++    typedef std::vector<CachedIp> Storage;
++    const Storage &raw() const { return ips; } ///< all cached entries
++
++    /// Finds and marks the given address as bad, adjusting current() if needed.
++    /// Has no effect if the search fails or the found address is already bad.
++    /// XXX: An attempt to mark the last good address erases all marks instead.
++    /// XXX: It is impossible to successfully mark a single address as bad.
++    void markAsBad(const char *name, const Ip::Address &ip);
++
++    /// undo successful markAsBad()
++    void forgetMarking(const char *name, const Ip::Address &ip);
++
++    /// appends an IP address if we do not have() it already
++    /// invalidates all iterators
++    void pushUnique(const Ip::Address &ip);
++
++    /// replace all info with the given (presumed good) IP address
++    void reset(const Ip::Address &ip);
++
++    /// prints current IP and other debugging information
++    void reportCurrent(std::ostream &os) const;
++
++private:
++    bool seekNewGood(const char *name);
++    void restoreGoodness(const char *name);
++
++    // Memory- and speed-optimized for "a few (and usually just one)" IPs,
++    // the vast majority of which are "good". The current implementation
++    // does linear searches and often reallocs when adding IPs.
++    Storage ips; ///< good and bad IPs
++
++    template <class Iterator> friend class IpsSelector;
++    size_t goodPosition = 0; ///< position of the IP returned by current()
++    size_t badCount_ = 0; ///< number of IPs that are currently marked as bad
++};
++
++// The CachedIps class keeps meta information about individual IP addresses
++// together with those IPs. CachedIps users do not care about caching details;
++// they just want to iterate (a subset of) cached IPs. The IpsIterator and
++// IpsSelector classes below are minimal helper classes that make cached IPs
++// iteration easier, safer, and copy-free. See also: CachedIps::good().
++
++/// Iterates over any (good and/or bad) IPs in CachedIps, in unspecified order.
++class IpsIterator
++{
++public:
++    typedef std::vector<CachedIp> Raw;
++    typedef Raw::const_iterator RawIterator;
++
++    // some of the standard iterator traits
++    using iterator_category = std::forward_iterator_tag;
++    using value_type = const Ip::Address;
++    using pointer = value_type *;
++    using reference = value_type &;
++
++    IpsIterator(const Raw &raw, const size_t): position_(raw.cbegin()) {}
++    // special constructor for end() iterator
++    explicit IpsIterator(const Raw &raw): position_(raw.cend()) {}
++
++    reference operator *() const { return position_->ip; }
++    pointer operator ->() const { return &position_->ip; }
++
++    IpsIterator& operator++() { ++position_; return *this; }
++    IpsIterator operator++(int) { const auto oldMe = *this; ++(*this); return oldMe; }
++
++    bool operator ==(const IpsIterator them) const { return position_ == them.position_; }
++    bool operator !=(const IpsIterator them) const { return !(*this == them); }
++
++private:
++    RawIterator position_; ///< current iteration location
++};
++
++/// Iterates over good IPs in CachedIps, starting at the so called current one.
++class GoodIpsIterator
++{
++public:
++    typedef std::vector<CachedIp> Raw;
++    typedef Raw::const_iterator RawIterator;
++
++    // some of the standard iterator traits
++    using iterator_category = std::forward_iterator_tag;
++    using value_type = const Ip::Address;
++    using pointer = value_type *;
++    using reference = value_type &;
++
++    GoodIpsIterator(const Raw &raw, const size_t currentPos): raw_(raw), position_(currentPos), processed_(0) { sync(); }
++    // special constructor for end() iterator
++    explicit GoodIpsIterator(const Raw &raw): raw_(raw), position_(0), processed_(raw.size()) {}
++
++    reference operator *() const { return current().ip; }
++    pointer operator ->() const { return &current().ip; }
++
++    GoodIpsIterator& operator++() { next(); sync(); return *this; }
++    GoodIpsIterator operator++(int) { const auto oldMe = *this; ++(*this); return oldMe; }
++
++    bool operator ==(const GoodIpsIterator them) const { return processed_ == them.processed_; }
++    bool operator !=(const GoodIpsIterator them) const { return !(*this == them); }
++
++private:
++    const CachedIp &current() const { return raw_[position_ % raw_.size()]; }
++    void next() { ++position_; ++processed_; }
++    void sync() { while (processed_ < raw_.size() && current().bad()) next(); }
++
++    const Raw &raw_; ///< CachedIps being iterated
++    size_t position_; ///< current iteration location, modulo raw.size()
++    size_t processed_; ///< number of visited positions, including skipped ones
++};
++
++/// Makes "which IPs to iterate" decision explicit in range-based for loops.
++/// Supported Iterator types are IpsIterator and GoodIpsIterator.
++template <class Iterator>
++class IpsSelector
++{
++public:
++    explicit IpsSelector(const CachedIps &ips): ips_(ips) {}
++
++    Iterator cbegin() const noexcept { return Iterator(ips_.raw(), ips_.goodPosition); }
++    Iterator cend() const noexcept { return Iterator(ips_.raw()); }
++    Iterator begin() const noexcept { return cbegin(); }
++    Iterator end() const noexcept { return cend(); }
++
++private:
++    const CachedIps &ips_; ///< master IP storage we are wrapping
++};
++
++/// an interface for receiving IP::Addresses from nbgethostbyname()
++class IpReceiver: public virtual CbdataParent
++{
++public:
++    virtual ~IpReceiver() {}
++
++    /// Called when nbgethostbyname() fully resolves the name.
++    /// The `ips` may contain both bad and good IP addresses, but each good IP
++    /// (if any) is guaranteed to had been previously reported via noteIp().
++    virtual void noteIps(const CachedIps *ips, const LookupDetails &details) = 0;
++
++    /// Called when/if nbgethostbyname() discovers a new good IP address.
++    virtual void noteIp(const Ip::Address &) {}
++
++    /// Called when/if nbgethostbyname() completes a single DNS lookup
++    /// if called, called before all the noteIp() calls for that DNS lookup.
++    virtual void noteLookup(const Dns::LookupDetails &) {}
++};
++
++/// initiate an (often) asynchronous DNS lookup; the `receiver` gets the results
++void nbgethostbyname(const char *name, const CbcPointer<IpReceiver> &receiver);
++
++} // namespace Dns
++
++typedef Dns::CachedIps ipcache_addrs; ///< deprecated alias
++
+ typedef void IPH(const ipcache_addrs *, const Dns::LookupDetails &details, void *);
+ 
+ void ipcache_purgelru(void *);
+@@ -32,14 +223,31 @@ const ipcache_addrs *ipcache_gethostbyname(const char *, int flags);
+ void ipcacheInvalidate(const char *);
+ void ipcacheInvalidateNegative(const char *);
+ void ipcache_init(void);
+-void ipcacheCycleAddr(const char *name, ipcache_addrs *);
+ void ipcacheMarkBadAddr(const char *name, const Ip::Address &);
+ void ipcacheMarkGoodAddr(const char *name, const Ip::Address &);
+-void ipcacheMarkAllGood(const char *name);
+ void ipcacheFreeMemory(void);
+-ipcache_addrs *ipcacheCheckNumeric(const char *name);
+ void ipcache_restart(void);
+ int ipcacheAddEntryFromHosts(const char *name, const char *ipaddr);
+ 
+-#endif /* _SQUID_IPCACHE_H */
++inline std::ostream &
++operator <<(std::ostream &os, const Dns::CachedIps &ips)
++{
++    ips.reportCurrent(os);
++    return os;
++}
++
++/* inlined implementations */
++
++inline Dns::IpsSelector<Dns::GoodIpsIterator>
++Dns::CachedIps::good() const
++{
++    return IpsSelector<GoodIpsIterator>(*this);
++}
++
++inline Dns::IpsSelector<Dns::IpsIterator>
++Dns::CachedIps::goodAndBad() const
++{
++    return IpsSelector<IpsIterator>(*this);
++}
+ 
++#endif /* _SQUID_IPCACHE_H */
+@@ -36,27 +36,26 @@ mcastJoinGroups(const ipcache_addrs *ia, const Dns::LookupDetails &, void *)
+ {
+ #ifdef IP_MULTICAST_TTL
+     struct ip_mreq mr;
+-    int i;
+ 
+     if (ia == NULL) {
+         debugs(7, DBG_CRITICAL, "comm_join_mcast_groups: Unknown host");
+         return;
+     }
+ 
+-    for (i = 0; i < (int) ia->count; ++i) {
+-        debugs(7, 9, "Listening for ICP requests on " << ia->in_addrs[i] );
++    for (const auto ip: ia->goodAndBad()) { // TODO: Consider using just good().
++        debugs(7, 9, "Listening for ICP requests on " << ip);
+ 
+-        if ( ! ia->in_addrs[i].isIPv4() ) {
++        if (!ip.isIPv4()) {
+             debugs(7, 9, "ERROR: IPv6 Multicast Listen has not been implemented!");
+             continue;
+         }
+ 
+-        ia->in_addrs[i].getInAddr(mr.imr_multiaddr);
++        ip.getInAddr(mr.imr_multiaddr);
+ 
+         mr.imr_interface.s_addr = INADDR_ANY;
+ 
+         if (setsockopt(icpIncomingConn->fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char *) &mr, sizeof(struct ip_mreq)) < 0)
+-            debugs(7, DBG_IMPORTANT, "ERROR: Join failed for " << icpIncomingConn << ", Multicast IP=" << ia->in_addrs[i]);
++            debugs(7, DBG_IMPORTANT, "ERROR: Join failed for " << icpIncomingConn << ", Multicast IP=" << ip);
+ 
+         char c = 0;
+         if (setsockopt(icpIncomingConn->fd, IPPROTO_IP, IP_MULTICAST_LOOP, &c, 1) < 0) {
+@@ -1181,8 +1181,6 @@ peerDNSConfigure(const ipcache_addrs *ia, const Dns::LookupDetails &, void *data
+ 
+     CachePeer *p = (CachePeer *)data;
+ 
+-    int j;
+-
+     if (p->n_addresses == 0) {
+         debugs(15, DBG_IMPORTANT, "Configuring " << neighborTypeStr(p) << " " << p->host << "/" << p->http_port << "/" << p->icp.port);
+ 
+@@ -1197,15 +1195,20 @@ peerDNSConfigure(const ipcache_addrs *ia, const Dns::LookupDetails &, void *data
+         return;
+     }
+ 
+-    if ((int) ia->count < 1) {
++    if (ia->empty()) {
+         debugs(0, DBG_CRITICAL, "WARNING: No IP address found for '" << p->host << "'!");
+         return;
+     }
+ 
+-    for (j = 0; j < (int) ia->count && j < PEER_MAX_ADDRESSES; ++j) {
+-        p->addresses[j] = ia->in_addrs[j];
+-        debugs(15, 2, "--> IP address #" << j << ": " << p->addresses[j]);
+-        ++ p->n_addresses;
++    for (const auto &ip: ia->goodAndBad()) { // TODO: Consider using just good().
++        if (p->n_addresses < PEER_MAX_ADDRESSES) {
++            const auto idx = p->n_addresses++;
++            p->addresses[idx] = ip;
++            debugs(15, 2, "--> IP address #" << idx << ": " << p->addresses[idx]);
++        } else {
++            debugs(15, 3, "ignoring remaining " << (ia->size() - p->n_addresses) << " ips");
++            break;
++        }
+     }
+ 
+     p->in_addr.setEmpty();
+@@ -88,7 +88,6 @@ static void peerGetSomeParent(ps_state *);
+ static void peerGetAllParents(ps_state *);
+ static void peerAddFwdServer(FwdServer **, CachePeer *, hier_code);
+ static void peerSelectPinned(ps_state * ps);
+-static void peerSelectDnsResults(const ipcache_addrs *ia, const Dns::LookupDetails &details, void *data);
+ 
+ CBDATA_CLASS_INIT(ps_state);
+ 
+@@ -285,7 +284,7 @@ peerSelectDnsPaths(ps_state *psstate)
+         // send the next one off for DNS lookup.
+         const char *host = fs->_peer.valid() ? fs->_peer->host : psstate->request->url.host();
+         debugs(44, 2, "Find IP destination for: " << psstate->url() << "' via " << host);
+-        ipcache_nbgethostbyname(host, peerSelectDnsResults, psstate);
++        Dns::nbgethostbyname(host, psstate);
+         return;
+     }
+ 
+@@ -324,68 +323,67 @@ peerSelectDnsPaths(ps_state *psstate)
+     delete psstate;
+ }
+ 
+-static void
+-peerSelectDnsResults(const ipcache_addrs *ia, const Dns::LookupDetails &details, void *data)
++void
++ps_state::noteLookup(const Dns::LookupDetails &details)
+ {
+-    ps_state *psstate = (ps_state *)data;
+-    if (peerSelectionAborted(psstate))
+-        return;
+-
+-    psstate->request->recordLookup(details);
++    /* ignore lookup delays that occurred after the initiator moved on */
+ 
+-    FwdServer *fs = psstate->servers;
+-    if (ia != NULL) {
++    if (peerSelectionAborted(this))
++        return;
+ 
+-        assert(ia->cur < ia->count);
++    if (!wantsMoreDestinations())
++        return;
+ 
+-        // loop over each result address, adding to the possible destinations.
+-        int ip = ia->cur;
+-        for (int n = 0; n < ia->count; ++n, ++ip) {
+-            Comm::ConnectionPointer p;
++    request->recordLookup(details);
++}
+ 
+-            if (ip >= ia->count) ip = 0; // looped back to zero.
++void
++ps_state::noteIp(const Ip::Address &ip)
++{
++    if (peerSelectionAborted(this))
++        return;
+ 
+-            if (!psstate->wantsMoreDestinations())
+-                break;
++    if (!wantsMoreDestinations())
++        return;
+ 
+-            // for TPROXY spoofing we must skip unusable addresses.
+-            if (psstate->request->flags.spoofClientIp && !(fs->_peer.valid() && fs->_peer->options.no_tproxy) ) {
+-                if (ia->in_addrs[ip].isIPv4() != psstate->request->client_addr.isIPv4()) {
+-                    // we CAN'T spoof the address on this link. find another.
+-                    continue;
+-                }
+-            }
++    const auto peer = servers->_peer.valid();
+ 
+-            p = new Comm::Connection();
+-            p->remote = ia->in_addrs[ip];
++    // for TPROXY spoofing, we must skip unusable addresses
++    if (request->flags.spoofClientIp && !(peer && peer->options.no_tproxy) ) {
++        if (ip.isIPv4() != request->client_addr.isIPv4())
++            return; // cannot spoof the client address on this link
++    }
+ 
+-            // when IPv6 is disabled we cannot use it
+-            if (!Ip::EnableIpv6 && p->remote.isIPv6()) {
+-                const char *host = (fs->_peer.valid() ? fs->_peer->host : psstate->request->url.host());
+-                ipcacheMarkBadAddr(host, p->remote);
+-                continue;
+-            }
++    Comm::ConnectionPointer p = new Comm::Connection();
++    p->remote = ip;
++    p->remote.port(peer ? peer->http_port : request->url.port());
++    handlePath(p, *servers);
++}
+ 
+-            p->remote.port(fs->_peer.valid() ? fs->_peer->http_port : psstate->request->url.port());
++void
++ps_state::noteIps(const Dns::CachedIps *ia, const Dns::LookupDetails &details)
++{
++    if (peerSelectionAborted(this))
++        return;
+ 
+-            psstate->handlePath(p, *fs);
+-        }
+-    } else {
+-        debugs(44, 3, "Unknown host: " << (fs->_peer.valid() ? fs->_peer->host : psstate->request->url.host()));
++    FwdServer *fs = servers;
++    if (!ia) {
++        debugs(44, 3, "Unknown host: " << (fs->_peer.valid() ? fs->_peer->host : request->url.host()));
+         // discard any previous error.
+-        delete psstate->lastError;
+-        psstate->lastError = NULL;
++        delete lastError;
++        lastError = NULL;
+         if (fs->code == HIER_DIRECT) {
+-            psstate->lastError = new ErrorState(ERR_DNS_FAIL, Http::scServiceUnavailable, psstate->request);
+-            psstate->lastError->dnsError = details.error;
++            lastError = new ErrorState(ERR_DNS_FAIL, Http::scServiceUnavailable, request);
++            lastError->dnsError = details.error;
+         }
+     }
++    // else noteIp() calls have already processed all IPs in *ia
+ 
+-    psstate->servers = fs->next;
++    servers = fs->next;
+     delete fs;
+ 
+     // see if more paths can be found
+-    peerSelectDnsPaths(psstate);
++    peerSelectDnsPaths(this);
+ }
+ 
+ static int
+@@ -987,6 +985,7 @@ ps_state::interestedInitiator()
+         return nullptr;
+     }
+ 
++    debugs(44, 7, id);
+     return initiator;
+ }
+ 
+@@ -92,7 +92,7 @@ send_announce(const ipcache_addrs *ia, const Dns::LookupDetails &, void *)
+         }
+     }
+ 
+-    Ip::Address S = ia->in_addrs[0];
++    Ip::Address S = ia->current();
+     S.port(port);
+     assert(Comm::IsConnOpen(icpOutgoingConn));
+ 
+@@ -18,12 +18,9 @@ const ipcache_addrs *ipcache_gethostbyname(const char *, int flags) STUB_RETVAL(
+ void ipcacheInvalidate(const char *) STUB
+ void ipcacheInvalidateNegative(const char *) STUB
+ void ipcache_init(void) STUB
+-void ipcacheCycleAddr(const char *name, ipcache_addrs *) STUB
+ void ipcacheMarkBadAddr(const char *name, const Ip::Address &) STUB
+ void ipcacheMarkGoodAddr(const char *name, const Ip::Address &) STUB
+-void ipcacheMarkAllGood(const char *name) STUB
+ void ipcacheFreeMemory(void) STUB
+-ipcache_addrs *ipcacheCheckNumeric(const char *name) STUB_RETVAL(NULL)
+ void ipcache_restart(void) STUB
+ int ipcacheAddEntryFromHosts(const char *name, const char *ipaddr) STUB_RETVAL(-1)
+ 

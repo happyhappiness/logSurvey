@@ -1,0 +1,407 @@
+@@ -0,0 +1,248 @@
++#include "squid.h"
++#include "parser/BinaryTokenizer.h"
++#include "security/Handshake.h"
++#if USE_OPENSSL
++#include "ssl/support.h"
++#endif
++
++Security::FieldGroup::FieldGroup(BinaryTokenizer &tk, const char *description) {
++    tk.context = description;
++}
++
++void
++Security::FieldGroup::commit(BinaryTokenizer &tk) {
++    tk.commit();
++    tk.context = "";
++}
++
++Security::ProtocolVersion::ProtocolVersion(BinaryTokenizer &tk):
++    vMajor(tk.uint8(".vMajor")),
++    vMinor(tk.uint8(".vMinor"))
++{
++}
++
++Security::TLSPlaintext::TLSPlaintext(BinaryTokenizer &tk):
++    FieldGroup(tk, "TLSPlaintext"),
++    type(tk.uint8(".type")),
++    version(tk),
++    length(tk.uint16(".length")),
++    fragment(tk.area(length, ".fragment"))
++{
++    commit(tk);
++}
++
++Security::Handshake::Handshake(BinaryTokenizer &tk):
++    FieldGroup(tk, "Handshake"),
++    msg_type(tk.uint8(".msg_type")),
++    length(tk.uint24(".length")),
++    body(tk.area(length, ".body"))
++{
++    commit(tk);
++}
++
++Security::Alert::Alert(BinaryTokenizer &tk):
++    FieldGroup(tk, "Alert"),
++    level(tk.uint8(".level")),
++    description(tk.uint8(".description"))
++{
++    commit(tk);
++}
++
++Security::P24String::P24String(BinaryTokenizer &tk, const char *description):
++    FieldGroup(tk, description),
++    length(tk.uint24(".length")),
++    body(tk.area(length, ".body"))
++{
++    commit(tk);
++}
++
++/// debugging helper to print various parsed records and messages
++class DebugFrame
++{
++public:
++    DebugFrame(const char *aName, uint64_t aType, uint64_t aSize):
++        name(aName), type(aType), size(aSize) {}
++
++    const char *name;
++    uint64_t type;
++    uint64_t size;
++};
++
++inline std::ostream &
++operator <<(std::ostream &os, const DebugFrame &frame)
++{
++    return os << frame.size << "-byte type-" << frame.type << ' ' << frame.name;
++}
++
++/// parses a single TLS Record Layer frame
++void
++Security::HandshakeParser::parseRecord()
++{
++    const TLSPlaintext record(tkRecords);
++
++    Must(record.length <= (1 << 14)); // RFC 5246: length MUST NOT exceed 2^14
++
++    // RFC 5246: MUST NOT send zero-length [non-application] fragments
++    Must(record.length || record.type == ContentType::ctApplicationData);
++
++    if (currentContentType != record.type) {
++        Must(tkMessages.atEnd()); // no currentContentType leftovers
++        fragments = record.fragment;
++        tkMessages.reset(fragments);
++        currentContentType = record.type;
++    } else {
++        fragments.append(record.fragment);
++        tkMessages.reinput(fragments);
++        tkMessages.rollback();
++    }
++    parseMessages();
++}
++
++/// parses one or more "higher-level protocol" frames of currentContentType
++void
++Security::HandshakeParser::parseMessages()
++{
++    debugs(83, 7, DebugFrame("fragments", currentContentType, fragments.length()));
++    while (!tkMessages.atEnd()) {
++        switch (currentContentType) {
++        case ContentType::ctChangeCipherSpec:
++            parseChangeCipherCpecMessage();
++            continue;
++        case ContentType::ctAlert:
++            parseAlertMessage();
++            continue;
++        case ContentType::ctHandshake:
++            parseHandshakeMessage();
++            continue;
++        case ContentType::ctApplicationData:
++            parseApplicationDataMessage();
++            continue;
++        }
++        skipMessage("unknown ContentType msg");
++    }
++}
++
++void
++Security::HandshakeParser::parseChangeCipherCpecMessage()
++{
++    Must(currentContentType == ContentType::ctChangeCipherSpec);
++    // we are currently ignoring Change Cipher Spec Protocol messages
++    // Everything after this message may be is encrypted
++    // The continuing parsing is pointless, abort here and set parseDone
++    skipMessage("ChangeCipherCpec msg");
++    ressumingSession = true;
++    parseDone = true;
++}
++
++void
++Security::HandshakeParser::parseAlertMessage()
++{
++    Must(currentContentType == ContentType::ctAlert);
++    const Alert alert(tkMessages);
++    debugs(83, 3, "level " << alert.level << " description " << alert.description);
++    // we are currently ignoring Alert Protocol messages
++}
++
++void
++Security::HandshakeParser::parseHandshakeMessage()
++{
++    Must(currentContentType == ContentType::ctHandshake);
++
++    const Handshake message(tkMessages);
++
++    switch (message.msg_type) {
++        case HandshakeType::hskServerHello:
++            Must(state < atHelloReceived);
++            // TODO: Parse ServerHello in message.body; extract version/session
++            // If the server is resuming a session, stop parsing w/o certificates
++            // because all subsequent [Finished] messages will be encrypted, right?
++            state = atHelloReceived;
++            return;
++        case HandshakeType::hskCertificate:
++            Must(state < atCertificatesReceived);
++            parseServerCertificates(message.body);
++            state = atCertificatesReceived;
++            return;
++        case HandshakeType::hskServerHelloDone:
++            Must(state < atHelloDoneReceived);
++            // zero-length
++            state = atHelloDoneReceived;
++            parseDone = true;
++            return;
++    }
++    debugs(83, 5, "ignoring " <<
++           DebugFrame("handshake msg", message.msg_type, message.length));
++}
++
++void
++Security::HandshakeParser::parseApplicationDataMessage()
++{
++    Must(currentContentType == ContentType::ctApplicationData);
++    skipMessage("app data");
++}
++
++void
++Security::HandshakeParser::skipMessage(const char *description)
++{
++    // tkMessages/fragments can only contain messages of the same ContentType.
++    // To skip a message, we can and should skip everything we have [left]. If
++    // we have partial messages, debugging will mislead about their boundaries.
++    tkMessages.skip(tkMessages.leftovers().length(), description);
++    tkMessages.commit();
++}
++
++/// parseServerHelloTry() wrapper that maintains parseDone/parseError state
++bool
++Security::HandshakeParser::parseServerHello(const SBuf &data)
++{
++    try {
++        tkRecords.reinput(data); // data contains _everything_ read so far
++        tkRecords.rollback();
++        while (!tkRecords.atEnd() && !parseDone)
++            parseRecord();
++        debugs(83, 7, "success; done: " << parseDone);
++        return parseDone;
++    }
++    catch (const BinaryTokenizer::InsufficientInput &) {
++        debugs(83, 5, "need more data");
++        Must(!parseError);
++    }
++    catch (const std::exception &ex) {
++        debugs(83, 2, "parsing error: " << ex.what());
++        parseError = true;
++    }
++    return false;
++}
++
++#if USE_OPENSSL
++X509 *
++Security::HandshakeParser::ParseCertificate(const SBuf &raw)
++{
++    typedef const unsigned char *x509Data;
++    const x509Data x509Start = reinterpret_cast<x509Data>(raw.rawContent());
++    x509Data x509Pos = x509Start;
++    X509 *x509 = d2i_X509(nullptr, &x509Pos, raw.length());
++    Must(x509); // successfully parsed
++    Must(x509Pos == x509Start + raw.length()); // no leftovers
++    return x509;
++}
++
++void
++Security::HandshakeParser::parseServerCertificates(const SBuf &raw)
++{
++    BinaryTokenizer tkList(raw);
++    const P24String list(tkList, "CertificateList");
++    Must(tkList.atEnd()); // no leftovers after all certificates
++
++    BinaryTokenizer tkItems(list.body);
++    while (!tkItems.atEnd()) {
++        const P24String item(tkItems, "Certificate");
++        X509 *cert = ParseCertificate(item.body);
++        if (!serverCertificates.get())
++            serverCertificates.reset(sk_X509_new_null());
++        sk_X509_push(serverCertificates.get(), cert);
++        debugs(83, 7, "parsed " << sk_X509_num(serverCertificates.get()) << " certificates so far");
++    }
++
++}
++#endif
+@@ -0,0 +1,157 @@
++/*
++ * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_SECURITY_HANDSHAKE_H
++#define SQUID_SECURITY_HANDSHAKE_H
++
++#include "fd.h"
++#include "parser/BinaryTokenizer.h"
++#include "sbuf/SBuf.h"
++#if USE_OPENSSL
++#include "ssl/gadgets.h"
++#endif
++
++namespace Security
++{
++
++// The Transport Layer Security (TLS) Protocol, Version 1.2
++
++/// Helper class to debug parsing of various TLS structures
++class FieldGroup
++{
++public:
++    FieldGroup(BinaryTokenizer &tk, const char *description); ///< starts parsing
++
++    void commit(BinaryTokenizer &tk); ///< commits successful parsing results
++};
++
++/// TLS Record Layer's content types from RFC 5246 Section 6.2.1
++enum ContentType {
++    ctChangeCipherSpec = 20,
++    ctAlert = 21,
++    ctHandshake = 22,
++    ctApplicationData = 23
++};
++
++/// TLS Record Layer's protocol version from RFC 5246 Section 6.2.1
++struct ProtocolVersion
++{
++    explicit ProtocolVersion(BinaryTokenizer &tk);
++
++    // the "v" prefix works around environments that #define major and minor
++    uint8_t vMajor;
++    uint8_t vMinor;
++};
++
++/// TLS Record Layer's frame from RFC 5246 Section 6.2.1.
++struct TLSPlaintext: public FieldGroup
++{
++    explicit TLSPlaintext(BinaryTokenizer &tk);
++
++    uint8_t type; ///< Rfc5246::ContentType
++    ProtocolVersion version;
++    uint16_t length;
++    SBuf fragment; ///< exactly length bytes
++};
++
++/// TLS Handshake protocol's handshake types from RFC 5246 Section 7.4
++enum HandshakeType {
++    hskServerHello = 2,
++    hskCertificate = 11,
++    hskServerHelloDone = 14
++};
++
++/// TLS Handshake Protocol frame from RFC 5246 Section 7.4.
++struct Handshake: public FieldGroup
++{
++    explicit Handshake(BinaryTokenizer &tk);
++
++    uint32_t msg_type: 8; ///< HandshakeType
++    uint32_t length: 24;
++    SBuf body; ///< Handshake Protocol message, exactly length bytes
++};
++
++/// TLS Alert protocol frame from RFC 5246 Section 7.2.
++struct Alert: public FieldGroup
++{
++    explicit Alert(BinaryTokenizer &tk);
++    uint8_t level; ///< warning or fatal
++    uint8_t description; ///< close_notify, unexpected_message, etc.
++};
++
++/// Like a Pascal "length-first" string but with a 3-byte length field.
++/// Used for (undocumented in RRC 5246?) Certificate and ASN1.Cert encodings.
++struct P24String: public FieldGroup
++{
++    explicit P24String(BinaryTokenizer &tk, const char *description);
++
++    uint32_t length;  // bytes in body (stored using 3 bytes, not 4!)
++    SBuf body; ///< exactly length bytes
++};
++
++/// Incremental SSL Handshake parser.
++class HandshakeParser {
++public:
++    /// The parsing states
++    typedef enum {atHelloNone = 0, atHelloStarted, atHelloReceived, atCertificatesReceived, atHelloDoneReceived, atNstReceived, atCcsReceived, atFinishReceived} ParserState;
++
++    HandshakeParser(): state(atHelloNone), ressumingSession(false), parseDone(false), parseError(false), currentContentType(0), unParsedContent(0), parsingPos(0), currentMsg(0), currentMsgSize(0), certificatesMsgPos(0), certificatesMsgSize(0) {}
++
++    /// Parses the initial sequence of raw bytes sent by the SSL server.
++    /// Returns true upon successful completion (HelloDone or Finished received).
++    /// Otherwise, returns false (and sets parseError to true on errors).
++    bool parseServerHello(const SBuf &data);
++
++#if USE_OPENSSL
++    Ssl::X509_STACK_Pointer serverCertificates; ///< parsed certificates chain
++#endif
++
++    ParserState state; ///< current parsing state.
++
++    bool ressumingSession; ///< True if this is a resumming session
++
++    bool parseDone; ///< The parser finishes its job
++    bool parseError; ///< Set to tru by parse on parse error.
++
++private:
++    unsigned int currentContentType; ///< The current SSL record content type
++    size_t unParsedContent; ///< The size of current SSL record, which is not parsed yet
++    size_t parsingPos; ///< The parsing position from the beginning of parsed data
++    size_t currentMsg; ///< The current handshake message possition from the beginning of parsed data
++    size_t currentMsgSize; ///< The current handshake message size.
++
++    size_t certificatesMsgPos; ///< The possition of certificates message from the beggining of parsed data
++    size_t certificatesMsgSize; ///< The size of certificates message
++
++private:
++    void parseServerHelloTry();
++
++    void parseRecord();
++    void parseMessages();
++
++    void parseChangeCipherCpecMessage();
++    void parseAlertMessage();
++    void parseHandshakeMessage();
++    void parseApplicationDataMessage();
++    void skipMessage(const char *msgType);
++
++    void parseServerCertificates(const SBuf &raw);
++#if USE_OPENSSL
++    static X509 *ParseCertificate(const SBuf &raw);
++#endif
++
++    /// concatenated TLSPlaintext.fragments of TLSPlaintext.type
++    SBuf fragments;
++
++    BinaryTokenizer tkRecords; // TLS record layer (parsing uninterpreted data)
++    BinaryTokenizer tkMessages; // TLS message layer (parsing fragments)
++};
++
++}
++
++#endif // SQUID_SECURITY_HANDSHAKE_H

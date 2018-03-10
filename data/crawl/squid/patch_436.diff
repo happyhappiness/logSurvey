@@ -1,0 +1,455 @@
+@@ -41,7 +41,8 @@ class ServerStateData: public Ftp::ServerStateData
+     void forwardError(err_type error = ERR_NONE, int xerrno = 0);
+     HttpReply *createHttpReply(const Http::StatusCode httpStatus, const int clen = 0);
+     void handleDataRequest();
+-    void startDataTransfer();
++    void startDataDownload();
++    void startDataUpload();
+ 
+     typedef void (ServerStateData::*PreliminaryCb)();
+     void forwardPreliminaryReply(const PreliminaryCb cb);
+@@ -54,6 +55,7 @@ class ServerStateData: public Ftp::ServerStateData
+         SENT_PASV,
+         SENT_DATA_REQUEST,
+         READING_DATA,
++        UPLOADING_DATA,
+         DONE
+     };
+     typedef void (ServerStateData::*SM_FUNC)();
+@@ -79,6 +81,7 @@ const ServerStateData::SM_FUNC ServerStateData::SM_FUNCS[] = {
+     &ServerStateData::readPasvReply, // SENT_PASV
+     &ServerStateData::readDataReply, // SENT_DATA_REQUEST
+     &ServerStateData::readTransferDoneReply, // READING_DATA
++    &ServerStateData::readReply, // UPLOADING_DATA
+     NULL // DONE
+ };
+ 
+@@ -101,7 +104,8 @@ ServerStateData::start()
+     if (clientState() == ConnStateData::FTP_BEGIN)
+         Ftp::ServerStateData::start();
+     else
+-    if (clientState() == ConnStateData::FTP_HANDLE_DATA_REQUEST)
++    if (clientState() == ConnStateData::FTP_HANDLE_DATA_REQUEST ||
++        clientState() == ConnStateData::FTP_HANDLE_UPLOAD_REQUEST)
+         handleDataRequest();
+     else
+         sendCommand();
+@@ -189,7 +193,7 @@ ServerStateData::handleRequestBodyProducerAborted()
+ {
+     ::ServerStateData::handleRequestBodyProducerAborted();
+ 
+-    abortTransaction("request body producer aborted");
++    failed(ERR_READ_ERROR);
+ }
+ 
+ bool
+@@ -293,7 +297,7 @@ ServerStateData::handleDataRequest()
+ }
+ 
+ void
+-ServerStateData::startDataTransfer()
++ServerStateData::startDataDownload()
+ {
+     assert(Comm::IsConnOpen(data.conn));
+ 
+@@ -310,6 +314,22 @@ ServerStateData::startDataTransfer()
+     state = READING_DATA;
+ }
+ 
++void
++ServerStateData::startDataUpload()
++{
++    assert(Comm::IsConnOpen(data.conn));
++
++    debugs(9, 3, HERE << "begin data transfer to " << data.conn->remote <<
++           " (" << data.conn->local << ")");
++
++    if (!startRequestBodyFlow()) { // register to receive body data
++        failed();
++        return;
++    }
++
++    state = UPLOADING_DATA;
++}
++
+ void
+ ServerStateData::readWelcome()
+ {
+@@ -362,13 +382,15 @@ ServerStateData::sendCommand()
+ 
+     state = clientState() == ConnStateData::FTP_HANDLE_PASV ? SENT_PASV :
+         clientState() == ConnStateData::FTP_HANDLE_DATA_REQUEST ? SENT_DATA_REQUEST :
++        clientState() == ConnStateData::FTP_HANDLE_UPLOAD_REQUEST ? SENT_DATA_REQUEST :
+         SENT_COMMAND;
+ }
+ 
+ void
+ ServerStateData::readReply()
+ {
+-    assert(clientState() == ConnStateData::FTP_CONNECTED);
++    assert(clientState() == ConnStateData::FTP_CONNECTED ||
++           clientState() == ConnStateData::FTP_HANDLE_UPLOAD_REQUEST);
+ 
+     if (100 <= ctrl.replycode && ctrl.replycode < 200)
+         forwardPreliminaryReply(&ServerStateData::scheduleReadControlReply);
+@@ -394,11 +416,15 @@ ServerStateData::readPasvReply()
+ void
+ ServerStateData::readDataReply()
+ {
+-    assert(clientState() == ConnStateData::FTP_HANDLE_DATA_REQUEST);
+-
+-    if (ctrl.replycode == 150)
+-        forwardPreliminaryReply(&ServerStateData::startDataTransfer);
+-    else
++    assert(clientState() == ConnStateData::FTP_HANDLE_DATA_REQUEST ||
++           clientState() == ConnStateData::FTP_HANDLE_UPLOAD_REQUEST);
++
++    if (ctrl.replycode == 150) {
++        if (clientState() == ConnStateData::FTP_HANDLE_DATA_REQUEST)
++            forwardPreliminaryReply(&ServerStateData::startDataDownload);
++        else // clientState() == ConnStateData::FTP_HANDLE_UPLOAD_REQUEST
++            forwardPreliminaryReply(&ServerStateData::startDataUpload);
++    } else
+         forwardReply();
+ }
+ 
+@@ -261,6 +261,7 @@ typedef void FtpReplyHandler(ClientSocketContext *context, const HttpReply *repl
+ static FtpReplyHandler FtpHandlePasvReply;
+ static FtpReplyHandler FtpHandleErrorReply;
+ static FtpReplyHandler FtpHandleDataReply;
++static FtpReplyHandler FtpHandleUploadReply;
+ 
+ static void FtpWriteEarlyReply(ConnStateData *conn, const int code, const char *msg);
+ static void FtpWriteReply(ClientSocketContext *context, MemBuf &mb);
+@@ -277,6 +278,7 @@ static FtpRequestHandler FtpHandleRequest;
+ static FtpRequestHandler FtpHandlePasvRequest;
+ static FtpRequestHandler FtpHandlePortRequest;
+ static FtpRequestHandler FtpHandleDataRequest;
++static FtpRequestHandler FtpHandleUploadRequest;
+ 
+ static bool FtpCheckDataConnection(ClientSocketContext *context);
+ static void FtpSetReply(ClientSocketContext *context, const int code, const char *msg);
+@@ -322,6 +324,25 @@ ConnStateData::readSomeData()
+     comm_read(clientConnection, in.addressToReadInto(), getAvailableBufferLength(), reader);
+ }
+ 
++void
++ConnStateData::readSomeFtpData()
++{
++    if (ftp.reader != NULL)
++        return;
++
++    const size_t availSpace = sizeof(ftp.uploadBuf) - ftp.uploadAvailSize;
++    if (availSpace <= 0)
++        return;
++
++    debugs(33, 4, HERE << ftp.dataConn << ": reading FTP data...");
++
++    typedef CommCbMemFunT<ConnStateData, CommIoCbParams> Dialer;
++    ftp.reader = JobCallback(33, 5, Dialer, this,
++                             ConnStateData::clientReadFtpData);
++    comm_read(ftp.dataConn, ftp.uploadBuf + ftp.uploadAvailSize, availSpace,
++              ftp.reader);
++}
++
+ void
+ ClientSocketContext::removeFromConnectionList(ConnStateData * conn)
+ {
+@@ -2887,15 +2908,17 @@ clientProcessRequest(ConnStateData *conn, HttpParser *hp, ClientSocketContext *c
+             goto finish;
+         }
+ 
+-        // We may stop producing, comm_close, and/or call setReplyToError()
+-        // below, so quit on errors to avoid http->doCallouts()
+-        if (!conn->handleRequestBodyData())
+-            goto finish;
++        if (!conn->isFtp) {
++            // We may stop producing, comm_close, and/or call setReplyToError()
++            // below, so quit on errors to avoid http->doCallouts()
++            if (!conn->handleRequestBodyData())
++                goto finish;
+ 
+-        if (!request->body_pipe->productionEnded()) {
+-            debugs(33, 5, HERE << "need more request body");
+-            context->mayUseConnection(true);
+-            assert(conn->flags.readMore);
++            if (!request->body_pipe->productionEnded()) {
++                debugs(33, 5, HERE << "need more request body");
++                context->mayUseConnection(true);
++                assert(conn->flags.readMore);
++            }
+         }
+     }
+ 
+@@ -3139,6 +3162,61 @@ ConnStateData::clientReadRequest(const CommIoCbParams &io)
+     clientAfterReadingRequests();
+ }
+ 
++void
++ConnStateData::clientReadFtpData(const CommIoCbParams &io)
++{
++    debugs(33,5,HERE << io.conn << " size " << io.size);
++    Must(ftp.reader != NULL);
++    ftp.reader = NULL;
++
++    assert(Comm::IsConnOpen(ftp.dataConn));
++    assert(io.conn->fd == ftp.dataConn->fd);
++
++    if (io.flag == COMM_OK) {
++        if (io.size > 0) {
++            kb_incr(&(statCounter.client_http.kbytes_in), io.size);
++
++            const bool uploadBufWasEmpty = ftp.uploadAvailSize <= 0;
++            char *const current_buf = ftp.uploadBuf + ftp.uploadAvailSize;
++            if (io.buf != current_buf)
++                memmove(current_buf, io.buf, io.size);
++            ftp.uploadAvailSize += io.size;
++            if (uploadBufWasEmpty)
++                handleFtpRequestData();
++        } else if (io.size == 0) {
++            debugs(33, 5, HERE << io.conn << " closed");
++            FtpCloseDataConnection(this);
++            if (ftp.uploadAvailSize <= 0)
++                finishDechunkingRequest(true);
++        }
++    } else {
++        debugs(33, 5, HERE << io.conn << " closed");
++        FtpCloseDataConnection(this);
++        finishDechunkingRequest(false);
++    }
++
++}
++
++void
++ConnStateData::handleFtpRequestData()
++{
++    assert(bodyPipe != NULL);
++
++    debugs(33,5, HERE << "handling FTP request data for " << clientConnection);
++    const size_t putSize = bodyPipe->putMoreData(ftp.uploadBuf,
++                                                 ftp.uploadAvailSize);
++    if (putSize > 0) {
++        ftp.uploadAvailSize -= putSize;
++        if (ftp.uploadAvailSize > 0)
++            memmove(ftp.uploadBuf, ftp.uploadBuf + putSize, ftp.uploadAvailSize);
++    }
++
++    if (Comm::IsConnOpen(ftp.dataConn))
++        readSomeFtpData();
++    else if (ftp.uploadAvailSize <= 0)
++        finishDechunkingRequest(true);
++}
++
+ /**
+  * called when new request data has been read from the socket
+  *
+@@ -3311,6 +3389,11 @@ ConnStateData::noteBodyConsumerAborted(BodyPipe::Pointer )
+     if (bodyPipe != NULL)
+         bodyPipe->enableAutoConsumption();
+ 
++    if (isFtp) {
++        FtpCloseDataConnection(this);
++        return;
++    }
++
+     stopReceiving("virgin request body consumer aborted"); // closes ASAP
+ }
+ 
+@@ -4757,6 +4840,7 @@ FtpAcceptDataConnection(const CommAcceptCbParams &params)
+ 
+     FtpCloseDataConnection(connState);
+     connState->ftp.dataConn = params.conn;
++    connState->ftp.uploadAvailSize = 0;
+ }
+ 
+ static void
+@@ -4775,6 +4859,7 @@ FtpCloseDataConnection(ConnStateData *conn)
+         conn->ftp.dataConn->close();
+     }
+     conn->ftp.dataConn = NULL;
++    conn->ftp.reader = NULL;
+ }
+ 
+ static void
+@@ -4852,7 +4937,6 @@ FtpWriteCustomReply(ClientSocketContext *context, const int code, const char *ms
+ static ClientSocketContext *
+ FtpParseRequest(ConnStateData *connState, HttpRequestMethod *method_p, Http::ProtocolVersion *http_ver)
+ {
+-    *method_p = Http::METHOD_GET;
+     *http_ver = Http::ProtocolVersion(1, 1);
+ 
+     const char *const eor =
+@@ -4902,6 +4986,9 @@ FtpParseRequest(ConnStateData *connState, HttpRequestMethod *method_p, Http::Pro
+     const String cmd = boc;
+     String params = bop;
+ 
++    *method_p = !cmd.caseCmp("APPE") || !cmd.caseCmp("STOR") ||
++        !cmd.caseCmp("STOU") ? Http::METHOD_PUT : Http::METHOD_GET;
++
+     if (connState->ftp.uri.size() == 0) {
+         // the first command must be USER
+         if (cmd.caseCmp("USER") != 0) {
+@@ -4936,6 +5023,8 @@ FtpParseRequest(ConnStateData *connState, HttpRequestMethod *method_p, Http::Pro
+     request->header.putStr(HDR_FTP_COMMAND, cmd.termedBuf());
+     request->header.putStr(HDR_FTP_ARGUMENTS, params.termedBuf() != NULL ?
+                            params.termedBuf() : "");
++    if (*method_p == Http::METHOD_PUT)
++        request->header.putStr(HDR_TRANSFER_ENCODING, "chunked");
+ 
+     ClientHttpRequest *const http = new ClientHttpRequest(connState);
+     http->request = request;
+@@ -4978,6 +5067,7 @@ FtpHandleReply(ClientSocketContext *context, HttpReply *reply, StoreIOBuffer dat
+         NULL, // FTP_CONNECTED
+         FtpHandlePasvReply, // FTP_HANDLE_PASV
+         FtpHandleDataReply, // FTP_HANDLE_DATA_REQUEST
++        FtpHandleUploadReply, // FTP_HANDLE_DATA_REQUEST
+         FtpHandleErrorReply // FTP_ERROR
+     };
+     const ConnStateData::FtpState state = context->getConn()->ftp.state;
+@@ -5127,6 +5217,12 @@ FtpWroteReplyData(const Comm::ConnectionPointer &conn, char *bufnotused, size_t
+     FtpCloseDataConnection(connState);
+ }
+ 
++static void
++FtpHandleUploadReply(ClientSocketContext *context, const HttpReply *reply, StoreIOBuffer data)
++{
++    FtpWriteForwardedReply(context, reply);
++}
++
+ static void
+ FtpWriteForwardedReply(ClientSocketContext *context, const HttpReply *reply)
+ {
+@@ -5140,10 +5236,11 @@ FtpWriteForwardedReply(ClientSocketContext *context, const HttpReply *reply, Asy
+ {
+     assert(reply != NULL);
+     const HttpHeader &header = reply->header;
++    ConnStateData *const connState = context->getConn();
+ 
+     if (!header.has(HDR_FTP_STATUS)) {
+         // Reply without FTP-Status header may come from ICAP or ACL.
+-        context->getConn()->ftp.state = ConnStateData::FTP_ERROR;
++        connState->ftp.state = ConnStateData::FTP_ERROR;
+         FtpWriteCustomReply(context, 421, reply->sline.reason());
+         return;
+     }
+@@ -5153,6 +5250,10 @@ FtpWriteForwardedReply(ClientSocketContext *context, const HttpReply *reply, Asy
+     const int status = header.getInt(HDR_FTP_STATUS);
+     debugs(33, 7, HERE << "status: " << status);
+ 
++    if (status == 150 && connState->ftp.state ==
++        ConnStateData::FTP_HANDLE_UPLOAD_REQUEST)
++        connState->readSomeFtpData();
++
+     MemBuf mb;
+     mb.init();
+     FtpPrintReply(mb, reply);
+@@ -5227,24 +5328,30 @@ FtpWroteReply(const Comm::ConnectionPointer &conn, char *bufnotused, size_t size
+     assert(context->socketState() == STREAM_COMPLETE);
+     connState->flags.readMore = true;
+     connState->ftp.state = ConnStateData::FTP_CONNECTED;
++    if (connState->in.bodyParser)
++        connState->finishDechunkingRequest(false);
+     context->keepaliveNextRequest();
+ }
+ 
+ bool
+ FtpHandleRequest(ClientSocketContext *context, String &cmd, String &params) {
+     static std::pair<const char *, FtpRequestHandler *> handlers[] = {
++        std::make_pair("LIST", FtpHandleDataRequest),
++        std::make_pair("NLST", FtpHandleDataRequest),
+         std::make_pair("PASV", FtpHandlePasvRequest),
+         std::make_pair("PORT", FtpHandlePortRequest),
+-        std::make_pair("RETR", FtpHandleDataRequest),
+-        std::make_pair("LIST", FtpHandleDataRequest),
+-        std::make_pair("NLST", FtpHandleDataRequest)
++        std::make_pair("RETR", FtpHandleDataRequest)
+     };
+ 
+     FtpRequestHandler *handler = NULL;
+-    for (size_t i = 0; i < sizeof(handlers) / sizeof(*handlers); ++i) {
+-        if (cmd.caseCmp(handlers[i].first) == 0) {
+-            handler = handlers[i].second;
+-            break;
++    if (context->http->request->method == Http::METHOD_PUT)
++        handler = FtpHandleUploadRequest;
++    else {
++        for (size_t i = 0; i < sizeof(handlers) / sizeof(*handlers); ++i) {
++            if (cmd.caseCmp(handlers[i].first) == 0) {
++                handler = handlers[i].second;
++                break;
++            }
+         }
+     }
+ 
+@@ -5314,6 +5421,17 @@ FtpHandleDataRequest(ClientSocketContext *context, String &cmd, String &params)
+     return true;
+ }
+ 
++bool
++FtpHandleUploadRequest(ClientSocketContext *context, String &cmd, String &params)
++{
++    if (!FtpCheckDataConnection(context))
++        return false;
++
++    context->getConn()->ftp.state = ConnStateData::FTP_HANDLE_UPLOAD_REQUEST;
++
++    return true;
++}
++
+ bool
+ FtpCheckDataConnection(ClientSocketContext *context)
+ {
+@@ -199,6 +199,7 @@ class ConnStateData : public BodyProducer, public HttpControlMsgSink
+     ~ConnStateData();
+ 
+     void readSomeData();
++    void readSomeFtpData();
+     int getAvailableBufferLength() const;
+     bool areAllContextsForThisConnection() const;
+     void freeAllContexts();
+@@ -321,6 +322,7 @@ class ConnStateData : public BodyProducer, public HttpControlMsgSink
+ 
+     // comm callbacks
+     void clientReadRequest(const CommIoCbParams &io);
++    void clientReadFtpData(const CommIoCbParams &io);
+     void connStateClosed(const CommCloseCbParams &io);
+     void requestTimeout(const CommTimeoutCbParams &params);
+ 
+@@ -338,6 +340,7 @@ class ConnStateData : public BodyProducer, public HttpControlMsgSink
+         FTP_CONNECTED,
+         FTP_HANDLE_PASV,
+         FTP_HANDLE_DATA_REQUEST,
++        FTP_HANDLE_UPLOAD_REQUEST,
+         FTP_ERROR
+     };
+     struct {
+@@ -346,6 +349,9 @@ class ConnStateData : public BodyProducer, public HttpControlMsgSink
+         Comm::ConnectionPointer dataListenConn;
+         Comm::ConnectionPointer dataConn;
+         Ip::Address serverDataAddr;
++        char uploadBuf[CLIENT_REQ_BUF_SZ];
++        size_t uploadAvailSize;
++        AsyncCall::Pointer reader; ///< set when we are reading FTP data
+     } ftp;
+ 
+ #if USE_SSL
+@@ -389,9 +395,10 @@ class ConnStateData : public BodyProducer, public HttpControlMsgSink
+     bool switchedToHttps() const { return false; }
+ #endif
+ 
++    void finishDechunkingRequest(bool withSuccess);
++
+ protected:
+     void startDechunkingRequest();
+-    void finishDechunkingRequest(bool withSuccess);
+     void abortChunkedRequestBody(const err_type error);
+     err_type handleChunkedRequestBody(size_t &putSize);
+ 
+@@ -400,6 +407,7 @@ class ConnStateData : public BodyProducer, public HttpControlMsgSink
+     int connFinishedWithConn(int size);
+     void clientAfterReadingRequests();
+     void processFtpRequest(ClientSocketContext *const context);
++    void handleFtpRequestData();
+ 
+ private:
+     HttpParser parser_;

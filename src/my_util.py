@@ -37,7 +37,6 @@ def get_log_function_pattern(repos):
 
     return regrex_string
 
-
 def store_file(file_name, file_content):
     """
     @ param patch(list) and counter\n
@@ -62,7 +61,7 @@ def urlopen(url, try_times = 20):
         print e.reason
         if times < try_times:
             print 'now trying the %d times' %times
-            return get_url_content(url, try_times = 0)
+            return urlopen(url, try_times = 0)
         else:
             return None
     else:

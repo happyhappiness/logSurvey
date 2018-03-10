@@ -1,0 +1,245 @@
+@@ -379,10 +379,10 @@ ServerStateData::sentRequestBody(const CommIoCbParams &io)
+     }
+ 
+     if (io.flag) {
+-        debugs(11, 1, "sentRequestBody error: FD " << io.fd << ": " << xstrerr(errno));
++        debugs(11, 1, "sentRequestBody error: FD " << io.fd << ": " << xstrerr(io.xerrno));
+         ErrorState *err;
+         err = errorCon(ERR_WRITE_ERROR, HTTP_BAD_GATEWAY, fwd->request);
+-        err->xerrno = errno;
++        err->xerrno = io.xerrno;
+         fwd->fail(err);
+         abortTransaction("I/O error while sending request body");
+         return;
+@@ -69,6 +69,7 @@ Adaptation::ServiceConfig::parse()
+ 
+     // handle optional service name=value parameters
+     const char *lastOption = NULL;
++    bool grokkedUri = false;
+     while (char *option = strtok(NULL, w_space)) {
+         if (strcmp(option, "0") == 0) { // backward compatibility
+             bypass = false;
+@@ -94,6 +95,8 @@ Adaptation::ServiceConfig::parse()
+             grokked = grokBool(bypass, name, value);
+         else if (strcmp(name, "routing") == 0)
+             grokked = grokBool(routing, name, value);
++        else if (strcmp(name, "uri") == 0)
++            grokked = grokkedUri = grokUri(value);
+         else if (strcmp(name, "ipv6") == 0) {
+             grokked = grokBool(ipv6, name, value);
+             if (grokked && ipv6 && !Ip::EnableIpv6)
+@@ -107,7 +110,7 @@ Adaptation::ServiceConfig::parse()
+     }
+ 
+     // what is left must be the service URI
+-    if (!grokUri(lastOption))
++    if (!grokkedUri && !grokUri(lastOption))
+         return false;
+ 
+     // there should be nothing else left
+@@ -8,6 +8,7 @@ namespace Icap
+ {
+ 
+ const XactOutcome xoUnknown = "ICAP_ERR_UNKNOWN";
++const XactOutcome xoGone = "ICAP_ERR_GONE";
+ const XactOutcome xoRace = "ICAP_ERR_RACE";
+ const XactOutcome xoError = "ICAP_ERR_OTHER";
+ const XactOutcome xoOpt = "ICAP_OPT";
+@@ -64,6 +64,7 @@ using Adaptation::vectPointStr;
+ 
+ typedef const char *XactOutcome; ///< transaction result for logging
+ extern const XactOutcome xoUnknown; ///< initial value: outcome was not set
++extern const XactOutcome xoGone; ///< initiator gone, will not continue
+ extern const XactOutcome xoRace; ///< ICAP server closed pconn when we started
+ extern const XactOutcome xoError; ///< all kinds of transaction errors
+ extern const XactOutcome xoOpt; ///< OPTION transaction
+@@ -92,6 +92,8 @@ class ServiceRep : public RefCountable, public Adaptation::Service,
+ 
+     virtual void finalize();
+ 
++    void invalidate(); // call when the service is no longer needed or valid
++
+     virtual bool probed() const; // see comments above
+     virtual bool up() const; // see comments above
+ 
+@@ -196,10 +196,14 @@ void Adaptation::Icap::Xaction::closeConnection()
+                                 theService->cfg().port, NULL, client_addr);
+             disableRetries();
+         } else {
+-            //status() adds leading spaces.
+-            debugs(93,3, HERE << "closing pconn" << status());
++            const bool reset = al.icap.outcome == xoGone || al.icap.outcome == xoError;
++            debugs(93,3, HERE << (reset ? "RST" : "FIN") << "-closing" <<
++                   status());
+             // comm_close will clear timeout
+-            comm_close(connection);
++            if (reset)
++                comm_reset_close(connection);
++            else
++                comm_close(connection);
+         }
+ 
+         writer = NULL;
+@@ -444,8 +448,10 @@ void Adaptation::Icap::Xaction::noteInitiatorAborted()
+ {
+ 
+     if (theInitiator.set()) {
++        debugs(93,4, HERE << "Initiator gone before ICAP transaction ended");
+         clearInitiator();
+         detailError(ERR_DETAIL_ICAP_INIT_GONE);
++        setOutcome(xoGone);
+         mustStop("initiator aborted");
+     }
+ 
+@@ -615,7 +615,10 @@ prepareLogWithRequestDetails(HttpRequest * request, AccessLogEntry * aLogEntry)
+ void
+ ClientHttpRequest::logRequest()
+ {
+-    if (out.size || logType) {
++    if (!out.size && !logType)
++        debugs(33,2, HERE << "logging half-baked transaction: " << log_uri);
++
++    if (true) {
+         al.icp.opcode = ICP_INVALID;
+         al.url = log_uri;
+         debugs(33, 9, "clientLogRequest: al.url='" << al.url << "'");
+@@ -2244,8 +2247,10 @@ parseHttpRequest(ConnStateData *conn, HttpParser *hp, HttpRequestMethod * method
+ int
+ ConnStateData::getAvailableBufferLength() const
+ {
+-    int result = in.allocatedSize - in.notYetUsed - 1;
+-    assert (result >= 0);
++    assert (in.allocatedSize > in.notYetUsed); // allocated more than used
++    const size_t result = in.allocatedSize - in.notYetUsed - 1;
++    // huge request_header_max_size may lead to more than INT_MAX unused space
++    assert (static_cast<ssize_t>(result) <= INT_MAX);
+     return result;
+ }
+ 
+@@ -161,6 +161,9 @@ static long ipcache_high = 200;
+ extern int _dns_ttl_;
+ #endif
+ 
++/// \ingroup IPCacheInternal
++inline int ipcacheCount() { return ip_table ? ip_table->count : 0; }
++
+ int
+ ipcache_entry::age() const
+ {
+@@ -235,7 +238,7 @@ ipcache_purgelru(void *voidnotused)
+     eventAdd("ipcache_purgelru", ipcache_purgelru, NULL, 10.0, 1);
+ 
+     for (m = lru_list.tail; m; m = prev) {
+-        if (memInUse(MEM_IPCACHE_ENTRY) < ipcache_low)
++        if (ipcacheCount() < ipcache_low)
+             break;
+ 
+         prev = m->prev;
+@@ -855,8 +858,10 @@ stat_ipcache_get(StoreEntry * sentry)
+     dlink_node *m;
+     assert(ip_table != NULL);
+     storeAppendPrintf(sentry, "IP Cache Statistics:\n");
+-    storeAppendPrintf(sentry, "IPcache Entries:  %d\n",
++    storeAppendPrintf(sentry, "IPcache Entries In Use:  %d\n",
+                       memInUse(MEM_IPCACHE_ENTRY));
++    storeAppendPrintf(sentry, "IPcache Entries Cached:  %d\n",
++                      ipcacheCount());
+     storeAppendPrintf(sentry, "IPcache Requests: %d\n",
+                       IpcacheStats.requests);
+     storeAppendPrintf(sentry, "IPcache Hits:            %d\n",
+@@ -1231,7 +1236,7 @@ snmp_netIpFn(variable_list * Var, snint * ErrP)
+ 
+     case IP_ENT:
+         Answer = snmp_var_new_integer(Var->name, Var->name_length,
+-                                      memInUse(MEM_IPCACHE_ENTRY),
++                                      ipcacheCount(),
+                                       SMI_GAUGE32);
+         break;
+ 
+@@ -794,11 +794,18 @@ Log::Format::SquidCustom(AccessLogEntry * al, customlog * log)
+                 }
+             }
+ 
+-            if (fmt->width) {
++            // enforce width limits if configured
++            const bool haveMaxWidth = fmt->precision && !doint && !dooff;
++            if (haveMaxWidth || fmt->width) {
++                const int minWidth = fmt->width ?
++                                     static_cast<int>(fmt->width) : 0;
++                const int maxWidth = haveMaxWidth ?
++                                     static_cast<int>(fmt->precision) : strlen(out);
++
+                 if (fmt->left)
+-                    mb.Printf("%-*s", (int) fmt->width, out);
++                    mb.Printf("%-*.*s", minWidth, maxWidth, out);
+                 else
+-                    mb.Printf("%*s", (int) fmt->width, out);
++                    mb.Printf("%*.*s", minWidth, maxWidth, out);
+             } else
+                 mb.append(out, strlen(out));
+         } else {
+@@ -75,11 +75,12 @@ Log::Format::SquidIcap(AccessLogEntry * al, Logfile * logfile)
+     if (user && !*user)
+         safe_free(user);
+ 
+-    logfilePrintf(logfile, "%9ld.%03d %6d %s -/%03d %"PRId64" %s %s %s -/%s -\n",
++    logfilePrintf(logfile, "%9ld.%03d %6d %s %s/%03d %"PRId64" %s %s %s -/%s -\n",
+                   (long int) current_time.tv_sec,
+                   (int) current_time.tv_usec / 1000,
+                   al->icap.trTime,
+                   client,
++                  al->icap.outcome,
+                   al->icap.resStatus,
+                   al->icap.bytesRead,
+                   Adaptation::Icap::ICAP::methodStr(al->icap.reqMethod),
+@@ -189,8 +189,8 @@ class logformat_token
+         } header;
+         char *timespec;
+     } data;
+-    unsigned char width;
+-    unsigned char precision;
++    unsigned int width;
++    unsigned int precision;
+     enum log_quote quote;
+     unsigned int left:1;
+     unsigned int space:1;
+@@ -1208,10 +1208,10 @@ SquidMainSafe(int argc, char **argv)
+     try {
+         return SquidMain(argc, argv);
+     } catch (const std::exception &e) {
+-        std::cerr << "dying from an unhandled exception: " << e.what() << std::endl;
++        debugs(0,0, "dying from an unhandled exception: " << e.what());
+         throw;
+     } catch (...) {
+-        std::cerr << "dying from an unhandled exception." << std::endl;
++        debugs(0,0, "dying from an unhandled exception.");
+         throw;
+     }
+     return -1; // not reached
+@@ -489,7 +489,8 @@ void
+ memClean(void)
+ {
+     MemPoolGlobalStats stats;
+-    MemPools::GetInstance().setIdleLimit(0);
++    if (Config.MemPools.limit > 0) // do not reset if disabled or same
++        MemPools::GetInstance().setIdleLimit(0);
+     MemPools::GetInstance().clean(0);
+     memPoolGetGlobalStats(&stats);
+ 
+@@ -254,6 +254,16 @@ StoreEntry::delayAwareRead(int fd, char *buf, int len, AsyncCall::Pointer callba
+ 
+     }
+ 
++    if (fd_table[fd].closing()) {
++        // Readers must have closing callbacks if they want to be notified. No
++        // readers appeared to care around 2009/12/14 as they skipped reading
++        // for other reasons. Closing may already be true at the delyaAwareRead
++        // call time or may happen while we wait after delayRead() above.
++        debugs(20, 3, HERE << "wont read from closing FD " << fd << " for " <<
++               callback);
++        return; // the read callback will never be called
++    }
++
+     comm_read(fd, buf, amountToRead, callback);
+ }
+ 

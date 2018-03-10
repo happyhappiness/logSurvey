@@ -1,24 +1,1294 @@
-----++++src/Notes.cc
-@@ -28,14 +28,20 @@
- Note::Value::~Value()
- {
-     aclDestroyAclList(&amp;aclList);
-+    delete valueFormat;
- }
- 
- Note::Value::Value(const char *aVal, const bool quoted, const char *descr, const Method m)
-     : aclList(nullptr), valueFormat(nullptr), theValue(aVal), theMethod(m)
- {
-     if (quoted) {
-         valueFormat = new Format::Format(descr ? descr : &quot;Notes&quot;);
--        valueFormat-&gt;parse(theValue.c_str());
-+        if (!valueFormat-&gt;parse(theValue.c_str())) {
-+            delete valueFormat;
-+            SBuf exceptionMsg;
-+            exceptionMsg.Printf(&quot;failed to parse annotation value %s&quot;, theValue.c_str());
-+            throw TexcHere(exceptionMsg.c_str());
+@@ -0,0 +1,215 @@
++/*
++ * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#include "squid.h"
++#include "base/File.h"
++#include "fs_io.h"
++#include "Instance.h"
++#include "parser/Tokenizer.h"
++#include "sbuf/Stream.h"
++#include "SquidConfig.h"
++#include "tools.h"
++
++#include <cerrno>
++
++/* To support concurrent PID files, convert local statics into PidFile class */
++
++/// Describes the (last) instance PID file being processed.
++/// This hack shortens reporting code while keeping its messages consistent.
++static SBuf TheFile;
++
++/// PidFilename() helper
++/// \returns PID file name or, if PID signaling was disabled, an empty SBuf
++static SBuf
++PidFilenameCalc()
++{
++    if (!Config.pidFilename || strcmp(Config.pidFilename, "none") == 0)
++        return SBuf();
++
++    // If chroot has been requested, then we first read the PID file before
++    // chroot() and then create/update it inside a chrooted environment.
++    // TODO: Consider removing half-baked chroot support from Squid.
++    extern bool Chrooted;
++    if (!Config.chroot_dir || Chrooted) // no need to compensate
++        return SBuf(Config.pidFilename);
++
++    SBuf filename;
++    filename.append(Config.chroot_dir);
++    filename.append("/");
++    filename.append(Config.pidFilename);
++    debugs(50, 3, "outside chroot: " << filename);
++    return filename;
++}
++
++/// \returns PID file description for debugging messages and error reporting
++static SBuf
++PidFileDescription(const SBuf &filename)
++{
++    return ToSBuf("PID file (", filename, ')');
++}
++
++/// Instance entry points are expected to call this first.
++/// \returns PidFilenameCalc() result while updating TheFile context
++static SBuf
++PidFilename()
++{
++    const auto name = PidFilenameCalc();
++    TheFile = PidFileDescription(name);
++    return name;
++}
++
++/// \returns the PID of another Squid instance (or throws)
++static pid_t
++GetOtherPid(File &pidFile)
++{
++    const auto input = pidFile.readSmall(1, 32);
++    int64_t rawPid = -1;
++
++    Parser::Tokenizer tok(input);
++    if (!(tok.int64(rawPid, 10, false) && // PID digits
++            (tok.skipOne(CharacterSet::CR)||true) && // optional CR (Windows/etc.)
++            tok.skipOne(CharacterSet::LF) && // required end of line
++            tok.atEnd())) { // no trailing garbage
++        throw TexcHere(ToSBuf("Malformed ", TheFile));
++    }
++
++    debugs(50, 7, "found PID " << rawPid << " in " << TheFile);
++
++    if (rawPid <= 1)
++        throw TexcHere(ToSBuf("Bad ", TheFile, " contains unreasonably small PID value: ", rawPid));
++    const auto finalPid = static_cast<pid_t>(rawPid);
++    if (static_cast<int64_t>(finalPid) != rawPid)
++        throw TexcHere(ToSBuf("Bad ", TheFile, " contains unreasonably large PID value: ", rawPid));
++
++    return finalPid;
++}
++
++/// determines whether a given process is running at the time of the call
++static bool
++ProcessIsRunning(const pid_t pid)
++{
++    const auto result = kill(pid, 0);
++    const auto savedErrno = errno;
++    if (result != 0)
++        debugs(50, 3, "kill(" << pid << ", 0) failed: " << xstrerr(savedErrno));
++    // if we do not have permissions to signal the process, then it is running
++    return (result == 0 || savedErrno == EPERM);
++}
++
++/// quits if another Squid instance (that owns the given PID file) is running
++static void
++ThrowIfAlreadyRunningWith(File &pidFile)
++{
++    bool running = false;
++    SBuf description;
++    try {
++        const auto pid = GetOtherPid(pidFile);
++        description = ToSBuf(TheFile, " with PID ", pid);
++        running = ProcessIsRunning(pid);
++    }
++    catch (const std::exception &ex) {
++        debugs(50, 5, "assuming no other Squid instance: " << ex.what());
++        return;
++    }
++
++    if (running)
++        throw TexcHere(ToSBuf("Squid is already running: Found fresh instance ", description));
++
++    debugs(50, 5, "assuming stale instance " << description);
++}
++
++pid_t
++Instance::Other()
++{
++    const auto filename = PidFilename();
++    if (filename.isEmpty())
++        throw TexcHere("no pid_filename configured");
++
++    File pidFile(filename, File::Be::ReadOnly().locked());
++    return GetOtherPid(pidFile);
++}
++
++void
++Instance::ThrowIfAlreadyRunning()
++{
++    const auto filename = PidFilename();
++    if (filename.isEmpty())
++        return; // the check is impossible
++
++    if (const auto filePtr = File::Optional(filename, File::Be::ReadOnly().locked())) {
++        const std::unique_ptr<File> pidFile(filePtr);
++        ThrowIfAlreadyRunningWith(*pidFile);
++    } else {
++        // It is best to assume then to check because checking without a lock
++        // might lead to false positives that lead to no Squid starting at all!
++        debugs(50, 5, "cannot lock " << TheFile << "; assuming no other Squid is running");
++        // If our assumption is false, we will fail to _create_ the PID file,
++        // and, hence, will not start, allowing that other Squid to run.
++    }
++}
++
++/// ties Instance::WriteOurPid() scheduler and RemoveInstance(void) handler
++static SBuf ThePidFileToRemove;
++
++/// atexit() handler; removes the PID file created with Instance::WriteOurPid()
++static void
++RemoveInstance()
++{
++    if (ThePidFileToRemove.isEmpty()) // not the PidFilename()!
++        return; // nothing to do
++
++    debugs(50, DBG_IMPORTANT, "Removing " << PidFileDescription(ThePidFileToRemove));
++    const char *filename = ThePidFileToRemove.c_str(); // avoid complex operations inside enter_suid()
++    enter_suid();
++    safeunlink(filename, 0);
++    leave_suid();
++
++    ThePidFileToRemove.clear();
++}
++
++/// creates a PID file; throws on error
++void
++Instance::WriteOurPid()
++{
++    // Instance code assumes that we do not support PID filename reconfiguration
++    static bool called = false;
++    Must(!called);
++    called = true;
++
++    const auto filename = PidFilename();
++    if (filename.isEmpty())
++        return; // nothing to do
++
++    File pidFile(filename, File::Be::ReadWrite().locked().createdIfMissing().openedByRoot());
++
++    // another instance may have started after the caller checked (if it did)
++    ThrowIfAlreadyRunningWith(pidFile);
++
++    /* now we know that we own the PID file created and/or locked above */
++
++    // Cleanup is scheduled through atexit() to ensure both:
++    // - cleanup upon fatal() and similar "unplanned" exits and
++    // - enter_suid() existence and proper logging support during cleanup.
++    // Even without PID filename reconfiguration support, we have to remember
++    // the file name we have used because Config.pidFilename may change!
++    (void)std::atexit(&RemoveInstance); // failures leave the PID file on disk
++    ThePidFileToRemove = filename;
++
++    /* write our PID to the locked file */
++    SBuf pidBuf;
++    pidBuf.Printf("%d\n", static_cast<int>(getpid()));
++    pidFile.truncate();
++    pidFile.writeAll(pidBuf);
++
++    // We must fsync before releasing the lock or other Squid processes may not see
++    // our written PID (and decide that they are dealing with a corrupted PID file).
++    pidFile.synchronize();
++
++    debugs(50, DBG_IMPORTANT, "Created " << TheFile);
++}
++
+@@ -0,0 +1,36 @@
++/*
++ * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_INSTANCE_H
++#define SQUID_INSTANCE_H
++
++#if HAVE_SYS_TYPES_H
++#include <sys/types.h>
++#endif
++
++/// code related to Squid Instance and PID file management
++namespace Instance {
++
++/// Usually throws if another Squid instance is running. False positives are
++/// highly unlikely, but the caller must tolerate false negatives well:
++/// We may not detect another running instance and, hence, may not throw.
++/// Does nothing if PID file maintenance is disabled.
++void ThrowIfAlreadyRunning();
++
++/// Creates or updates the PID file for the current process.
++/// Does nothing if PID file maintenance is disabled.
++void WriteOurPid();
++
++/// \returns another Squid instance PID
++/// Throws if PID file maintenance is disabled.
++pid_t Other();
++
++} // namespace Instance
++
++#endif
++
+@@ -351,6 +351,8 @@ squid_SOURCES = \
+ 	icp_opcode.h \
+ 	icp_v2.cc \
+ 	icp_v3.cc \
++	Instance.h \
++	Instance.cc \
+ 	int.h \
+ 	int.cc \
+ 	internal.h \
+@@ -1156,6 +1158,7 @@ tests_testBoilerplate_SOURCES = \
+ 	tests/testBoilerplate.h \
+ 	tests/stub_debug.cc \
+ 	tests/stub_libmem.cc \
++	tests/stub_SBuf.cc \
+ 	tests/stub_time.cc
+ nodist_tests_testBoilerplate_SOURCES = \
+ 	tests/stub_cbdata.cc \
+@@ -1179,7 +1182,8 @@ nodist_tests_testCharacterSet_SOURCES = \
+ 	tests/stub_cbdata.cc \
+ 	tests/stub_debug.cc \
+ 	tests/stub_libmem.cc \
+-	tests/stub_MemBuf.cc
++	tests/stub_MemBuf.cc \
++	tests/stub_SBuf.cc
+ tests_testCharacterSet_LDFLAGS = $(LIBADD_DL)
+ tests_testCharacterSet_LDADD= \
+ 	base/libbase.la \
+@@ -2624,6 +2628,7 @@ nodist_tests_testIcmp_SOURCES = \
+ 	SquidTime.h \
+ 	tests/stub_debug.cc \
+ 	tests/stub_libmem.cc \
++	tests/stub_SBuf.cc \
+ 	time.cc \
+ 	globals.cc
+ tests_testIcmp_LDFLAGS = $(LIBADD_DL)
+@@ -2642,6 +2647,7 @@ nodist_tests_testNetDb_SOURCES = \
+ 	SquidTime.h \
+ 	tests/stub_debug.cc \
+ 	tests/stub_libmem.cc \
++	tests/stub_SBuf.cc \
+ 	time.cc \
+ 	globals.cc
+ tests_testNetDb_LDFLAGS = $(LIBADD_DL)
+@@ -3600,6 +3606,7 @@ tests_testEnumIterator_SOURCES = \
+ 	base/EnumIterator.h \
+ 	tests/stub_debug.cc \
+ 	tests/stub_libmem.cc \
++	tests/stub_SBuf.cc \
+ 	tests/testEnumIterator.h \
+ 	tests/testEnumIterator.cc
+ nodist_tests_testEnumIterator_SOURCES = \
+@@ -3618,6 +3625,7 @@ nodist_tests_testYesNoNone_SOURCES = \
+ 	tests/STUB.h \
+ 	tests/stub_debug.cc \
+ 	tests/stub_libmem.cc \
++	tests/stub_SBuf.cc \
+ 	base/YesNoNone.h
+ tests_testYesNoNone_LDADD= \
+ 	base/libbase.la \
+@@ -3631,6 +3639,7 @@ tests_testMem_SOURCES = \
+ 	tests/testMem.h
+ nodist_tests_testMem_SOURCES = \
+ 	tests/stub_debug.cc \
++	tests/stub_SBuf.cc \
+ 	tests/stub_time.cc \
+ 	$(TESTSOURCES)
+ tests_testMem_LDADD= \
+@@ -0,0 +1,381 @@
++/*
++ * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#include "squid.h"
++#include "base/File.h"
++#include "Debug.h"
++#include "sbuf/Stream.h"
++#include "tools.h"
++#include "xusleep.h"
++
++#include <utility>
++
++#if HAVE_FCNTL_H
++#include <fcntl.h>
++#endif
++#if HAVE_SYS_FILE_H
++#include <sys/file.h>
++#endif
++#if HAVE_SYS_STAT_H
++#include <sys/stat.h>
++#endif
++#if HAVE_UNISTD_H
++#include <unistd.h>
++#endif
++
++/* FileOpeningConfig */
++
++FileOpeningConfig
++FileOpeningConfig::ReadOnly()
++{
++    FileOpeningConfig cfg;
++
++    /* I/O */
++#if _SQUID_WINDOWS_
++    cfg.desiredAccess = GENERIC_READ;
++    cfg.shareMode = FILE_SHARE_READ;
++#else
++    cfg.openFlags = O_RDONLY;
++#endif
++
++    /* locking (if enabled later) */
++#if _SQUID_WINDOWS_
++    cfg.lockFlags = 0; // no named constant for a shared lock
++#elif _SQUID_SOLARIS_
++    cfg.lockType = F_RDLCK;
++#else
++    cfg.flockMode = LOCK_SH | LOCK_NB;
++#endif
++
++    return cfg;
++}
++
++FileOpeningConfig
++FileOpeningConfig::ReadWrite()
++{
++    FileOpeningConfig cfg;
++
++    /* I/O */
++#if _SQUID_WINDOWS_
++    cfg.desiredAccess = GENERIC_READ | GENERIC_WRITE;
++    cfg.shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE;
++#else
++    cfg.openFlags = O_RDWR;
++#endif
++
++    /* locking (if enabled later) */
++#if _SQUID_WINDOWS_
++    cfg.lockFlags = LOCKFILE_EXCLUSIVE_LOCK;
++#elif _SQUID_SOLARIS_
++    cfg.lockType = F_WRLCK;
++#else
++    cfg.flockMode = LOCK_EX | LOCK_NB;
++#endif
++
++    return cfg;
++}
++
++FileOpeningConfig &
++FileOpeningConfig::locked(unsigned int attempts)
++{
++    lockAttempts = attempts;
++    // for simplicity, correct locking flags are preset in constructing methods
++    return *this;
++}
++
++FileOpeningConfig &
++FileOpeningConfig::createdIfMissing()
++{
++#if _SQUID_WINDOWS_
++    Must((desiredAccess & GENERIC_WRITE) == GENERIC_WRITE);
++    creationDisposition = OPEN_ALWAYS;
++#else
++    Must((openFlags & O_RDWR) == O_RDWR);
++    openFlags |= O_CREAT;
++    creationMask = (S_IXUSR | S_IXGRP|S_IWGRP | S_IXOTH|S_IWOTH); // unwanted bits
++#endif
++    return *this;
++}
++
++/* File */
++
++#if _SQUID_SOLARIS_
++// XXX: fcntl() locks are incompatible with complex applications that may lock
++// multiple open descriptors corresponding to the same underlying file. There is
++// nothing better on Solaris, but do not be tempted to use this elsewhere. For
++// more info, see http://bugs.squid-cache.org/show_bug.cgi?id=4212#c14
++/// fcntl(... struct flock) convenience wrapper
++int
++fcntlLock(const int fd, const short lockType)
++{
++    // the exact composition and order of flock data members is unknown!
++    struct flock fl;
++    memset(&fl, 0, sizeof(fl));
++    fl.l_type = lockType;
++    fl.l_whence = SEEK_SET; // with zero l_len and l_start, means "whole file"
++    return ::fcntl(fd, F_SETLK, &fl);
++}
++#endif // _SQUID_SOLARIS_
++
++File *
++File::Optional(const SBuf &filename, const FileOpeningConfig &cfg)
++{
++    try {
++        return new File(filename, cfg);
++    }
++    catch (const std::exception &ex) {
++        debugs(54, 5, "will not lock: " << ex.what());
++    }
++    return nullptr;
++}
++
++File::File(const SBuf &aName, const FileOpeningConfig &cfg):
++    name_(aName)
++{
++    debugs(54, 7, "constructing, this=" << this << ' ' << name_);
++    // close the file during post-open constructor exceptions
++    try {
++        open(cfg);
++        lock(cfg);
++    }
++    catch (...)
++    {
++        close();
++        throw;
++    }
++}
++
++File::~File()
++{
++    debugs(54, 7, "destructing, this=" << this << ' ' << name_);
++    close();
++}
++
++File::File(File &&other)
++{
++    *this = std::move(other);
++}
++
++File &
++File::operator = (File &&other)
++{
++    std::swap(fd_, other.fd_);
++    return *this;
++}
++
++/// opens (or creates) the file
++void
++File::open(const FileOpeningConfig &cfg)
++{
++#if _SQUID_WINDOWS_
++    fd_ = CreateFile(TEXT(name_.c_str()), desiredAccess, shareMode, nullptr, creationDisposition, FILE_ATTRIBUTE_NORMAL, nullptr);
++    if (fd_ == InvalidHandle) {
++        const auto savedError = GetLastError();
++        throw TexcHere(sysCallFailure("CreateFile", WindowsErrorMessage(savedError).c_str()));
++    }
++#else
++    mode_t oldCreationMask = 0;
++    const auto filename = name_.c_str(); // avoid complex operations inside enter_suid()
++    enter_suid();
++    if (cfg.creationMask)
++        oldCreationMask = umask(cfg.creationMask); // XXX: Why here? Should not this be set for the whole Squid?
++    fd_ = ::open(filename, cfg.openFlags, cfg.openMode);
++    const auto savedErrno = errno;
++    if (cfg.creationMask)
++        umask(oldCreationMask);
++    leave_suid();
++    if (fd_ < 0)
++        throw TexcHere(sysCallError("open", savedErrno));
++#endif
++}
++
++void
++File::close()
++{
++    if (!isOpen())
++        return;
++#if _SQUID_WINDOWS_
++    if (!CloseHandle(fd_)) {
++        const auto savedError = GetLastError();
++        debugs(54, DBG_IMPORTANT, sysCallFailure("CloseHandle", WindowsErrorMessage(savedError)));
++    }
++#else
++    if (::close(fd_) != 0) {
++        const auto savedErrno = errno;
++        debugs(54, DBG_IMPORTANT, sysCallError("close", savedErrno));
++    }
++#endif
++    // closing the file handler implicitly removes all associated locks
++}
++
++void
++File::truncate()
++{
++#if _SQUID_WINDOWS_
++    if (!SetFilePointer(fd_, 0, nullptr, FILE_BEGIN)) {
++        const auto savedError = GetLastError();
++        throw TexcHere(sysCallFailure("SetFilePointer", WindowsErrorMessage(savedError).c_str()));
++    }
++
++    if (!SetEndOfFile(fd_)) {
++        const auto savedError = GetLastError();
++        throw TexcHere(sysCallFailure("SetEndOfFile", WindowsErrorMessage(savedError).c_str()));
++    }
++#else
++    if (::lseek(fd_, SEEK_SET, 0) < 0) {
++        const auto savedErrno = errno;
++        throw TexcHere(sysCallError("lseek", savedErrno));
++    }
++
++    if (::ftruncate(fd_, 0) != 0) {
++        const auto savedErrno = errno;
++        throw TexcHere(sysCallError("ftruncate", savedErrno));
++    }
++#endif
++}
++
++SBuf
++File::readSmall(const SBuf::size_type minBytes, const SBuf::size_type maxBytes)
++{
++    SBuf buf;
++    const auto readLimit = maxBytes + 1; // to detect excessively large files that we do not handle
++#if _SQUID_WINDOWS_
++    DWORD result = 0;
++    if (!ReadFile(fd_, buf.rawSpace(readLimit), readLimit, &result, nullptr)) {
++        const auto savedError = GetLastError();
++        throw TexcHere(sysCallFailure("ReadFile", WindowsErrorMessage(savedError).c_str()));
++    }
++#else
++    const auto result = ::read(fd_, buf.rawSpace(readLimit), readLimit);
++    if (result < 0) {
++        const auto savedErrno = errno;
++        throw TexcHere(sysCallError("read", savedErrno));
++    }
++#endif
++    const auto bytesRead = static_cast<size_t>(result);
++    assert(bytesRead <= readLimit);
++    Must(!buf.length());
++    buf.forceSize(bytesRead);
++
++    if (buf.length() < minBytes) {
++        const auto failure = buf.length() ? "premature eof" : "empty file";
++        throw TexcHere(sysCallFailure("read", failure));
++    }
++
++    if (buf.length() > maxBytes) {
++        const auto failure = "unreasonably large file";
++        throw TexcHere(sysCallFailure("read", failure));
++    }
++
++    Must(minBytes <= buf.length() && buf.length() <= maxBytes);
++    return buf;
++}
++
++void
++File::writeAll(const SBuf &data)
++{
++#if _SQUID_WINDOWS_
++    DWORD bytesWritten = 0;
++    if (!WriteFile(fd_, data.rawContent(), data.length(), &bytesWritten, nullptr)) {
++        const auto savedError = GetLastError();
++        throw TexcHere(sysCallFailure("WriteFile", WindowsErrorMessage(savedError).c_str()));
++    }
++#else
++    const auto bytesWritten = ::write(fd_, data.rawContent(), data.length());
++    if (bytesWritten < 0) {
++        const auto savedErrno = errno;
++        throw TexcHere(sysCallError("write", savedErrno));
++    }
++#endif
++    if (static_cast<size_t>(bytesWritten) != data.length())
++        throw TexcHere(sysCallFailure("write", "partial write"));
++}
++
++void
++File::synchronize()
++{
++#if _SQUID_WINDOWS_
++    if (!FlushFileBuffers(fd_)) {
++        const auto savedError = GetLastError();
++        throw TexcHere(sysCallFailure("FlushFileBuffers", WindowsErrorMessage(savedError).c_str()));
++#else
++    if (::fsync(fd_) != 0) {
++        const auto savedErrno = errno;
++        throw TexcHere(sysCallError("fsync", savedErrno));
++    }
++#endif
++}
++
++/// calls lockOnce() as many times as necessary (including zero)
++void
++File::lock(const FileOpeningConfig &cfg)
++{
++    unsigned int attemptsLeft = cfg.lockAttempts;
++    while (attemptsLeft) {
++        try {
++            --attemptsLeft;
++            return lockOnce(cfg);
++        } catch (const std::exception &ex) {
++            if (!attemptsLeft)
++                throw;
++            debugs(54, 4, "sleeping and then trying up to " << attemptsLeft <<
++                   " more time(s) after a failure: " << ex.what());
 +        }
++        Must(attemptsLeft); // the catch statement handles the last attempt
++        xusleep(cfg.RetryGapUsec);
++    }
++    debugs(54, 9, "disabled");
++}
++
++/// locks, blocking or returning immediately depending on the lock waiting mode
++void
++File::lockOnce(const FileOpeningConfig &cfg)
++{
++#if _SQUID_WINDOWS_
++    if (!LockFileEx(fd_, cfg.lockFlags, 0, 0, 1, 0)) {
++        const auto savedError = GetLastError();
++        throw TexcHere(sysCallFailure("LockFileEx", WindowsErrorMessage(savedError).c_str()));
++    }
++#elif _SQUID_SOLARIS_
++    if (fcntlLock(fd_, cfg.lockType) != 0) {
++        const auto savedErrno = errno;
++        throw TexcHere(sysCallError("fcntl(flock)", savedErrno));
++    }
++#else
++    if (::flock(fd_, cfg.flockMode) != 0) {
++        const auto savedErrno = errno;
++        throw TexcHere(sysCallError("flock", savedErrno));
++    }
++#endif
++    debugs(54, 3, "succeeded for " << name_);
++}
++
++bool
++File::isOpen() const
++{
++#if _SQUID_WINDOWS_
++    return fd_ != InvalidHandle;
++#else
++    return fd_ >= 0;
++#endif
++}
++
++/// \returns a description a system call-related failure
++SBuf
++File::sysCallFailure(const char *callName, const char *error) const
++{
++    return ToSBuf("failed to ", callName, ' ', name_, ": ", error);
++}
++
++/// \returns a description of an errno-based system call failure
++SBuf
++File::sysCallError(const char *callName, const int savedErrno) const
++{
++    return sysCallFailure(callName, xstrerr(savedErrno));
++}
++
+@@ -0,0 +1,117 @@
++/*
++ * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_BASE_FILE_H
++#define SQUID_BASE_FILE_H
++
++#include "sbuf/SBuf.h"
++
++/// How should a file be opened/created? Should it be locked?
++class FileOpeningConfig
++{
++public:
++    static FileOpeningConfig ReadOnly(); // shared reading
++    static FileOpeningConfig ReadWrite(); // exclusive creation and/or reading/writing
++
++    /* adjustment methods; named to work well with the File::Be::X shorthand */
++
++    /// protect concurrent accesses by attempting to obtain an appropriate lock
++    FileOpeningConfig &locked(unsigned int attempts = 5);
++
++    /// when opening a file for writing, create it if it does not exist
++    FileOpeningConfig &createdIfMissing();
++
++    /// enter_suid() to open the file; leaves suid ASAP after that
++    FileOpeningConfig &openedByRoot() { openByRoot = true; return *this; }
++
++    /* add more mode adjustment methods as needed */
++
++private:
++    friend class File;
++
++    /* file opening parameters */
++#if _SQUID_WINDOWS_
++    DWORD desiredAccess = 0; ///< 2nd CreateFile() parameter
++    DWORD shareMode = 0; ///< 3rd CreateFile() parameter
++    DWORD creationDisposition = OPEN_EXISTING; ///< 5th CreateFile() parameter
++#else
++    mode_t creationMask = 0; ///< umask() parameter; the default is S_IWGRP|S_IWOTH
++    int openFlags = 0; ///< opening flags; 2nd open(2) parameter
++    mode_t openMode = 0644; ///< access mode; 3rd open(2) parameter
++#endif
++
++    /* file locking (disabled unless lock(n) sets positive lockAttempts) */
++#if _SQUID_WINDOWS_
++    DWORD lockFlags = 0; ///< 2nd LockFileEx() parameter
++#elif _SQUID_SOLARIS_
++    int lockType = F_UNLCK; ///< flock::type member for fcntl(F_SETLK)
++#else
++    int flockMode = LOCK_UN; ///< 2nd flock(2) parameter
++#endif
++    static const unsigned int RetryGapUsec = 500000; /// pause before each lock retry
++    unsigned int lockAttempts = 0; ///< how many times to try locking
++    bool openByRoot = false;
++};
++
++/// a portable locking-aware exception-friendly file (with RAII API)
++class File
++{
++public:
++    typedef FileOpeningConfig Be; ///< convenient shorthand for File() callers
++
++    /// \returns nil if File() throws or a new File object (otherwise)
++    static File *Optional(const SBuf &aName, const FileOpeningConfig &cfg);
++
++    File(const SBuf &aFilename, const FileOpeningConfig &cfg); ///< opens
++    ~File(); ///< closes
++
++    /* can move but cannot copy */
++    File(const File &) = delete;
++    File &operator = (const File &) = delete;
++    File(File &&other);
++    File &operator = (File &&other);
++
++    const SBuf &name() const { return name_; }
++
++    /* system call wrappers */
++
++    /// makes the file size (and the current I/O offset) zero
++    void truncate();
++    SBuf readSmall(SBuf::size_type minBytes, SBuf::size_type maxBytes); ///< read(2) for small files
++    void writeAll(const SBuf &data); ///< write(2) with a "wrote everything" check
++    void synchronize(); ///< fsync(2)
++
++protected:
++    bool isOpen() const;
++
++    void open(const FileOpeningConfig &cfg);
++    void lock(const FileOpeningConfig &cfg);
++    void lockOnce(const FileOpeningConfig &cfg);
++    void close();
++
++    /// \returns a description a system call-related failure
++    SBuf sysCallFailure(const char *callName, const char *error) const;
++    /// \returns a description of an errno-based system call failure
++    SBuf sysCallError(const char *callName, const int savedErrno) const;
++
++private:
++    SBuf name_; ///< location on disk
++
++    // Windows-specific HANDLE is needed because LockFileEx() does not take POSIX FDs.
++#if _SQUID_WINDOWS_
++    typedef HANDLE Handle;
++    static const Handle InvalidHandle = INVALID_HANDLE_VALUE;
++#else
++    typedef int Handle;
++    static const Handle InvalidHandle = -1;
++#endif
++    Handle fd_ = InvalidHandle; ///< OS-specific file handle
++};
++
++#endif
++
+@@ -25,6 +25,8 @@ libbase_la_SOURCES = \
+ 	CharacterSet.h \
+ 	CharacterSet.cc \
+ 	EnumIterator.h \
++	File.h \
++	File.cc \
+ 	HardFun.h \
+ 	InstanceId.h \
+ 	Lock.h \
+@@ -9,6 +9,7 @@
+ #include "squid.h"
+ #include "base/TextException.h"
+ #include "Debug.h"
++#include "sbuf/SBuf.h"
+ #include "util.h"
+ 
+ TextException::TextException()
+@@ -28,6 +29,10 @@ TextException::TextException(const char *aMsg, const char *aFileName, int aLineN
+     message(aMsg?xstrdup(aMsg):NULL), theFileName(aFileName), theLineNo(aLineNo), theId(anId)
+ {}
+ 
++TextException::TextException(SBuf msg, const char *aFileName, int aLineNo, unsigned int anId):
++    TextException(msg.c_str(), aFileName, aLineNo, anId)
++{}
++
+ TextException::~TextException() throw()
+ {
+     if (message) xfree(message);
+@@ -13,6 +13,8 @@
+ 
+ #include <exception>
+ 
++class SBuf;
++
+ static unsigned int FileNameHashCached(const char *fname);
+ 
+ // simple exception to report custom errors
+@@ -24,6 +26,7 @@ class TextException: public std::exception
+ public:
+     TextException();
+     TextException(const char *aMessage, const char *aFileName = 0, int aLineNo = -1, unsigned int anId =0);
++    TextException(SBuf aMessage, const char *aFileName = 0, int aLineNo = -1, unsigned int anId =0);
+     TextException(const TextException& right);
+     virtual ~TextException() throw();
+ 
+@@ -48,6 +48,7 @@
+ #include "icmp/net_db.h"
+ #include "ICP.h"
+ #include "ident/Ident.h"
++#include "Instance.h"
+ #include "ip/tools.h"
+ #include "ipc/Coordinator.h"
+ #include "ipc/Kids.h"
+@@ -63,6 +64,7 @@
+ #include "profiler/Profiler.h"
+ #include "redirect.h"
+ #include "refresh.h"
++#include "sbuf/Stream.h"
+ #include "SBufStatsAction.h"
+ #include "send-announce.h"
+ #include "SquidConfig.h"
+@@ -170,7 +172,6 @@ static void watch_child(char **);
+ static void setEffectiveUser(void);
+ static void SquidShutdown(void);
+ static void mainSetCwd(void);
+-static int checkRunningPid(void);
+ 
+ #if !_SQUID_WINDOWS_
+ static const char *squid_start_script = "squid_start";
+@@ -1002,9 +1003,6 @@ mainReconfigureFinish(void *)
+             eventDelete(start_announce, NULL);
      }
+ 
+-    if (!InDaemonMode())
+-        writePidFile(); /* write PID file */
+-
+     reconfiguring = 0;
  }
  
-----++++GitHub
+@@ -1068,13 +1066,16 @@ mainChangeDir(const char *dir)
+     return false;
+ }
+ 
++/// Hack: Have we called chroot()? This exposure is needed because some code has
++/// to open the same files before and after chroot()
++bool Chrooted = false;
++
+ /// set the working directory.
+ static void
+ mainSetCwd(void)
+ {
+-    static bool chrooted = false;
+-    if (Config.chroot_dir && !chrooted) {
+-        chrooted = true;
++    if (Config.chroot_dir && !Chrooted) {
++        Chrooted = true;
+ 
+         if (chroot(Config.chroot_dir) != 0) {
+             int xerrno = errno;
+@@ -1256,8 +1257,8 @@ mainInitialize(void)
+     if (Config.chroot_dir)
+         no_suid();
+ 
+-    if (!configured_once && !InDaemonMode())
+-        writePidFile();     /* write PID file */
++    if (!InDaemonMode() && IamMasterProcess())
++        Instance::WriteOurPid();
+ 
+ #if defined(_SQUID_LINUX_THREADS_)
+ 
+@@ -1372,14 +1373,11 @@ SquidMainSafe(int argc, char **argv)
+     try {
+         return SquidMain(argc, argv);
+     } catch (const std::exception &e) {
+-        debugs(1, DBG_CRITICAL, "FATAL: dying from an unhandled exception: " <<
+-               e.what());
+-        throw;
++        debugs(1, DBG_CRITICAL, "FATAL: " << e.what());
+     } catch (...) {
+         debugs(1, DBG_CRITICAL, "FATAL: dying from an unhandled exception.");
+-        throw;
+     }
+-    return -1; // not reached
++    return -1; // TODO: return EXIT_FAILURE instead
+ }
+ 
+ /// computes name and ID for the current kid process
+@@ -1535,9 +1533,12 @@ SquidMain(int argc, char **argv)
+             return parse_err;
+     }
+     setUmask(Config.umask);
+-    if (-1 == opt_send_signal)
+-        if (checkRunningPid())
+-            exit(0);
++
++    // Master optimization: Where possible, avoid pointless daemon fork() and/or
++    // pointless wait for the exclusive PID file lock. This optional/weak check
++    // is not applicable to kids because they always co-exist with their master.
++    if (opt_send_signal == -1 && IamMasterProcess())
++        Instance::ThrowIfAlreadyRunning();
+ 
+ #if TEST_ACCESS
+ 
+@@ -1562,7 +1563,7 @@ SquidMain(int argc, char **argv)
+         }
+ 
+         sendSignal();
+-        /* NOTREACHED */
++        return 0;
+     }
+ 
+     debugs(1,2, HERE << "Doing post-config initialization\n");
+@@ -1666,50 +1667,24 @@ SquidMain(int argc, char **argv)
+ static void
+ sendSignal(void)
+ {
+-    pid_t pid;
+     debug_log = stderr;
+ 
+-    if (strcmp(Config.pidFilename, "none") == 0) {
+-        debugs(0, DBG_IMPORTANT, "No pid_filename specified. Trusting you know what you are doing.");
+-    }
+-
+-    pid = readPidFile();
+-
+-    if (pid > 1) {
+ #if USE_WIN32_SERVICE
+-        if (opt_signal_service) {
+-            WIN32_sendSignal(opt_send_signal);
+-            exit(0);
+-        } else {
+-            fprintf(stderr, "%s: ERROR: Could not send ", APP_SHORTNAME);
+-            fprintf(stderr, "signal to Squid Service:\n");
+-            fprintf(stderr, "missing -n command line switch.\n");
+-            exit(1);
+-        }
+-        /* NOTREACHED */
+-#endif
+-
+-        if (kill(pid, opt_send_signal) &&
+-                /* ignore permissions if just running check */
+-                !(opt_send_signal == 0 && errno == EPERM)) {
+-            int xerrno = errno;
+-            fprintf(stderr, "%s: ERROR: Could not send ", APP_SHORTNAME);
+-            fprintf(stderr, "signal %d to process %d: %s\n",
+-                    opt_send_signal, (int) pid, xstrerr(xerrno));
+-            exit(1);
+-        }
+-    } else {
+-        if (opt_send_signal != SIGTERM) {
+-            fprintf(stderr, "%s: ERROR: No running copy\n", APP_SHORTNAME);
+-            exit(1);
+-        } else {
+-            fprintf(stderr, "%s: No running copy\n", APP_SHORTNAME);
+-            exit(0);
+-        }
++    (void)Instance::Other();
++    if (!opt_signal_service)
++        throw TexcHere("missing -n command line switch");
++    WIN32_sendSignal(opt_send_signal);
++#else
++    const auto pid = Instance::Other();
++    if (kill(pid, opt_send_signal) &&
++            /* ignore permissions if just running check */
++            !(opt_send_signal == 0 && errno == EPERM)) {
++        const auto savedErrno = errno;
++        throw TexcHere(ToSBuf("failed to send signal ", opt_send_signal,
++                              " to Squid instance with PID ", pid, ": ", xstrerr(savedErrno)));
+     }
+-
++#endif
+     /* signal successfully sent */
+-    exit(0);
+ }
+ 
+ #if !_SQUID_WINDOWS_
+@@ -1750,31 +1725,6 @@ mainStartScript(const char *prog)
+ 
+ #endif /* _SQUID_WINDOWS_ */
+ 
+-static int
+-checkRunningPid(void)
+-{
+-    // master process must start alone, but its kids processes may co-exist
+-    if (!IamMasterProcess())
+-        return 0;
+-
+-    pid_t pid;
+-
+-    if (!debug_log)
+-        debug_log = stderr;
+-
+-    pid = readPidFile();
+-
+-    if (pid < 2)
+-        return 0;
+-
+-    if (kill(pid, 0) < 0)
+-        return 0;
+-
+-    debugs(0, DBG_CRITICAL, "Squid is already running!  Process ID " <<  pid);
+-
+-    return 1;
+-}
+-
+ #if !_SQUID_WINDOWS_
+ static void
+ masterCheckAndBroadcastSignals()
+@@ -1865,8 +1815,8 @@ watch_child(char *argv[])
+         dup2(nullfd, 2);
+     }
+ 
+-    writePidFile();
+-    enter_suid(); // writePidFile() uses leave_suid()
++    Instance::WriteOurPid();
++    enter_suid(); // writing the PID file usually involves leave_suid()
+ 
+ #if defined(_SQUID_LINUX_THREADS_)
+     squid_signal(SIGQUIT, rotate_logs, 0);
+@@ -1972,8 +1922,6 @@ watch_child(char *argv[])
+             RunRegisteredHere(RegisteredRunner::finishShutdown);
+             enter_suid();
+ 
+-            removePidFile();
+-            enter_suid(); // removePidFile() uses leave_suid()
+             if (TheKids.someSignaled(SIGINT) || TheKids.someSignaled(SIGTERM)) {
+                 syslog(LOG_ALERT, "Exiting due to unexpected forced shutdown");
+                 exit(1);
+@@ -2093,10 +2041,6 @@ SquidShutdown()
+ 
+     memClean();
+ 
+-    if (!InDaemonMode()) {
+-        removePidFile();
+-    }
+-
+     debugs(1, DBG_IMPORTANT, "Squid Cache (Version " << version_string << "): Exiting normally.");
+ 
+     /*
+@@ -118,5 +118,17 @@ class SBufStream : public std::ostream
+     SBufStreamBuf theBuffer;
+ };
+ 
++/// slowly stream-prints all arguments into a freshly allocated SBuf
++template <typename... Args>
++inline
++SBuf ToSBuf(Args&&... args)
++{
++    // TODO: Make this code readable after requiring C++17.
++    SBufStream out;
++    using expander = int[];
++    (void)expander{0, (void(out << std::forward<Args>(args)),0)...};
++    return out.buf();
++}
++
+ #endif /* SQUID_SBUFSTREAM_H */
+ 
+@@ -61,9 +61,6 @@ int NumberOfKids() STUB_RETVAL(0)
+ 
+ //not actually needed in the Stub, causes dependency on SBuf
+ //SBuf ProcessRoles() STUB_RETVAL(SBuf())
+-void writePidFile(void) STUB
+-void removePidFile(void) STUB
+-pid_t readPidFile(void) STUB_RETVAL(0)
+ void setMaxFD(void) STUB
+ void setSystemLimits(void) STUB
+ void squid_signal(int sig, SIGHDLR * func, int flags) STUB
+@@ -77,3 +74,7 @@ void keepCapabilities(void) STUB
+ void restoreCapabilities(bool keep) STUB
+ pid_t WaitForOnePid(pid_t pid, PidStatus &status, int flags) STUB_RETVAL(0)
+ 
++#if _SQUID_WINDOWS_
++SBuf WindowsErrorMessage(DWORD) STUB_RETVAL(SBuf())
++#endif // _SQUID_WINDOWS_
++
+@@ -25,6 +25,7 @@
+ #include "ipc/Kids.h"
+ #include "ipcache.h"
+ #include "MemBuf.h"
++#include "sbuf/Stream.h"
+ #include "SquidConfig.h"
+ #include "SquidMath.h"
+ #include "SquidTime.h"
+@@ -710,97 +711,6 @@ ProcessRoles()
+     return roles;
+ }
+ 
+-void
+-writePidFile(void)
+-{
+-    int fd;
+-    const char *f = NULL;
+-    mode_t old_umask;
+-    char buf[32];
+-
+-    debugs(50, DBG_IMPORTANT, "creating PID file: " << Config.pidFilename);
+-
+-    if ((f = Config.pidFilename) == NULL)
+-        return;
+-
+-    if (!strcmp(Config.pidFilename, "none"))
+-        return;
+-
+-    enter_suid();
+-
+-    old_umask = umask(022);
+-
+-    fd = open(f, O_WRONLY | O_CREAT | O_TRUNC | O_TEXT, 0644);
+-    int xerrno = errno;
+-
+-    umask(old_umask);
+-
+-    leave_suid();
+-
+-    if (fd < 0) {
+-        debugs(50, DBG_CRITICAL, "" << f << ": " << xstrerr(xerrno));
+-        debug_trap("Could not open PID file for write");
+-        return;
+-    }
+-
+-    snprintf(buf, 32, "%d\n", (int) getpid());
+-    const size_t ws = write(fd, buf, strlen(buf));
+-    assert(ws == strlen(buf));
+-    close(fd);
+-}
+-
+-void
+-removePidFile()
+-{
+-    if (Config.pidFilename && strcmp(Config.pidFilename, "none") != 0) {
+-        debugs(50, DBG_IMPORTANT, "removing PID file: " << Config.pidFilename);
+-        enter_suid();
+-        safeunlink(Config.pidFilename, 0);
+-        leave_suid();
+-    }
+-}
+-
+-pid_t
+-readPidFile(void)
+-{
+-    FILE *pid_fp = NULL;
+-    const char *f = Config.pidFilename;
+-    char *chroot_f = NULL;
+-    pid_t pid = -1;
+-    int i;
+-
+-    if (f == NULL || !strcmp(Config.pidFilename, "none")) {
+-        fprintf(stderr, APP_SHORTNAME ": ERROR: No PID file name defined\n");
+-        exit(1);
+-    }
+-
+-    if (Config.chroot_dir && geteuid() == 0) {
+-        int len = strlen(Config.chroot_dir) + 1 + strlen(f) + 1;
+-        chroot_f = (char *)xmalloc(strlen(Config.chroot_dir) + 1 + strlen(f) + 1);
+-        snprintf(chroot_f, len, "%s/%s", Config.chroot_dir, f);
+-        f = chroot_f;
+-    }
+-
+-    if ((pid_fp = fopen(f, "r"))) {
+-        pid = 0;
+-
+-        if (fscanf(pid_fp, "%d", &i) == 1)
+-            pid = (pid_t) i;
+-
+-        fclose(pid_fp);
+-    } else {
+-        int xerrno = errno;
+-        if (xerrno != ENOENT) {
+-            fprintf(stderr, APP_SHORTNAME ": ERROR: Could not open PID file for read\n");
+-            fprintf(stderr, "\t%s: %s\n", f, xstrerr(xerrno));
+-            exit(1);
+-        }
+-    }
+-
+-    safe_free(chroot_f);
+-    return pid;
+-}
+-
+ /* A little piece of glue for odd systems */
+ #ifndef RLIMIT_NOFILE
+ #ifdef RLIMIT_OFILE
+@@ -1234,3 +1144,28 @@ WaitForOnePid(pid_t pid, PidStatus &status, int flags)
+ #endif
+ }
+ 
++#if _SQUID_WINDOWS_
++SBuf
++WindowsErrorMessage(DWORD errorId)
++{
++    char *rawMessage = nullptr;
++    const auto length = FormatMessage(
++                            FORMAT_MESSAGE_ALLOCATE_BUFFER |
++                            FORMAT_MESSAGE_FROM_SYSTEM |
++                            FORMAT_MESSAGE_IGNORE_INSERTS,
++                            nullptr,
++                            errorId,
++                            MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), // Default language
++                            static_cast<LPTSTR>(&rawMessage),
++                            0,
++                            nullptr);
++    if (!length) {
++        Must(!rawMessage); // nothing to LocalFree()
++        return ToSBuf("windows error ", errorId);
++    }
++    const auto result = SBuf(rawMessage, length);
++    LocalFree(rawMessage);
++    return result;
++}
++#endif // _SQUID_WINDOWS_
++
+@@ -48,12 +48,9 @@ void sig_shutdown(int sig); ///< handles shutdown notifications from kids
+ void leave_suid(void);
+ void enter_suid(void);
+ void no_suid(void);
+-void writePidFile(void);
+-void removePidFile();
+ void setMaxFD(void);
+ void setSystemLimits(void);
+ void squid_signal(int sig, SIGHDLR *, int flags);
+-pid_t readPidFile(void);
+ void keepCapabilities(void);
+ void BroadcastSignalIfAny(int& sig);
+ 
+@@ -116,5 +113,10 @@ inline pid_t WaitForAnyPid(PidStatus &status, int flags)
+     return WaitForOnePid(-1, status, flags);
+ }
+ 
++#if _SQUID_WINDOWS_
++/// xstrerror(errno) equivalent for Windows errors returned by GetLastError()
++SBuf WindowsErrorMessage(DWORD errorId);
++#endif // _SQUID_WINDOWS_
++
+ #endif /* SQUID_TOOLS_H_ */
+ 

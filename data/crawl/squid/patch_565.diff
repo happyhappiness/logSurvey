@@ -1,0 +1,670 @@
+@@ -34,10 +34,14 @@
+ 
+ #include "squid-old.h"
+ #include "acl/FilledChecklist.h"
++#include "acl/Gadgets.h"
+ #include "compat/strtoll.h"
+ #include "HttpHdrContRange.h"
+ #include "HttpHeader.h"
++#include "HttpHeaderTools.h"
++#include "HttpRequest.h"
+ #include "MemBuf.h"
++#include "Store.h"
+ 
+ static void httpHeaderPutStrvf(HttpHeader * hdr, http_hdr_type id, const char *fmt, va_list vargs);
+ 
+@@ -414,18 +418,24 @@ httpHdrMangle(HttpHeaderEntry * e, HttpRequest * request, int req_or_rep)
+     int retval;
+ 
+     /* check with anonymizer tables */
+-    header_mangler *hm;
++    HeaderManglers *hms = NULL;
+     assert(e);
+ 
+     if (ROR_REQUEST == req_or_rep) {
+-        hm = &Config.request_header_access[e->id];
++        hms = Config.request_header_access;
+     } else if (ROR_REPLY == req_or_rep) {
+-        hm = &Config.reply_header_access[e->id];
++        hms = Config.reply_header_access;
+     } else {
+         /* error. But let's call it "request". */
+-        hm = &Config.request_header_access[e->id];
++        hms = Config.request_header_access;
+     }
+ 
++    /* manglers are not configured for this message kind */
++    if (!hms)
++        return 1;
++
++    const header_mangler *hm = hms->find(*e);
++
+     /* mangler or checklist went away. default allow */
+     if (!hm || !hm->access_list) {
+         return 1;
+@@ -467,17 +477,143 @@ httpHdrMangleList(HttpHeader * l, HttpRequest * request, int req_or_rep)
+         l->refreshMask();
+ }
+ 
+-/**
+- * return 1 if manglers are configured.  Used to set a flag
+- * for optimization during request forwarding.
+- */
+-int
+-httpReqHdrManglersConfigured()
++static
++void header_mangler_clean(header_mangler &m)
++{
++    aclDestroyAccessList(&m.access_list);
++    safe_free(m.replacement);
++}
++
++static
++void header_mangler_dump_access(StoreEntry * entry, const char *option,
++    const header_mangler &m, const char *name)
++{
++    if (m.access_list != NULL) {
++        storeAppendPrintf(entry, "%s ", option);
++        dump_acl_access(entry, name, m.access_list);
++    }
++}
++
++static
++void header_mangler_dump_replacement(StoreEntry * entry, const char *option,
++    const header_mangler &m, const char *name)
++{
++    if (m.replacement)
++        storeAppendPrintf(entry, "%s %s %s\n", option, name, m.replacement);
++}
++
++HeaderManglers::HeaderManglers()
++{
++    memset(known, 0, sizeof(known));
++    memset(&all, 0, sizeof(all));
++}
++
++HeaderManglers::~HeaderManglers()
++{
++    for (int i = 0; i < HDR_ENUM_END; i++)
++        header_mangler_clean(known[i]);
++
++    typedef ManglersByName::iterator MBNI;
++    for (MBNI i = custom.begin(); i != custom.end(); ++i)
++        header_mangler_clean(i->second);
++
++    header_mangler_clean(all);
++}
++
++void
++HeaderManglers::dumpAccess(StoreEntry * entry, const char *name) const
+ {
+     for (int i = 0; i < HDR_ENUM_END; i++) {
+-        if (NULL != Config.request_header_access[i].access_list)
+-            return 1;
++        header_mangler_dump_access(entry, name, known[i],
++                                   httpHeaderNameById(i));
+     }
+ 
+-    return 0;
++    typedef ManglersByName::const_iterator MBNCI;
++    for (MBNCI i = custom.begin(); i != custom.end(); ++i)
++        header_mangler_dump_access(entry, name, i->second, i->first.c_str());
++
++    header_mangler_dump_access(entry, name, all, "All");
+ }
++
++void
++HeaderManglers::dumpReplacement(StoreEntry * entry, const char *name) const
++{
++    for (int i = 0; i < HDR_ENUM_END; i++) {
++        header_mangler_dump_replacement(entry, name, known[i],
++                                        httpHeaderNameById(i));
++    }
++
++    typedef ManglersByName::const_iterator MBNCI;
++    for (MBNCI i = custom.begin(); i != custom.end(); ++i) {
++        header_mangler_dump_replacement(entry, name, i->second,
++                                        i->first.c_str());
++    }
++
++    header_mangler_dump_replacement(entry, name, all, "All");
++}
++
++header_mangler *
++HeaderManglers::track(const char *name)
++{
++    int id = httpHeaderIdByNameDef(name, strlen(name));
++
++    if (id == HDR_BAD_HDR) { // special keyword or a custom header
++        if (strcmp(name, "All") == 0)
++            id = HDR_ENUM_END;
++        else if (strcmp(name, "Other") == 0)
++            id = HDR_OTHER;
++    }
++
++    header_mangler *m = NULL;
++    if (id == HDR_ENUM_END) {
++        m = &all;
++    } else
++    if (id == HDR_BAD_HDR) {
++        m = &custom[name];
++    } else {
++        m = &known[id]; // including HDR_OTHER
++    }
++
++    assert(m);
++    return m;
++}
++
++void
++HeaderManglers::setReplacement(const char *name, const char *value)
++{
++    // for backword compatibility, we allow replacements to be configured
++    // for headers w/o access rules, but such replacements are ignored
++    header_mangler *m = track(name);
++
++    safe_free(m->replacement); // overwrite old value if any
++    m->replacement = xstrdup(value);
++}
++
++const header_mangler *
++HeaderManglers::find(const HttpHeaderEntry &e) const
++{
++    // a known header with a configured ACL list
++    if (e.id != HDR_OTHER && 0 <= e.id && e.id < HDR_ENUM_END &&
++        known[e.id].access_list)
++        return &known[e.id];
++
++    // a custom header
++    if (e.id == HDR_OTHER) {
++        // does it have an ACL list configured?
++        // Optimize: use a name type that we do not need to convert to here
++        const ManglersByName::const_iterator i = custom.find(e.name.termedBuf());
++        if (i != custom.end())
++            return &i->second;
++    }
++
++    // Next-to-last resort: "Other" rules match any custom header
++    if (e.id == HDR_OTHER && known[HDR_OTHER].access_list)
++        return &known[HDR_OTHER];
++
++    // Last resort: "All" rules match any header
++    if (all.access_list)
++        return &all;
++
++    return NULL;
++}
++
+@@ -0,0 +1,58 @@
++#ifndef SQUID_HTTPHEADERTOOLS_H
++#define SQUID_HTTPHEADERTOOLS_H
++
++#if HAVE_MAP
++#include <map>
++#endif
++#if HAVE_STRING
++#include <string>
++#endif
++
++class acl_access;
++struct _header_mangler {
++    acl_access *access_list;
++    char *replacement;
++};
++typedef struct _header_mangler header_mangler;
++
++class StoreEntry;
++
++/// A collection of header_mangler objects for a given message kind.
++class HeaderManglers {
++public:
++    HeaderManglers();
++    ~HeaderManglers();
++
++    /// returns a header mangler for field e or nil if none was specified
++    const header_mangler *find(const HttpHeaderEntry &e) const;
++
++    /// returns a mangler for the named header (known or custom)
++    header_mangler *track(const char *name);
++
++    /// updates mangler for the named header with a replacement value
++    void setReplacement(const char *name, const char *replacementValue);
++
++    /// report the *_header_access part of the configuration
++    void dumpAccess(StoreEntry *entry, const char *optionName) const;
++    /// report the *_header_replace part of the configuration
++    void dumpReplacement(StoreEntry *entry, const char *optionName) const;
++
++private:
++    /// a name:mangler map; optimize: use unordered map or some such
++    typedef std::map<std::string, header_mangler> ManglersByName;
++
++    /// one mangler for each known header
++    header_mangler known[HDR_ENUM_END];
++
++    /// one mangler for each custom header
++    ManglersByName custom;
++
++    /// configured if some mangling ACL applies to all header names
++    header_mangler all;
++
++private:
++    /* not implemented */
++    HeaderManglers(const HeaderManglers &);
++    HeaderManglers &operator =(const HeaderManglers &);
++};
++#endif
+@@ -363,6 +363,7 @@ squid_SOURCES = \
+ 	HttpHeader.h \
+ 	HttpHeaderMask.h \
+ 	HttpHeaderRange.h \
++	HttpHeaderTools.h \
+ 	HttpHeaderTools.cc \
+ 	HttpBody.h \
+ 	HttpBody.cc \
+@@ -1055,6 +1056,7 @@ TESTS += $(check_PROGRAMS)
+ 
+ # - add other component .(h|cc) files needed to link and run tests
+ tests_testHttpReply_SOURCES=\
++	anyp/ProtocolType.cc \
+ 	cbdata.cc \
+ 	cbdata.h \
+ 	ETag.cc \
+@@ -1091,9 +1093,11 @@ tests_testHttpReply_SOURCES=\
+ 	SquidString.h \
+ 	SquidTime.h \
+ 	String.cc \
++	tests/stub_access_log.cc \
+ 	tests/stub_cache_cf.cc \
+ 	tests/stub_cache_manager.cc \
+ 	tests/stub_debug.cc \
++	tests/stub_errorpage.cc \
+ 	tests/stub_HelperChildConfig.cc \
+ 	StatCounters.h \
+ 	StatCounters.cc \
+@@ -1102,25 +1106,31 @@ tests_testHttpReply_SOURCES=\
+ 	tests/stub_store.cc \
+ 	tests/stub_store_stats.cc \
+ 	tests/stub_tools.cc \
++	tests/stub_HttpRequest.cc \
+ 	tests/testHttpReply.cc \
+ 	tests/testHttpReply.h \
+ 	tests/testMain.cc \
+ 	time.cc \
++	url.cc \
++	URLScheme.cc \
+ 	wordlist.cc
+ nodist_tests_testHttpReply_SOURCES=\
+ 	$(TESTSOURCES)
+ tests_testHttpReply_LDFLAGS = $(LIBADD_DL)
+ tests_testHttpReply_LDADD=\
++	acl/libacls.la \
+ 	acl/libapi.la \
+ 	acl/libstate.la \
+ 	$(AUTH_LIBS) \
+ 	ip/libip.la \
+ 	base/libbase.la \
++	$(SSL_LIBS) \
+ 	$(top_builddir)/lib/libmisccontainers.la \
+ 	$(top_builddir)/lib/libmiscencoding.la \
+ 	$(top_builddir)/lib/libmiscutil.la \
+ 	$(SQUID_CPPUNIT_LIBS) \
+ 	$(SQUID_CPPUNIT_LA) \
++	$(SSLLIB) \
+ 	$(COMPAT_LIB) \
+ 	$(XTRA_LIBS)
+ tests_testHttpReply_DEPENDENCIES= $(SQUID_CPPUNIT_LA)
+@@ -1182,6 +1192,7 @@ tests_testACLMaxUserIP_SOURCES= \
+ 	tests/stub_debug.cc \
+ 	tests/stub_DelayId.cc \
+ 	tests/stub_DiskIOModule.cc \
++	tests/stub_errorpage.cc \
+ 	tests/stub_fd.cc \
+ 	tests/stub_HttpRequest.cc \
+ 	tests/stub_MemObject.cc \
+@@ -1218,6 +1229,7 @@ tests_testACLMaxUserIP_LDADD= \
+ 	base/libbase.la \
+ 	libsquid.la \
+ 	ip/libip.la \
++	$(SSL_LIBS) \
+ 	$(top_builddir)/lib/libmisccontainers.la \
+ 	$(top_builddir)/lib/libmiscencoding.la \
+ 	$(top_builddir)/lib/libmiscutil.la \
+@@ -2499,6 +2511,7 @@ tests_testStore_LDADD= \
+ 	mgr/libmgr.la \
+ 	ipc/libipc.la \
+ 	anyp/libanyp.la \
++	$(SSL_LIBS) \
+ 	$(top_builddir)/lib/libmisccontainers.la \
+ 	$(top_builddir)/lib/libmiscencoding.la \
+ 	$(top_builddir)/lib/libmiscutil.la \
+@@ -169,12 +169,13 @@ static void free_all(void);
+ void requirePathnameExists(const char *name, const char *path);
+ static OBJH dump_config;
+ #if USE_HTTP_VIOLATIONS
+-static void dump_http_header_access(StoreEntry * entry, const char *name, header_mangler header[]);
+-static void parse_http_header_access(header_mangler header[]);
+-static void free_http_header_access(header_mangler header[]);
+-static void dump_http_header_replace(StoreEntry * entry, const char *name, header_mangler header[]);
+-static void parse_http_header_replace(header_mangler * header);
+-static void free_http_header_replace(header_mangler * header);
++static void free_HeaderManglers(HeaderManglers **pm);
++static void dump_http_header_access(StoreEntry * entry, const char *name, const HeaderManglers *manglers);
++static void parse_http_header_access(HeaderManglers **manglers);
++#define free_http_header_access free_HeaderManglers
++static void dump_http_header_replace(StoreEntry * entry, const char *name, const HeaderManglers *manglers);
++static void parse_http_header_replace(HeaderManglers **manglers);
++#define free_http_header_replace free_HeaderManglers
+ #endif
+ static void parse_denyinfo(acl_deny_info_list ** var);
+ static void dump_denyinfo(StoreEntry * entry, const char *name, acl_deny_info_list * var);
+@@ -810,7 +811,7 @@ configDoConfigure(void)
+     // TODO: replace with a dedicated "purge" ACL option?
+     Config2.onoff.enable_purge = (ACLMethodData::ThePurgeCount > 0);
+ 
+-    Config2.onoff.mangle_request_headers = httpReqHdrManglersConfigured();
++    Config2.onoff.mangle_request_headers = (Config.request_header_access != NULL);
+ 
+     if (geteuid() == 0) {
+         if (NULL != Config.effectiveUser) {
+@@ -1675,23 +1676,15 @@ parse_client_delay_pool_access(ClientDelayConfig * cfg)
+ 
+ #if USE_HTTP_VIOLATIONS
+ static void
+-dump_http_header_access(StoreEntry * entry, const char *name, header_mangler header[])
++dump_http_header_access(StoreEntry * entry, const char *name, const HeaderManglers *manglers)
+ {
+-    int i;
+-
+-    for (i = 0; i < HDR_ENUM_END; i++) {
+-        if (header[i].access_list != NULL) {
+-            storeAppendPrintf(entry, "%s ", name);
+-            dump_acl_access(entry, httpHeaderNameById(i),
+-                            header[i].access_list);
+-        }
+-    }
++    if (manglers)
++        manglers->dumpAccess(entry, name);
+ }
+ 
+ static void
+-parse_http_header_access(header_mangler header[])
++parse_http_header_access(HeaderManglers **pm)
+ {
+-    int id, i;
+     char *t = NULL;
+ 
+     if ((t = strtok(NULL, w_space)) == NULL) {
+@@ -1700,64 +1693,34 @@ parse_http_header_access(header_mangler header[])
+         return;
+     }
+ 
+-    /* Now lookup index of header. */
+-    id = httpHeaderIdByNameDef(t, strlen(t));
+-
+-    if (strcmp(t, "All") == 0)
+-        id = HDR_ENUM_END;
+-    else if (strcmp(t, "Other") == 0)
+-        id = HDR_OTHER;
+-    else if (id == -1) {
+-        debugs(3, 0, "" << cfg_filename << " line " << config_lineno << ": " << config_input_line);
+-        debugs(3, 0, "parse_http_header_access: unknown header name '" << t << "'");
+-        return;
+-    }
+-
+-    if (id != HDR_ENUM_END) {
+-        parse_acl_access(&header[id].access_list);
+-    } else {
+-        char *next_string = t + strlen(t) - 1;
+-        *next_string = 'A';
+-        *(next_string + 1) = ' ';
+-
+-        for (i = 0; i < HDR_ENUM_END; i++) {
+-            char *new_string = xstrdup(next_string);
+-            strtok(new_string, w_space);
+-            parse_acl_access(&header[i].access_list);
+-            safe_free(new_string);
+-        }
+-    }
++    if (!*pm)
++        *pm = new HeaderManglers;
++    HeaderManglers *manglers = *pm;
++    header_mangler *mangler = manglers->track(t);
++    assert(mangler);
++    parse_acl_access(&mangler->access_list);
+ }
+ 
+ static void
+-free_http_header_access(header_mangler header[])
++free_HeaderManglers(HeaderManglers **pm)
+ {
+-    int i;
+-
+-    for (i = 0; i < HDR_ENUM_END; i++) {
+-        free_acl_access(&header[i].access_list);
++    // we delete the entire http_header_* mangler configuration at once
++    if (const HeaderManglers *manglers = *pm) {
++        delete manglers;
++        *pm = NULL;
+     }
+ }
+ 
+ static void
+-dump_http_header_replace(StoreEntry * entry, const char *name, header_mangler
+-                         header[])
++dump_http_header_replace(StoreEntry * entry, const char *name, const HeaderManglers *manglers)
+ {
+-    int i;
+-
+-    for (i = 0; i < HDR_ENUM_END; i++) {
+-        if (NULL == header[i].replacement)
+-            continue;
+-
+-        storeAppendPrintf(entry, "%s %s %s\n", name, httpHeaderNameById(i),
+-                          header[i].replacement);
+-    }
++    if (manglers)
++        manglers->dumpReplacement(entry, name);
+ }
+ 
+ static void
+-parse_http_header_replace(header_mangler header[])
++parse_http_header_replace(HeaderManglers **pm)
+ {
+-    int id, i;
+     char *t = NULL;
+ 
+     if ((t = strtok(NULL, w_space)) == NULL) {
+@@ -1766,44 +1729,12 @@ parse_http_header_replace(header_mangler header[])
+         return;
+     }
+ 
+-    /* Now lookup index of header. */
+-    id = httpHeaderIdByNameDef(t, strlen(t));
+-
+-    if (strcmp(t, "All") == 0)
+-        id = HDR_ENUM_END;
+-    else if (strcmp(t, "Other") == 0)
+-        id = HDR_OTHER;
+-    else if (id == -1) {
+-        debugs(3, 0, "" << cfg_filename << " line " << config_lineno << ": " << config_input_line);
+-        debugs(3, 0, "parse_http_header_replace: unknown header name " << t << ".");
+-
+-        return;
+-    }
+-
+-    if (id != HDR_ENUM_END) {
+-        if (header[id].replacement != NULL)
+-            safe_free(header[id].replacement);
+-
+-        header[id].replacement = xstrdup(t + strlen(t) + 1);
+-    } else {
+-        for (i = 0; i < HDR_ENUM_END; i++) {
+-            if (header[i].replacement != NULL)
+-                safe_free(header[i].replacement);
+-
+-            header[i].replacement = xstrdup(t + strlen(t) + 1);
+-        }
+-    }
+-}
+-
+-static void
+-free_http_header_replace(header_mangler header[])
+-{
+-    int i;
++    const char *value = t + strlen(t) + 1;
+ 
+-    for (i = 0; i < HDR_ENUM_END; i++) {
+-        if (header[i].replacement != NULL)
+-            safe_free(header[i].replacement);
+-    }
++    if (!*pm)
++        *pm = new HeaderManglers;
++    HeaderManglers *manglers = *pm;
++    manglers->setReplacement(t, value);
+ }
+ 
+ #endif
+@@ -4392,7 +4392,7 @@ DOC_END
+ 
+ NAME: request_header_access
+ IFDEF: USE_HTTP_VIOLATIONS
+-TYPE: http_header_access[]
++TYPE: http_header_access
+ LOC: Config.request_header_access
+ DEFAULT: none
+ DOC_START
+@@ -4404,16 +4404,30 @@ DOC_START
+ 
+ 	This option replaces the old 'anonymize_headers' and the
+ 	older 'http_anonymizer' option with something that is much
+-	more configurable. This new method creates a list of ACLs
+-	for each header, allowing you very fine-tuned header
+-	mangling.
+-
+-	This option only applies to request headers, i.e., from the
+-	client to the server.
+-
+-	You can only specify known headers for the header name.
+-	Other headers are reclassified as 'Other'. You can also
+-	refer to all the headers with 'All'.
++	more configurable. A list of ACLs for each header name allows
++	removal of specific header fields under specific conditions.
++
++	This option only applies to outgoing HTTP request headers (i.e.,
++	headers sent by Squid to the next HTTP hop such as a cache peer
++	or an origin server). The option has no effect during cache hit
++	detection. The equivalent adaptation vectoring point in ICAP
++	terminology is post-cache REQMOD.
++
++	The option is applied to individual outgoing request header
++	fields. For each request header field F, Squid uses the first
++	qualifying sets of request_header_access rules:
++
++	    1. Rules with header_name equal to F's name.
++	    2. Rules with header_name 'Other', provided F's name is not
++	       on the hard-coded list of commonly used HTTP header names.
++	    3. Rules with header_name 'All'.
++
++	Within that qualifying rule set, rule ACLs are checked as usual.
++	If ACLs of an "allow" rule match, the header field is allowed to
++	go through as is. If ACLs of a "deny" rule match, the header is
++	removed and request_header_replace is then checked to identify
++	if the removed header has a replacement. If no rules within the
++	set have matching ACLs, the header field is left as is.
+ 
+ 	For example, to achieve the same behavior as the old
+ 	'http_anonymizer standard' option, you should use:
+@@ -4464,7 +4478,7 @@ DOC_END
+ 
+ NAME: reply_header_access
+ IFDEF: USE_HTTP_VIOLATIONS
+-TYPE: http_header_access[]
++TYPE: http_header_access
+ LOC: Config.reply_header_access
+ DEFAULT: none
+ DOC_START
+@@ -4478,17 +4492,8 @@ DOC_START
+ 	server to the client.
+ 
+ 	This is the same as request_header_access, but in the other
+-	direction.
+-
+-	This option replaces the old 'anonymize_headers' and the
+-	older 'http_anonymizer' option with something that is much
+-	more configurable. This new method creates a list of ACLs
+-	for each header, allowing you very fine-tuned header
+-	mangling.
+-
+-	You can only specify known headers for the header name.
+-	Other headers are reclassified as 'Other'. You can also
+-	refer to all the headers with 'All'.
++	direction. Please see request_header_access for detailed
++	documentation.
+ 
+ 	For example, to achieve the same behavior as the old
+ 	'http_anonymizer standard' option, you should use:
+@@ -4539,7 +4544,7 @@ DOC_END
+ 
+ NAME: request_header_replace header_replace
+ IFDEF: USE_HTTP_VIOLATIONS
+-TYPE: http_header_replace[]
++TYPE: http_header_replace
+ LOC: Config.request_header_access
+ DEFAULT: none
+ DOC_START
+@@ -4558,7 +4563,7 @@ DOC_END
+ 
+ NAME: reply_header_replace
+ IFDEF: USE_HTTP_VIOLATIONS
+-TYPE: http_header_replace[]
++TYPE: http_header_replace
+ LOC: Config.reply_header_access
+ DEFAULT: none
+ DOC_START
+@@ -234,7 +234,6 @@ SQUIDCEXTERN void httpHeaderCleanModule(void);
+ /* store report about current header usage and other stats */
+ void httpHeaderStoreReport(StoreEntry * e);
+ SQUIDCEXTERN void httpHdrMangleList(HttpHeader *, HttpRequest *, int req_or_rep);
+-SQUIDCEXTERN int httpReqHdrManglersConfigured();
+ 
+ #if SQUID_SNMP
+ SQUIDCEXTERN PF snmpHandleUdp;
+@@ -36,6 +36,7 @@
+ 
+ /* needed for the global config */
+ #include "HttpHeader.h"
++#include "HttpHeaderTools.h"
+ 
+ /* for ICP_END */
+ #include "icp_opcode.h"
+@@ -58,14 +59,6 @@ struct acl_deny_info_list {
+     acl_deny_info_list *next;
+ };
+ 
+-
+-class acl_access;
+-
+-struct _header_mangler {
+-    acl_access *access_list;
+-    char *replacement;
+-};
+-
+ class ACLChecklist;
+ 
+ #if SQUID_SNMP
+@@ -577,10 +570,10 @@ struct SquidConfig {
+     } mcast_miss;
+ #endif
+ 
+-    /* one access list per header type we know of */
+-    header_mangler request_header_access[HDR_ENUM_END];
+-    /* one access list per header type we know of */
+-    header_mangler reply_header_access[HDR_ENUM_END];
++    /// request_header_access and request_header_replace
++    HeaderManglers *request_header_access;
++    /// reply_header_access and reply_header_replace
++    HeaderManglers *reply_header_access;
+     char *coredump_dir;
+     char *chroot_dir;
+ #if USE_CACHE_DIGESTS

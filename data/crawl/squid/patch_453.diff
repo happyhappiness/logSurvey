@@ -1,0 +1,862 @@
+@@ -232,9 +232,11 @@ class AccessLogEntry: public RefCountable
+     HttpRequest *request; //< virgin HTTP request
+     HttpRequest *adapted_request; //< HTTP request after adaptation and redirection
+ 
+-    /// key:value pairs set by note and adaptation_meta directives
+-    /// plus key=value pairs returned from URL rewrite/redirect helper
+-    NotePairs notes;
++    // TODO: merge configNotes and helperNotes
++    /// key:value pairs set by note.
++    NotePairs::Pointer configNotes;
++    /// key=value pairs returned from URL rewrite/redirect helper
++    NotePairs::Pointer helperNotes;
+ 
+ #if ICAP_CLIENT
+     /** \brief This subclass holds log info for ICAP part of request
+@@ -145,16 +145,15 @@ HelperReply::parseResponseKeys()
+         *p = '\0';
+         ++p;
+ 
+-        const String key(other().content());
++        const char *key = other().content();
+ 
+         // the value may be a quoted string or a token
+         const bool urlDecode = (*p != '"'); // check before moving p.
+         char *v = strwordtok(NULL, &p);
+         if (v != NULL && urlDecode && (p-v) > 2) // 1-octet %-escaped requires 3 bytes
+             rfc1738_unescape(v);
+-        const String value(v?v:""); // value can be empty, but must not be NULL
+ 
+-        notes.add(key, value);
++        notes.add(key, v ? v : ""); // value can be empty, but must not be NULL
+ 
+         modifiableOther().consume(p - other().content());
+         modifiableOther().consumeWhitespacePrefix();
+@@ -184,13 +183,9 @@ operator <<(std::ostream &os, const HelperReply &r)
+     }
+ 
+     // dump the helper key=pair "notes" list
+-    if (r.notes.notes.size() > 0) {
++    if (!r.notes.empty()) {
+         os << ", notes={";
+-        for (Notes::NotesList::const_iterator m = r.notes.notes.begin(); m != r.notes.notes.end(); ++m) {
+-            for (Note::Values::iterator v = (*m)->values.begin(); v != (*m)->values.end(); ++v) {
+-                os << ',' << (*m)->key << '=' << ConfigParser::QuoteString((*v)->value);
+-            }
+-        }
++	os << r.notes.toString("; ");
+         os << "}";
+     }
+ 
+@@ -65,7 +65,7 @@ class HelperReply
+     } result;
+ 
+     // list of key=value pairs the helper produced
+-    Notes notes;
++    NotePairs notes;
+ 
+     /// for stateful replies the responding helper 'server' needs to be preserved across callbacks
+     CbcPointer<helper_stateful_server> whichServer;
+@@ -176,7 +176,6 @@ typedef enum {
+ #if USE_SSL
+     hoErrorDetail,
+ #endif
+-    hoNote,
+     hoEnd
+ } http_hdr_owner_type;
+ 
+@@ -168,10 +168,7 @@ HttpRequest::clean()
+ 
+     myportname.clean();
+ 
+-    if (helperNotes) {
+-        delete helperNotes;
+-        helperNotes = NULL;
+-    }
++    helperNotes = NULL;
+ 
+     tag.clean();
+ #if USE_AUTH
+@@ -231,10 +228,7 @@ HttpRequest::clone() const
+     // XXX: what to do with copy->peer_domain?
+ 
+     copy->myportname = myportname;
+-    if (helperNotes) {
+-        copy->helperNotes = new Notes;
+-        copy->helperNotes->notes = helperNotes->notes;
+-    }
++    copy->helperNotes = helperNotes;
+     copy->tag = tag;
+ #if USE_AUTH
+     copy->extacl_user = extacl_user;
+@@ -203,7 +203,7 @@ class HttpRequest: public HttpMsg
+ 
+     String myportname; // Internal tag name= value from port this requests arrived in.
+ 
+-    Notes *helperNotes;         ///< collection of meta notes associated with this request by helper lookups.
++    NotePairs::Pointer helperNotes;         ///< collection of meta notes associated with this request by helper lookups.
+ 
+     String tag;			/* Internal tag for this request */
+ 
+@@ -36,6 +36,7 @@
+ #include "HttpReply.h"
+ #include "SquidConfig.h"
+ #include "Store.h"
++#include "StrList.h"
+ 
+ #include <algorithm>
+ #include <string>
+@@ -74,59 +75,19 @@ Note::match(HttpRequest *request, HttpReply *reply)
+ }
+ 
+ Note::Pointer
+-Notes::find(const String &noteKey) const
++Notes::add(const String &noteKey)
+ {
+-    typedef Notes::NotesList::const_iterator AMLI;
++    typedef Notes::NotesList::iterator AMLI;
+     for (AMLI i = notes.begin(); i != notes.end(); ++i) {
+         if ((*i)->key == noteKey)
+             return (*i);
+     }
+ 
+-    return Note::Pointer();
+-}
+-
+-void
+-Notes::add(const String &noteKey, const String &noteValue)
+-{
+-    Note::Pointer key = add(noteKey);
+-    key->addValue(noteValue);
+-}
+-
+-Note::Pointer
+-Notes::add(const String &noteKey)
+-{
+-    Note::Pointer note = find(noteKey);
+-    if (note == NULL) {
+-        note = new Note(noteKey);
+-        notes.push_back(note);
+-    }
++    Note::Pointer note = new Note(noteKey);
++    notes.push_back(note);
+     return note;
+ }
+ 
+-void
+-Notes::add(const Notes &src)
+-{
+-    typedef Notes::NotesList::const_iterator AMLI;
+-    typedef Note::Values::iterator VLI;
+-
+-    for (AMLI i = src.notes.begin(); i != src.notes.end(); ++i) {
+-
+-        // ensure we have a key by that name to fill out values for...
+-        // NP: not sharing pointers at the key level since merging other helpers
+-        // details later would affect this src objects keys, which is a bad idea.
+-        Note::Pointer ourKey = add((*i)->key);
+-
+-        // known key names, merge the values lists...
+-        for (VLI v = (*i)->values.begin(); v != (*i)->values.end(); ++v ) {
+-            // 2012-11-29: values are read-only and Pointer can safely be shared
+-            // for now we share pointers to save memory and gain speed.
+-            // If that ever ceases to be true, convert this to a full copy.
+-            ourKey->values.push_back(*v);
+-            // TODO: prune/skip duplicates ?
+-        }
+-    }
+-}
+-
+ Note::Pointer
+ Notes::parse(ConfigParser &parser)
+ {
+@@ -170,3 +131,80 @@ Notes::clean()
+ {
+     notes.clean();
+ }
++
++const char *
++NotePairs::find(const char *noteKey) const
++{
++    static String value;
++    value.clean();
++    for (Vector<NotePairs::Entry *>::const_iterator  i = entries.begin(); i != entries.end(); ++i) {
++        if ((*i)->name.cmp(noteKey) == 0) {
++            if (value.size())
++                value.append(", ");
++            value.append(ConfigParser::QuoteString((*i)->value));
++        }
++    }
++    return value.size() ? value.termedBuf() : NULL;
++}
++
++const char *
++NotePairs::toString(const char *sep) const
++{
++   static String value;
++    value.clean();
++    for (Vector<NotePairs::Entry *>::const_iterator  i = entries.begin(); i != entries.end(); ++i) {
++        value.append((*i)->name);
++        value.append(": ");
++        value.append(ConfigParser::QuoteString((*i)->value));
++        value.append(sep);
++    }
++    return value.size() ? value.termedBuf() : NULL;
++}
++
++const char *
++NotePairs::findFirst(const char *noteKey) const
++{
++    for (Vector<NotePairs::Entry *>::const_iterator  i = entries.begin(); i != entries.end(); ++i) {
++        if ((*i)->name.cmp(noteKey) == 0)
++            return (*i)->value.termedBuf();
++    }
++    return NULL;
++}
++
++void
++NotePairs::add(const char *key, const char *note)
++{
++    entries.push_back(new NotePairs::Entry(key, note));
++}
++
++void
++NotePairs::addStrList(const char *key, const char *values)
++{
++    String strValues(values);
++    const char *item;
++    const char *pos = NULL;
++    int ilen = 0;
++    while(strListGetItem(&strValues, ',', &item, &ilen, &pos)) {
++        String v;
++        v.append(item, ilen);
++        entries.push_back(new NotePairs::Entry(key, v.termedBuf()));
++    }
++}
++
++bool
++NotePairs::hasPair(const char *key, const char *value) const
++{
++    for (Vector<NotePairs::Entry *>::const_iterator  i = entries.begin(); i != entries.end(); ++i) {
++        if ((*i)->name.cmp(key) == 0 || (*i)->value.cmp(value) == 0)
++            return true;
++    }
++    return false;
++}
++
++void
++NotePairs::append(const NotePairs *src)
++{
++    for (Vector<NotePairs::Entry *>::const_iterator  i = src->entries.begin(); i != src->entries.end(); ++i) {
++        entries.push_back(new NotePairs::Entry((*i)->name.termedBuf(), (*i)->value.termedBuf()));
++    }
++}
+@@ -1,8 +1,11 @@
+ #ifndef SQUID_NOTES_H
+ #define SQUID_NOTES_H
+ 
+-#include "HttpHeader.h"
+-#include "HttpHeaderTools.h"
++#include "Array.h"
++#include "base/RefCount.h"
++#include "CbDataList.h"
++#include "MemPool.h"
++#include "SquidString.h"
+ #include "typedefs.h"
+ 
+ #if HAVE_STRING
+@@ -11,12 +14,13 @@
+ 
+ class HttpRequest;
+ class HttpReply;
++class ACLList;
+ 
+ /**
+- * Used to store notes. The notes are custom key:value pairs
+- * ICAP request headers or ECAP options used to pass
++ * Used to store a note configuration. The notes are custom key:value
++ * pairs ICAP request headers or ECAP options used to pass
+  * custom transaction-state related meta information to squid
+- * internal subsystems or to addaptation services.
++ * internal subsystems or to adaptation services.
+  */
+ class Note: public RefCountable
+ {
+@@ -49,18 +53,13 @@ class Note: public RefCountable
+      */
+     const char *match(HttpRequest *request, HttpReply *reply);
+ 
+-    /**
+-     * Returns the first value for this key or an empty string.
+-     */
+-    const char *firstValue() const { return (values.size()>0&&values[0]->value.defined()?values[0]->value.termedBuf():""); }
+-
+     String key; ///< The note key
+     Values values; ///< The possible values list for the note
+ };
+ 
+ class ConfigParser;
+ /**
+- * Used to store a notes list.
++ * Used to store a notes configuration list.
+  */
+ class Notes
+ {
+@@ -90,29 +89,6 @@ class Notes
+     /// return true if the notes list is empty
+     bool empty() { return notes.empty(); }
+ 
+-    /**
+-     * Adds a note key and value to the notes list.
+-     * If the key name already exists in list, add the given value to its set of values.
+-     */
+-    void add(const String &noteKey, const String &noteValue);
+-
+-    /**
+-     * Adds a set of notes from another notes list to this set.
+-     * Creating entries for any new keys needed.
+-     * If the key name already exists in list, add the given value to its set of values.
+-     *
+-     * WARNING:
+-     * The list entries are all of shared Pointer type. Altering the src object(s) after
+-     * using this function will update both Notes lists. Likewise, altering this
+-     * destination NotesList will affect any relevant copies of src still in use.
+-     */
+-    void add(const Notes &src);
+-
+-    /**
+-     * Returns a pointer to an existing Note with given key name or nil.
+-     */
+-    Note::Pointer find(const String &noteKey) const;
+-
+     NotesList notes; ///< The Note::Pointer objects array list
+     const char *descr; ///< A short description for notes list
+     const char **blacklisted; ///< Null terminated list of blacklisted note keys
+@@ -126,22 +102,76 @@ class Notes
+     Note::Pointer add(const String &noteKey);
+ };
+ 
+-class NotePairs : public HttpHeader
++/**
++ * Used to store list of notes
++ */
++class NotePairs: public RefCountable
+ {
+ public:
+-    NotePairs() : HttpHeader(hoNote) {}
+-
+-    /// convert a NotesList into a NotesPairs
+-    /// appending to any existing entries already present
+-    void append(const Notes::NotesList &src) {
+-        for (Notes::NotesList::const_iterator m = src.begin(); m != src.end(); ++m)
+-            for (Note::Values::iterator v =(*m)->values.begin(); v != (*m)->values.end(); ++v)
+-                putExt((*m)->key.termedBuf(), (*v)->value.termedBuf());
+-    }
+-
+-    void append(const NotePairs *src) {
+-        HttpHeader::append(dynamic_cast<const HttpHeader*>(src));
+-    }
++    typedef RefCount<NotePairs> Pointer;
++
++    /**
++     * Used to store a note key/value pair.
++     */
++    class Entry {
++    public:
++        Entry(const char *aKey, const char *aValue): name(aKey), value(aValue) {} 
++        String name;
++        String value;
++        MEMPROXY_CLASS(Entry);
++    };
++
++    NotePairs() {}
++
++    /**
++     * Append the entries of the src NotePairs list to our list.
++     */
++    void append(const NotePairs *src);
++
++    /**
++     * Returns a comma separated list of notes with key 'noteKey'.
++     * Use findFirst instead when a unique kv-pair is needed.
++     */
++    const char *find(const char *noteKey) const;
++
++    /**
++     * Returns the first note value for this key or an empty string.
++     */
++    const char *findFirst(const char *noteKey) const;
++
++    /**
++     * Adds a note key and value to the notes list.
++     * If the key name already exists in list, add the given value to its set
++     * of values.
++     */
++    void add(const char *key, const char *value);
++
++    /**
++     * Adds a note key and values strList to the notes list.
++     * If the key name already exists in list, add the new values to its set
++     * of values.
++     */
++    void addStrList(const char *key, const char *values);
++
++    /**
++     * Return true if the key/value pair is already stored
++     */
++    bool hasPair(const char *key, const char *value) const;
++
++    /**
++     * Convert NotePairs list to a string consist of "Key: Value"
++     * entries separated by sep string.
++     */
++    const char *toString(const char *sep = "\r\n") const;
++
++    /**
++     * True if there are not entries in the list
++     */
++    bool empty() const {return entries.empty();}
++
++    Vector<NotePairs::Entry *> entries;	  ///< The key/value pair entries
+ };
+ 
++MEMPROXY_CLASS_INLINE(NotePairs::Entry);
++
+ #endif
+@@ -53,7 +53,7 @@ class History: public RefCountable
+     HttpHeader allMeta;
+     /// key:value pairs set by adaptation_meta, to be added to
+     /// AccessLogEntry::notes when ALE becomes available
+-    NotePairs metaHeaders;
++    NotePairs::Pointer metaHeaders;
+ 
+     /// sets future services for the Adaptation::AccessCheck to notice
+     void setFutureServices(const DynamicGroupCfg &services);
+@@ -231,8 +231,11 @@ Adaptation::Ecap::XactionRep::start()
+         typedef Notes::iterator ACAMLI;
+         for (ACAMLI i = Adaptation::Config::metaHeaders.begin(); i != Adaptation::Config::metaHeaders.end(); ++i) {
+             const char *v = (*i)->match(request, reply);
+-            if (v && !ah->metaHeaders.hasByNameListMember((*i)->key.termedBuf(), v, ',')) {
+-                ah->metaHeaders.addEntry(new HttpHeaderEntry(HDR_OTHER, (*i)->key.termedBuf(), v));
++            if (v) {
++                if (ah->metaHeaders == NULL)
++                    ah->metaHeaders = new NotePairs();
++                if (!ah->metaHeaders->hasPair((*i)->key.termedBuf(), v)) 
++                    ah->metaHeaders->add((*i)->key.termedBuf(), v);
+             }
+         }
+     }
+@@ -1432,8 +1432,12 @@ void Adaptation::Icap::ModXact::makeRequestHeaders(MemBuf &buf)
+         if (const char *value = (*i)->match(r, reply)) {
+             buf.Printf("%s: %s\r\n", (*i)->key.termedBuf(), value);
+             Adaptation::History::Pointer ah = request->adaptHistory(false);
+-            if (ah != NULL && !ah->metaHeaders.hasByNameListMember((*i)->key.termedBuf(), value, ','))
+-                ah->metaHeaders.addEntry(new HttpHeaderEntry(HDR_OTHER, (*i)->key.termedBuf(), value));
++            if (ah != NULL) {
++                if (ah->metaHeaders == NULL)
++                    ah->metaHeaders = new NotePairs;
++                if (!ah->metaHeaders->hasPair((*i)->key.termedBuf(), value))
++                    ah->metaHeaders->add((*i)->key.termedBuf(), value);
++            }
+         }
+     }
+ 
+@@ -306,9 +306,9 @@ Auth::Digest::UserRequest::HandleReply(void *data, const HelperReply &reply)
+         Auth::Digest::User *digest_user = dynamic_cast<Auth::Digest::User *>(auth_user_request->user().getRaw());
+         assert(digest_user != NULL);
+ 
+-        Note::Pointer ha1Note = reply.notes.find("ha1");
++        const char *ha1Note = reply.notes.findFirst("ha1");
+         if (ha1Note != NULL) {
+-            CvtBin(ha1Note->firstValue(), digest_user->HA1);
++            CvtBin(ha1Note, digest_user->HA1);
+             digest_user->HA1created = 1;
+         } else {
+             debugs(29, DBG_IMPORTANT, "ERROR: Digest auth helper did not produce a HA1. Using the wrong helper program? received: " << reply);
+@@ -332,9 +332,9 @@ Auth::Digest::UserRequest::HandleReply(void *data, const HelperReply &reply)
+         digest_request->user()->credentials(Auth::Failed);
+         digest_request->flags.invalid_password = true;
+ 
+-        Note::Pointer msgNote = reply.notes.find("message");
++        const char *msgNote = reply.notes.find("message");
+         if (msgNote != NULL) {
+-            digest_request->setDenyMessage(msgNote->firstValue());
++            digest_request->setDenyMessage(msgNote);
+         } else if (reply.other().hasContent()) {
+             // old helpers did send ERR result but a bare message string instead of message= key name.
+             digest_request->setDenyMessage(reply.other().content());
+@@ -247,20 +247,20 @@ Auth::Negotiate::UserRequest::HandleReply(void *data, const HelperReply &reply)
+         safe_free(lm_request->server_blob);
+         lm_request->request->flags.mustKeepalive = true;
+         if (lm_request->request->flags.proxyKeepalive) {
+-            Note::Pointer tokenNote = reply.notes.find("token");
+-            lm_request->server_blob = xstrdup(tokenNote->firstValue());
++            const char *tokenNote = reply.notes.findFirst("token");
++            lm_request->server_blob = xstrdup(tokenNote);
+             auth_user_request->user()->credentials(Auth::Handshake);
+             auth_user_request->denyMessage("Authentication in progress");
+-            debugs(29, 4, HERE << "Need to challenge the client with a server token: '" << tokenNote->firstValue() << "'");
++            debugs(29, 4, HERE << "Need to challenge the client with a server token: '" << tokenNote << "'");
+         } else {
+             auth_user_request->user()->credentials(Auth::Failed);
+             auth_user_request->denyMessage("Negotiate authentication requires a persistent connection");
+         }
+         break;
+ 
+     case HelperReply::Okay: {
+-        Note::Pointer userNote = reply.notes.find("user");
+-        Note::Pointer tokenNote = reply.notes.find("token");
++        const char *userNote = reply.notes.findFirst("user");
++        const char *tokenNote = reply.notes.findFirst("token");
+         if (userNote == NULL || tokenNote == NULL) {
+             // XXX: handle a success with no username better
+             /* protocol error */
+@@ -269,10 +269,10 @@ Auth::Negotiate::UserRequest::HandleReply(void *data, const HelperReply &reply)
+         }
+ 
+         /* we're finished, release the helper */
+-        auth_user_request->user()->username(userNote->firstValue());
++        auth_user_request->user()->username(userNote);
+         auth_user_request->denyMessage("Login successful");
+         safe_free(lm_request->server_blob);
+-        lm_request->server_blob = xstrdup(tokenNote->firstValue());
++        lm_request->server_blob = xstrdup(tokenNote);
+         lm_request->releaseAuthServer();
+ 
+         /* connection is authenticated */
+@@ -306,18 +306,18 @@ Auth::Negotiate::UserRequest::HandleReply(void *data, const HelperReply &reply)
+     break;
+ 
+     case HelperReply::Error: {
+-        Note::Pointer messageNote = reply.notes.find("message");
+-        Note::Pointer tokenNote = reply.notes.find("token");
++        const char *messageNote = reply.notes.find("message");
++        const char *tokenNote = reply.notes.findFirst("token");
+ 
+         /* authentication failure (wrong password, etc.) */
+         if (messageNote != NULL)
+-            auth_user_request->denyMessage(messageNote->firstValue());
++            auth_user_request->denyMessage(messageNote);
+         else
+             auth_user_request->denyMessage("Negotiate Authentication denied with no reason given");
+         auth_user_request->user()->credentials(Auth::Failed);
+         safe_free(lm_request->server_blob);
+         if (tokenNote != NULL)
+-            lm_request->server_blob = xstrdup(tokenNote->firstValue());
++            lm_request->server_blob = xstrdup(tokenNote);
+         lm_request->releaseAuthServer();
+         debugs(29, 4, HERE << "Failed validating user via Negotiate. Error returned '" << reply << "'");
+     }
+@@ -333,11 +333,11 @@ Auth::Negotiate::UserRequest::HandleReply(void *data, const HelperReply &reply)
+          * Authenticate Negotiate start.
+          * If after a KK deny the user's request w/ 407 and mark the helper as
+          * Needing YR. */
+-        Note::Pointer errNote = reply.notes.find("message");
++        const char *errNote = reply.notes.find("message");
+         if (reply.result == HelperReply::Unknown)
+             auth_user_request->denyMessage("Internal Error");
+         else if (errNote != NULL)
+-            auth_user_request->denyMessage(errNote->firstValue());
++            auth_user_request->denyMessage(errNote);
+         else
+             auth_user_request->denyMessage("Negotiate Authentication failed with no reason given");
+         auth_user_request->user()->credentials(Auth::Failed);
+@@ -241,11 +241,11 @@ Auth::Ntlm::UserRequest::HandleReply(void *data, const HelperReply &reply)
+         safe_free(lm_request->server_blob);
+         lm_request->request->flags.mustKeepalive = true;
+         if (lm_request->request->flags.proxyKeepalive) {
+-            Note::Pointer serverBlob = reply.notes.find("token");
+-            lm_request->server_blob = xstrdup(serverBlob->firstValue());
++            const char *serverBlob = reply.notes.findFirst("token");
++            lm_request->server_blob = xstrdup(serverBlob);
+             auth_user_request->user()->credentials(Auth::Handshake);
+             auth_user_request->denyMessage("Authentication in progress");
+-            debugs(29, 4, HERE << "Need to challenge the client with a server token: '" << serverBlob->firstValue() << "'");
++            debugs(29, 4, HERE << "Need to challenge the client with a server token: '" << serverBlob << "'");
+         } else {
+             auth_user_request->user()->credentials(Auth::Failed);
+             auth_user_request->denyMessage("NTLM authentication requires a persistent connection");
+@@ -254,13 +254,13 @@ Auth::Ntlm::UserRequest::HandleReply(void *data, const HelperReply &reply)
+ 
+     case HelperReply::Okay: {
+         /* we're finished, release the helper */
+-        Note::Pointer userLabel = reply.notes.find("user");
+-        auth_user_request->user()->username(userLabel->firstValue());
++        const char *userLabel = reply.notes.findFirst("user");
++        auth_user_request->user()->username(userLabel);
+         auth_user_request->denyMessage("Login successful");
+         safe_free(lm_request->server_blob);
+         lm_request->releaseAuthServer();
+ 
+-        debugs(29, 4, HERE << "Successfully validated user via NTLM. Username '" << userLabel->firstValue() << "'");
++        debugs(29, 4, HERE << "Successfully validated user via NTLM. Username '" << userLabel << "'");
+         /* connection is authenticated */
+         debugs(29, 4, HERE << "authenticated user " << auth_user_request->user()->username());
+         /* see if this is an existing user with a different proxy_auth
+@@ -293,15 +293,15 @@ Auth::Ntlm::UserRequest::HandleReply(void *data, const HelperReply &reply)
+ 
+     case HelperReply::Error: {
+         /* authentication failure (wrong password, etc.) */
+-        Note::Pointer errNote = reply.notes.find("message");
++        const char *errNote = reply.notes.find("message");
+         if (errNote != NULL)
+-            auth_user_request->denyMessage(errNote->firstValue());
++            auth_user_request->denyMessage(errNote);
+         else
+             auth_user_request->denyMessage("NTLM Authentication denied with no reason given");
+         auth_user_request->user()->credentials(Auth::Failed);
+         safe_free(lm_request->server_blob);
+         lm_request->releaseAuthServer();
+-        debugs(29, 4, HERE << "Failed validating user via NTLM. Error returned '" << errNote->firstValue() << "'");
++        debugs(29, 4, HERE << "Failed validating user via NTLM. Error returned '" << errNote << "'");
+     }
+     break;
+ 
+@@ -315,11 +315,11 @@ Auth::Ntlm::UserRequest::HandleReply(void *data, const HelperReply &reply)
+          * Authenticate NTLM start.
+          * If after a KK deny the user's request w/ 407 and mark the helper as
+          * Needing YR. */
+-        Note::Pointer errNote = reply.notes.find("message");
++        const char *errNote = reply.notes.find("message");
+         if (reply.result == HelperReply::Unknown)
+             auth_user_request->denyMessage("Internal Error");
+         else if (errNote != NULL)
+-            auth_user_request->denyMessage(errNote->firstValue());
++            auth_user_request->denyMessage(errNote);
+         else
+             auth_user_request->denyMessage("NTLM Authentication failed with no reason given");
+         auth_user_request->user()->credentials(Auth::Failed);
+@@ -598,7 +598,6 @@ prepareLogWithRequestDetails(HttpRequest * request, AccessLogEntry::Pointer &aLo
+             packerToMemInit(&p, &mb);
+             ah->lastMeta.packInto(&p);
+             aLogEntry->adapt.last_meta = xstrdup(mb.buf);
+-            aLogEntry->notes.append(&ah->metaHeaders);
+         }
+ #endif
+ 
+@@ -615,8 +614,6 @@ prepareLogWithRequestDetails(HttpRequest * request, AccessLogEntry::Pointer &aLo
+     aLogEntry->http.method = request->method;
+     aLogEntry->http.version = request->http_ver;
+     aLogEntry->hier = request->hier;
+-    if (request->helperNotes)
+-        aLogEntry->notes.append(request->helperNotes->notes);
+     if (request->content_length > 0) // negative when no body or unknown length
+         aLogEntry->cache.requestSize += request->content_length;
+     aLogEntry->cache.extuser = request->extacl_user.termedBuf();
+@@ -700,7 +697,9 @@ ClientHttpRequest::logRequest()
+     typedef Notes::iterator ACAMLI;
+     for (ACAMLI i = Config.notes.begin(); i != Config.notes.end(); ++i) {
+         if (const char *value = (*i)->match(request, al->reply)) {
+-            al->notes.addEntry(new HttpHeaderEntry(HDR_OTHER, (*i)->key.termedBuf(), value));
++            if (al->configNotes == NULL)
++                al->configNotes = new NotePairs;
++            al->configNotes->add((*i)->key.termedBuf(), value);
+             debugs(33, 3, HERE << (*i)->key.termedBuf() << " " << value);
+         }
+     }
+@@ -1256,12 +1256,14 @@ ClientRequestContext::clientRedirectDone(const HelperReply &reply)
+     assert(redirect_state == REDIRECT_PENDING);
+     redirect_state = REDIRECT_DONE;
+ 
+-    // copy the URL rewriter response Notes to the HTTP request for logging
++    // Put helper response Notes into the transaction state record (ALE) eventually
+     // do it early to ensure that no matter what the outcome the notes are present.
+-    // TODO put them straight into the transaction state record (ALE?) eventually
+-    if (!old_request->helperNotes)
+-        old_request->helperNotes = new Notes;
+-    old_request->helperNotes->add(reply.notes);
++    if (http->al != NULL) {
++        if (!http->al->helperNotes)
++            http->al->helperNotes = new NotePairs;
++        http->al->helperNotes->append(&reply.notes);
++        old_request->helperNotes = http->al->helperNotes;
++    }
+ 
+     switch (reply.result) {
+     case HelperReply::Unknown:
+@@ -1289,8 +1291,8 @@ ClientRequestContext::clientRedirectDone(const HelperReply &reply)
+         // #2: redirect with a default status code     OK url="..."
+         // #3: re-write the URL                        OK rewrite-url="..."
+ 
+-        Note::Pointer statusNote = reply.notes.find("status");
+-        Note::Pointer urlNote = reply.notes.find("url");
++        const char *statusNote = reply.notes.findFirst("status");
++        const char *urlNote = reply.notes.findFirst("url");
+ 
+         if (urlNote != NULL) {
+             // HTTP protocol redirect to be done.
+@@ -1302,7 +1304,7 @@ ClientRequestContext::clientRedirectDone(const HelperReply &reply)
+             // HTTP/1.1 client being diverted by forward-proxy should get 303 (Http::scSeeOther)
+             Http::StatusCode status = Http::scMovedTemporarily;
+             if (statusNote != NULL) {
+-                const char * result = statusNote->firstValue();
++                const char * result = statusNote;
+                 status = static_cast<Http::StatusCode>(atoi(result));
+             }
+ 
+@@ -1312,21 +1314,21 @@ ClientRequestContext::clientRedirectDone(const HelperReply &reply)
+                     || status == Http::scPermanentRedirect
+                     || status == Http::scTemporaryRedirect) {
+                 http->redirect.status = status;
+-                http->redirect.location = xstrdup(urlNote->firstValue());
++                http->redirect.location = xstrdup(urlNote);
+                 // TODO: validate the URL produced here is RFC 2616 compliant absolute URI
+             } else {
+-                debugs(85, DBG_CRITICAL, "ERROR: URL-rewrite produces invalid " << status << " redirect Location: " << urlNote->firstValue());
++                debugs(85, DBG_CRITICAL, "ERROR: URL-rewrite produces invalid " << status << " redirect Location: " << urlNote);
+             }
+         } else {
+             // URL-rewrite wanted. Ew.
+-            urlNote = reply.notes.find("rewrite-url");
++            urlNote = reply.notes.findFirst("rewrite-url");
+ 
+             // prevent broken helpers causing too much damage. If old URL == new URL skip the re-write.
+-            if (urlNote != NULL && strcmp(urlNote->firstValue(), http->uri)) {
++            if (urlNote != NULL && strcmp(urlNote, http->uri)) {
+                 // XXX: validate the URL properly *without* generating a whole new request object right here.
+                 // XXX: the clone() should be done only AFTER we know the new URL is valid.
+                 HttpRequest *new_request = old_request->clone();
+-                if (urlParse(old_request->method, const_cast<char*>(urlNote->firstValue()), new_request)) {
++                if (urlParse(old_request->method, const_cast<char*>(urlNote), new_request)) {
+                     debugs(61,2, HERE << "URL-rewriter diverts URL from " << urlCanonical(old_request) << " to " << urlCanonical(new_request));
+ 
+                     // update the new request to flag the re-writing was done on it
+@@ -1347,7 +1349,7 @@ ClientRequestContext::clientRedirectDone(const HelperReply &reply)
+                     HTTPMSGLOCK(http->request);
+                 } else {
+                     debugs(85, DBG_CRITICAL, "ERROR: URL-rewrite produces invalid request: " <<
+-                           old_request->method << " " << urlNote->firstValue() << " " << old_request->http_ver);
++                           old_request->method << " " << urlNote << " " << old_request->http_ver);
+                     delete new_request;
+                 }
+             }
+@@ -1377,12 +1379,14 @@ ClientRequestContext::clientStoreIdDone(const HelperReply &reply)
+     assert(store_id_state == REDIRECT_PENDING);
+     store_id_state = REDIRECT_DONE;
+ 
+-    // copy the helper response Notes to the HTTP request for logging
++    // Put helper response Notes into the transaction state record (ALE) eventually
+     // do it early to ensure that no matter what the outcome the notes are present.
+-    // TODO put them straight into the transaction state record (ALE?) eventually
+-    if (!old_request->helperNotes)
+-        old_request->helperNotes = new Notes;
+-    old_request->helperNotes->add(reply.notes);
++    if (http->al != NULL) {
++        if (!http->al->helperNotes)
++            http->al->helperNotes = new NotePairs;
++        http->al->helperNotes->append(&reply.notes);
++        old_request->helperNotes = http->al->helperNotes;
++    }
+ 
+     switch (reply.result) {
+     case HelperReply::Unknown:
+@@ -1406,14 +1410,14 @@ ClientRequestContext::clientStoreIdDone(const HelperReply &reply)
+         break;
+ 
+     case HelperReply::Okay: {
+-        Note::Pointer urlNote = reply.notes.find("store-id");
++        const char *urlNote = reply.notes.findFirst("store-id");
+ 
+         // prevent broken helpers causing too much damage. If old URL == new URL skip the re-write.
+-        if (urlNote != NULL && strcmp(urlNote->firstValue(), http->uri) ) {
++        if (urlNote != NULL && strcmp(urlNote, http->uri) ) {
+             // Debug section required for some very specific cases.
+-            debugs(85, 9, "Setting storeID with: " << urlNote->firstValue() );
+-            http->request->store_id = urlNote->firstValue();
+-            http->store_id = urlNote->firstValue();
++            debugs(85, 9, "Setting storeID with: " << urlNote );
++            http->request->store_id = urlNote;
++            http->store_id = urlNote;
+         }
+     }
+     break;
+@@ -1328,26 +1328,26 @@ externalAclHandleReply(void *data, const HelperReply &reply)
+ 
+     // XXX: make entryData store a proper HelperReply object instead of copying.
+ 
+-    Note::Pointer label = reply.notes.find("tag");
+-    if (label != NULL && label->values[0]->value.size() > 0)
+-        entryData.tag = label->values[0]->value;
++    const char *label = reply.notes.findFirst("tag");
++    if (label != NULL && *label != '\0')
++        entryData.tag = label;
+ 
+-    label = reply.notes.find("message");
+-    if (label != NULL && label->values[0]->value.size() > 0)
+-        entryData.message = label->values[0]->value;
++    label = reply.notes.findFirst("message");
++    if (label != NULL && *label != '\0')
++        entryData.message = label;
+ 
+-    label = reply.notes.find("log");
+-    if (label != NULL && label->values[0]->value.size() > 0)
+-        entryData.log = label->values[0]->value;
++    label = reply.notes.findFirst("log");
++    if (label != NULL && *label != '\0')
++        entryData.log = label;
+ 
+ #if USE_AUTH
+-    label = reply.notes.find("user");
+-    if (label != NULL && label->values[0]->value.size() > 0)
+-        entryData.user = label->values[0]->value;
++    label = reply.notes.findFirst("user");
++    if (label != NULL && *label != '\0')
++        entryData.user = label;
+ 
+-    label = reply.notes.find("password");
+-    if (label != NULL && label->values[0]->value.size() > 0)
+-        entryData.password = label->values[0]->value;
++    label = reply.notes.findFirst("password");
++    if (label != NULL && *label != '\0')
++        entryData.password = label;
+ #endif
+ 
+     dlinkDelete(&state->list, &state->def->queue);
+@@ -1042,17 +1042,39 @@ Format::Format::assemble(MemBuf &mb, const AccessLogEntry::Pointer &al, int logS
+ #endif
+         case LFT_NOTE:
+             if (fmt->data.string) {
+-                sb = al->notes.getByName(fmt->data.string);
++#if USE_ADAPTATION
++                Adaptation::History::Pointer ah = al->request->adaptHistory();
++                if (ah != NULL && ah->metaHeaders != NULL) {
++                    if (const char *meta = ah->metaHeaders->find(fmt->data.string))
++                        sb.append(meta);
++                }
++#endif
++                if (al->helperNotes != NULL) {
++                    if (const char *note = al->helperNotes->find(fmt->data.string)) {
++                        if (sb.size())
++                            sb.append(", ");
++                        sb.append(note);
++                    }
++                }
++                if (al->configNotes != NULL) {
++                    if (const char *note = al->configNotes->find(fmt->data.string)) {
++                        if (sb.size())
++                            sb.append(", ");
++                        sb.append(note);
++                    }
++                }
+                 out = sb.termedBuf();
+                 quote = 1;
+             } else {
+-                HttpHeaderPos pos = HttpHeaderInitPos;
+-                while (const HttpHeaderEntry *e = al->notes.getEntry(&pos)) {
+-                    sb.append(e->name);
+-                    sb.append(": ");
+-                    sb.append(e->value);
+-                    sb.append("\r\n");
+-                }
++#if USE_ADAPTATION
++                Adaptation::History::Pointer ah = al->request->adaptHistory();
++                if (ah != NULL && ah->metaHeaders != NULL && !ah->metaHeaders->empty())
++                    sb.append(ah->metaHeaders->toString());
++#endif
++                if (al->helperNotes != NULL && !al->helperNotes->empty())
++                    sb.append(al->helperNotes->toString());
++                if (al->configNotes != NULL && !al->configNotes->empty())
++                    sb.append(al->configNotes->toString());
+                 out = sb.termedBuf();
+                 quote = 1;
+             }

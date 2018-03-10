@@ -1,260 +1,3800 @@
-----++++doc/Programming-Guide/BasicAuthentication.dox
-@@ -1,51 +0,0 @@
+@@ -255,6 +255,17 @@ Changes to squid-4.0.1 (14 Oct 2015):
+ 	- ... and many documentation changes
+ 	- ... and much code cleanup and polishing
+ 
++Changes to squid-3.5.24 (28 Jan 2017):
++
++	- Regression Bug 3940: Make 'cache deny' do what is documented
++	- TLS: Fix SSLv2 records bumping despite a matching step2 peek rule
++	- TLS: Mitigate DoS attacks that use client-initiated SSL/TLS renegotiation
++	- Fix "Source and destination overlap in memcpy" Valgrind errors
++	- Reduce crashes due to unexpected ClientHttpRequest termination
++	- Update External ACL helpers error handling and caching
++	- Detect HTTP header ACL issues
++	- ... and some documentation fixes
++
+ Changes to squid-3.5.23 (16 Dec 2016):
+ 
+ 	- Bug 4627: fix generate-host-certificates and dynamic_cert_mem_cache_size docs
+@@ -48,10 +48,12 @@ typedef union {
+ #include <sys/resource.h>
+ SQUIDCEXTERN int getrusage(int, struct rusage *);
+ 
++#if defined(__SUNPRO_CC)
+ // Solaris 11 needs this before <sys/socket.h> to get the definition for msg_control
+ // and possibly other type definitions we dont know about specifically
+ #define _XPG4_2 1
+ #include <sys/socket.h>
++#endif
+ 
+ /**
+  * prototypes for system function missing from system includes
+@@ -2607,20 +2607,6 @@ SQUID_DEFINE_BOOL(WITH_VALGRIND,${with_valgrind_debug:=no},
+                   [Valgrind memory debugger support])
+ AC_MSG_NOTICE([Valgrind debug support enabled: $with_valgrind_debug])
+ 
+-dnl Disable "memPools" code
+-#AC_ARG_ENABLE(chunkedmempools,
+-#  AS_HELP_STRING([--enable-chunkedmempools],
+-#                 [Enable experimental chunked memPools. Note that this option
+-#                 simply sets the default behaviour. Specific classes can override this 
+-#                  at runtime, and only lib/MemPool.c needs to be altered 
+-#                  to change the squid-wide default for all classes.]), [ 
+-#SQUID_YESNO([$enableval],
+-#            [--enable-chunkedmempools option takes no arguments])
+-#])
+-SQUID_DEFINE_BOOL(USE_CHUNKEDMEMPOOLS,${enable_chunkedmempools:=no},
+-   [Enable chunked Memory Pools support (experimental)])
+-#AC_MSG_NOTICE([Chunked MemPools enabled: $enable_chunkedmempools])
+-
+ dnl Enable WIN32 Service compile mode
+ AC_ARG_ENABLE(win32-service,
+   AS_HELP_STRING([--enable-win32-service],
+@@ -1,6 +1,6 @@
+ <!doctype linuxdoc system>
+ <article>
+-<title>Squid 3.5.23 release notes</title>
++<title>Squid 3.5.24 release notes</title>
+ <author>Squid Developers</author>
+ 
+ <abstract>
+@@ -13,7 +13,7 @@ for Applied Network Research and members of the Web Caching community.
+ 
+ <sect>Notice
+ <p>
+-The Squid Team are pleased to announce the release of Squid-3.5.23.
++The Squid Team are pleased to announce the release of Squid-3.5.24.
+ 
+ This new release is available for download from <url url="http://www.squid-cache.org/Versions/v3/3.5/"> or the
+  <url url="http://www.squid-cache.org/Download/http-mirrors.html" name="mirrors">.
+@@ -133,6 +133,10 @@ This section gives an account of those changes in three categories:
+ 	<tag>--disable-inline</tag>
+ 	<p>Removed.
+ 
++	<tag>-DUSE_CHUNKEDMEMPOOLS=1</tag>
++	<p>Removed compiler flag. Use run-time environment variable <em>MEMPOOLS=1</em>
++	   to enable chunked memory pools instead.
++
+ </descrip>
+ 
+ 
+@@ -140,8 +140,6 @@ if (groff --help >/dev/null); then
+ fi
+ 
+ # Generate language-pack tarballs
+-# NP: Only to be done on trunk.
+-if test "${tag}" = "trunk" ; then
+-	sh -c "cd ${tmpdir}/errors && tar -zcf ${PWD}/${PACKAGE}-${VERSION}-${suffix}-langpack.tar.gz ./*/* ./alias* ./TRANSLATORS ./COPYRIGHT "
+-	echo ${PACKAGE}-${VERSION}-${suffix}-langpack.tar.gz >>${tag}.out
+-fi
++# NP: Only useful on development branch
++sh -c "cd ${tmpdir}/errors && tar -zcf ${PWD}/${PACKAGE}-${VERSION}-${suffix}-langpack.tar.gz ./*/* ./alias* ./TRANSLATORS ./COPYRIGHT "
++echo ${PACKAGE}-${VERSION}-${suffix}-langpack.tar.gz >>${tag}.out
+@@ -65,6 +65,18 @@ AccessLogEntry::getLogMethod() const
+     return method;
+ }
+ 
++void
++AccessLogEntry::syncNotes(HttpRequest *req)
++{
++    // XXX: auth code only has access to HttpRequest being authenticated
++    // so we must handle the case where HttpRequest is set without ALE being set.
++    assert(req);
++    if (!notes)
++        notes = req->notes();
++    else
++        assert(notes == req->notes());
++}
++
+ AccessLogEntry::~AccessLogEntry()
+ {
+     safe_free(headers.request);
+@@ -57,6 +57,8 @@ class AccessLogEntry: public RefCountable
+     /// Fetch the transaction method string (ICP opcode, HTCP opcode or HTTP method)
+     SBuf getLogMethod() const;
+ 
++    void syncNotes(HttpRequest *request);
++
+     SBuf url;
+ 
+     /// TCP/IP level details about the client connection
+@@ -18,6 +18,9 @@
+ #include "acl/AdaptationServiceData.h"
+ #endif
+ #include "acl/AllOf.h"
++#include "acl/AnnotateClient.h"
++#include "acl/AnnotateTransaction.h"
++#include "acl/AnnotationData.h"
+ #include "acl/AnyOf.h"
+ #if USE_SQUID_EUI
+ #include "acl/Arp.h"
+@@ -224,6 +227,12 @@ Acl::AllOf Acl::AllOf::RegistryEntry_;
+ ACL::Prototype ACLNote::RegistryProtoype(&ACLNote::RegistryEntry_, "note");
+ ACLStrategised<NotePairs::Entry *> ACLNote::RegistryEntry_(new ACLNoteData, ACLNoteStrategy::Instance(), "note");
+ 
++ACL::Prototype ACLAnnotateClient::RegistryProtoype(&ACLAnnotateClient::RegistryEntry_, "annotate_client");
++ACLStrategised<NotePairs::Entry *> ACLAnnotateClient::RegistryEntry_(new ACLAnnotationData, ACLAnnotateClientStrategy::Instance(), "annotate_client");
++
++ACL::Prototype ACLAnnotateTransaction::RegistryProtoype(&ACLAnnotateTransaction::RegistryEntry_, "annotate_transaction");
++ACLStrategised<NotePairs::Entry *> ACLAnnotateTransaction::RegistryEntry_(new ACLAnnotationData, ACLAnnotateTransactionStrategy::Instance(), "annotate_transaction");
++
+ #if USE_ADAPTATION
+ ACL::Prototype ACLAdaptationService::RegistryProtoype(&ACLAdaptationService::RegistryEntry_, "adaptation_service");
+ ACLStrategised<const char *> ACLAdaptationService::RegistryEntry_(new ACLAdaptationServiceData, ACLAdaptationServiceStrategy::Instance(), "adaptation_service");
+@@ -24,10 +24,9 @@
+  */
+ class CommonPool
+ {
++    MEMPROXY_CLASS(CommonPool);
+ 
+ public:
+-    void *operator new(size_t);
+-    void operator delete (void *);
+     static CommonPool *Factory (unsigned char _class, CompositePoolNode::Pointer&);
+     char const* theClassTypeLabel() const {return typeLabel.termedBuf();}
+ 
+@@ -24,11 +24,10 @@ class StoreEntry;
+ /// \ingroup DelayPoolsAPI
+ class CompositePoolNode : public RefCountable, public Updateable
+ {
++    MEMPROXY_CLASS(CompositePoolNode);
+ 
+ public:
+     typedef RefCount<CompositePoolNode> Pointer;
+-    void *operator new(size_t);
+-    void operator delete (void *);
+     virtual ~CompositePoolNode() {}
+ 
+     virtual void stats(StoreEntry * sentry) =0;
+@@ -309,7 +309,7 @@ ConfigParser::TokenParse(const char * &nextToken, ConfigParser::TokenType &type)
+         if (ConfigParser::StrictMode && type == ConfigParser::SimpleToken) {
+             bool tokenIsNumber = true;
+             for (const char *s = tokenStart; s != nextToken; ++s) {
+-                const bool isValidChar = isalnum(*s) || strchr(".,()-=_/:", *s) ||
++                const bool isValidChar = isalnum(*s) || strchr(".,()-=_/:+", *s) ||
+                                          (tokenIsNumber && *s == '%' && (s + 1 == nextToken));
+ 
+                 if (!isdigit(*s))
+@@ -43,7 +43,6 @@ class DelayPools
+     static unsigned char *DelayClasses();
+     static void registerForUpdates(Updateable *);
+     static void deregisterForUpdates (Updateable *);
+-    static long MemoryUsed;
+     static DelayPool *delay_data;
+ 
+ private:
+@@ -57,7 +57,7 @@ DelaySpec::parse()
+ 
+     // parse the first digits into restore_bps
+     const char *p = NULL;
+-    if (!StringToInt(token, restore_bps, &p, 10) && *p != '/') {
++    if (!StringToInt(token, restore_bps, &p, 10) || *p != '/') {
+         debugs(77, DBG_CRITICAL, "ERROR: invalid delay rate '" << token << "'. Expecting restore/max or 'none'.");
+         self_destruct();
+     }
+@@ -16,20 +16,6 @@
+ #include "NullDelayId.h"
+ #include "Store.h"
+ 
+-void *
+-DelayTagged::operator new(size_t size)
+-{
+-    DelayPools::MemoryUsed += sizeof (DelayTagged);
+-    return ::operator new (size);
+-}
+-
+-void
+-DelayTagged::operator delete (void *address)
+-{
+-    DelayPools::MemoryUsed -= sizeof (DelayTagged);
+-    ::operator delete (address);
+-}
+-
+ DelayTagged::DelayTagged()
+ {
+     DelayPools::registerForUpdates (this);
+@@ -138,34 +124,6 @@ DelayTagged::id(CompositePoolNode::CompositeSelectionDetails &details)
+     return new Id(this, details.tag);
+ }
+ 
+-void *
+-DelayTagged::Id::operator new(size_t size)
+-{
+-    DelayPools::MemoryUsed += sizeof (Id);
+-    return ::operator new (size);
+-}
+-
+-void
+-DelayTagged::Id::operator delete (void *address)
+-{
+-    DelayPools::MemoryUsed -= sizeof (Id);
+-    ::operator delete (address);
+-}
+-
+-void *
+-DelayTaggedBucket::operator new(size_t size)
+-{
+-    DelayPools::MemoryUsed += sizeof (DelayTaggedBucket);
+-    return ::operator new (size);
+-}
+-
+-void
+-DelayTaggedBucket::operator delete (void *address)
+-{
+-    DelayPools::MemoryUsed -= sizeof (DelayTaggedBucket);
+-    ::operator delete (address);
+-}
+-
+ DelayTaggedBucket::DelayTaggedBucket(String &aTag) : tag (aTag)
+ {
+     debugs(77, 3, "DelayTaggedBucket::DelayTaggedBucket");
+@@ -23,11 +23,10 @@
+ /// \ingroup DelayPoolsAPI
+ class DelayTaggedBucket : public RefCountable
+ {
++    MEMPROXY_CLASS(DelayTaggedBucket);
+ 
+ public:
+     typedef RefCount<DelayTaggedBucket> Pointer;
+-    void *operator new(size_t);
+-    void operator delete (void *);
+ 
+     void stats(StoreEntry *)const;
+     DelayTaggedBucket(String &aTag);
+@@ -39,11 +38,11 @@ class DelayTaggedBucket : public RefCountable
+ /// \ingroup DelayPoolsAPI
+ class DelayTagged : public CompositePoolNode
+ {
++    MEMPROXY_CLASS(DelayTagged);
+ 
+ public:
+     typedef RefCount<DelayTagged> Pointer;
+-    void *operator new(size_t);
+-    void operator delete (void *);
++
+     DelayTagged();
+     virtual ~DelayTagged();
+     virtual void stats(StoreEntry * sentry);
+@@ -58,10 +57,9 @@ class DelayTagged : public CompositePoolNode
+     /// \ingroup DelayPoolsInternal
+     class Id:public DelayIdComposite
+     {
++        MEMPROXY_CLASS(DelayTagged::Id);
+ 
+     public:
+-        void *operator new(size_t);
+-        void operator delete (void *);
+         Id (RefCount<DelayTagged>, String &);
+         ~Id();
+         virtual int bytesWanted (int min, int max) const;
+@@ -18,20 +18,6 @@
+ #include "NullDelayId.h"
+ #include "Store.h"
+ 
+-void *
+-DelayUser::operator new(size_t size)
+-{
+-    DelayPools::MemoryUsed += sizeof (DelayUser);
+-    return ::operator new (size);
+-}
+-
+-void
+-DelayUser::operator delete (void *address)
+-{
+-    DelayPools::MemoryUsed -= sizeof (DelayUser);
+-    ::operator delete (address);
+-}
+-
+ DelayUser::DelayUser()
+ {
+     DelayPools::registerForUpdates (this);
+@@ -149,34 +135,6 @@ DelayUser::id(CompositePoolNode::CompositeSelectionDetails &details)
+     return new Id(this, details.user->user());
+ }
+ 
+-void *
+-DelayUser::Id::operator new(size_t size)
+-{
+-    DelayPools::MemoryUsed += sizeof (Id);
+-    return ::operator new (size);
+-}
+-
+-void
+-DelayUser::Id::operator delete (void *address)
+-{
+-    DelayPools::MemoryUsed -= sizeof (Id);
+-    ::operator delete (address);
+-}
+-
+-void *
+-DelayUserBucket::operator new(size_t size)
+-{
+-    DelayPools::MemoryUsed += sizeof (DelayUserBucket);
+-    return ::operator new (size);
+-}
+-
+-void
+-DelayUserBucket::operator delete(void *address)
+-{
+-    DelayPools::MemoryUsed -= sizeof(DelayUserBucket);
+-    ::operator delete(address);
+-}
+-
+ DelayUserBucket::DelayUserBucket(Auth::User::Pointer aUser) : authUser(aUser)
+ {
+     debugs(77, 3, "DelayUserBucket::DelayUserBucket");
+@@ -24,11 +24,10 @@
+ /// \ingroup DelayPoolsAPI
+ class DelayUserBucket : public RefCountable
+ {
++    MEMPROXY_CLASS(DelayUserBucket);
+ 
+ public:
+     typedef RefCount<DelayUserBucket> Pointer;
+-    void *operator new(size_t);
+-    void operator delete (void *);
+ 
+     void stats(StoreEntry *)const;
+     DelayUserBucket(Auth::User::Pointer);
+@@ -40,11 +39,10 @@ class DelayUserBucket : public RefCountable
+ /// \ingroup DelayPoolsAPI
+ class DelayUser : public CompositePoolNode
+ {
++    MEMPROXY_CLASS(DelayUser);
+ 
+ public:
+     typedef RefCount<DelayUser> Pointer;
+-    void *operator new(size_t);
+-    void operator delete (void *);
+     DelayUser();
+     virtual ~DelayUser();
+     virtual void stats(StoreEntry * sentry);
+@@ -59,10 +57,9 @@ class DelayUser : public CompositePoolNode
+     /// \ingroup DelayPoolsInternal
+     class Id:public DelayIdComposite
+     {
++        MEMPROXY_CLASS(DelayUser::Id);
+ 
+     public:
+-        void *operator new(size_t);
+-        void operator delete (void *);
+         Id(RefCount<DelayUser>, Auth::User::Pointer);
+         ~Id();
+         virtual int bytesWanted (int min, int max) const;
+@@ -15,20 +15,6 @@
+ #include "CommRead.h"
+ #include "DelayVector.h"
+ 
+-void *
+-DelayVector::operator new(size_t size)
+-{
+-    DelayPools::MemoryUsed += sizeof (DelayVector);
+-    return ::operator new (size);
+-}
+-
+-void
+-DelayVector::operator delete (void *address)
+-{
+-    DelayPools::MemoryUsed -= sizeof (DelayVector);
+-    ::operator delete (address);
+-}
+-
+ DelayVector::DelayVector()
+ {
+     DelayPools::registerForUpdates (this);
+@@ -95,20 +81,6 @@ DelayVector::push_back(CompositePoolNode::Pointer aNode)
+     pools.push_back(aNode);
+ }
+ 
+-void *
+-DelayVector::Id::operator new(size_t size)
+-{
+-    DelayPools::MemoryUsed += sizeof (Id);
+-    return ::operator new (size);
+-}
+-
+-void
+-DelayVector::Id::operator delete (void *address)
+-{
+-    DelayPools::MemoryUsed -= sizeof (Id);
+-    ::operator delete (address);
+-}
+-
+ DelayVector::Id::Id(DelayVector::Pointer aDelayVector, CompositeSelectionDetails &details) : theVector(aDelayVector)
+ {
+     debugs(77, 3, "DelayVector::Id::Id");
+@@ -16,11 +16,10 @@
+ /// \ingroup DelayPoolsAPI
+ class DelayVector : public CompositePoolNode
+ {
++    MEMPROXY_CLASS(DelayVector);
+ 
+ public:
+     typedef RefCount<DelayVector> Pointer;
+-    void *operator new(size_t);
+-    void operator delete (void *);
+     DelayVector();
+     virtual ~DelayVector();
+     virtual void stats(StoreEntry * sentry);
+@@ -36,11 +35,9 @@ class DelayVector : public CompositePoolNode
+     /// \ingroup DelayPoolsInternal
+     class Id:public DelayIdComposite
+     {
++        MEMPROXY_CLASS(DelayVector::Id);
+ 
+     public:
+-        void *operator new(size_t);
+-        void operator delete (void *);
+-
+         Id (RefCount<DelayVector>,CompositeSelectionDetails &);
+         ~Id();
+         virtual int bytesWanted (int min, int max) const;
+@@ -37,7 +37,7 @@ ExternalACLEntry::update(ExternalACLEntryData const &someData)
+     result = someData.result;
+ 
+     // replace all notes. not combine
+-    notes.entries.clear();
++    notes.clear();
+     notes.append(&someData.notes);
+ 
+ #if USE_AUTH
+@@ -1513,7 +1513,7 @@ HttpHeaderEntry::getInt64() const
+ {
+     int64_t val = -1;
+     const bool ok = httpHeaderParseOffset(value.termedBuf(), &val);
+-    httpHeaderNoteParsedEntry(id, value, ok);
++    httpHeaderNoteParsedEntry(id, value, !ok);
+     return val; // remains -1 if !ok (XXX: bad method API)
+ }
+ 
+@@ -139,7 +139,7 @@ HttpRequest::clean()
+ 
+     myportname.clean();
+ 
+-    notes = NULL;
++    theNotes = nullptr;
+ 
+     tag.clean();
+ #if USE_AUTH
+@@ -249,7 +249,7 @@ HttpRequest::inheritProperties(const HttpMsg *aMsg)
+ 
+     downloader = aReq->downloader;
+ 
+-    notes = aReq->notes;
++    theNotes = aReq->theNotes;
+ 
+     sources = aReq->sources;
+     return true;
+@@ -667,3 +667,25 @@ HttpRequest::effectiveRequestUri() const
+     return url.absolute();
+ }
+ 
++NotePairs::Pointer
++HttpRequest::notes()
++{
++    if (!theNotes)
++        theNotes = new NotePairs;
++    return theNotes;
++}
++
++void
++UpdateRequestNotes(ConnStateData *csd, HttpRequest &request, NotePairs const &helperNotes)
++{
++    // Tag client connection if the helper responded with clt_conn_tag=tag.
++    const char *cltTag = "clt_conn_tag";
++    if (const char *connTag = helperNotes.findFirst(cltTag)) {
++        if (csd) {
++            csd->notes()->remove(cltTag);
++            csd->notes()->add(cltTag, connTag);
++        }
++    }
++    request.notes()->replaceOrAdd(&helperNotes);
++}
++
+@@ -156,8 +156,6 @@ class HttpRequest: public HttpMsg
+ 
+     String myportname; // Internal tag name= value from port this requests arrived in.
+ 
+-    NotePairs::Pointer notes; ///< annotations added by the note directive and helpers
+-
+     String tag;         /* Internal tag for this request */
+ 
+     String extacl_user;     /* User name returned by extacl lookup */
+@@ -220,9 +218,17 @@ class HttpRequest: public HttpMsg
+     void ignoreRange(const char *reason);
+     int64_t getRangeOffsetLimit(); /* the result of this function gets cached in rangeOffsetLimit */
+ 
++    /// \returns existing non-empty transaction annotations,
++    /// creates and returns empty annotations otherwise
++    NotePairs::Pointer notes();
++    bool hasNotes() const { return bool(theNotes) && !theNotes->empty(); }
++
+ private:
+     mutable int64_t rangeOffsetLimit;  /* caches the result of getRangeOffsetLimit */
+ 
++    /// annotations added by the note directive and helpers
++    /// and(or) by annotate_transaction/annotate_client ACLs.
++    NotePairs::Pointer theNotes;
+ protected:
+     virtual void packFirstLineInto(Packable * p, bool full_uri) const;
+ 
+@@ -233,5 +239,11 @@ class HttpRequest: public HttpMsg
+     virtual bool inheritProperties(const HttpMsg *aMsg);
+ };
+ 
++class ConnStateData;
++/**
++ * Updates ConnStateData ids and HttpRequest notes from helpers received notes.
++ */
++void UpdateRequestNotes(ConnStateData *csd, HttpRequest &request, NotePairs const &notes);
++
+ #endif /* SQUID_HTTPREQUEST_H */
+ 
+@@ -109,7 +109,6 @@ DELAY_POOL_ALL_SOURCE = \
+ 	DelayUser.h \
+ 	DelayVector.cc \
+ 	DelayVector.h \
+-	NullDelayId.cc \
+ 	NullDelayId.h \
+ 	ClientDelayConfig.cc \
+ 	ClientDelayConfig.h
+@@ -1434,6 +1433,7 @@ tests_testDiskIO_SOURCES = \
+ 	ConfigOption.cc \
+ 	ConfigParser.cc \
+ 	$(DELAY_POOL_SOURCE) \
++	FadingCounter.cc \
+ 	fs_io.h \
+ 	fs_io.cc \
+ 	tests/stub_ETag.cc \
+@@ -2925,6 +2925,7 @@ tests_testUfs_SOURCES = \
+ 	fde.h \
+ 	fde.cc \
+ 	client_db.h \
++	FadingCounter.cc \
+ 	fs_io.h \
+ 	fs_io.cc \
+ 	FileMap.h \
+@@ -3093,6 +3094,7 @@ tests_testRock_SOURCES = \
+ 	ETag.cc \
+ 	EventLoop.cc \
+ 	event.cc \
++	FadingCounter.cc \
+ 	fatal.h \
+ 	fatal.cc \
+ 	fd.h \
+@@ -16,6 +16,8 @@
+ #include "http/Stream.h"
+ #include "HttpReply.h"
+ #include "HttpRequest.h"
++#include "parser/Tokenizer.h"
++#include "sbuf/StringConvert.h"
+ #include "SquidConfig.h"
+ #include "Store.h"
+ #include "StrList.h"
+@@ -28,153 +30,236 @@ Note::Value::~Value()
+     aclDestroyAclList(&aclList);
+ }
+ 
+-Note::Value::Pointer
+-Note::addValue(const String &value)
++Note::Value::Value(const char *aVal, const bool quoted, const char *descr, const Method m)
++    : aclList(nullptr), valueFormat(nullptr), theValue(aVal), theMethod(m)
+ {
+-    Value::Pointer v = new Value(value);
+-    values.push_back(v);
+-    return v;
++    if (quoted) {
++        valueFormat = new Format::Format(descr ? descr : "Notes");
++        valueFormat->parse(theValue.c_str());
++    }
+ }
+ 
+-const char *
+-Note::match(HttpRequest *request, HttpReply *reply, const AccessLogEntry::Pointer &al)
++const SBuf &
++Note::Value::format(const AccessLogEntryPointer &al)
+ {
++    if (al && valueFormat) {
++        static MemBuf mb;
++        mb.reset();
++        valueFormat->assemble(mb, al, 0);
++        theFormattedValue.assign(mb.content());
++        return theFormattedValue;
++    }
++    return theValue;
++}
+ 
+-    typedef Values::iterator VLI;
+-    ACLFilledChecklist ch(NULL, request, NULL);
++Note::Value::Pointer
++Note::addValue(const char *value, const bool quoted, const char *descr, const Value::Method m)
++{
++    values.push_back(new Value(value, quoted, descr, m));
++    return values.back();
++}
++
++bool
++Note::match(HttpRequest *request, HttpReply *reply, const AccessLogEntry::Pointer &al, SBuf &matched)
++{
++    ACLFilledChecklist ch(nullptr, request, nullptr);
+     ch.reply = reply;
+     if (reply)
+         HTTPMSGLOCK(ch.reply);
+ 
+-    for (VLI i = values.begin(); i != values.end(); ++i ) {
+-        const int ret= ch.fastCheck((*i)->aclList);
+-        debugs(93, 5, HERE << "Check for header name: " << key << ": " << (*i)->value
+-               <<", HttpRequest: " << request << " HttpReply: " << reply << " matched: " << ret);
++    for (auto v: values) {
++        assert(v->aclList);
++        const int ret = ch.fastCheck(v->aclList);
++        debugs(93, 5, "Check for header name: " << theKey << ": " << v->value() <<
++               ", HttpRequest: " << request << " HttpReply: " << reply << " matched: " << ret);
+         if (ret == ACCESS_ALLOWED) {
+-            if (al != NULL && (*i)->valueFormat != NULL) {
+-                static MemBuf mb;
+-                mb.reset();
+-                (*i)->valueFormat->assemble(mb, al, 0);
+-                return mb.content();
+-            } else
+-                return (*i)->value.termedBuf();
++            matched = v->format(al);
++            return true;
+         }
+     }
+-    return NULL;
++    matched.clear();
++    return false;
+ }
+ 
+-Note::Pointer
+-Notes::add(const String &noteKey)
++void
++Note::updateNotePairs(NotePairs::Pointer pairs, const CharacterSet *delimiters, const AccessLogEntryPointer &al)
+ {
+-    typedef Notes::NotesList::iterator AMLI;
+-    for (AMLI i = notes.begin(); i != notes.end(); ++i) {
+-        if ((*i)->key == noteKey)
+-            return (*i);
++    for (auto v: values) {
++        const SBuf &formatted = v->format(al);
++        if (!pairs->empty() && v->method() == Value::mhReplace)
++            pairs->remove(theKey);
++        if (delimiters)
++            pairs->addStrList(key(), formatted, *delimiters);
++        else
++            pairs->add(key(), formatted);
+     }
++}
+ 
+-    Note::Pointer note = new Note(noteKey);
+-    notes.push_back(note);
+-    return note;
++void
++Note::dump(StoreEntry *entry, const char *k)
++{
++    for (auto v: values) {
++        storeAppendPrintf(entry, "%s %.*s %s",
++                          k, key().length(), key().rawContent(), ConfigParser::QuoteString(SBufToString(v->value())));
++        dump_acl_list(entry, v->aclList);
++        storeAppendPrintf(entry, "\n");
++    }
++}
++
++SBuf
++Note::toString(const char *sep) const
++{
++    SBuf result;
++    for (auto val: values)
++        result.appendf("%.*s: %.*s%s", key().length(), key().rawContent(),
++                       val->value().length(), val->value().rawContent(), sep);
++    return result;
+ }
+ 
+ Note::Pointer
+-Notes::parse(ConfigParser &parser)
++Notes::add(const SBuf &noteKey)
++{
++    if (Note::Pointer p = find(noteKey))
++        return p;
++    notes.push_back(new Note(noteKey));
++    return notes.back();
++}
++
++Note::Pointer
++Notes::find(const SBuf &noteKey)
++{
++    for (auto n: notes)
++        if (n->key() == noteKey)
++            return n;
++    return nullptr;
++}
++
++void
++Notes::validateKey(const SBuf &key) const
+ {
+-    String key = ConfigParser::NextToken();
+-    ConfigParser::EnableMacros();
+-    String value = ConfigParser::NextQuotedToken();
+-    ConfigParser::DisableMacros();
+-    bool valueWasQuoted = ConfigParser::LastTokenWasQuoted();
+-    Note::Pointer note = add(key);
+-    Note::Value::Pointer noteValue = note->addValue(value);
+-
+-    String label(key);
+-    label.append('=');
+-    label.append(value);
+-    aclParseAclList(parser, &noteValue->aclList, label.termedBuf());
+-    if (formattedValues && valueWasQuoted) {
+-        noteValue->valueFormat =  new Format::Format(descr ? descr : "Notes");
+-        noteValue->valueFormat->parse(value.termedBuf());
+-    }
+     if (blacklisted) {
+-        for (int i = 0; blacklisted[i] != NULL; ++i) {
+-            if (note->key.caseCmp(blacklisted[i]) == 0) {
+-                fatalf("%s:%d: meta key \"%s\" is a reserved %s name",
+-                       cfg_filename, config_lineno, note->key.termedBuf(),
++        for (int i = 0; blacklisted[i] != nullptr; ++i) {
++            if (!key.cmp(blacklisted[i])) {
++                fatalf("%s:%d: meta key \"%.*s\" is a reserved %s name",
++                       cfg_filename, config_lineno, key.length(), key.rawContent(),
+                        descr ? descr : "");
+             }
+         }
+     }
++    // TODO: fix code duplication: the same set of specials is produced
++    // by isKeyNameChar().
++    static const CharacterSet allowedSpecials = CharacterSet::ALPHA +
++            CharacterSet::DIGIT + CharacterSet("specials", "-_");
++    const auto specialIndex = key.findFirstNotOf(allowedSpecials);
++    if (specialIndex != SBuf::npos) {
++        debugs(28, DBG_CRITICAL, "Warning: used special character '" <<
++               key[specialIndex] << "' within annotation name. " <<
++               "Future Squid versions will not support this.");
++    }
++}
+ 
++Note::Pointer
++Notes::parse(ConfigParser &parser)
++{
++    const char *tok = ConfigParser::NextToken();
++    if (!tok)
++        fatalf("FATAL: Missing note key");
++    SBuf key(tok);
++    validateKey(key);
++    ConfigParser::EnableMacros();
++    const char *val = ConfigParser::NextQuotedToken();
++    if (!val)
++        fatalf("FATAL: Missing note value");
++    ConfigParser::DisableMacros();
++    Note::Pointer note = add(key);
++    Note::Value::Pointer noteValue = note->addValue(val, formattedValues && ConfigParser::LastTokenWasQuoted(), descr);
++    key.append('=');
++    key.append(val);
++    aclParseAclList(parser, &noteValue->aclList, key.c_str());
+     return note;
+ }
+ 
+ void
+-Notes::dump(StoreEntry *entry, const char *key)
+-{
+-    typedef Notes::NotesList::iterator AMLI;
+-    for (AMLI m = notes.begin(); m != notes.end(); ++m) {
+-        typedef Note::Values::iterator VLI;
+-        for (VLI v =(*m)->values.begin(); v != (*m)->values.end(); ++v ) {
+-            storeAppendPrintf(entry, "%s " SQUIDSTRINGPH " %s",
+-                              key, SQUIDSTRINGPRINT((*m)->key), ConfigParser::QuoteString((*v)->value));
+-            dump_acl_list(entry, (*v)->aclList);
+-            storeAppendPrintf(entry, "\n");
++Notes::parseKvPair() {
++    char *k, *v;
++    int parsedPairs = 0;
++    while (ConfigParser::NextKvPair(k, v)) {
++        int keyLen = strlen(k);
++        const Note::Value::Method method = (k[keyLen - 1] == '+') ? Note::Value::mhAppend : Note::Value::mhReplace;
++        if (method == Note::Value::mhAppend)
++            keyLen--;
++        else {
++            assert(method == Note::Value::mhReplace);
++            if (Note::Pointer oldNote = find(SBuf(k, keyLen)))
++                debugs(28, DBG_CRITICAL, "Warning: annotation configuration with key " << k <<
++                       " already exists and will be overwritten");
+         }
++        SBuf key(k, keyLen);
++        validateKey(key);
++        Note::Pointer note = add(key);
++        (void)note->addValue(v, formattedValues && ConfigParser::LastTokenWasQuoted(), descr, method);
++        parsedPairs++;
+     }
++    if (!parsedPairs)
++        fatalf("FATAL: Missing annotation kv pair");
+ }
+ 
+ void
+-Notes::clean()
++Notes::updateNotePairs(NotePairs::Pointer pairs, const CharacterSet *delimiters, const AccessLogEntry::Pointer &al)
+ {
+-    notes.clear();
++    for (auto n: notes)
++        n->updateNotePairs(pairs, delimiters, al);
+ }
+ 
+-NotePairs::~NotePairs()
++void
++Notes::dump(StoreEntry *entry, const char *key)
+ {
+-    while (!entries.empty()) {
+-        delete entries.back();
+-        entries.pop_back();
+-    }
++    for (auto n: notes)
++        n->dump(entry, key);
+ }
+ 
+ const char *
+-NotePairs::find(const char *noteKey, const char *sep) const
++Notes::toString(const char *sep) const
++{
++    static SBuf result;
++    result.clear();
++    for (auto note: notes)
++        result.append(note->toString(sep));
++    return result.isEmpty() ? nullptr : result.c_str();
++}
++
++bool
++NotePairs::find(SBuf &resultNote, const char *noteKey, const char *sep) const
+ {
+-    static String value;
+-    value.clean();
+-    for (std::vector<NotePairs::Entry *>::const_iterator  i = entries.begin(); i != entries.end(); ++i) {
+-        if ((*i)->name.cmp(noteKey) == 0) {
+-            if (value.size())
+-                value.append(sep);
+-            value.append((*i)->value);
++    resultNote.clear();
++    for (auto e: entries) {
++        if (!e->name().cmp(noteKey)) {
++            if (!resultNote.isEmpty())
++                resultNote.append(sep);
++            resultNote.append(e->value());
+         }
+     }
+-    return value.size() ? value.termedBuf() : NULL;
++    return resultNote.length();
+ }
+ 
+ const char *
+ NotePairs::toString(const char *sep) const
+ {
+-    static String value;
+-    value.clean();
+-    for (std::vector<NotePairs::Entry *>::const_iterator  i = entries.begin(); i != entries.end(); ++i) {
+-        value.append((*i)->name);
+-        value.append(": ");
+-        value.append((*i)->value);
+-        value.append(sep);
+-    }
+-    return value.size() ? value.termedBuf() : NULL;
++    static SBuf result;
++    result.clear();
++    for (auto e: entries)
++        result.appendf("%.*s: %.*s%s", e->name().length(), e->name().rawContent(),
++                       e->value().length(), e->value().rawContent(), sep);
++    return result.isEmpty() ? nullptr : result.c_str();
+ }
+ 
+ const char *
+ NotePairs::findFirst(const char *noteKey) const
+ {
+-    for (std::vector<NotePairs::Entry *>::const_iterator  i = entries.begin(); i != entries.end(); ++i) {
+-        if ((*i)->name.cmp(noteKey) == 0)
+-            return (*i)->value.termedBuf();
+-    }
+-    return NULL;
++    for (auto e: entries)
++        if (!e->name().cmp(noteKey))
++            return const_cast<SBuf &>(e->value()).c_str();
++    return nullptr;
+ }
+ 
+ void
+@@ -183,96 +268,89 @@ NotePairs::add(const char *key, const char *note)
+     entries.push_back(new NotePairs::Entry(key, note));
+ }
+ 
++void
++NotePairs::add(const SBuf &key, const SBuf &note)
++{
++    entries.push_back(new NotePairs::Entry(key, note));
++}
++
+ void
+ NotePairs::remove(const char *key)
+ {
+-    std::vector<NotePairs::Entry *>::iterator i = entries.begin();
+-    while (i != entries.end()) {
+-        if ((*i)->name.cmp(key) == 0) {
+-            delete *i;
+-            i = entries.erase(i);
+-        } else {
+-            ++i;
+-        }
+-    }
++    Entries::iterator i = entries.begin();
++    while (i != entries.end())
++        i = (*i)->name().cmp(key) ? i+1 : entries.erase(i);
+ }
+ 
+ void
+-NotePairs::addStrList(const char *key, const char *values)
++NotePairs::remove(const SBuf &key)
++{
++    Entries::iterator i = entries.begin();
++    while (i != entries.end())
++        i = (*i)->name() == key ? entries.erase(i) : i+1;
++}
++
++static void
++AppendTokens(NotePairs::Entries &entries, const SBuf &key, const SBuf &val, const CharacterSet &delimiters)
++{
++    Parser::Tokenizer tok(val);
++    SBuf v;
++    while (tok.token(v, delimiters))
++        entries.push_back(new NotePairs::Entry(key, v));
++    v = tok.remaining();
++    if (!v.isEmpty())
++        entries.push_back(new NotePairs::Entry(key, v));
++}
++
++const NotePairs::Entries &
++NotePairs::expandListEntries(const CharacterSet *delimiters) const
+ {
+-    String strValues(values);
+-    const char *item;
+-    const char *pos = NULL;
+-    int ilen = 0;
+-    while (strListGetItem(&strValues, ',', &item, &ilen, &pos)) {
+-        String v;
+-        v.append(item, ilen);
+-        entries.push_back(new NotePairs::Entry(key, v.termedBuf()));
++    if (delimiters) {
++        static NotePairs::Entries expandedEntries;
++        expandedEntries.clear();
++        for(auto entry: entries)
++            AppendTokens(expandedEntries, entry->name(), entry->value(), *delimiters);
++        return expandedEntries;
+     }
++    return entries;
++}
++
++void
++NotePairs::addStrList(const SBuf &key, const SBuf &values, const CharacterSet &delimiters)
++{
++    AppendTokens(entries, key, values, delimiters);
+ }
+ 
+ bool
+-NotePairs::hasPair(const char *key, const char *value) const
++NotePairs::hasPair(const SBuf &key, const SBuf &value) const
+ {
+-    for (std::vector<NotePairs::Entry *>::const_iterator  i = entries.begin(); i != entries.end(); ++i) {
+-        if ((*i)->name.cmp(key) == 0 && (*i)->value.cmp(value) == 0)
++    for (auto e: entries)
++        if (e->name() == key && e->value() == value)
+             return true;
+-    }
+     return false;
+ }
+ 
+ void
+ NotePairs::append(const NotePairs *src)
+ {
+-    for (std::vector<NotePairs::Entry *>::const_iterator  i = src->entries.begin(); i != src->entries.end(); ++i) {
+-        entries.push_back(new NotePairs::Entry((*i)->name.termedBuf(), (*i)->value.termedBuf()));
+-    }
++    for (auto e: src->entries)
++        entries.push_back(new NotePairs::Entry(e->name(), e->value()));
+ }
+ 
+ void
+ NotePairs::appendNewOnly(const NotePairs *src)
+ {
+-    for (std::vector<NotePairs::Entry *>::const_iterator  i = src->entries.begin(); i != src->entries.end(); ++i) {
+-        if (!hasPair((*i)->name.termedBuf(), (*i)->value.termedBuf()))
+-            entries.push_back(new NotePairs::Entry((*i)->name.termedBuf(), (*i)->value.termedBuf()));
++    for (auto e: src->entries) {
++        if (!hasPair(e->name(), e->value()))
++            entries.push_back(new NotePairs::Entry(e->name(), e->value()));
+     }
+ }
+ 
+ void
+ NotePairs::replaceOrAdd(const NotePairs *src)
+ {
+-    for (std::vector<NotePairs::Entry *>::const_iterator  i = src->entries.begin(); i != src->entries.end(); ++i) {
+-        remove((*i)->name.termedBuf());
+-    }
++    for (auto e: src->entries)
++        remove(e->name());
+     append(src);
+ }
+ 
+-NotePairs &
+-SyncNotes(AccessLogEntry &ale, HttpRequest &request)
+-{
+-    // XXX: auth code only has access to HttpRequest being authenticated
+-    // so we must handle the case where HttpRequest is set without ALE being set.
+-
+-    if (!ale.notes) {
+-        if (!request.notes)
+-            request.notes = new NotePairs;
+-        ale.notes = request.notes;
+-    } else {
+-        assert(ale.notes == request.notes);
+-    }
+-    return *ale.notes;
+-}
+-
+-void
+-UpdateRequestNotes(ConnStateData *csd, HttpRequest &request, NotePairs const &helperNotes)
+-{
+-    // Tag client connection if the helper responded with clt_conn_tag=tag.
+-    if (const char *connTag = helperNotes.findFirst("clt_conn_tag")) {
+-        if (csd)
+-            csd->connectionTag(connTag);
+-    }
+-    if (!request.notes)
+-        request.notes = new NotePairs;
+-    request.notes->replaceOrAdd(&helperNotes);
+-}
+-
+@@ -20,7 +20,11 @@
+ 
+ class HttpRequest;
+ class HttpReply;
++class AccessLogEntry;
++class NotePairs;
++
+ typedef RefCount<AccessLogEntry> AccessLogEntryPointer;
++typedef RefCount<NotePairs> NotePairsPointer;
+ 
+ /**
+  * Used to store a note configuration. The notes are custom key:value
+@@ -32,85 +36,129 @@ class Note: public RefCountable
+ {
+ public:
+     typedef RefCount<Note> Pointer;
++
+     /// Stores a value for the note.
+     class Value: public RefCountable
+     {
+     public:
+         typedef RefCount<Value> Pointer;
+-        String value; ///< Configured annotation value, possibly with %macros
+-        ACLList *aclList; ///< The access list used to determine if this value is valid for a request
+-        /// Compiled annotation value format
+-        Format::Format *valueFormat;
+-        explicit Value(const String &aVal) : value(aVal), aclList(NULL), valueFormat(NULL) {}
++        friend class Note;
++
++        enum Method { mhReplace, mhAppend };
++
++        Value(const char *aVal, const bool quoted, const char *descr, const Method method = mhReplace);
+         ~Value();
+-    };
+-    typedef std::vector<Value::Pointer> Values;
++        Value(const Value&) = delete;
++        Value &operator=(const Value&) = delete;
++
++        Method method() const { return theMethod; }
++        const SBuf &value() const { return theValue; }
+ 
+-    explicit Note(const String &aKey): key(aKey) {}
++        ACLList *aclList; ///< The access list used to determine if this value is valid for a request
+ 
+-    /**
+-     * Adds a value to the note and returns a  pointer to the
+-     * related Value object.
+-     */
+-    Value::Pointer addValue(const String &value);
++    private:
++        /// \return the formatted value with expanded logformat %macros (quoted values).
++        /// \return the original value (non-quoted values).
++        const SBuf &format(const AccessLogEntryPointer &al);
++
++        Format::Format *valueFormat; ///< Compiled annotation value format.
++        SBuf theValue; ///< Configured annotation value, possibly with %macros.
++        /// The expanded value produced by format(), empty for non-quoted values.
++        SBuf theFormattedValue;
++        /// Specifies how theValue will be applied to the existing annotation
++        /// with the same key: it either replaces the existing value or is appended
++        /// to the list of existing values.
++        Method theMethod;
++    };
++    typedef std::vector<Value::Pointer> Values;
+ 
+-    /**
+-     * Walks through the  possible values list of the note and selects
+-     * the first value which matches the given HttpRequest and HttpReply
+-     * or NULL if none matches.
+-     * If an AccessLogEntry given and Value::valueFormat is not null, the
+-     * formatted value returned.
+-     */
+-    const char *match(HttpRequest *request, HttpReply *reply, const AccessLogEntryPointer &al);
++    Note(const char *aKey, const size_t keyLen): theKey(aKey, keyLen) {}
++    explicit Note(const SBuf aKey): theKey(aKey) {}
++    Note(const Note&) = delete;
++    Note &operator=(const Note&) = delete;
++
++    /// Adds a value to the note and returns a pointer to the
++    /// related Value object.
++    Value::Pointer addValue(const char *value, const bool quoted, const char *descr,
++                            const Value::Method m = Value::mhAppend);
++
++    /// Walks through the  possible values list of the note, selects
++    /// the first value, matching the given HttpRequest and HttpReply
++    /// and assignes the given 'matched' to it.
++    /// \return true if matched, false otherwise
++    bool match(HttpRequest *request, HttpReply *reply, const AccessLogEntryPointer &al, SBuf &matched);
++    const SBuf &key() const { return theKey; }
++    void updateNotePairs(NotePairsPointer pairs, const CharacterSet *delimiters, const AccessLogEntryPointer &al);
++    /// Dump the single Note to the given StoreEntry object.
++    void dump(StoreEntry *entry, const char *key);
++    /// For the key and all its Values compile a string of
++    /// "Key: Value" pairs separated by sep string.
++    SBuf toString(const char *sep) const;
+ 
+-    String key; ///< The note key
++private:
++    SBuf theKey; ///< The note key
+     Values values; ///< The possible values list for the note
+ };
+ 
+ class ConfigParser;
++
+ /**
+  * Used to store a notes configuration list.
+  */
+-class Notes
++class Notes : public RefCountable
+ {
+ public:
++    typedef RefCount<Notes> Pointer;
+     typedef std::vector<Note::Pointer> NotesList;
+     typedef NotesList::iterator iterator; ///< iterates over the notes list
+     typedef NotesList::const_iterator const_iterator; ///< iterates over the notes list
+ 
+-    Notes(const char *aDescr, const char **metasBlacklist, bool allowFormatted = false): descr(aDescr), blacklisted(metasBlacklist), formattedValues(allowFormatted) {}
+-    Notes(): descr(NULL), blacklisted(NULL), formattedValues(false) {}
++    Notes(const char *aDescr, const char **metasBlacklist, bool allowFormatted = true): descr(aDescr), blacklisted(metasBlacklist), formattedValues(allowFormatted) {}
++    Notes(): descr(nullptr), blacklisted(nullptr), formattedValues(false) {}
+     ~Notes() { notes.clear(); }
+-    /**
+-     * Parse a notes line and returns a pointer to the
+-     * parsed Note object.
+-     */
++    Notes(const Notes&) = delete;
++    Notes &operator=(const Notes&) = delete;
++
++    /// Parses a notes line and returns a pointer to the parsed Note object.
+     Note::Pointer parse(ConfigParser &parser);
+-    /**
+-     * Dump the notes list to the given StoreEntry object.
+-     */
++
++    /// Parses an annotate line with "key=value" or "key+=value" formats.
++    void parseKvPair();
++
++    /// Dump the notes list to the given StoreEntry object.
+     void dump(StoreEntry *entry, const char *name);
+-    void clean(); /// clean the notes list
++    /// clean the notes list
++    void clean() { notes.clear(); }
+ 
+     /// points to the first argument
+     iterator begin() { return notes.begin(); }
+     /// points to the end of list
+     iterator end() { return notes.end(); }
+-    /// return true if the notes list is empty
+-    bool empty() { return notes.empty(); }
++    /// \returns true if the notes list is empty
++    bool empty() const { return notes.empty(); }
++    /// Convert Notes list to a string consist of "Key: Value"
++    /// entries separated by sep string.
++    const char *toString(const char *sep = "\r\n") const;
++    void updateNotePairs(NotePairsPointer pairs, const CharacterSet *delimiters,
++                         const AccessLogEntryPointer &al);
++private:
++
++    /// Verifies that the key is not blacklisted (fatal error) and
++    /// does not contain special characters (non-fatal error).
++    /// If keyLen is not provided, the key is assumed null-terminated.
++    void validateKey(const SBuf &key) const;
++
++    /// Adds a note to the notes list and returns a pointer to the
++    /// related Note object. If the note key already exists in list,
++    /// returns a pointer to the existing object.
++    /// If keyLen is not provided, the noteKey is assumed null-terminated.
++    Note::Pointer add(const SBuf &noteKey);
++    Note::Pointer find(const SBuf &noteKey);
+ 
+     NotesList notes; ///< The Note::Pointer objects array list
+     const char *descr; ///< A short description for notes list
+     const char **blacklisted; ///< Null terminated list of blacklisted note keys
+     bool formattedValues; ///< Whether the formatted values are supported
+-
+-private:
+-    /**
+-     * Adds a note to the notes list and returns a pointer to the
+-     * related Note object. If the note key already exists in list,
+-     * returns a pointer to the existing object.
+-     */
+-    Note::Pointer add(const String &noteKey);
+ };
+ 
+ /**
+@@ -121,101 +169,87 @@ class NotePairs: public RefCountable
+ public:
+     typedef RefCount<NotePairs> Pointer;
+ 
+-    /**
+-     * Used to store a note key/value pair.
+-     */
+-    class Entry
++    /// Used to store a note key/value pair.
++    class Entry : public RefCountable
+     {
+         MEMPROXY_CLASS(Entry);
+     public:
+-        Entry(const char *aKey, const char *aValue): name(aKey), value(aValue) {}
+-        String name;
+-        String value;
++        typedef RefCount<Entry> Pointer;
++
++        Entry(const SBuf &aKey, const SBuf &aValue)
++            : theName(aKey), theValue(aValue) {}
++        Entry(const char *aKey, const char *aValue)
++            : theName(aKey), theValue(aValue) {}
++        Entry(const Entry &) = delete;
++        Entry &operator=(const Entry &) = delete;
++
++        const SBuf &name() const { return theName; }
++        const SBuf &value() const { return theValue; }
++
++    private:
++        SBuf theName;
++        SBuf theValue;
+     };
++    typedef std::vector<Entry::Pointer> Entries;      ///< The key/value pair entries
+ 
+     NotePairs() {}
+-    ~NotePairs();
++    NotePairs &operator=(NotePairs const &) = delete;
++    NotePairs(NotePairs const &) = delete;
+ 
+-    /**
+-     * Append the entries of the src NotePairs list to our list.
+-     */
++    /// Append the entries of the src NotePairs list to our list.
+     void append(const NotePairs *src);
+ 
+-    /**
+-     * Replace existing list entries with the src NotePairs entries.
+-     * Entries which do not exist in the destination set are added.
+-     */
++    /// Replace existing list entries with the src NotePairs entries.
++    /// Entries which do not exist in the destination set are added.
+     void replaceOrAdd(const NotePairs *src);
+ 
+-    /**
+-     * Append any new entries of the src NotePairs list to our list.
+-     * Entries which already exist in the destination set are ignored.
+-     */
++    /// Append any new entries of the src NotePairs list to our list.
++    /// Entries which already exist in the destination set are ignored.
+     void appendNewOnly(const NotePairs *src);
+ 
+-    /**
+-     * Returns a comma separated list of notes with key 'noteKey'.
+-     * Use findFirst instead when a unique kv-pair is needed.
+-     */
+-    const char *find(const char *noteKey, const char *sep = ",") const;
++    /// \param resultNote a comma separated list of notes with key 'noteKey'.
++    /// \returns true if there are entries with the given 'noteKey'.
++    /// Use findFirst() instead when a unique kv-pair is needed.
++    bool find(SBuf &resultNote, const char *noteKey, const char *sep = ",") const;
+ 
+-    /**
+-     * Returns the first note value for this key or an empty string.
+-     */
++    /// \returns the first note value for this key or an empty string.
+     const char *findFirst(const char *noteKey) const;
+ 
+-    /**
+-     * Adds a note key and value to the notes list.
+-     * If the key name already exists in list, add the given value to its set
+-     * of values.
+-     */
++    /// Adds a note key and value to the notes list.
++    /// If the key name already exists in the list, add the given value to its set
++    /// of values.
++    void add(const SBuf &key, const SBuf &value);
+     void add(const char *key, const char *value);
+ 
+-    /**
+-     * Remove all notes with a given key.
+-     */
++    /// Remove all notes with a given key. If keyLen is not
++    /// provided, the key is assumed null-terminated.
+     void remove(const char *key);
++    void remove(const SBuf &key);
++
++    /// Adds a note key and values strList to the notes list.
++    /// If the key name already exists in the list, add the new values to its set
++    /// of values.
++    void addStrList(const SBuf &key, const SBuf &values, const CharacterSet &delimiters);
+ 
+-    /**
+-     * Adds a note key and values strList to the notes list.
+-     * If the key name already exists in list, add the new values to its set
+-     * of values.
+-     */
+-    void addStrList(const char *key, const char *values);
+-
+-    /**
+-     * Return true if the key/value pair is already stored
+-     */
+-    bool hasPair(const char *key, const char *value) const;
+-
+-    /**
+-     * Convert NotePairs list to a string consist of "Key: Value"
+-     * entries separated by sep string.
+-     */
++    /// \returns true if the key/value pair is already stored
++    bool hasPair(const SBuf &key, const SBuf &value) const;
++
++    /// Convert NotePairs list to a string consist of "Key: Value"
++    /// entries separated by sep string.
+     const char *toString(const char *sep = "\r\n") const;
+ 
+-    /**
+-     * True if there are not entries in the list
+-     */
++    /// \returns true if there are not entries in the list
+     bool empty() const {return entries.empty();}
+ 
+-    std::vector<NotePairs::Entry *> entries;      ///< The key/value pair entries
++    void clear() { entries.clear(); }
++
++    /// If delimiters are provided, returns another Entries, converting each single multi-token
++    /// pair to multiple single-token pairs; returns existing entries otherwise.
++    const Entries &expandListEntries(const CharacterSet *delimiters) const;
+ 
+ private:
+-    NotePairs &operator = (NotePairs const &); // Not implemented
+-    NotePairs(NotePairs const &); // Not implemented
++    Entries entries; ///< The key/value pair entries
+ };
+ 
+-class AccessLogEntry;
+-/**
+- * Keep in sync HttpRequest and the corresponding AccessLogEntry objects
+- */
+-NotePairs &SyncNotes(AccessLogEntry &ale, HttpRequest &request);
+-
+-class ConnStateData;
+-/**
+- * Updates ConnStateData ids and HttpRequest notes from helpers received notes.
+- */
+-void UpdateRequestNotes(ConnStateData *csd, HttpRequest &request, NotePairs const &notes);
+ #endif
+ 
+@@ -1,32 +0,0 @@
 -/*
-- * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
+- * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
 - *
 - * Squid software is distributed under GPLv2+ license and includes
 - * contributions from numerous individuals and organizations.
 - * Please see the COPYING and CONTRIBUTORS files for details.
 - */
 -
--/**
--\defgroup AuthAPIBasic Basic Authentication
--\ingroup AuthAPI
+-/* DEBUG: section 77    Delay Pools */
 -
--\par
--Basic authentication provides a username and password.  These
--are written to the authentication module processes on a single
--line, separated by a space:
--\code
--&lt;USERNAME&gt; &lt;PASSWORD&gt;
--\endcode
+-#include "squid.h"
 -
--\par
--	The authentication module process reads username, password pairs
--	on stdin and returns either &quot;OK&quot; or &quot;ERR&quot; on stdout for
--	each input line.
+-#if USE_DELAY_POOLS
+-#include "DelayPools.h"
+-#include "NullDelayId.h"
 -
--\par
--	The following simple perl script demonstrates how the
--	authentication module works.  This script allows any
--	user named &quot;Dirk&quot; (without checking the password)
--	and allows any user that uses the password &quot;Sekrit&quot;:
--
--\code
--#!/usr/bin/perl -w
--$|=1;		# no buffering, important!
--while (&lt;&gt;) {
--        chop;
--        ($u,$p) = split;
--        $ans = &amp;amp;check($u,$p);
--        print &quot;$ans\n&quot;;
+-void *
+-NullDelayId::operator new(size_t size)
+-{
+-    DelayPools::MemoryUsed += sizeof (NullDelayId);
+-    return ::operator new (size);
 -}
 -
--sub check {
--        local($u,$p) = @_;
--        return &#39;ERR&#39; unless (defined $p &amp;amp;&amp;amp; defined $u);
--        return &#39;OK&#39; if (&#39;Dirk&#39; eq $u);
--        return &#39;OK&#39; if (&#39;Sekrit&#39; eq $p);
--        return &#39;ERR&#39;;
+-void
+-NullDelayId::operator delete (void *address)
+-{
+-    DelayPools::MemoryUsed -= sizeof (NullDelayId);
+-    ::operator delete (address);
 -}
--\endcode
 -
-- */
-----++++src/SquidConfig.h
-@@ -10,9 +10,6 @@
- #define SQUID_SQUIDCONFIG_H_
- 
- #include &quot;acl/forward.h&quot;
--#if USE_AUTH
--#include &quot;auth/SchemesConfig.h&quot;
--#endif
- #include &quot;base/RefCount.h&quot;
- #include &quot;base/YesNoNone.h&quot;
- #include &quot;ClientDelayConfig.h&quot;
-@@ -201,9 +198,6 @@ class SquidConfig
- 
-     Helper::ChildConfig redirectChildren;
-     Helper::ChildConfig storeIdChildren;
--    time_t authenticateGCInterval;
--    time_t authenticateTTL;
--    time_t authenticateIpTTL;
- 
-     struct {
-         char *surrogate_id;
-@@ -400,9 +394,6 @@ class SquidConfig
- 
-         acl_access *forceRequestBodyContinuation;
-         acl_access *serverPconnForNonretriable;
--#if USE_AUTH
--        acl_access *authSchemes;
--#endif
-     } accessList;
-     AclDenyInfoList *denyInfoList;
- 
-@@ -543,10 +534,6 @@ class SquidConfig
-         int v4_first;       ///&lt; Place IPv4 first in the order of DNS results.
-         ssize_t packet_max; ///&lt; maximum size EDNS advertised for DNS replies.
-     } dns;
+-#endif /* USE_DELAY_POOLS */
 -
--#if USE_AUTH
--    Auth::SchemesConfigs authSchemesConfigs;
--#endif
+@@ -12,15 +12,13 @@
+ #define NULLDELAYID_H
+ 
+ #if USE_DELAY_POOLS
+-#include "base/RefCount.h"
+ #include "DelayIdComposite.h"
+ 
+ class NullDelayId : public DelayIdComposite
+ {
++    MEMPROXY_CLASS(NullDelayId);
+ 
+ public:
+-    void *operator new(size_t);
+-    void operator delete (void *);
+     virtual int bytesWanted (int minimum, int maximum) const {return max(minimum,maximum);}
+ 
+     virtual void bytesIn(int qty) {}
+@@ -34,7 +34,8 @@ const ACLFlag ACLFlags::NoFlags[1] = {ACL_F_END};
+ 
+ const char *AclMatchedName = NULL;
+ 
+-ACLFlags::FlagsTokenizer::FlagsTokenizer(): tokPos(NULL) { }
++ACLFlags::FlagsTokenizer::FlagsTokenizer()
++    : tokPos(nullptr), Parameter(nullptr) {}
+ 
+ ACLFlag
+ ACLFlags::FlagsTokenizer::nextFlag()
+@@ -50,19 +51,19 @@ ACLFlags::FlagsTokenizer::nextFlag()
+ bool
+ ACLFlags::FlagsTokenizer::hasParameter() const
+ {
+-    return tokPos && tokPos[0] && tokPos[1] == '=' && tokPos[2];
++    return tokPos && tokPos[0] && !tokPos[1] && Parameter;
+ }
+ 
+ SBuf
+ ACLFlags::FlagsTokenizer::getParameter() const
+ {
+-    return hasParameter() ? SBuf(&tokPos[2]) : SBuf();
++    return hasParameter() ? SBuf(Parameter) : SBuf();
+ }
+ 
+ bool
+ ACLFlags::FlagsTokenizer::needNextToken() const
+ {
+-    return !tokPos || !tokPos[0] || !tokPos[1] || tokPos[1] == '=';
++    return !tokPos || !tokPos[0] || !tokPos[1];
+ }
+ 
+ bool
+@@ -71,10 +72,17 @@ ACLFlags::FlagsTokenizer::nextToken()
+     char *t = ConfigParser::PeekAtToken();
+     if (t == NULL || t[0] != '-' || !t[1])
+         return false;
+-    (void)ConfigParser::NextQuotedToken();
+-    if (strcmp(t, "--") == 0)
+-        return false;
+-    tokPos = t + 1;
++    if (strchr(t, '=')) {
++        if(!ConfigParser::NextKvPair(tokPos, Parameter))
++            abortFlags("Invalid formatting for flag '" << t << "'");
++        assert(tokPos[0] == '-');
++        tokPos++;
++    } else {
++        (void)ConfigParser::NextToken();
++        if (!strcmp(t, "--"))
++            return false;
++        tokPos = t + 1;
++    }
+     return true;
+ }
+ 
+@@ -93,6 +93,7 @@ class ACLFlags
+         bool nextToken();
+ 
+         char *tokPos;
++        char *Parameter;
+     };
+ 
+ private:
+@@ -0,0 +1,37 @@
++/*
++ * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#include "squid.h"
++#include "acl/AnnotateClient.h"
++#include "acl/AnnotationData.h"
++#include "client_side.h"
++#include "http/Stream.h"
++#include "Notes.h"
++
++int
++ACLAnnotateClientStrategy::match(ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &flags)
++{
++    if (const auto conn = checklist->conn()) {
++        ACLAnnotationData *tdata = dynamic_cast<ACLAnnotationData*>(data);
++        assert(tdata);
++        tdata->annotate(conn->notes(), flags.delimiters(), checklist->al);
++        if (const auto request = checklist->request)
++            tdata->annotate(request->notes(), flags.delimiters(), checklist->al);
++        return 1;
++    }
++    return 0;
++}
++
++ACLAnnotateClientStrategy *
++ACLAnnotateClientStrategy::Instance()
++{
++    return &Instance_;
++}
++
++ACLAnnotateClientStrategy ACLAnnotateClientStrategy::Instance_;
++
+@@ -0,0 +1,40 @@
++/*
++ * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_ACLANNOTATECLIENT
++#define SQUID_ACLANNOTATECLIENT
++
++#include "acl/Strategised.h"
++#include "acl/Strategy.h"
++
++/// \ingroup ACLAPI
++class ACLAnnotateClientStrategy : public ACLStrategy<NotePairs::Entry *>
++{
++public:
++    static ACLAnnotateClientStrategy *Instance();
++    ACLAnnotateClientStrategy(ACLAnnotateClientStrategy const &) = delete;
++    ACLAnnotateClientStrategy& operator=(ACLAnnotateClientStrategy const &) = delete;
++
++    virtual bool requiresRequest() const { return true; }
++    virtual int match(ACLData<MatchType> * &, ACLFilledChecklist *, ACLFlags &);
++
++private:
++    static ACLAnnotateClientStrategy Instance_;
++    ACLAnnotateClientStrategy() { }
++};
++
++/// \ingroup ACLAPI
++class ACLAnnotateClient
++{
++private:
++    static ACL::Prototype RegistryProtoype;
++    static ACLStrategised<NotePairs::Entry *> RegistryEntry_;
++};
++
++#endif /* SQUID_ACLANNOTATECLIENT */
++
+@@ -0,0 +1,35 @@
++/*
++ * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#include "squid.h"
++#include "acl/AnnotateTransaction.h"
++#include "acl/AnnotationData.h"
++#include "acl/Checklist.h"
++#include "HttpRequest.h"
++#include "Notes.h"
++
++int
++ACLAnnotateTransactionStrategy::match(ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &flags)
++{
++    if (const auto request = checklist->request) {
++        ACLAnnotationData *tdata = dynamic_cast<ACLAnnotationData*>(data);
++        assert(tdata);
++        tdata->annotate(request->notes(), flags.delimiters(), checklist->al);
++        return 1;
++    }
++    return 0;
++}
++
++ACLAnnotateTransactionStrategy *
++ACLAnnotateTransactionStrategy::Instance()
++{
++    return &Instance_;
++}
++
++ACLAnnotateTransactionStrategy ACLAnnotateTransactionStrategy::Instance_;
++
+@@ -0,0 +1,40 @@
++/*
++ * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_ACLANNOTATETRANSACTION
++#define SQUID_ACLANNOTATETRANSACTION
++
++#include "acl/Strategised.h"
++#include "acl/Strategy.h"
++
++/// \ingroup ACLAPI
++class ACLAnnotateTransactionStrategy : public ACLStrategy<NotePairs::Entry *>
++{
++public:
++    virtual int match(ACLData<MatchType> * &, ACLFilledChecklist *, ACLFlags &);
++    virtual bool requiresRequest() const { return true; }
++
++    static ACLAnnotateTransactionStrategy *Instance();
++    ACLAnnotateTransactionStrategy(ACLAnnotateTransactionStrategy const &) = delete;
++    ACLAnnotateTransactionStrategy& operator=(ACLAnnotateTransactionStrategy const &) = delete;
++
++private:
++    static ACLAnnotateTransactionStrategy Instance_;
++    ACLAnnotateTransactionStrategy() {}
++};
++
++/// \ingroup ACLAPI
++class ACLAnnotateTransaction
++{
++private:
++    static ACL::Prototype RegistryProtoype;
++    static ACLStrategised<NotePairs::Entry *> RegistryEntry_;
++};
++
++#endif /* SQUID_ACLANNOTATETRANSACTION */
++
+@@ -0,0 +1,68 @@
++/*
++ * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#include "squid.h"
++#include "acl/Acl.h"
++#include "acl/AnnotationData.h"
++#include "acl/Checklist.h"
++#include "cache_cf.h"
++#include "ConfigParser.h"
++#include "Debug.h"
++#include "format/Format.h"
++#include "sbuf/Algorithms.h"
++
++const char *AnnotationBlackList[] = {
++    "user",
++    "group",
++    "password",
++    "status",
++    "message",
++    "log",
++    "tag",
++    "ttl",
++    "ha1",
++    "rewrite-url",
++    "url",
++    nullptr
++};
++
++ACLAnnotationData::ACLAnnotationData()
++    : notes(new Notes("annotation_data", AnnotationBlackList)) {}
++
++SBufList
++ACLAnnotationData::dump() const
++{
++    SBufList sl;
++    if (const char *strNotes = notes->toString())
++        sl.push_back(SBuf(strNotes));
++    return sl;
++}
++
++void
++ACLAnnotationData::parse()
++{
++    notes->parseKvPair();
++    if (char *t = ConfigParser::PeekAtToken()) {
++        debugs(29, DBG_CRITICAL, "FATAL: Unexpected argument '" << t << "' after annotation specification");
++        self_destruct();
++        return;
++    }
++}
++
++void
++ACLAnnotationData::annotate(NotePairs::Pointer pairs, const CharacterSet *delimiters, const AccessLogEntry::Pointer &al)
++{
++    notes->updateNotePairs(pairs, delimiters, al);
++}
++
++ACLData<NotePairs::Entry *> *
++ACLAnnotationData::clone() const
++{
++    return new ACLAnnotationData;
++}
++
+@@ -0,0 +1,39 @@
++/*
++ * Copyright (C) 1996-2017 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_ACLANNOTATIONDATA_H
++#define SQUID_ACLANNOTATIONDATA_H
++
++#include "AccessLogEntry.h"
++#include "acl/Data.h"
++#include "Notes.h"
++
++/// \ingroup ACLAPI
++class ACLAnnotationData : public ACLData<NotePairs::Entry *>
++{
++    MEMPROXY_CLASS(ACLAnnotationData);
++
++public:
++    ACLAnnotationData();
++
++    /* ACLData<M> API */
++    virtual bool match(NotePairs::Entry *) { return true; }
++    virtual SBufList dump() const;
++    virtual void parse();
++    virtual bool empty() const { return notes->empty(); }
++    virtual ACLData<NotePairs::Entry *> *clone() const;
++
++    /// Stores annotations into pairs.
++    void annotate(NotePairs::Pointer pairs, const CharacterSet *delimiters, const AccessLogEntry::Pointer &al);
++
++private:
++    Notes::Pointer notes;
++};
++
++#endif /* SQUID_ACLANNOTATIONDATA_H */
++
+@@ -52,6 +52,12 @@ libacls_la_SOURCES = \
+ 	TimeData.h \
+ 	AllOf.cc \
+ 	AllOf.h \
++	AnnotateClient.cc \
++	AnnotateClient.h \
++	AnnotateTransaction.cc \
++	AnnotateTransaction.h \
++	AnnotationData.cc \
++	AnnotationData.h \
+ 	AnyOf.cc \
+ 	AnyOf.h \
+ 	Asn.cc \
+@@ -20,7 +20,7 @@ int
+ ACLNoteStrategy::match(ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &flags)
+ {
+     if (const auto request = checklist->request) {
+-        if (request->notes != NULL && matchNotes(data, request->notes.getRaw(), flags.delimiters()))
++        if (request->hasNotes() && matchNotes(data, request->notes().getRaw(), flags.delimiters()))
+             return 1;
+ #if USE_ADAPTATION
+         const Adaptation::History::Pointer ah = request->adaptLogHistory();
+@@ -34,24 +34,10 @@ ACLNoteStrategy::match(ACLData<MatchType> * &data, ACLFilledChecklist *checklist
+ bool
+ ACLNoteStrategy::matchNotes(ACLData<MatchType> *noteData, const NotePairs *note, const CharacterSet *delimiters) const
+ {
+-    for (auto &entry: note->entries) {
+-        if (delimiters) {
+-            NotePairs::Entry e(entry->name.termedBuf(), "");
+-            Parser::Tokenizer t(StringToSBuf(entry->value));
+-            SBuf s;
+-            while (t.token(s, *delimiters)) {
+-                e.value = s.c_str();
+-                if (noteData->match(&e))
+-                    return true;
+-            }
+-            s = t.remaining();
+-            e.value = s.c_str();
+-            if (noteData->match(&e))
+-                return true;
+-        }
+-        if (noteData->match(entry))
++    const NotePairs::Entries &entries = note->expandListEntries(delimiters);
++    for (auto e: entries)
++        if (noteData->match(e.getRaw()))
+             return true;
+-    }
+     return false;
+ }
+ 
+@@ -27,19 +27,19 @@ ACLNoteData::~ACLNoteData()
+ bool
+ ACLNoteData::match(NotePairs::Entry *entry)
+ {
+-    if (entry->name.cmp(name.termedBuf()) != 0)
++    if (entry->name().cmp(name) != 0)
+         return false; // name mismatch
+ 
+     // a name-only note ACL matches any value; others require a values match
+     return values->empty() ||
+-           values->match(entry->value.termedBuf());
++           values->match(entry->value());
+ }
+ 
+ SBufList
+ ACLNoteData::dump() const
+ {
+     SBufList sl;
+-    sl.push_back(StringToSBuf(name));
++    sl.push_back(name);
+ #if __cplusplus >= 201103L
+     sl.splice(sl.end(), values->dump());
+ #else
+@@ -62,7 +62,7 @@ ACLNoteData::parse()
+ bool
+ ACLNoteData::empty() const
+ {
+-    return name.size() == 0;
++    return name.isEmpty();
+ }
+ 
+ ACLData<NotePairs::Entry *> *
+@@ -30,7 +30,7 @@ class ACLNoteData : public ACLData<NotePairs::Entry *>
+     virtual ACLData<NotePairs::Entry *> *clone() const;
+ 
+ private:
+-    String name;                   ///< Note name to check. It is always set
++    SBuf name;                   ///< Note name to check. It is always set
+     ACLStringData *values; ///< if set, at least one value must match
  };
  
- extern SquidConfig Config;
-----++++src/auth/Config.cc
-@@ -9,160 +9,8 @@
- /* DEBUG: section 29    Authenticator */
+@@ -45,7 +45,7 @@ const char *metasBlacklist[] = {
+     "Transfer-Complete",
+     NULL
+ };
+-Notes Adaptation::Config::metaHeaders("ICAP header", metasBlacklist, true);
++Notes Adaptation::Config::metaHeaders("ICAP header", metasBlacklist);
+ bool Adaptation::Config::needHistory = false;
  
- #include &quot;squid.h&quot;
-+#include &quot;acl/Tree.h&quot;
- #include &quot;auth/Config.h&quot;
--#include &quot;auth/Gadgets.h&quot;
--#include &quot;auth/UserRequest.h&quot;
--#include &quot;cache_cf.h&quot;
--#include &quot;ConfigParser.h&quot;
--#include &quot;Debug.h&quot;
--#include &quot;format/Format.h&quot;
--#include &quot;globals.h&quot;
--#include &quot;Store.h&quot;
--#include &quot;wordlist.h&quot;
+ Adaptation::ServiceConfig*
+@@ -188,10 +188,11 @@ Adaptation::Ecap::XactionRep::metaValue(const libecap::Name &name) const
  
--Auth::ConfigVector Auth::TheConfig;
--
--/**
-- * Get an User credentials object filled out for the given Proxy- or WWW-Authenticate header.
-- * Any decoding which needs to be done will be done.
-- *
-- * It may be a cached AuthUser or a new Unauthenticated object.
-- * It may also be NULL reflecting that no user could be created.
-- */
--Auth::UserRequest::Pointer
--Auth::Config::CreateAuthUser(const char *proxy_auth, AccessLogEntry::Pointer &amp;al)
--{
--    assert(proxy_auth != NULL);
--    debugs(29, 9, HERE &lt;&lt; &quot;header = &#39;&quot; &lt;&lt; proxy_auth &lt;&lt; &quot;&#39;&quot;);
--
--    Auth::Config *config = Find(proxy_auth);
--
--    if (config == NULL || !config-&gt;active()) {
--        debugs(29, (shutting_down?3:DBG_IMPORTANT), (shutting_down?&quot;&quot;:&quot;WARNING: &quot;) &lt;&lt;
--               &quot;Unsupported or unconfigured/inactive proxy-auth scheme, &#39;&quot; &lt;&lt; proxy_auth &lt;&lt; &quot;&#39;&quot;);
--        return NULL;
--    }
--    static MemBuf rmb;
--    rmb.reset();
--    if (config-&gt;keyExtras) {
--        // %credentials and %username, which normally included in
--        // request_format, are - at this time, but that is OK
--        // because user name is added to key explicitly, and we do
--        // not want to store authenticated credentials at all.
--        config-&gt;keyExtras-&gt;assemble(rmb, al, 0);
--    }
--
--    return config-&gt;decode(proxy_auth, rmb.hasContent() ? rmb.content() : NULL);
--}
--
--Auth::Config *
--Auth::Config::Find(const char *proxy_auth)
--{
--    for (Auth::ConfigVector::iterator  i = Auth::TheConfig.begin(); i != Auth::TheConfig.end(); ++i)
--        if (strncasecmp(proxy_auth, (*i)-&gt;type(), strlen((*i)-&gt;type())) == 0)
--            return *i;
--
--    return NULL;
--}
--
--Auth::Config *
--Auth::Config::GetParsed(const char *proxy_auth)
--{
--    if (auto *cfg = Find(proxy_auth))
--        return cfg;
--    fatalf(&quot;auth_schemes: required authentication method &#39;%s&#39; is not configured&quot;, proxy_auth);
--    return nullptr;
--}
--
--/** Default behaviour is to expose nothing */
--void
--Auth::Config::registerWithCacheManager(void)
--{}
--
--void
--Auth::Config::parse(Auth::Config * scheme, int, char *param_str)
--{
--    if (strcmp(param_str, &quot;program&quot;) == 0) {
--        if (authenticateProgram)
--            wordlistDestroy(&amp;authenticateProgram);
--
--        parse_wordlist(&amp;authenticateProgram);
--
--        requirePathnameExists(&quot;Authentication helper program&quot;, authenticateProgram-&gt;key);
--
--    } else if (strcmp(param_str, &quot;realm&quot;) == 0) {
--        realm.clear();
--
--        char *token = ConfigParser::NextQuotedOrToEol();
--
--        while (token &amp;&amp; *token &amp;&amp; xisspace(*token))
--            ++token;
--
--        if (!token || !*token) {
--            debugs(29, DBG_PARSE_NOTE(DBG_IMPORTANT), &quot;ERROR: Missing auth_param &quot; &lt;&lt; scheme-&gt;type() &lt;&lt; &quot; realm&quot;);
--            self_destruct();
--            return;
--        }
--
--        realm = token;
--
--    } else if (strcmp(param_str, &quot;children&quot;) == 0) {
--        authenticateChildren.parseConfig();
--
--    } else if (strcmp(param_str, &quot;key_extras&quot;) == 0) {
--        keyExtrasLine = ConfigParser::NextQuotedToken();
--        Format::Format *nlf =  new ::Format::Format(scheme-&gt;type());
--        if (!nlf-&gt;parse(keyExtrasLine.termedBuf())) {
--            debugs(29, DBG_CRITICAL, &quot;FATAL: Failed parsing key_extras formatting value&quot;);
--            self_destruct();
--            return;
--        }
--        if (keyExtras)
--            delete keyExtras;
--
--        keyExtras = nlf;
--
--        if (char *t = strtok(NULL, w_space)) {
--            debugs(29, DBG_CRITICAL, &quot;FATAL: Unexpected argument &#39;&quot; &lt;&lt; t &lt;&lt; &quot;&#39; after request_format specification&quot;);
--            self_destruct();
--        }
--    } else {
--        debugs(29, DBG_CRITICAL, &quot;Unrecognised &quot; &lt;&lt; scheme-&gt;type() &lt;&lt; &quot; auth scheme parameter &#39;&quot; &lt;&lt; param_str &lt;&lt; &quot;&#39;&quot;);
--    }
--}
--
--bool
--Auth::Config::dump(StoreEntry *entry, const char *name, Auth::Config *scheme) const
--{
--    if (!authenticateProgram)
--        return false; // not configured
--
--    wordlist *list = authenticateProgram;
--    storeAppendPrintf(entry, &quot;%s %s&quot;, name, scheme-&gt;type());
--    while (list != NULL) {
--        storeAppendPrintf(entry, &quot; %s&quot;, list-&gt;key);
--        list = list-&gt;next;
--    }
--    storeAppendPrintf(entry, &quot;\n&quot;);
--
--    storeAppendPrintf(entry, &quot;%s %s realm &quot; SQUIDSBUFPH &quot;\n&quot;, name, scheme-&gt;type(), SQUIDSBUFPRINT(realm));
--
--    storeAppendPrintf(entry, &quot;%s %s children %d startup=%d idle=%d concurrency=%d\n&quot;,
--                      name, scheme-&gt;type(),
--                      authenticateChildren.n_max, authenticateChildren.n_startup,
--                      authenticateChildren.n_idle, authenticateChildren.concurrency);
--
--    if (keyExtrasLine.size() &gt; 0)
--        storeAppendPrintf(entry, &quot;%s %s key_extras \&quot;%s\&quot;\n&quot;, name, scheme-&gt;type(), keyExtrasLine.termedBuf());
--
--    return true;
--}
--
--void
--Auth::Config::done()
--{
--    delete keyExtras;
--    keyExtras = NULL;
--    keyExtrasLine.clean();
--}
-+Auth::Config Auth::TheConfig;
+     if (name.known()) { // must check to avoid empty names matching unset cfg
+         typedef Notes::iterator ACAMLI;
+-        for (ACAMLI i = Adaptation::Config::metaHeaders.begin(); i != Adaptation::Config::metaHeaders.end(); ++i) {
+-            if (name == (*i)->key.termedBuf()) {
+-                if (const char *value = (*i)->match(request, reply, al))
+-                    return libecap::Area::FromTempString(value);
++        for (auto h: Adaptation::Config::metaHeaders) {
++            if (name == h->key().toStdString()) {
++                SBuf matched;
++                if (h->match(request, reply, al, matched))
++                    return libecap::Area::FromTempString(matched.toStdString());
+                 else
+                     return libecap::Area();
+             }
+@@ -209,12 +210,11 @@ Adaptation::Ecap::XactionRep::visitEachMetaHeader(libecap::NamedValueVisitor &vi
+     Must(request);
+     HttpReply *reply = dynamic_cast<HttpReply*>(theVirginRep.raw().header);
  
-----++++GitHub
+-    typedef Notes::iterator ACAMLI;
+-    for (ACAMLI i = Adaptation::Config::metaHeaders.begin(); i != Adaptation::Config::metaHeaders.end(); ++i) {
+-        const char *v = (*i)->match(request, reply, al);
+-        if (v) {
+-            const libecap::Name name((*i)->key.termedBuf());
+-            const libecap::Area value = libecap::Area::FromTempString(v);
++    for (auto h: Adaptation::Config::metaHeaders) {
++        SBuf matched;
++        if (h->match(request, reply, al, matched)) {
++            const libecap::Name name(h->key().toStdString());
++            const libecap::Area value = libecap::Area::FromTempString(matched.toStdString());
+             visitor.visit(name, value);
+         }
+     }
+@@ -238,14 +238,13 @@ Adaptation::Ecap::XactionRep::start()
+     if (ah != NULL) {
+         // retrying=false because ecap never retries transactions
+         adaptHistoryId = ah->recordXactStart(service().cfg().key, current_time, false);
+-        typedef Notes::iterator ACAMLI;
+-        for (ACAMLI i = Adaptation::Config::metaHeaders.begin(); i != Adaptation::Config::metaHeaders.end(); ++i) {
+-            const char *v = (*i)->match(request, reply, al);
+-            if (v) {
++        SBuf matched;
++        for (auto h: Adaptation::Config::metaHeaders) {
++            if (h->match(request, reply, al, matched)) {
+                 if (ah->metaHeaders == NULL)
+                     ah->metaHeaders = new NotePairs();
+-                if (!ah->metaHeaders->hasPair((*i)->key.termedBuf(), v))
+-                    ah->metaHeaders->add((*i)->key.termedBuf(), v);
++                if (!ah->metaHeaders->hasPair(h->key(), matched))
++                    ah->metaHeaders->add(h->key(), matched);
+             }
+         }
+     }
+@@ -1486,22 +1486,25 @@ void Adaptation::Icap::ModXact::makeRequestHeaders(MemBuf &buf)
+         makeUsernameHeader(request, buf);
+ 
+     // Adaptation::Config::metaHeaders
+-    typedef Notes::iterator ACAMLI;
+-    for (ACAMLI i = Adaptation::Config::metaHeaders.begin(); i != Adaptation::Config::metaHeaders.end(); ++i) {
++    for (auto h: Adaptation::Config::metaHeaders) {
+         HttpRequest *r = virgin.cause ?
+                          virgin.cause : dynamic_cast<HttpRequest*>(virgin.header);
+         Must(r);
+ 
+         HttpReply *reply = dynamic_cast<HttpReply*>(virgin.header);
+ 
+-        if (const char *value = (*i)->match(r, reply, alMaster)) {
+-            buf.appendf("%s: %s\r\n", (*i)->key.termedBuf(), value);
++        SBuf matched;
++        if (h->match(r, reply, alMaster, matched)) {
++            buf.append(h->key().rawContent(), h->key().length());
++            buf.append(": ", 2);
++            buf.append(matched.rawContent(), matched.length());
++            buf.append("\r\n", 2);
+             Adaptation::History::Pointer ah = request->adaptHistory(false);
+             if (ah != NULL) {
+                 if (ah->metaHeaders == NULL)
+                     ah->metaHeaders = new NotePairs;
+-                if (!ah->metaHeaders->hasPair((*i)->key.termedBuf(), value))
+-                    ah->metaHeaders->add((*i)->key.termedBuf(), value);
++                if (!ah->metaHeaders->hasPair(h->key(), matched))
++                    ah->metaHeaders->add(h->key(), matched);
+             }
+         }
+     }
+@@ -19,6 +19,8 @@
+ #include "comm/Connection.h"
+ #include "fatal.h"
+ #include "format/Format.h"
++#include "helper.h"
++#include "helper/Reply.h"
+ #include "http/Stream.h"
+ #include "HttpReply.h"
+ #include "HttpRequest.h"
+@@ -116,13 +118,13 @@ Auth::UserRequest::setDenyMessage(char const *aString)
+ }
+ 
+ char const *
+-Auth::UserRequest::getDenyMessage()
++Auth::UserRequest::getDenyMessage() const
+ {
+     return message;
+ }
+ 
+ char const *
+-Auth::UserRequest::denyMessage(char const * const default_message)
++Auth::UserRequest::denyMessage(char const * const default_message) const
+ {
+     if (getDenyMessage() == NULL)
+         return default_message;
+@@ -574,3 +576,14 @@ Auth::UserRequest::helperRequestKeyExtras(HttpRequest *request, AccessLogEntry::
+     return NULL;
+ }
+ 
++void
++Auth::UserRequest::denyMessageFromHelper(const char *proto, const Helper::Reply &reply)
++{
++    static SBuf messageNote;
++    if (!reply.notes.find(messageNote, "message")) {
++        messageNote.append(proto);
++        messageNote.append(" Authentication denied with no reason given");
++    }
++    setDenyMessage(messageNote.c_str());
++}
++
+@@ -179,13 +179,13 @@ class UserRequest : public RefCountable
+      */
+     void start(HttpRequest *request, AccessLogEntry::Pointer &al, AUTHCB *handler, void *data);
+ 
+-    char const * denyMessage(char const * const default_message = NULL);
++    char const * denyMessage(char const * const default_message = NULL) const;
+ 
+     /** Possibly overrideable in future */
+     void setDenyMessage(char const *);
+ 
+     /** Possibly overrideable in future */
+-    char const * getDenyMessage();
++    char const * getDenyMessage() const;
+ 
+     /**
+      * Squid does not make assumptions about where the username is stored.
+@@ -208,6 +208,9 @@ class UserRequest : public RefCountable
+ 
+     const char *helperRequestKeyExtras(HttpRequest *, AccessLogEntry::Pointer &al);
+ 
++    /// Sets the reason of 'authentication denied' helper response.
++    void denyMessageFromHelper(char const *proto, const Helper::Reply &reply);
++
+ protected:
+     /**
+      * The scheme-specific actions to be performed when sending helper lookup.
+@@ -355,8 +355,7 @@ Auth::Digest::UserRequest::HandleReply(void *data, const Helper::Reply &reply)
+         Auth::Digest::User *digest_user = dynamic_cast<Auth::Digest::User *>(auth_user_request->user().getRaw());
+         assert(digest_user != NULL);
+ 
+-        const char *ha1Note = reply.notes.findFirst("ha1");
+-        if (ha1Note != NULL) {
++        if (const char *ha1Note = reply.notes.findFirst("ha1")) {
+             CvtBin(ha1Note, digest_user->HA1);
+             digest_user->HA1created = 1;
+         } else {
+@@ -381,9 +380,9 @@ Auth::Digest::UserRequest::HandleReply(void *data, const Helper::Reply &reply)
+         digest_request->user()->credentials(Auth::Failed);
+         digest_request->flags.invalid_password = true;
+ 
+-        const char *msgNote = reply.notes.find("message");
+-        if (msgNote != NULL) {
+-            digest_request->setDenyMessage(msgNote);
++        SBuf msgNote;
++        if (reply.notes.find(msgNote, "message")) {
++            digest_request->setDenyMessage(msgNote.c_str());
+         } else if (reply.other().hasContent()) {
+             // old helpers did send ERR result but a bare message string instead of message= key name.
+             digest_request->setDenyMessage(reply.other().content());
+@@ -307,11 +307,11 @@ Auth::Negotiate::UserRequest::HandleReply(void *data, const Helper::Reply &reply
+             const char *tokenNote = reply.notes.findFirst("token");
+             lm_request->server_blob = xstrdup(tokenNote);
+             auth_user_request->user()->credentials(Auth::Handshake);
+-            auth_user_request->denyMessage("Authentication in progress");
++            auth_user_request->setDenyMessage("Authentication in progress");
+             debugs(29, 4, HERE << "Need to challenge the client with a server token: '" << tokenNote << "'");
+         } else {
+             auth_user_request->user()->credentials(Auth::Failed);
+-            auth_user_request->denyMessage("Negotiate authentication requires a persistent connection");
++            auth_user_request->setDenyMessage("Negotiate authentication requires a persistent connection");
+         }
+         break;
+ 
+@@ -327,7 +327,7 @@ Auth::Negotiate::UserRequest::HandleReply(void *data, const Helper::Reply &reply
+ 
+         /* we're finished, release the helper */
+         auth_user_request->user()->username(userNote);
+-        auth_user_request->denyMessage("Login successful");
++        auth_user_request->setDenyMessage("Login successful");
+         safe_free(lm_request->server_blob);
+         lm_request->server_blob = xstrdup(tokenNote);
+         lm_request->releaseAuthServer();
+@@ -356,47 +356,37 @@ Auth::Negotiate::UserRequest::HandleReply(void *data, const Helper::Reply &reply
+     }
+     break;
+ 
+-    case Helper::Error: {
+-        const char *messageNote = reply.notes.find("message");
+-        const char *tokenNote = reply.notes.findFirst("token");
+-
++    case Helper::Error:
+         /* authentication failure (wrong password, etc.) */
+-        if (messageNote != NULL)
+-            auth_user_request->denyMessage(messageNote);
+-        else
+-            auth_user_request->denyMessage("Negotiate Authentication denied with no reason given");
++        auth_user_request->denyMessageFromHelper("Negotiate", reply);
+         auth_user_request->user()->credentials(Auth::Failed);
+         safe_free(lm_request->server_blob);
+-        if (tokenNote != NULL)
++        if (const char *tokenNote = reply.notes.findFirst("token"))
+             lm_request->server_blob = xstrdup(tokenNote);
+         lm_request->releaseAuthServer();
+         debugs(29, 4, "Failed validating user via Negotiate. Result: " << reply);
+-    }
+-    break;
++        break;
+ 
+     case Helper::Unknown:
+         debugs(29, DBG_IMPORTANT, "ERROR: Negotiate Authentication Helper '" << reply.whichServer << "' crashed!.");
+     /* continue to the next case */
+ 
+     case Helper::TimedOut:
+-    case Helper::BrokenHelper: {
++    case Helper::BrokenHelper:
+         /* TODO kick off a refresh process. This can occur after a YR or after
+          * a KK. If after a YR release the helper and resubmit the request via
+          * Authenticate Negotiate start.
+          * If after a KK deny the user's request w/ 407 and mark the helper as
+          * Needing YR. */
+-        const char *errNote = reply.notes.find("message");
+         if (reply.result == Helper::Unknown)
+-            auth_user_request->denyMessage("Internal Error");
+-        else if (errNote != NULL)
+-            auth_user_request->denyMessage(errNote);
++            auth_user_request->setDenyMessage("Internal Error");
+         else
+-            auth_user_request->denyMessage("Negotiate Authentication failed with no reason given");
++            auth_user_request->denyMessageFromHelper("Negotiate", reply);
+         auth_user_request->user()->credentials(Auth::Failed);
+         safe_free(lm_request->server_blob);
+         lm_request->releaseAuthServer();
+         debugs(29, DBG_IMPORTANT, "ERROR: Negotiate Authentication validating user. Result: " << reply);
+-    } // break;
++        break;
+     }
+ 
+     if (lm_request->request) {
+@@ -302,11 +302,11 @@ Auth::Ntlm::UserRequest::HandleReply(void *data, const Helper::Reply &reply)
+             const char *serverBlob = reply.notes.findFirst("token");
+             lm_request->server_blob = xstrdup(serverBlob);
+             auth_user_request->user()->credentials(Auth::Handshake);
+-            auth_user_request->denyMessage("Authentication in progress");
++            auth_user_request->setDenyMessage("Authentication in progress");
+             debugs(29, 4, HERE << "Need to challenge the client with a server token: '" << serverBlob << "'");
+         } else {
+             auth_user_request->user()->credentials(Auth::Failed);
+-            auth_user_request->denyMessage("NTLM authentication requires a persistent connection");
++            auth_user_request->setDenyMessage("NTLM authentication requires a persistent connection");
+         }
+         break;
+ 
+@@ -321,7 +321,7 @@ Auth::Ntlm::UserRequest::HandleReply(void *data, const Helper::Reply &reply)
+             break;
+         }
+         auth_user_request->user()->username(userLabel);
+-        auth_user_request->denyMessage("Login successful");
++        auth_user_request->setDenyMessage("Login successful");
+         safe_free(lm_request->server_blob);
+         lm_request->releaseAuthServer();
+ 
+@@ -351,44 +351,35 @@ Auth::Ntlm::UserRequest::HandleReply(void *data, const Helper::Reply &reply)
+     }
+     break;
+ 
+-    case Helper::Error: {
++    case Helper::Error:
+         /* authentication failure (wrong password, etc.) */
+-        const char *errNote = reply.notes.find("message");
+-        if (errNote != NULL)
+-            auth_user_request->denyMessage(errNote);
+-        else
+-            auth_user_request->denyMessage("NTLM Authentication denied with no reason given");
++        auth_user_request->denyMessageFromHelper("NTLM", reply);
+         auth_user_request->user()->credentials(Auth::Failed);
+         safe_free(lm_request->server_blob);
+         lm_request->releaseAuthServer();
+         debugs(29, 4, "Failed validating user via NTLM. Result: " << reply);
+-    }
+-    break;
++        break;
+ 
+     case Helper::Unknown:
+         debugs(29, DBG_IMPORTANT, "ERROR: NTLM Authentication Helper '" << reply.whichServer << "' crashed!.");
+     /* continue to the next case */
+ 
+     case Helper::TimedOut:
+-    case Helper::BrokenHelper: {
++    case Helper::BrokenHelper:
+         /* TODO kick off a refresh process. This can occur after a YR or after
+          * a KK. If after a YR release the helper and resubmit the request via
+          * Authenticate NTLM start.
+          * If after a KK deny the user's request w/ 407 and mark the helper as
+          * Needing YR. */
+-        const char *errNote = reply.notes.find("message");
+         if (reply.result == Helper::Unknown)
+-            auth_user_request->denyMessage("Internal Error");
+-        else if (errNote != NULL)
+-            auth_user_request->denyMessage(errNote);
++            auth_user_request->setDenyMessage("Internal Error");
+         else
+-            auth_user_request->denyMessage("NTLM Authentication failed with no reason given");
++            auth_user_request->denyMessageFromHelper("NTLM", reply);
+         auth_user_request->user()->credentials(Auth::Failed);
+         safe_free(lm_request->server_blob);
+         lm_request->releaseAuthServer();
+         debugs(29, DBG_IMPORTANT, "ERROR: NTLM Authentication validating user. Result: " << reply);
+-    }
+-    break;
++        break;
+     }
+ 
+     if (lm_request->request) {
+@@ -1217,6 +1217,79 @@ DOC_START
+ 	  # Annotation sources include note and adaptation_meta directives
+ 	  # as well as helper and eCAP responses.
+ 
++	acl aclname annotate_transaction [-m[=delimiters]] key=value ...
++	acl aclname annotate_transaction [-m[=delimiters]] key+=value ...
++	  # Always matches. [fast]
++	  # Used for its side effect: This ACL immediately adds a
++	  # key=value annotation to the current master transaction.
++	  # The added annotation can then be tested using note ACL and
++	  # logged (or sent to helpers) using %note format code.
++	  #
++	  # Annotations can be specified using replacement and addition
++	  # formats. The key=value form replaces old same-key annotation
++	  # value(s). The key+=value form appends a new value to the old
++	  # same-key annotation. Both forms create a new key=value
++	  # annotation if no same-key annotation exists already. If
++	  # -m flag is used, then the value is interpreted as a list
++	  # and the annotation will contain key=token pair(s) instead of the
++	  # whole key=value pair.
++	  #
++	  # This ACL is especially useful for recording complex multi-step
++	  # ACL-driven decisions. For example, the following configuration
++	  # avoids logging transactions accepted after aclX matched:
++	  #
++	  #  # First, mark transactions accepted after aclX matched
++	  #  acl markSpecial annotate_transaction special=true
++	  #  http_access allow acl001
++	  #  ...
++	  #  http_access deny acl100
++	  #  http_access allow aclX markSpecial
++	  #
++	  #  # Second, do not log marked transactions:
++	  #  acl markedSpecial note special true
++	  #  access_log ... deny markedSpecial
++	  #
++	  #  # Note that the following would not have worked because aclX
++	  #  # alone does not determine whether the transaction was allowed:
++	  #  access_log ... deny aclX # Wrong!
++	  #
++	  # Warning: This ACL annotates the transaction even when negated
++	  # and even if subsequent ACLs fail to match. For example, the
++	  # following three rules will have exactly the same effect as far
++	  # as annotations set by the "mark" ACL are concerned:
++	  #
++	  #  some_directive acl1 ... mark # rule matches if mark is reached
++	  #  some_directive acl1 ... !mark     # rule never matches
++	  #  some_directive acl1 ... mark !all # rule never matches
++
++	acl aclname annotate_client [-m[=delimiters]] key=value ...
++	acl aclname annotate_client [-m[=delimiters]] key+=value ...
++	  #
++	  # Always matches. [fast]
++	  # Used for its side effect: This ACL immediately adds a
++	  # key=value annotation to the current client-to-Squid
++	  # connection. Connection annotations are propagated to the current
++	  # and all future master transactions on the annotated connection.
++	  # See the annotate_transaction ACL for details.
++	  #
++	  # For example, the following configuration avoids rewriting URLs
++	  # of transactions bumped by SslBump:
++	  #
++	  #  # First, mark bumped connections:
++	  #  acl markBumped annotate_client bumped=true
++	  #  ssl_bump peek acl1
++	  #  ssl_bump stare acl2
++	  #  ssl_bump bump acl3 markBumped
++	  #  ssl_bump splice all
++	  #
++	  #  # Second, do not send marked transactions to the redirector:
++	  #  acl markedBumped note bumped true
++	  #  url_rewrite_access deny markedBumped
++	  #
++	  #  # Note that the following would not have worked because acl3 alone
++	  #  # does not determine whether the connection is going to be bumped:
++	  #  url_rewrite_access deny acl3 # Wrong!
++
+ 	acl aclname adaptation_service service ...
+ 	  # Matches the name of any icap_service, ecap_service,
+ 	  # adaptation_service_set, or adaptation_service_chain that Squid
+@@ -2612,15 +2685,11 @@ DOC_START
+ 			To control SSLv3 use the options= parameter.
+ 			Supported Values: 1.0 (default), 1.1, 1.2
+ 
+-	options=... 	Specify various TLS/SSL implementation options:
+-
+-			    NO_SSLv3    Disallow the use of SSLv3
++	options=...	Specify various TLS/SSL implementation options.
+ 
+-			    NO_TLSv1    Disallow the use of TLSv1.0
++			OpenSSL options most important are:
+ 
+-			    NO_TLSv1_1  Disallow the use of TLSv1.1
+-
+-			    NO_TLSv1_2  Disallow the use of TLSv1.2
++			    NO_SSLv3    Disallow the use of SSLv3
+ 
+ 			    SINGLE_DH_USE
+ 				      Always create a new key when using
+@@ -2637,8 +2706,21 @@ DOC_START
+ 				      Be warned that this reduces SSL/TLS
+ 				      strength to some attacks.
+ 
+-			See the OpenSSL SSL_CTX_set_options documentation for a
+-			more complete list.
++				See the OpenSSL SSL_CTX_set_options documentation
++				for a more complete list.
++
++			GnuTLS options most important are:
++
++			    %NO_TICKETS
++				      Disable use of RFC5077 session tickets.
++				      Some servers may have problems
++				      understanding the TLS extension due
++				      to ambiguous specification in RFC4507.
++
++				See the GnuTLS Priority Strings documentation
++				for a more complete list.
++				http://www.gnutls.org/manual/gnutls.html#Priority-Strings
++
+ 	
+ 	cafile=		PEM file containing CA certificates to use when verifying
+ 			the peer certificate. May be repeated to load multiple files.
+@@ -3374,18 +3456,14 @@ DOC_START
+ 
+ 	tls-min-version=1.N
+ 			The minimum TLS protocol version to permit. To control
+-			SSLv3 use the ssloptions= parameter.
++			SSLv3 use the tls-options= parameter.
+ 			Supported Values: 1.0 (default), 1.1, 1.2
+ 
+-	ssloptions=... 	Specify various SSL implementation options:
++	tls-options=...	Specify various TLS implementation options.
+ 
+-			    NO_SSLv3    Disallow the use of SSLv3
++			OpenSSL options most important are:
+ 
+-			    NO_TLSv1    Disallow the use of TLSv1.0
+-
+-			    NO_TLSv1_1  Disallow the use of TLSv1.1
+-
+-			    NO_TLSv1_2  Disallow the use of TLSv1.2
++			    NO_SSLv3    Disallow the use of SSLv3
+ 
+ 			    SINGLE_DH_USE
+ 				      Always create a new key when using
+@@ -3404,7 +3482,19 @@ DOC_START
+ 
+ 			See the OpenSSL SSL_CTX_set_options documentation for a
+ 			more complete list.
+-	
++
++			GnuTLS options most important are:
++
++			    %NO_TICKETS
++				      Disable use of RFC5077 session tickets.
++				      Some servers may have problems
++				      understanding the TLS extension due
++				      to ambiguous specification in RFC4507.
++
++				See the GnuTLS Priority Strings documentation
++				for a more complete list.
++				http://www.gnutls.org/manual/gnutls.html#Priority-Strings
++
+ 	tls-cafile=	PEM file containing CA certificates to use when verifying
+ 			the peer certificate. May be repeated to load multiple files.
+ 	
+@@ -8699,17 +8789,13 @@ DOC_START
+ 
+ 	tls-min-version=1.N
+ 			The minimum TLS protocol version to permit. To control
+-			SSLv3 use the ssloptions= parameter.
++			SSLv3 use the tls-options= parameter.
+ 			Supported Values: 1.0 (default), 1.1, 1.2
+ 
+ 	tls-options=...	Specify various OpenSSL library options:
+ 
+ 			    NO_SSLv3    Disallow the use of SSLv3
+ 
+-			    NO_TLSv1    Disallow the use of TLSv1.0
+-			    NO_TLSv1_1  Disallow the use of TLSv1.1
+-			    NO_TLSv1_2  Disallow the use of TLSv1.2
+-
+ 			    SINGLE_DH_USE
+ 				      Always create a new key when using
+ 				      temporary/ephemeral DH key exchanges
+@@ -430,15 +430,15 @@ ClientHttpRequest::logRequest()
+ 
+     /* Add notes (if we have a request to annotate) */
+     if (request) {
+-        // The al->notes and request->notes must point to the same object.
+-        (void)SyncNotes(*al, *request);
+-        for (auto i = Config.notes.begin(); i != Config.notes.end(); ++i) {
+-            if (const char *value = (*i)->match(request, al->reply, NULL)) {
+-                NotePairs &notes = SyncNotes(*al, *request);
+-                notes.add((*i)->key.termedBuf(), value);
+-                debugs(33, 3, (*i)->key.termedBuf() << " " << value);
++        SBuf matched;
++        for (auto h: Config.notes) {
++            if (h->match(request, al->reply, NULL, matched)) {
++                request->notes()->add(h->key(), matched);
++                debugs(33, 3, h->key() << " " << matched);
+             }
+         }
++        // The al->notes and request->notes must point to the same object.
++        al->syncNotes(request);
+     }
+ 
+     ACLFilledChecklist checklist(NULL, request, NULL);
+@@ -1321,7 +1321,8 @@ parseHttpRequest(ConnStateData *csd, const Http1::RequestParserPointer &hp)
+             auto result = csd->abortRequestParsing(
+                               tooBig ? "error:request-too-large" : "error:invalid-request");
+             // assume that remaining leftovers belong to this bad request
+-            csd->consumeInput(csd->inBuf.length());
++            if (!csd->inBuf.isEmpty())
++                csd->consumeInput(csd->inBuf.length());
+             return result;
+         }
+     }
+@@ -1684,10 +1685,10 @@ clientProcessRequest(ConnStateData *conn, const Http1::RequestParserPointer &hp,
+ 
+     request->flags.internal = http->flags.internal;
+     setLogUri (http, urlCanonicalClean(request.getRaw()));
+-    request->client_addr = conn->clientConnection->remote; // XXX: remove reuest->client_addr member.
++    request->client_addr = conn->clientConnection->remote; // XXX: remove request->client_addr member.
+ #if FOLLOW_X_FORWARDED_FOR
+     // indirect client gets stored here because it is an HTTP header result (from X-Forwarded-For:)
+-    // not a details about teh TCP connection itself
++    // not details about the TCP connection itself
+     request->indirect_client_addr = conn->clientConnection->remote;
+ #endif /* FOLLOW_X_FORWARDED_FOR */
+     request->my_addr = conn->clientConnection->local;
+@@ -4120,3 +4121,11 @@ ConnStateData::mayTunnelUnsupportedProto()
+            ;
+ }
+ 
++NotePairs::Pointer
++ConnStateData::notes()
++{
++    if (!theNotes)
++        theNotes = new NotePairs;
++    return theNotes;
++}
++
+@@ -259,10 +259,6 @@ class ConnStateData : public Server, public HttpControlMsgSink, private Independ
+     bool switchedToHttps() const { return false; }
+ #endif
+ 
+-    /* clt_conn_tag=tag annotation access */
+-    const SBuf &connectionTag() const { return connectionTag_; }
+-    void connectionTag(const char *aTag) { connectionTag_ = aTag; }
+-
+     /// handle a control message received by context from a peer and call back
+     virtual bool writeControlMsgAndCall(HttpReply *rep, AsyncCall::Pointer &call) = 0;
+ 
+@@ -299,6 +295,11 @@ class ConnStateData : public Server, public HttpControlMsgSink, private Independ
+     virtual void startShutdown();
+     virtual void endingShutdown();
+ 
++    /// \returns existing non-empty connection annotations,
++    /// creates and returns empty annotations otherwise
++    NotePairs::Pointer notes();
++    bool hasNotes() const { return bool(theNotes) && !theNotes->empty(); }
++
+ protected:
+     void startDechunkingRequest();
+     void finishDechunkingRequest(bool withSuccess);
+@@ -376,8 +377,10 @@ class ConnStateData : public Server, public HttpControlMsgSink, private Independ
+     const char *stoppedSending_;
+     /// the reason why we no longer read the request or nil
+     const char *stoppedReceiving_;
+-
+-    SBuf connectionTag_; ///< clt_conn_tag=Tag annotation for client connection
++    /// Connection annotations, clt_conn_tag and other tags are stored here.
++    /// If set, are propagated to the current and all future master transactions
++    /// on the connection.
++    NotePairs::Pointer theNotes;
+ };
+ 
+ void setLogUri(ClientHttpRequest * http, char const *uri, bool cleanUrl = false);
+@@ -894,7 +894,7 @@ void
+ ClientRequestContext::clientRedirectStart()
+ {
+     debugs(33, 5, HERE << "'" << http->uri << "'");
+-    (void)SyncNotes(*http->al, *http->request);
++    http->al->syncNotes(http->request);
+     if (Config.accessList.redirector) {
+         acl_checklist = clientAclChecklistCreate(Config.accessList.redirector, http);
+         acl_checklist->nonBlockingCheck(clientRedirectAccessCheckDone, this);
+@@ -1206,8 +1206,8 @@ ClientRequestContext::clientRedirectDone(const Helper::Reply &reply)
+ 
+     // Put helper response Notes into the transaction state record (ALE) eventually
+     // do it early to ensure that no matter what the outcome the notes are present.
+-    if (http->al != NULL)
+-        (void)SyncNotes(*http->al, *old_request);
++    if (http->al)
++        http->al->syncNotes(old_request);
+ 
+     UpdateRequestNotes(http->getConn(), *old_request, reply.notes);
+ 
+@@ -1329,8 +1329,8 @@ ClientRequestContext::clientStoreIdDone(const Helper::Reply &reply)
+ 
+     // Put helper response Notes into the transaction state record (ALE) eventually
+     // do it early to ensure that no matter what the outcome the notes are present.
+-    if (http->al != NULL)
+-        (void)SyncNotes(*http->al, *old_request);
++    if (http->al)
++        http->al->syncNotes(old_request);
+ 
+     UpdateRequestNotes(http->getConn(), *old_request, reply.notes);
+ 
+@@ -1677,17 +1677,18 @@ ClientHttpRequest::doCallouts()
+ {
+     assert(calloutContext);
+ 
++    auto &ale = calloutContext->http->al;
+     /*Save the original request for logging purposes*/
+-    if (!calloutContext->http->al->request) {
+-        calloutContext->http->al->request = request;
+-        HTTPMSGLOCK(calloutContext->http->al->request);
++    if (!ale->request) {
++        ale->request = request;
++        HTTPMSGLOCK(ale->request);
+ 
+-        NotePairs &notes = SyncNotes(*calloutContext->http->al, *calloutContext->http->request);
+         // Make the previously set client connection ID available as annotation.
+         if (ConnStateData *csd = calloutContext->http->getConn()) {
+-            if (!csd->connectionTag().isEmpty())
+-                notes.add("clt_conn_tag", SBuf(csd->connectionTag()).c_str());
++            if (!csd->notes()->empty())
++                calloutContext->http->request->notes()->appendNewOnly(csd->notes().getRaw());
+         }
++        ale->syncNotes(calloutContext->http->request);
+     }
+ 
+     if (!calloutContext->error) {
+@@ -82,8 +82,6 @@ static void commSetTcpNoDelay(int);
+ #endif
+ static void commSetTcpRcvbuf(int, int);
+ 
+-fd_debug_t *fdd_table = NULL;
+-
+ bool
+ isOpen(const int fd)
+ {
+@@ -428,9 +426,6 @@ comm_init_opened(const Comm::ConnectionPointer &conn,
+     assert(!isOpen(conn->fd)); // NP: global isOpen checks the fde entry for openness not the Comm::Connection
+     fd_open(conn->fd, FD_SOCKET, note);
+ 
+-    fdd_table[conn->fd].close_file = NULL;
+-    fdd_table[conn->fd].close_line = 0;
+-
+     fde *F = &fd_table[conn->fd];
+     F->local_addr = conn->local;
+ 
+@@ -856,13 +851,11 @@ comm_close_complete(const FdeCbParams &params)
+ void
+ _comm_close(int fd, char const *file, int line)
+ {
+-    debugs(5, 3, "comm_close: start closing FD " << fd);
++    debugs(5, 3, "start closing FD " << fd << " by " << file << ":" << line);
+     assert(fd >= 0);
+     assert(fd < Squid_MaxFD);
+ 
+     fde *F = &fd_table[fd];
+-    fdd_table[fd].close_file = file;
+-    fdd_table[fd].close_line = line;
+ 
+     if (F->closing())
+         return;
+@@ -1221,7 +1214,6 @@ void
+ comm_init(void)
+ {
+     fd_table =(fde *) xcalloc(Squid_MaxFD, sizeof(fde));
+-    fdd_table = (fd_debug_t *)xcalloc(Squid_MaxFD, sizeof(fd_debug_t));
+ 
+     /* make sure the accept() socket FIFO delay queue exists */
+     Comm::AcceptLimiter::Instance();
+@@ -1248,7 +1240,6 @@ comm_exit(void)
+     TheHalfClosed = NULL;
+ 
+     safe_free(fd_table);
+-    safe_free(fdd_table);
+     Comm::CallbackTableDestruct();
+ }
+ 
+@@ -1918,10 +1909,6 @@ comm_open_uds(int sock_type,
+     assert(!isOpen(new_socket));
+     fd_open(new_socket, FD_MSGHDR, addr->sun_path);
+ 
+-    fdd_table[new_socket].close_file = NULL;
+-
+-    fdd_table[new_socket].close_line = 0;
+-
+     fd_table[new_socket].sock_family = AI.ai_family;
+ 
+     if (!(flags & COMM_NOCLOEXEC))
+@@ -407,9 +407,6 @@ Comm::TcpAcceptor::oldAccept(Comm::ConnectionPointer &details)
+     // so we end up with a uniform "(HTTP|FTP-data|HTTPS|...) remote-ip:remote-port"
+     fd_open(sock, FD_SOCKET, "HTTP Request");
+ 
+-    fdd_table[sock].close_file = NULL;
+-    fdd_table[sock].close_line = 0;
+-
+     fde *F = &fd_table[sock];
+     details->remote.toStr(F->ipaddr,MAX_IPSTRLEN);
+     F->remote_port = details->remote.port();
+@@ -11,14 +11,6 @@
+ 
+ /* misc collection of bits shared by Comm code, but not needed by the rest of Squid. */
+ 
+-struct _fd_debug_t {
+-    char const *close_file;
+-    int close_line;
+-};
+-
+-typedef struct _fd_debug_t fd_debug_t;
+-extern fd_debug_t *fdd_table;
+-
+ bool isOpen(const int fd);
+ void commStopHalfClosedMonitor(int fd);
+ 
+@@ -40,17 +40,13 @@
+ #include "Store.h"
+ #include "StoreClient.h"
+ 
+-/// \ingroup DelayPoolsInternal
+-long DelayPools::MemoryUsed = 0;
+-
+ /// \ingroup DelayPoolsInternal
+ class Aggregate : public CompositePoolNode
+ {
++    MEMPROXY_CLASS(Aggregate);
+ 
+ public:
+     typedef RefCount<Aggregate> Pointer;
+-    void *operator new(size_t);
+-    void operator delete (void *);
+     Aggregate();
+     ~Aggregate();
+     virtual DelaySpec *rate() {return &spec;}
+@@ -69,10 +65,9 @@ class Aggregate : public CompositePoolNode
+     /// \ingroup DelayPoolsInternal
+     class AggregateId:public DelayIdComposite
+     {
++        MEMPROXY_CLASS(Aggregate::AggregateId);
+ 
+     public:
+-        void *operator new(size_t);
+-        void operator delete (void *);
+         AggregateId (RefCount<Aggregate>);
+         virtual int bytesWanted (int min, int max) const;
+         virtual void bytesIn(int qty);
+@@ -140,10 +135,9 @@ class VectorPool : public CompositePoolNode
+     /// \ingroup DelayPoolsInternal
+     class Id:public DelayIdComposite
+     {
++        MEMPROXY_CLASS(VectorPool::Id);
+ 
+     public:
+-        void *operator new(size_t);
+-        void operator delete (void *);
+         Id (RefCount<VectorPool>, int);
+         virtual int bytesWanted (int min, int max) const;
+         virtual void bytesIn(int qty);
+@@ -157,10 +151,7 @@ class VectorPool : public CompositePoolNode
+ /// \ingroup DelayPoolsInternal
+ class IndividualPool : public VectorPool
+ {
+-
+-public:
+-    void *operator new(size_t);
+-    void operator delete(void *);
++    MEMPROXY_CLASS(IndividualPool);
+ 
+ protected:
+     virtual char const *label() const {return "Individual";}
+@@ -170,10 +161,7 @@ class IndividualPool : public VectorPool
+ /// \ingroup DelayPoolsInternal
+ class ClassCNetPool : public VectorPool
+ {
+-
+-public:
+-    void *operator new(size_t);
+-    void operator delete (void *);
++    MEMPROXY_CLASS(ClassCNetPool);
+ 
+ protected:
+     virtual char const *label() const {return "Network";}
+@@ -235,10 +223,9 @@ class ClassCHostPool : public CompositePoolNode
+     /// \ingroup DelayPoolsInternal
+     class Id:public DelayIdComposite
+     {
++        MEMPROXY_CLASS(ClassCHostPool::Id);
+ 
+     public:
+-        void *operator new(size_t);
+-        void operator delete (void *);
+         Id (RefCount<ClassCHostPool>, unsigned char, unsigned char);
+         virtual int bytesWanted (int min, int max) const;
+         virtual void bytesIn(int qty);
+@@ -256,20 +243,6 @@ Aggregate::AggregateId::delayRead(DeferredRead const &aRead)
+     theAggregate->delayRead(aRead);
+ }
+ 
+-void *
+-CommonPool::operator new(size_t size)
+-{
+-    DelayPools::MemoryUsed += sizeof (CommonPool);
+-    return ::operator new (size);
+-}
+-
+-void
+-CommonPool::operator delete(void *address)
+-{
+-    DelayPools::MemoryUsed -= sizeof(CommonPool);
+-    ::operator delete(address);
+-}
+-
+ CommonPool *
+ CommonPool::Factory(unsigned char _class, CompositePoolNode::Pointer& compositeCopy)
+ {
+@@ -400,34 +373,6 @@ ClassCBucket::initHostIndex (DelaySpec &rate, unsigned char index, unsigned char
+     individuals.values[newIndex].init (rate);
+ }
+ 
+-void *
+-CompositePoolNode::operator new(size_t size)
+-{
+-    DelayPools::MemoryUsed += sizeof (CompositePoolNode);
+-    return ::operator new (size);
+-}
+-
+-void
+-CompositePoolNode::operator delete (void *address)
+-{
+-    DelayPools::MemoryUsed -= sizeof (CompositePoolNode);
+-    ::operator delete (address);
+-}
+-
+-void *
+-Aggregate::operator new(size_t size)
+-{
+-    DelayPools::MemoryUsed += sizeof (Aggregate);
+-    return ::operator new (size);
+-}
+-
+-void
+-Aggregate::operator delete (void *address)
+-{
+-    DelayPools::MemoryUsed -= sizeof (Aggregate);
+-    ::operator delete (address);
+-}
+-
+ Aggregate::Aggregate()
+ {
+     theBucket.init (*rate());
+@@ -482,20 +427,6 @@ Aggregate::id(CompositeSelectionDetails &details)
+         return new NullDelayId;
+ }
+ 
+-void *
+-Aggregate::AggregateId::operator new(size_t size)
+-{
+-    DelayPools::MemoryUsed += sizeof (AggregateId);
+-    return ::operator new (size);
+-}
+-
+-void
+-Aggregate::AggregateId::operator delete (void *address)
+-{
+-    DelayPools::MemoryUsed -= sizeof (AggregateId);
+-    ::operator delete (address);
+-}
+-
+ Aggregate::AggregateId::AggregateId(RefCount<Aggregate> anAggregate) : theAggregate(anAggregate)
+ {}
+ 
+@@ -537,8 +468,6 @@ DelayPools::InitDelayData()
+ 
+     DelayPools::delay_data = new DelayPool[pools()];
+ 
+-    DelayPools::MemoryUsed += pools() * sizeof(DelayPool);
+-
+     eventAdd("DelayPools::Update", DelayPools::Update, NULL, 1.0, 1);
+ }
+ 
+@@ -547,7 +476,6 @@ DelayPools::FreeDelayData()
+ {
+     eventDelete(DelayPools::Update, NULL);
+     delete[] DelayPools::delay_data;
+-    DelayPools::MemoryUsed -= pools() * sizeof(*DelayPools::delay_data);
+     pools_ = 0;
+ }
+ 
+@@ -610,19 +538,15 @@ std::vector<Updateable *> DelayPools::toUpdate;
+ void
+ DelayPools::Stats(StoreEntry * sentry)
+ {
+-    unsigned short i;
+-
+     storeAppendPrintf(sentry, "Delay pools configured: %d\n\n", DelayPools::pools());
+ 
+-    for (i = 0; i < DelayPools::pools(); ++i) {
++    for (unsigned short i = 0; i < DelayPools::pools(); ++i) {
+         if (DelayPools::delay_data[i].theComposite().getRaw()) {
+             storeAppendPrintf(sentry, "Pool: %d\n\tClass: %s\n\n", i + 1, DelayPools::delay_data[i].pool->theClassTypeLabel());
+             DelayPools::delay_data[i].theComposite()->stats (sentry);
+         } else
+             storeAppendPrintf(sentry, "\tMisconfigured pool.\n\n");
+     }
+-
+-    storeAppendPrintf(sentry, "Memory Used: %d bytes\n", (int) DelayPools::MemoryUsed);
+ }
+ 
+ void
+@@ -679,20 +603,6 @@ VectorMap<Key,Value>::insert (Key const key)
+     return index;
+ }
+ 
+-void *
+-IndividualPool::operator new(size_t size)
+-{
+-    DelayPools::MemoryUsed += sizeof (IndividualPool);
+-    return ::operator new (size);
+-}
+-
+-void
+-IndividualPool::operator delete (void *address)
+-{
+-    DelayPools::MemoryUsed -= sizeof (IndividualPool);
+-    ::operator delete (address);
+-}
+-
+ VectorPool::VectorPool()
+ {
+     DelayPools::registerForUpdates (this);
+@@ -799,20 +709,6 @@ VectorPool::id(CompositeSelectionDetails &details)
+     return new Id(this, resultIndex);
+ }
+ 
+-void *
+-VectorPool::Id::operator new(size_t size)
+-{
+-    DelayPools::MemoryUsed += sizeof (Id);
+-    return ::operator new (size);
+-}
+-
+-void
+-VectorPool::Id::operator delete(void *address)
+-{
+-    DelayPools::MemoryUsed -= sizeof (Id);
+-    ::operator delete (address);
+-}
+-
+ VectorPool::Id::Id(VectorPool::Pointer aPool, int anIndex) : theVector (aPool), theIndex (anIndex)
+ {}
+ 
+@@ -840,20 +736,6 @@ IndividualPool::makeKey(Ip::Address &src_addr) const
+     return (ntohl(host.s_addr) & 0xff);
+ }
+ 
+-void *
+-ClassCNetPool::operator new(size_t size)
+-{
+-    DelayPools::MemoryUsed += sizeof (ClassCNetPool);
+-    return ::operator new (size);
+-}
+-
+-void
+-ClassCNetPool::operator delete (void *address)
+-{
+-    DelayPools::MemoryUsed -= sizeof (ClassCNetPool);
+-    ::operator delete (address);
+-}
+-
+ unsigned int
+ ClassCNetPool::makeKey(Ip::Address &src_addr) const
+ {
+@@ -979,20 +861,6 @@ ClassCHostPool::id(CompositeSelectionDetails &details)
+     return new Id (this, netIndex, hostIndex);
+ }
+ 
+-void *
+-ClassCHostPool::Id::operator new(size_t size)
+-{
+-    DelayPools::MemoryUsed += sizeof (Id);
+-    return ::operator new (size);
+-}
+-
+-void
+-ClassCHostPool::Id::operator delete (void *address)
+-{
+-    DelayPools::MemoryUsed -= sizeof (Id);
+-    ::operator delete (address);
+-}
+-
+ ClassCHostPool::Id::Id (ClassCHostPool::Pointer aPool, unsigned char aNet, unsigned char aHost) : theClassCHost (aPool), theNet (aNet), theHost (aHost)
+ {}
+ 
+@@ -16,25 +16,24 @@
+ #include "SquidTime.h"
+ #include "Store.h"
+ 
+-fde *fde::Table = NULL;
++fde *fde::Table = nullptr;
+ 
+ bool
+-fde::readPending(int fdNumber)
++fde::readPending(int fdNumber) const
+ {
+     if (type == FD_SOCKET)
+         return Comm::MonitorsRead(fdNumber);
+ 
+-    return read_handler ? true : false ;
++    return read_handler != nullptr;
+ }
+ 
+ void
+-fde::dumpStats (StoreEntry &dumpEntry, int fdNumber)
++fde::dumpStats(StoreEntry &dumpEntry, int fdNumber) const
+ {
+     if (!flags.open)
+         return;
+ 
+ #if _SQUID_WINDOWS_
+-
+     storeAppendPrintf(&dumpEntry, "%4d 0x%-8lX %-6.6s %4d %7" PRId64 "%c %7" PRId64 "%c %-21s %s\n",
+                       fdNumber,
+                       win32.handle,
+@@ -43,7 +42,7 @@ fde::dumpStats (StoreEntry &dumpEntry, int fdNumber)
+                       fdNumber,
+ #endif
+                       fdTypeStr[type],
+-                      timeoutHandler != NULL ? (int) (timeout - squid_curtime) : 0,
++                      timeoutHandler ? (int) (timeout - squid_curtime) : 0,
+                       bytes_read,
+                       readPending(fdNumber) ? '*' : ' ',
+                       bytes_written,
+@@ -53,12 +52,10 @@ fde::dumpStats (StoreEntry &dumpEntry, int fdNumber)
+ }
+ 
+ void
+-fde::DumpStats (StoreEntry *dumpEntry)
++fde::DumpStats(StoreEntry *dumpEntry)
+ {
+-    int i;
+     storeAppendPrintf(dumpEntry, "Active file descriptors:\n");
+ #if _SQUID_WINDOWS_
+-
+     storeAppendPrintf(dumpEntry, "%-4s %-10s %-6s %-4s %-7s* %-7s* %-21s %s\n",
+                       "File",
+                       "Handle",
+@@ -78,30 +75,24 @@ fde::DumpStats (StoreEntry *dumpEntry)
+     storeAppendPrintf(dumpEntry, "---- ------ ---- -------- -------- --------------------- ------------------------------\n");
+ #endif
+ 
+-    for (i = 0; i < Squid_MaxFD; ++i) {
+-        fd_table[i].dumpStats(*dumpEntry, i);
++    for (int i = 0; i < Squid_MaxFD; ++i) {
++        fde::Table[i].dumpStats(*dumpEntry, i);
+     }
+ }
+ 
+ char const *
+ fde::remoteAddr() const
+ {
+-    LOCAL_ARRAY(char, buf, MAX_IPSTRLEN );
+-
+-    if (type != FD_SOCKET)
+-        return null_string;
+-
+-    if ( *ipaddr )
+-        snprintf( buf, MAX_IPSTRLEN, "%s:%d", ipaddr, (int)remote_port);
+-    else
+-        local_addr.toUrl(buf,MAX_IPSTRLEN); // toHostStr does not include port.
++    static char buf[MAX_IPSTRLEN];
++    *buf = 0;
++
++    if (type == FD_SOCKET) {
++        if (*ipaddr)
++            snprintf(buf, MAX_IPSTRLEN, "%s:%u", ipaddr, remote_port);
++        else
++            local_addr.toUrl(buf,MAX_IPSTRLEN); // toHostStr does not include port.
++    }
+ 
+     return buf;
+ }
+ 
+-void
+-fde::noteUse()
+-{
+-    ++ pconn.uses;
+-}
+-
+@@ -19,6 +19,7 @@
+ #if USE_DELAY_POOLS
+ class ClientInfo;
+ #endif
++class dwrite_q;
+ 
+ /**
+  * READ_HANDLER functions return < 0 if, and only if, they fail with an error.
+@@ -32,89 +33,102 @@ typedef int READ_HANDLER(int, char *, int);
+  */
+ typedef int WRITE_HANDLER(int, const char *, int);
+ 
+-class dwrite_q;
+ class _fde_disk
+ {
+ public:
++    _fde_disk() { wrt_handle = nullptr; }
++
+     DWCB *wrt_handle;
+-    void *wrt_handle_data;
+-    dwrite_q *write_q;
+-    dwrite_q *write_q_tail;
+-    off_t offset;
+-    _fde_disk() { memset(this, 0, sizeof(_fde_disk)); }
++    void *wrt_handle_data = nullptr;
++    dwrite_q *write_q = nullptr;
++    dwrite_q *write_q_tail = nullptr;
++    off_t offset = 0;
+ };
+ 
+ class fde
+ {
+ 
+ public:
+-    fde() { clear(); };
++    fde() {
++        *ipaddr = 0;
++        *desc = 0;
++        read_handler = nullptr;
++        write_handler = nullptr;
++        read_method = nullptr;
++        write_method = nullptr;
++    }
++
++    /// Clear the fde class back to NULL equivalent.
++    void clear() { *this = fde(); }
+ 
+     /// True if comm_close for this fd has been called
+-    bool closing() { return flags.close_request; }
++    bool closing() const { return flags.close_request; }
+ 
+     /* NOTE: memset is used on fdes today. 20030715 RBC */
+-    static void DumpStats (StoreEntry *);
++    static void DumpStats(StoreEntry *);
+ 
+     char const *remoteAddr() const;
+-    void dumpStats (StoreEntry &, int);
+-    bool readPending(int);
+-    void noteUse();
++    void dumpStats(StoreEntry &, int) const;
++    bool readPending(int) const;
++
++    /// record a transaction on this FD
++    void noteUse() { ++pconn.uses; }
+ 
+ public:
+ 
+     /// global table of FD and their state.
+     static fde* Table;
+ 
+-    unsigned int type;
+-    unsigned short remote_port;
++    unsigned int type = 0;
++    unsigned short remote_port = 0;
+ 
+     Ip::Address local_addr;
+-    tos_t tosToServer;          /**< The TOS value for packets going towards the server.
++    tos_t tosToServer = '\0';      /**< The TOS value for packets going towards the server.
+                                         See also tosFromServer. */
+-    nfmark_t nfmarkToServer;    /**< The netfilter mark for packets going towards the server.
++    nfmark_t nfmarkToServer = 0;   /**< The netfilter mark for packets going towards the server.
+                                         See also nfmarkFromServer. */
+-    int sock_family;
++    int sock_family = 0;
+     char ipaddr[MAX_IPSTRLEN];            /* dotted decimal address of peer */
+     char desc[FD_DESC_SZ];
+ 
+     struct _fde_flags {
+-        bool open;
+-        bool close_request; ///< true if file_ or comm_close has been called
+-        bool write_daemon;
+-        bool socket_eof;
+-        bool nolinger;
+-        bool nonblocking;
+-        bool ipc;
+-        bool called_connect;
+-        bool nodelay;
+-        bool close_on_exec;
+-        bool read_pending;
++        bool open = false;
++        bool close_request = false; ///< true if file_ or comm_close has been called
++        bool write_daemon = false;
++        bool socket_eof = false;
++        bool nolinger = false;
++        bool nonblocking = false;
++        bool ipc = false;
++        bool called_connect = false;
++        bool nodelay = false;
++        bool close_on_exec = false;
++        bool read_pending = false;
+         //bool write_pending; //XXX seems not to be used
+-        bool transparent;
++        bool transparent = false;
+     } flags;
+ 
+-    int64_t bytes_read;
+-    int64_t bytes_written;
++    int64_t bytes_read = 0;
++    int64_t bytes_written = 0;
+ 
+     struct {
+-        int uses;                   /* ie # req's over persistent conn */
++        int uses = 0;                   /* ie # req's over persistent conn */
+     } pconn;
+ 
+ #if USE_DELAY_POOLS
+-    ClientInfo * clientInfo;/* pointer to client info used in client write limiter or NULL if not present */
++    /// pointer to client info used in client write limiter or nullptr if not present
++    ClientInfo * clientInfo = nullptr;
+ #endif
+-    unsigned epoll_state;
++    unsigned epoll_state = 0;
+ 
+     _fde_disk disk;
+     PF *read_handler;
+-    void *read_data;
++    void *read_data = nullptr;
+     PF *write_handler;
+-    void *write_data;
++    void *write_data = nullptr;
+     AsyncCall::Pointer timeoutHandler;
+-    time_t timeout;
+-    time_t writeStart;
+-    void *lifetime_data;
++    time_t timeout = 0;
++    time_t writeStart = 0;
++    void *lifetime_data = nullptr;
+     AsyncCall::Pointer closeHandler;
+     AsyncCall::Pointer halfClosedReader; /// read handler for half-closed fds
+     READ_HANDLER *read_method;
+@@ -123,66 +137,27 @@ class fde
+     Security::ContextPointer dynamicTlsContext; ///< cached and then freed when fd is closed
+ #if _SQUID_WINDOWS_
+     struct {
+-        long handle;
++        long handle = (long)nullptr;
+     } win32;
+ #endif
+-    tos_t tosFromServer;                /**< Stores the TOS flags of the packets from the remote server.
++    tos_t tosFromServer = '\0';        /**< Stores the TOS flags of the packets from the remote server.
+                                             See FwdState::dispatch(). Note that this differs to
+                                             tosToServer in that this is the value we *receive* from the,
+                                             connection, whereas tosToServer is the value to set on packets
+                                             *leaving* Squid.  */
+-    unsigned int nfmarkFromServer;      /**< Stores the Netfilter mark value of the connection from the remote
++    unsigned int nfmarkFromServer = 0; /**< Stores the Netfilter mark value of the connection from the remote
+                                             server. See FwdState::dispatch(). Note that this differs to
+                                             nfmarkToServer in that this is the value we *receive* from the,
+                                             connection, whereas nfmarkToServer is the value to set on packets
+                                             *leaving* Squid.   */
+-
+-    /** Clear the fde class back to NULL equivalent. */
+-    inline void clear() {
+-        type = 0;
+-        remote_port = 0;
+-        local_addr.setEmpty();
+-        tosToServer = '\0';
+-        nfmarkToServer = 0;
+-        sock_family = 0;
+-        memset(ipaddr, '\0', MAX_IPSTRLEN);
+-        memset(desc,'\0',FD_DESC_SZ);
+-        memset(&flags,0,sizeof(_fde_flags));
+-        bytes_read = 0;
+-        bytes_written = 0;
+-        pconn.uses = 0;
+-#if USE_DELAY_POOLS
+-        clientInfo = NULL;
+-#endif
+-        epoll_state = 0;
+-        read_handler = NULL;
+-        read_data = NULL;
+-        write_handler = NULL;
+-        write_data = NULL;
+-        timeoutHandler = NULL;
+-        timeout = 0;
+-        writeStart = 0;
+-        lifetime_data = NULL;
+-        closeHandler = NULL;
+-        halfClosedReader = NULL;
+-        read_method = NULL;
+-        write_method = NULL;
+-        ssl.reset();
+-        dynamicTlsContext.reset();
+-#if _SQUID_WINDOWS_
+-        win32.handle = (long)NULL;
+-#endif
+-        tosFromServer = '\0';
+-        nfmarkFromServer = 0;
+-    }
+ };
+ 
+ #define fd_table fde::Table
+ 
+ int fdNFree(void);
+ 
+-#define FD_READ_METHOD(fd, buf, len) (*fd_table[fd].read_method)(fd, buf, len)
+-#define FD_WRITE_METHOD(fd, buf, len) (*fd_table[fd].write_method)(fd, buf, len)
++#define FD_READ_METHOD(fd, buf, len) (*fde::Table[fd].read_method)(fd, buf, len)
++#define FD_WRITE_METHOD(fd, buf, len) (*fde::Table[fd].write_method)(fd, buf, len)
+ 
+ #endif /* SQUID_FDE_H */
+ 
+@@ -1390,18 +1390,19 @@ Format::Format::assemble(MemBuf &mb, const AccessLogEntry::Pointer &al, int logS
+             tmp[1] = '\0';
+             if (fmt->data.header.header && *fmt->data.header.header) {
+                 const char *separator = tmp;
++                static SBuf note;
+ #if USE_ADAPTATION
+                 Adaptation::History::Pointer ah = al->request ? al->request->adaptHistory() : Adaptation::History::Pointer();
+                 if (ah != NULL && ah->metaHeaders != NULL) {
+-                    if (const char *meta = ah->metaHeaders->find(fmt->data.header.header, separator))
+-                        sb.append(meta);
++                    if (ah->metaHeaders->find(note, fmt->data.header.header, separator))
++                        sb.append(note.c_str());
+                 }
+ #endif
+                 if (al->notes != NULL) {
+-                    if (const char *note = al->notes->find(fmt->data.header.header, separator)) {
++                    if (al->notes->find(note, fmt->data.header.header, separator)) {
+                         if (sb.size())
+                             sb.append(separator);
+-                        sb.append(note);
++                        sb.append(note.c_str());
+                     }
+                 }
+                 out = sb.termedBuf();
+@@ -1467,6 +1468,11 @@ Format::Format::assemble(MemBuf &mb, const AccessLogEntry::Pointer &al, int logS
+ 
+         if (out && *out) {
+             if (quote || fmt->quote != LOG_QUOTE_NONE) {
++                // Do not write to the tmp buffer because it may contain the to-be-quoted value.
++                static char quotedOut[2 * sizeof(tmp)];
++                static_assert(sizeof(quotedOut) > 0, "quotedOut has zero length");
++                quotedOut[0] = '\0';
++
+                 char *newout = NULL;
+                 int newfree = 0;
+ 
+@@ -1482,7 +1488,7 @@ Format::Format::assemble(MemBuf &mb, const AccessLogEntry::Pointer &al, int logS
+                         newout = (char *)xmalloc(out_len);
+                         newfree = 1;
+                     } else
+-                        newout = tmp;
++                        newout = quotedOut;
+                     log_quoted_string(out, newout);
+                 }
+                 break;
+@@ -77,15 +77,13 @@ MemPools::idleLimit() const
+     return mem_idle_limit;
+ }
+ 
+-/* Change the default calue of defaultIsChunked to override
++/* Change the default value of defaultIsChunked to override
+  * all pools - including those used before main() starts where
+  * MemPools::GetInstance().setDefaultPoolChunking() can be called.
+  */
+-MemPools::MemPools() : pools(NULL), mem_idle_limit(2 << 20 /* 2 MB */),
+-    poolCount(0), defaultIsChunked(USE_CHUNKEDMEMPOOLS && !RUNNING_ON_VALGRIND)
++MemPools::MemPools()
+ {
+-    char *cfg = getenv("MEMPOOLS");
+-    if (cfg)
++    if (char *cfg = getenv("MEMPOOLS"))
+         defaultIsChunked = atoi(cfg);
+ }
+ 
+@@ -29,7 +29,6 @@
+  */
+ 
+ #include "mem/Meter.h"
+-#include "splay.h"
+ #include "util.h"
+ 
+ #if HAVE_GNUMALLOC_H
+@@ -165,10 +164,11 @@ class MemPools
+     void clean(time_t maxage);
+ 
+     void setDefaultPoolChunking(bool const &);
+-    MemImplementingAllocator *pools;
+-    ssize_t mem_idle_limit;
+-    int poolCount;
+-    bool defaultIsChunked;
++
++    MemImplementingAllocator *pools = nullptr;
++    ssize_t mem_idle_limit = (2 << 20) /* 2MB */;
++    int poolCount = 0;
++    bool defaultIsChunked = false;
+ };
+ 
+ /**
+@@ -10,6 +10,7 @@
+ #define _MEM_POOL_CHUNKED_H_
+ 
+ #include "mem/Pool.h"
++#include "splay.h"
+ 
+ #define MEM_CHUNK_SIZE        4 * 4096  /* 16KB ... 4 * VM_PAGE_SZ */
+ #define MEM_CHUNK_MAX_SIZE  256 * 1024  /* 2MB */
+@@ -415,10 +415,10 @@ Security::PeerConnector::handleNegotiateError(const int ret)
+ 
+     switch (ret) {
+     case GNUTLS_E_WARNING_ALERT_RECEIVED: {
+-            auto alert = gnutls_alert_get(session.get());
+-            debugs(83, DBG_IMPORTANT, "TLS ALERT: " << gnutls_alert_get_name(alert));
+-        }
+-        // drop through to next case
++        auto alert = gnutls_alert_get(session.get());
++        debugs(83, DBG_IMPORTANT, "TLS ALERT: " << gnutls_alert_get_name(alert));
++    }
++    // drop through to next case
+ 
+     case GNUTLS_E_AGAIN:
+     case GNUTLS_E_INTERRUPTED:
+@@ -23,8 +23,8 @@ Security::PeerOptions Security::ProxyOutgoingConfig;
+ 
+ Security::PeerOptions::PeerOptions()
+ {
+-     // init options consistent with an empty sslOptions
+-     parseOptions();
++    // init options consistent with an empty sslOptions
++    parseOptions();
+ }
+ 
+ void
+@@ -191,7 +191,7 @@ Security::PeerOptions::updateTlsVersionLimits()
+         return;
+     }
+ 
+-     if (sslVersion > 2) {
++    if (sslVersion > 2) {
+         // backward compatibility hack for sslversion= configuration
+         // only use if tls-min-version=N.N is not present
+         // values 0-2 for auto and SSLv2 are not supported any longer.
+@@ -514,7 +514,7 @@ Security::PeerOptions::parseOptions()
+         fatalf("Unknown TLS option '%s'", err);
+     }
+     parsedOptions = Security::ParsedOptions(op, [](gnutls_priority_t p) {
+-            gnutls_priority_deinit(p);
++        gnutls_priority_deinit(p);
+     });
+ #endif
+ }
+@@ -92,9 +92,9 @@ Security::SessionPointer
+ Security::NewSessionObject(const Security::ContextPointer &ctx)
+ {
+     Security::SessionPointer session(SSL_new(ctx.get()), [](SSL *p) {
+-            debugs(83, 5, "SSL_free session=" << (void*)p);
+-            SSL_free(p);
+-        });
++        debugs(83, 5, "SSL_free session=" << (void*)p);
++        SSL_free(p);
++    });
+     debugs(83, 5, "SSL_new session=" << (void*)session.get());
+     return session;
+ }
+@@ -122,8 +122,8 @@ CreateSession(const Security::ContextPointer &ctx, const Comm::ConnectionPointer
+     gnutls_session_t tmp;
+     errCode = gnutls_init(&tmp, static_cast<unsigned int>(type) | GNUTLS_NONBLOCK);
+     Security::SessionPointer session(tmp, [](gnutls_session_t p) {
+-            debugs(83, 5, "gnutls_deinit session=" << (void*)p);
+-            gnutls_deinit(p);
++        debugs(83, 5, "gnutls_deinit session=" << (void*)p);
++        gnutls_deinit(p);
+     });
+     debugs(83, 5, "gnutls_init " << (type == Security::Io::BIO_TO_SERVER ? "client" : "server" )<< " session=" << (void*)session.get());
+     if (errCode != GNUTLS_E_SUCCESS) {
+@@ -110,20 +110,20 @@ typedef std::unordered_set<Security::ErrorCode> Errors;
+ 
+ namespace Io
+ {
+-    enum Type {
++enum Type {
+ #if USE_OPENSSL
+-        BIO_TO_CLIENT = 6000,
+-        BIO_TO_SERVER
++    BIO_TO_CLIENT = 6000,
++    BIO_TO_SERVER
+ #elif USE_GNUTLS
+-        // NP: this is odd looking but correct.
+-        // 'to-client' means we are a server, and vice versa.
+-        BIO_TO_CLIENT = GNUTLS_SERVER,
+-        BIO_TO_SERVER = GNUTLS_CLIENT
++    // NP: this is odd looking but correct.
++    // 'to-client' means we are a server, and vice versa.
++    BIO_TO_CLIENT = GNUTLS_SERVER,
++    BIO_TO_SERVER = GNUTLS_CLIENT
+ #else
+-        BIO_TO_CLIENT = 6000,
+-        BIO_TO_SERVER
++    BIO_TO_CLIENT = 6000,
++    BIO_TO_SERVER
+ #endif
+-    };
++};
+ 
+ } // namespace Io
+ 
+@@ -187,6 +187,13 @@ Http::One::Server::buildHttpRequest(Http::StreamPointer &context)
+         request->header.putStr(Http::HOST, tmp.c_str());
+     }
+ 
++    // TODO: We fill request notes here until we find a way to verify whether
++    // no ACL checking is performed before ClientHttpRequest::doCallouts().
++    if (hasNotes()) {
++        assert(!request->hasNotes());
++        request->notes()->append(notes().getRaw());
++    }
++
+     http->request = request.getRaw();
+     HTTPMSGLOCK(http->request);
+ 
+@@ -171,18 +171,16 @@ Ssl::PeekingPeerConnector::initialize(Security::SessionPointer &serverSession)
+             BIO *bc = SSL_get_rbio(clientSession);
+             Ssl::ClientBio *cltBio = static_cast<Ssl::ClientBio *>(BIO_get_data(bc));
+             Must(cltBio);
+-            if (details && details->tlsVersion.protocol != AnyP::PROTO_NONE) {
++            if (details && details->tlsVersion.protocol != AnyP::PROTO_NONE)
+                 applyTlsDetailsToSSL(serverSession.get(), details, csd->sslBumpMode);
+-                // Should we allow it for all protocols?
+-                if (details->tlsVersion.protocol == AnyP::PROTO_TLS || details->tlsVersion == AnyP::ProtocolVersion(AnyP::PROTO_SSL, 3, 0)) {
+-                    BIO *b = SSL_get_rbio(serverSession.get());
+-                    Ssl::ServerBio *srvBio = static_cast<Ssl::ServerBio *>(BIO_get_data(b));
+-                    // Inherite client features, like SSL version, SNI and other
+-                    srvBio->setClientFeatures(details, cltBio->rBufData());
+-                    srvBio->recordInput(true);
+-                    srvBio->mode(csd->sslBumpMode);
+-                }
+-            }
++
++            BIO *b = SSL_get_rbio(serverSession.get());
++            Ssl::ServerBio *srvBio = static_cast<Ssl::ServerBio *>(BIO_get_data(b));
++            Must(srvBio);
++            // inherit client features such as TLS version and SNI
++            srvBio->setClientFeatures(details, cltBio->rBufData());
++            srvBio->recordInput(true);
++            srvBio->mode(csd->sslBumpMode);
+         } else {
+             // Set client SSL options
+             SSL_set_options(serverSession.get(), ::Security::ProxyOutgoingConfig.parsedOptions);
+@@ -20,6 +20,7 @@
+ #include "globals.h"
+ #include "ip/Address.h"
+ #include "parser/BinaryTokenizer.h"
++#include "SquidTime.h"
+ #include "ssl/bio.h"
+ 
+ #if HAVE_OPENSSL_SSL_H
+@@ -167,15 +168,46 @@ Ssl::Bio::stateChanged(const SSL *ssl, int where, int ret)
+            SSL_state_string(ssl) << " (" << SSL_state_string_long(ssl) << ")");
+ }
+ 
++Ssl::ClientBio::ClientBio(const int anFd):
++    Bio(anFd),
++    holdRead_(false),
++    holdWrite_(false),
++    helloSize(0),
++    abortReason(nullptr)
++{
++    renegotiations.configure(10*1000);
++}
++
+ void
+ Ssl::ClientBio::stateChanged(const SSL *ssl, int where, int ret)
+ {
+     Ssl::Bio::stateChanged(ssl, where, ret);
++    // detect client-initiated renegotiations DoS (CVE-2011-1473)
++    if (where & SSL_CB_HANDSHAKE_START) {
++        const int reneg = renegotiations.count(1);
++
++        if (abortReason)
++            return; // already decided and informed the admin
++
++        if (reneg > RenegotiationsLimit) {
++            abortReason = "renegotiate requests flood";
++            debugs(83, DBG_IMPORTANT, "Terminating TLS connection [from " << fd_table[fd_].ipaddr << "] due to " << abortReason << ". This connection received " <<
++                   reneg << " renegotiate requests in the last " <<
++                   RenegotiationsWindow << " seconds (and " <<
++                   renegotiations.remembered() << " requests total).");
++        }
++    }
+ }
+ 
+ int
+ Ssl::ClientBio::write(const char *buf, int size, BIO *table)
+ {
++    if (abortReason) {
++        debugs(83, 3, "BIO on FD " << fd_ << " is aborted");
++        BIO_clear_retry_flags(table);
++        return -1;
++    }
++
+     if (holdWrite_) {
+         BIO_set_retry_write(table);
+         return 0;
+@@ -187,6 +219,12 @@ Ssl::ClientBio::write(const char *buf, int size, BIO *table)
+ int
+ Ssl::ClientBio::read(char *buf, int size, BIO *table)
+ {
++    if (abortReason) {
++        debugs(83, 3, "BIO on FD " << fd_ << " is aborted");
++        BIO_clear_retry_flags(table);
++        return -1;
++    }
++
+     if (holdRead_) {
+         debugs(83, 7, "Hold flag is set, retry latter. (Hold " << size << "bytes)");
+         BIO_set_retry_read(table);
+@@ -230,7 +268,7 @@ void
+ Ssl::ServerBio::setClientFeatures(Security::TlsDetails::Pointer const &details, SBuf const &aHello)
+ {
+     clientTlsDetails = details;
+-    clientHelloMessage = aHello;
++    clientSentHello = aHello;
+ };
+ 
+ int
+@@ -334,6 +372,9 @@ static bool
+ adjustSSL(SSL *ssl, Security::TlsDetails::Pointer const &details, SBuf &helloMessage)
+ {
+ #if SQUID_USE_OPENSSL_HELLO_OVERWRITE_HACK
++    if (!details)
++        return false;
++
+     if (!ssl->s3) {
+         debugs(83, 5, "No SSLv3 data found!");
+         return false;
+@@ -437,33 +478,37 @@ Ssl::ServerBio::write(const char *buf, int size, BIO *table)
+     }
+ 
+     if (!helloBuild && (bumpMode_ == Ssl::bumpPeek || bumpMode_ == Ssl::bumpStare)) {
+-        if (
+-            buf[1] >= 3  //it is an SSL Version3 message
+-            && buf[0] == 0x16 // and it is a Handshake/Hello message
+-        ) {
+-
+-            //Hello message is the first message we write to server
+-            assert(helloMsg.isEmpty());
+-
+-            auto ssl = fd_table[fd_].ssl.get();
+-            if (ssl) {
+-                if (bumpMode_ == Ssl::bumpPeek) {
+-                    if (adjustSSL(ssl, clientTlsDetails, clientHelloMessage))
+-                        allowBump = true;
+-                    allowSplice = true;
+-                    helloMsg.append(clientHelloMessage);
+-                    debugs(83, 7,  "SSL HELLO message for FD " << fd_ << ": Random number is adjusted for peek mode");
+-                } else { /*Ssl::bumpStare*/
++        // buf contains OpenSSL-generated ClientHello. We assume it has a
++        // complete ClientHello and nothing else, but cannot fully verify
++        // that quickly. We only verify that buf starts with a v3+ record
++        // containing ClientHello.
++        Must(size >= 2); // enough for version and content_type checks below
++        Must(buf[1] >= 3); // record's version.major; determines buf[0] meaning
++        Must(buf[0] == 22); // TLSPlaintext.content_type == handshake in v3+
++
++        //Hello message is the first message we write to server
++        assert(helloMsg.isEmpty());
++
++        if (auto ssl = fd_table[fd_].ssl.get()) {
++            if (bumpMode_ == Ssl::bumpPeek) {
++                // we should not be here if we failed to parse the client-sent ClientHello
++                Must(!clientSentHello.isEmpty());
++                if (adjustSSL(ssl, clientTlsDetails, clientSentHello))
+                     allowBump = true;
+-                    if (adjustSSL(ssl, clientTlsDetails, clientHelloMessage)) {
+-                        allowSplice = true;
+-                        helloMsg.append(clientHelloMessage);
+-                        debugs(83, 7,  "SSL HELLO message for FD " << fd_ << ": Random number is adjusted for stare mode");
+-                    }
++                allowSplice = true;
++                // Replace OpenSSL-generated ClientHello with client-sent one.
++                helloMsg.append(clientSentHello);
++                debugs(83, 7,  "FD " << fd_ << ": Using client-sent ClientHello for peek mode");
++            } else { /*Ssl::bumpStare*/
++                allowBump = true;
++                if (!clientSentHello.isEmpty() && adjustSSL(ssl, clientTlsDetails, clientSentHello)) {
++                    allowSplice = true;
++                    helloMsg.append(clientSentHello);
++                    debugs(83, 7,  "FD " << fd_ << ": Using client-sent ClientHello for stare mode");
+                 }
+             }
+         }
+-        // If we do not build any hello message, copy the current
++        // if we did not use the client-sent ClientHello, then use the OpenSSL-generated one
+         if (helloMsg.isEmpty())
+             helloMsg.append(buf, size);
+ 
+@@ -11,6 +11,7 @@
+ 
+ #if USE_OPENSSL
+ 
++#include "FadingCounter.h"
+ #include "fd.h"
+ #include "security/Handshake.h"
+ 
+@@ -66,7 +67,7 @@ class Bio
+ class ClientBio: public Bio
+ {
+ public:
+-    explicit ClientBio(const int anFd): Bio(anFd), holdRead_(false), holdWrite_(false), helloSize(0) {}
++    explicit ClientBio(const int anFd);
+ 
+     /// The ClientBio version of the Ssl::Bio::stateChanged method
+     /// When the client hello message retrieved, fill the
+@@ -86,9 +87,19 @@ class ClientBio: public Bio
+     /// by the caller.
+     void setReadBufData(SBuf &data) {rbuf = data;}
+ private:
++    /// approximate size of a time window for computing client-initiated renegotiation rate (in seconds)
++    static const time_t RenegotiationsWindow = 10;
++
++    /// the maximum tolerated number of client-initiated renegotiations in RenegotiationsWindow
++    static const int RenegotiationsLimit = 5;
++
+     bool holdRead_; ///< The read hold state of the bio.
+     bool holdWrite_;  ///< The write hold state of the bio.
+     int helloSize; ///< The SSL hello message sent by client size
++    FadingCounter renegotiations; ///< client requested renegotiations limit control
++
++    /// why we should terminate the connection during next TLS operation (or nil)
++    const char *abortReason;
+ };
+ 
+ /// BIO node to handle socket IO for squid server side
+@@ -168,7 +179,7 @@ class ServerBio: public Bio
+     /// SSL client features extracted from ClientHello message or SSL object
+     Security::TlsDetails::Pointer clientTlsDetails;
+     /// TLS client hello message, used to adapt our tls Hello message to the server
+-    SBuf clientHelloMessage;
++    SBuf clientSentHello;
+     SBuf helloMsg; ///< Used to buffer output data.
+     mb_size_t  helloMsgSize;
+     bool helloBuild; ///< True if the client hello message sent to the server
+@@ -502,34 +502,12 @@ Ssl::Initialize(void)
+     ssl_ex_index_ssl_untrusted_chain = SSL_get_ex_new_index(0, (void *) "ssl_untrusted_chain", NULL, NULL, &ssl_free_CertChain);
+ }
+ 
+-#if defined(SSL3_FLAGS_NO_RENEGOTIATE_CIPHERS) && (OPENSSL_VERSION_NUMBER < 0x10100000L)
+-static void
+-ssl_info_cb(const SSL *ssl, int where, int ret)
+-{
+-    (void)ret;
+-    if ((where & SSL_CB_HANDSHAKE_DONE) != 0) {
+-        // disable renegotiation (CVE-2009-3555)
+-        ssl->s3->flags |= SSL3_FLAGS_NO_RENEGOTIATE_CIPHERS;
+-    }
+-}
+-#endif
+-
+-static void
+-maybeDisableRenegotiate(Security::ContextPointer &ctx)
+-{
+-#if defined(SSL3_FLAGS_NO_RENEGOTIATE_CIPHERS) && (OPENSSL_VERSION_NUMBER < 0x10100000L)
+-    SSL_CTX_set_info_callback(ctx.get(), ssl_info_cb);
+-#endif
+-}
+-
+ static bool
+ configureSslContext(Security::ContextPointer &ctx, AnyP::PortCfg &port)
+ {
+     int ssl_error;
+     SSL_CTX_set_options(ctx.get(), port.secure.parsedOptions);
+ 
+-    maybeDisableRenegotiate(ctx);
+-
+     if (port.sslContextSessionId)
+         SSL_CTX_set_session_id_context(ctx.get(), (const unsigned char *)port.sslContextSessionId, strlen(port.sslContextSessionId));
+ 
+@@ -655,8 +633,6 @@ Ssl::InitClientContext(Security::ContextPointer &ctx, Security::PeerOptions &pee
+     if (!ctx)
+         return false;
+ 
+-    maybeDisableRenegotiate(ctx);
+-
+     if (!peer.sslCipher.isEmpty()) {
+         debugs(83, 5, "Using chiper suite " << peer.sslCipher << ".");
+ 
+@@ -9,7 +9,17 @@
+ #ifndef SQUID_STORE_FORWARD_H
+ #define SQUID_STORE_FORWARD_H
+ 
+-typedef int32_t sfileno;
++// bug 4610 see comments 22-38
++// Nasty hack, but it turns out C++ allows int32_t to be
++// unsigned when used as a bitmask (as sfile* are later)
++#if INT_MAX == INT32_MAX
++typedef signed int signed_int32_t;
++#elif SHORT_MAX == INT32_MAX
++typedef signed short int signed_int32_t;
++#else
++#error I do not know how to typedef a signed 32bit integer.
++#endif
++typedef signed_int32_t sfileno;
+ typedef signed int sdirno;
+ 
+ /// maximum number of entries per cache_dir
+@@ -56,4 +56,5 @@ void HttpRequest::packFirstLineInto(Packable *, bool) const STUB
+ bool HttpRequest::sanityCheckStartLine(const char *, const size_t, Http::StatusCode *) STUB_RETVAL(false)
+ void HttpRequest::hdrCacheInit() STUB
+ bool HttpRequest::inheritProperties(const HttpMsg *) STUB_RETVAL(false)
++NotePairs::Pointer HttpRequest::notes() STUB_RETVAL(NotePairs::Pointer())
+ 
+@@ -39,6 +39,7 @@ void ConnStateData::connStateClosed(const CommCloseCbParams &) STUB
+ void ConnStateData::requestTimeout(const CommTimeoutCbParams &) STUB
+ void ConnStateData::swanSong() STUB
+ void ConnStateData::quitAfterError(HttpRequest *) STUB
++NotePairs::Pointer ConnStateData::notes() STUB_RETVAL(NotePairs::Pointer())
+ #if USE_OPENSSL
+ void ConnStateData::httpsPeeked(Comm::ConnectionPointer) STUB
+ void ConnStateData::getSslContextStart() STUB
+@@ -59,8 +59,8 @@ void Auth::UserRequest::operator delete (void *) STUB
+ Auth::UserRequest::UserRequest() STUB
+ Auth::UserRequest::~UserRequest() STUB
+ void Auth::UserRequest::setDenyMessage(char const *) STUB
+-char const * Auth::UserRequest::getDenyMessage() STUB_RETVAL("stub")
+-char const * Auth::UserRequest::denyMessage(char const * const) STUB_RETVAL("stub")
++char const * Auth::UserRequest::getDenyMessage() const STUB_RETVAL("stub")
++char const * Auth::UserRequest::denyMessage(char const * const) const STUB_RETVAL("stub")
+ void authenticateAuthUserRequestRemoveIp(Auth::UserRequest::Pointer, Ip::Address const &) STUB
+ void authenticateAuthUserRequestClearIp(Auth::UserRequest::Pointer) STUB
+ int authenticateAuthUserRequestIPCount(Auth::UserRequest::Pointer) STUB_RETVAL(0)
+@@ -72,7 +72,7 @@ Security::PeerOptions::PeerOptions() {
+ #if USE_OPENSSL
+     parsedOptions = 0;
+ #endif
+-     STUB_NOP
++    STUB_NOP
+ }
+ void Security::PeerOptions::parse(char const*) STUB
+ Security::ContextPointer Security::PeerOptions::createClientContext(bool) STUB_RETVAL(Security::ContextPointer())
+@@ -830,7 +830,7 @@ urlCheckRequest(const HttpRequest * r)
+         break;
+ 
+     case AnyP::PROTO_HTTPS:
+-#if USE_OPENSSL || USE_GNUTLS
++#if USE_OPENSSL
+         rc = 1;
+ #else
+         /*
+@@ -341,6 +341,14 @@ verifyTlsCertificate(gnutls_session_t session)
+ }
+ #endif
+ 
++#if USE_GNUTLS
++static void
++gnutlsDebugHandler(int level, const char *msg)
++{
++    debugVerbose(level, "GnuTLS: " << msg);
++}
++#endif
++
+ void
+ Transport::InitTls()
+ {
+@@ -355,6 +363,11 @@ Transport::InitTls()
+ 
+     Config.tlsEnabled = true;
+ 
++#if USE_GNUTLS
++    gnutls_global_set_log_function(&gnutlsDebugHandler);
++    gnutls_global_set_log_level(scParams.verbosityLevel);
++#endif
++
+     // Initialize for anonymous TLS
+     gnutls_anon_allocate_client_credentials(&Config.anonCredentials);
+ 

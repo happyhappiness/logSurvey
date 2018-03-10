@@ -1,0 +1,401 @@
+@@ -38,7 +38,6 @@ class ClientRequestContext : public RefCountable
+ #if USE_ADAPTATION
+ 
+     void adaptationAccessCheck();
+-    void adaptationAclCheckDone(Adaptation::ServiceGroupPointer g);
+ #endif
+ #if USE_SSL
+     /**
+@@ -211,29 +211,17 @@ ServerStateData::serverComplete2()
+ #endif
+ 
+     completeForwarding();
+-    quitIfAllDone();
+ }
+ 
+-// When we are done talking to the primary server, we may be still talking
+-// to the ICAP service. And vice versa. Here, we quit only if we are done
+-// talking to both.
+-void ServerStateData::quitIfAllDone()
++bool ServerStateData::doneAll() const
+ {
++    return  doneWithServer() &&
+ #if USE_ADAPTATION
+-    if (!doneWithAdaptation()) {
+-        debugs(11,5, HERE << "transaction not done: still talking to ICAP");
+-        return;
+-    }
++        doneWithAdaptation() &&
++        Adaptation::Initiator::doneAll() &&
++        BodyProducer::doneAll() &&
+ #endif
+-
+-    if (!doneWithServer()) {
+-        debugs(11,5, HERE << "transaction not done: still talking to server");
+-        return;
+-    }
+-
+-    debugs(11,3, HERE << "transaction done");
+-
+-    deleteThis("ServerStateData::quitIfAllDone");
++        BodyConsumer::doneAll();
+ }
+ 
+ // FTP side overloads this to work around multiple calls to fwd->complete
+@@ -766,7 +754,6 @@ ServerStateData::handleAdaptationCompleted()
+     }
+ 
+     completeForwarding();
+-    quitIfAllDone();
+ }
+ 
+ 
+@@ -827,7 +814,7 @@ ServerStateData::handleAdaptationBlocked(const Adaptation::Answer &answer)
+ }
+ 
+ void
+-ServerStateData::adaptationAclCheckDone(Adaptation::ServiceGroupPointer group)
++ServerStateData::noteAdaptationAclCheckDone(Adaptation::ServiceGroupPointer group)
+ {
+     adaptationAccessCheckPending = false;
+ 
+@@ -852,13 +839,6 @@ ServerStateData::adaptationAclCheckDone(Adaptation::ServiceGroupPointer group)
+     startAdaptation(group, originalRequest());
+     processReplyBody();
+ }
+-
+-void
+-ServerStateData::adaptationAclCheckDoneWrapper(Adaptation::ServiceGroupPointer group, void *data)
+-{
+-    ServerStateData *state = (ServerStateData *)data;
+-    state->adaptationAclCheckDone(group);
+-}
+ #endif
+ 
+ void
+@@ -881,7 +861,7 @@ ServerStateData::adaptOrFinalizeReply()
+     // The callback can be called with a NULL service if adaptation is off.
+     adaptationAccessCheckPending = Adaptation::AccessCheck::Start(
+                                        Adaptation::methodRespmod, Adaptation::pointPreCache,
+-                                       originalRequest(), virginReply(), adaptationAclCheckDoneWrapper, this);
++                                       originalRequest(), virginReply(), this);
+     debugs(11,5, HERE << "adaptationAccessCheckPending=" << adaptationAccessCheckPending);
+     if (adaptationAccessCheckPending)
+         return;
+@@ -87,11 +87,9 @@ class ServerStateData:
+     virtual  HttpRequest *originalRequest();
+ 
+ #if USE_ADAPTATION
+-    void adaptationAclCheckDone(Adaptation::ServiceGroupPointer group);
+-    static void adaptationAclCheckDoneWrapper(Adaptation::ServiceGroupPointer group, void *data);
+-
+-    // ICAPInitiator: start an ICAP transaction and receive adapted headers.
++    // Adaptation::Initiator API: start an ICAP transaction and receive adapted headers.
+     virtual void noteAdaptationAnswer(const Adaptation::Answer &answer);
++    virtual void noteAdaptationAclCheckDone(Adaptation::ServiceGroupPointer group);
+ 
+     // BodyProducer: provide virgin response body to ICAP.
+     virtual void noteMoreBodySpaceAvailable(BodyPipe::Pointer );
+@@ -102,14 +100,7 @@ class ServerStateData:
+ 
+ //AsyncJob virtual methods
+     virtual void swanSong();
+-    virtual bool doneAll() const {
+-        return
+-#if USE_ADAPTATION
+-            Adaptation::Initiator::doneAll() &&
+-            BodyProducer::doneAll() &&
+-#endif
+-            BodyConsumer::doneAll() && false;
+-    }
++    virtual bool doneAll() const;
+ 
+ public: // should be protected
+     void serverComplete();     /**< call when no server communication is expected */
+@@ -198,7 +189,6 @@ class ServerStateData:
+     bool receivedWholeRequestBody; ///< handleRequestBodyProductionEnded called
+ 
+ private:
+-    void quitIfAllDone();            /**< successful termination */
+     void sendBodyIsTooLargeError();
+     void maybePurgeOthers();
+ 
+@@ -5,6 +5,7 @@
+ #include "HttpRequest.h"
+ #include "HttpReply.h"
+ #include "acl/FilledChecklist.h"
++#include "adaptation/Initiator.h"
+ #include "adaptation/Service.h"
+ #include "adaptation/ServiceGroups.h"
+ #include "adaptation/AccessRule.h"
+@@ -18,13 +19,13 @@ cbdata_type Adaptation::AccessCheck::CBDATA_AccessCheck = CBDATA_UNKNOWN;
+ 
+ bool
+ Adaptation::AccessCheck::Start(Method method, VectPoint vp,
+-                               HttpRequest *req, HttpReply *rep, AccessCheckCallback *cb, void *cbdata)
++                               HttpRequest *req, HttpReply *rep, Adaptation::Initiator *initiator)
+ {
+ 
+     if (Config::Enabled) {
+         // the new check will call the callback and delete self, eventually
+         AsyncJob::Start(new AccessCheck( // we do not store so not a CbcPointer
+-                            ServiceFilter(method, vp, req, rep), cb, cbdata));
++                            ServiceFilter(method, vp, req, rep), initiator));
+         return true;
+     }
+ 
+@@ -33,11 +34,9 @@ Adaptation::AccessCheck::Start(Method method, VectPoint vp,
+ }
+ 
+ Adaptation::AccessCheck::AccessCheck(const ServiceFilter &aFilter,
+-                                     AccessCheckCallback *aCallback,
+-                                     void *aCallbackData):
++                                     Adaptation::Initiator *initiator):
+         AsyncJob("AccessCheck"), filter(aFilter),
+-        callback(aCallback),
+-        callback_data(cbdataReference(aCallbackData)),
++        theInitiator(initiator),
+         acl_checklist(NULL)
+ {
+ #if ICAP_CLIENT
+@@ -57,8 +56,6 @@ Adaptation::AccessCheck::~AccessCheck()
+     if (h != NULL)
+         h->stop("ACL");
+ #endif
+-    if (callback_data)
+-        cbdataReferenceDone(callback_data);
+ }
+ 
+ void
+@@ -185,11 +182,8 @@ void
+ Adaptation::AccessCheck::callBack(const ServiceGroupPointer &g)
+ {
+     debugs(93,3, HERE << g);
+-
+-    void *validated_cbdata;
+-    if (cbdataReferenceValidDone(callback_data, &validated_cbdata)) {
+-        callback(g, validated_cbdata);
+-    }
++    CallJobHere1(93, 5, theInitiator, Adaptation::Initiator,
++                 noteAdaptationAclCheckDone, g);
+     mustStop("done"); // called back or will never be able to call back
+ }
+ 
+@@ -5,6 +5,7 @@
+ #include "base/AsyncJob.h"
+ #include "adaptation/Elements.h"
+ #include "adaptation/forward.h"
++#include "adaptation/Initiator.h"
+ #include "adaptation/ServiceFilter.h"
+ 
+ class HttpRequest;
+@@ -24,17 +25,16 @@ class AccessCheck: public virtual AsyncJob
+ 
+     // use this to start async ACL checks; returns true if started
+     static bool Start(Method method, VectPoint vp, HttpRequest *req,
+-                      HttpReply *rep, AccessCheckCallback *cb, void *cbdata);
++                      HttpReply *rep, Adaptation::Initiator *initiator);
+ 
+ protected:
+     // use Start to start adaptation checks
+-    AccessCheck(const ServiceFilter &aFilter, AccessCheckCallback *, void *);
++    AccessCheck(const ServiceFilter &aFilter, Adaptation::Initiator *);
+     ~AccessCheck();
+ 
+ private:
+     const ServiceFilter filter;
+-    AccessCheckCallback *callback;
+-    void *callback_data;
++    CbcPointer<Adaptation::Initiator> theInitiator; ///< the job which ordered this access check
+     ACLFilledChecklist *acl_checklist;
+ 
+     typedef int Candidate;
+@@ -7,6 +7,12 @@
+ #include "adaptation/Initiator.h"
+ #include "base/AsyncJobCalls.h"
+ 
++void
++Adaptation::Initiator::noteAdaptationAclCheckDone(Adaptation::ServiceGroupPointer group)
++{
++    Must(false);
++}
++
+ CbcPointer<Adaptation::Initiate>
+ Adaptation::Initiator::initiateAdaptation(Initiate *x)
+ {
+@@ -23,6 +23,9 @@ class Initiator: virtual public AsyncJob
+     Initiator(): AsyncJob("Initiator") {}
+     virtual ~Initiator() {}
+ 
++    /// AccessCheck calls this back with a possibly nil service group
++    /// to signal whether adaptation is needed and where it should start.
++    virtual void noteAdaptationAclCheckDone(Adaptation::ServiceGroupPointer group);
+     /// called with the initial adaptation decision (adapt, block, error);
+     /// virgin and/or adapted body transmission may continue after this
+     virtual void noteAdaptationAnswer(const Answer &answer) = 0;
+@@ -818,45 +818,33 @@ ClientRequestContext::clientAccessCheckDone(const allow_t &answer)
+ }
+ 
+ #if USE_ADAPTATION
+-static void
+-adaptationAclCheckDoneWrapper(Adaptation::ServiceGroupPointer g, void *data)
+-{
+-    ClientRequestContext *calloutContext = (ClientRequestContext *)data;
+-
+-    if (!calloutContext->httpStateIsValid())
+-        return;
+-
+-    calloutContext->adaptationAclCheckDone(g);
+-}
+-
+ void
+-ClientRequestContext::adaptationAclCheckDone(Adaptation::ServiceGroupPointer g)
++ClientHttpRequest::noteAdaptationAclCheckDone(Adaptation::ServiceGroupPointer g)
+ {
+     debugs(93,3,HERE << this << " adaptationAclCheckDone called");
+-    assert(http);
+ 
+ #if ICAP_CLIENT
+-    Adaptation::Icap::History::Pointer ih = http->request->icapHistory();
++    Adaptation::Icap::History::Pointer ih = request->icapHistory();
+     if (ih != NULL) {
+-        if (http->getConn() != NULL) {
+-            ih->rfc931 = http->getConn()->clientConnection->rfc931;
++        if (getConn() != NULL) {
++            ih->rfc931 = getConn()->clientConnection->rfc931;
+ #if USE_SSL
+-            assert(http->getConn()->clientConnection != NULL);
+-            ih->ssluser = sslGetUserEmail(fd_table[http->getConn()->clientConnection->fd].ssl);
++            assert(getConn()->clientConnection != NULL);
++            ih->ssluser = sslGetUserEmail(fd_table[getConn()->clientConnection->fd].ssl);
+ #endif
+         }
+-        ih->log_uri = http->log_uri;
+-        ih->req_sz = http->req_sz;
++        ih->log_uri = log_uri;
++        ih->req_sz = req_sz;
+     }
+ #endif
+ 
+     if (!g) {
+         debugs(85,3, HERE << "no adaptation needed");
+-        http->doCallouts();
++        doCallouts();
+         return;
+     }
+ 
+-    http->startAdaptation(g);
++    startAdaptation(g);
+ }
+ 
+ #endif
+@@ -1499,7 +1487,7 @@ ClientHttpRequest::doCallouts()
+         calloutContext->adaptation_acl_check_done = true;
+         if (Adaptation::AccessCheck::Start(
+                     Adaptation::methodReqmod, Adaptation::pointPreCache,
+-                    request, NULL, adaptationAclCheckDoneWrapper, calloutContext))
++                    request, NULL, this))
+             return; // will call callback
+     }
+ #endif
+@@ -180,6 +180,7 @@ class ClientHttpRequest
+     virtual void noteAdaptationAnswer(const Adaptation::Answer &answer);
+     void handleAdaptedHeader(HttpMsg *msg);
+     void handleAdaptationBlock(const Adaptation::Answer &answer);
++    virtual void noteAdaptationAclCheckDone(Adaptation::ServiceGroupPointer group);
+ 
+     // BodyConsumer API, called by BodyPipe
+     virtual void noteMoreBodyDataAvailable(BodyPipe::Pointer);
+@@ -234,7 +234,7 @@ class FtpStateData : public ServerStateData
+ 
+ public:
+     // these should all be private
+-    void start();
++    virtual void start();
+     void loginParser(const char *, int escaped);
+     int restartable();
+     void appendSuccessHeader();
+@@ -457,7 +457,7 @@ FtpStateData::ctrlClosed(const CommCloseCbParams &io)
+ {
+     debugs(9, 4, HERE);
+     ctrl.clear();
+-    deleteThis("FtpStateData::ctrlClosed");
++    mustStop("FtpStateData::ctrlClosed");
+ }
+ 
+ /// handler called by Comm when FTP data channel is closed unexpectedly
+@@ -1517,8 +1517,7 @@ FtpStateData::buildTitleUrl()
+ void
+ ftpStart(FwdState * fwd)
+ {
+-    FtpStateData *ftpState = new FtpStateData(fwd, fwd->serverConnection());
+-    ftpState->start();
++    AsyncJob::Start(new FtpStateData(fwd, fwd->serverConnection()));
+ }
+ 
+ void
+@@ -3877,7 +3876,7 @@ FtpStateData::abortTransaction(const char *reason)
+     }
+ 
+     fwd->handleUnregisteredServerEnd();
+-    deleteThis("FtpStateData::abortTransaction");
++    mustStop("FtpStateData::abortTransaction");
+ }
+ 
+ /// creates a data channel Comm close callback
+@@ -154,20 +154,11 @@ HttpStateData::dataConnection() const
+     return serverConnection;
+ }
+ 
+-/*
+-static void
+-httpStateFree(int fd, void *data)
+-{
+-    HttpStateData *httpState = static_cast<HttpStateData *>(data);
+-    debugs(11, 5, "httpStateFree: FD " << fd << ", httpState=" << data);
+-    delete httpState;
+-}*/
+-
+ void
+ HttpStateData::httpStateConnClosed(const CommCloseCbParams &params)
+ {
+     debugs(11, 5, "httpStateFree: FD " << params.fd << ", httpState=" << params.data);
+-    deleteThis("HttpStateData::httpStateConnClosed");
++    mustStop("HttpStateData::httpStateConnClosed");
+ }
+ 
+ int
+@@ -2181,11 +2172,15 @@ void
+ httpStart(FwdState *fwd)
+ {
+     debugs(11, 3, "httpStart: \"" << RequestMethodStr(fwd->request->method) << " " << fwd->entry->url() << "\"" );
+-    HttpStateData *httpState = new HttpStateData(fwd);
++    AsyncJob::Start(new HttpStateData(fwd));
++}
+ 
+-    if (!httpState->sendRequest()) {
++void
++HttpStateData::start()
++{
++    if (!sendRequest()) {
+         debugs(11, 3, "httpStart: aborted");
+-        delete httpState;
++        mustStop("HttpStateData::start failed");
+         return;
+     }
+ 
+@@ -2341,5 +2336,5 @@ HttpStateData::abortTransaction(const char *reason)
+     }
+ 
+     fwd->handleUnregisteredServerEnd();
+-    deleteThis("HttpStateData::abortTransaction");
++    mustStop("HttpStateData::abortTransaction");
+ }
+@@ -102,6 +102,7 @@ class HttpStateData : public ServerStateData
+     bool continueAfterParsingHeader();
+     void truncateVirginBody();
+ 
++    virtual void start();
+     virtual void haveParsedReplyHeaders();
+     virtual bool getMoreRequestBody(MemBuf &buf);
+     virtual void closeServer(); // end communication with the server

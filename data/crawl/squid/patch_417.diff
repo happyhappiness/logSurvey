@@ -1,0 +1,269 @@
+@@ -314,13 +314,15 @@ ServerStateData::createHttpReply(const Http::StatusCode httpStatus, const int cl
+     }
+     if (clen >= 0)
+         header.putInt64(HDR_CONTENT_LENGTH, clen);
++
++    if (ctrl.message) {
++        for (wordlist *W = ctrl.message; W && W->next; W = W->next)
++            header.putStr(HDR_FTP_PRE, httpHeaderQuoteString(W->key).termedBuf());
++    }
+     if (ctrl.replycode > 0)
+         header.putInt(HDR_FTP_STATUS, ctrl.replycode);
+-    if (ctrl.message) {
+-        for (wordlist *W = ctrl.message; W; W = W->next)
+-            header.putStr(HDR_FTP_REASON, W->key);
+-    } else if (ctrl.last_command)
+-        header.putStr(HDR_FTP_REASON, ctrl.last_command);
++    if (ctrl.last_reply)
++        header.putStr(HDR_FTP_REASON, ctrl.last_reply);
+ 
+     reply->hdrCacheInit();
+ 
+@@ -339,10 +339,8 @@ ServerStateData::handleControlReply()
+ 
+     size_t bytes_used = 0;
+     wordlistDestroy(&ctrl.message);
+-    ctrl.message = parseControlReply(ctrl.buf, ctrl.offset, &ctrl.replycode,
+-                                     &bytes_used);
+ 
+-    if (ctrl.message == NULL) {
++    if (!parseControlReply(bytes_used)) {
+         /* didn't get complete reply yet */
+ 
+         if (ctrl.offset == ctrl.size) {
+@@ -351,7 +349,13 @@ ServerStateData::handleControlReply()
+ 
+         scheduleReadControlReply(0);
+         return;
+-    } else if (ctrl.offset == bytes_used) {
++    } 
++
++    assert(ctrl.message); // the entire FTP server response, line by line
++    assert(ctrl.replycode >= 0); // FTP status code (from the last line)
++    assert(ctrl.last_reply); // FTP reason (from the last line)
++
++    if (ctrl.offset == bytes_used) {
+         /* used it all up */
+         ctrl.offset = 0;
+     } else {
+@@ -361,14 +365,6 @@ ServerStateData::handleControlReply()
+         memmove(ctrl.buf, ctrl.buf + bytes_used, ctrl.offset);
+     }
+ 
+-    /* Move the last line of the reply message to ctrl.last_reply */
+-    const wordlist *W;
+-    for (W = ctrl.message; W && W->next; W = W->next);
+-    if (W) {
+-        safe_free(ctrl.last_reply);
+-        ctrl.last_reply = xstrdup(W->key);
+-    }
+-
+     debugs(9, 3, HERE << "state=" << state << ", code=" << ctrl.replycode);
+ }
+ 
+@@ -733,8 +729,10 @@ ServerStateData::doneSendingRequestBody()
+      */
+ }
+ 
+-wordlist *
+-ServerStateData::parseControlReply(char *buf, size_t len, int *codep, size_t *used)
++/// Parses FTP server control response into ctrl structure fields,
++/// setting bytesUsed and returning true on success.
++bool
++ServerStateData::parseControlReply(size_t &bytesUsed)
+ {
+     char *s;
+     char *sbuf;
+@@ -744,15 +742,14 @@ ServerStateData::parseControlReply(char *buf, size_t len, int *codep, size_t *us
+     wordlist *head = NULL;
+     wordlist *list;
+     wordlist **tail = &head;
+-    size_t offset;
+     size_t linelen;
+-    int code = -1;
+     debugs(9, 3, HERE);
+     /*
+      * We need a NULL-terminated buffer for scanning, ick
+      */
++    const size_t len = ctrl.offset;
+     sbuf = (char *)xmalloc(len + 1);
+-    xstrncpy(sbuf, buf, len + 1);
++    xstrncpy(sbuf, ctrl.buf, len + 1);
+     end = sbuf + len - 1;
+ 
+     while (*end != '\r' && *end != '\n' && end > sbuf)
+@@ -765,7 +762,7 @@ ServerStateData::parseControlReply(char *buf, size_t len, int *codep, size_t *us
+     if (usable == 0) {
+         debugs(9, 3, HERE << "didn't find end of line");
+         safe_free(sbuf);
+-        return NULL;
++        return false;
+     }
+ 
+     debugs(9, 3, HERE << len << " bytes to play with");
+@@ -787,39 +784,39 @@ ServerStateData::parseControlReply(char *buf, size_t len, int *codep, size_t *us
+         if (linelen > 3)
+             complete = (*s >= '0' && *s <= '9' && *(s + 3) == ' ');
+ 
+-        if (complete)
+-            code = atoi(s);
+-
+-        offset = 0;
+-
+-        if (linelen > 3)
+-            if (*s >= '0' && *s <= '9' && (*(s + 3) == '-' || *(s + 3) == ' '))
+-                offset = 4;
+-
+         list = new wordlist();
+ 
+-        list->key = (char *)xmalloc(linelen - offset);
++        list->key = (char *)xmalloc(linelen);
+ 
+-        xstrncpy(list->key, s + offset, linelen - offset);
++        xstrncpy(list->key, s, linelen);
+ 
+         /* trace the FTP communication chat at level 2 */
+-        debugs(9, 2, "ftp>> " << code << " " << list->key);
++        debugs(9, 2, "ftp>> " << list->key);
++
++        if (complete) {
++            // use list->key for last_reply because s contains the new line
++            ctrl.last_reply = xstrdup(list->key + 4);
++            ctrl.replycode = atoi(list->key);
++        }
+ 
+         *tail = list;
+ 
+         tail = &list->next;
+     }
+ 
+-    *used = (size_t) (s - sbuf);
++    bytesUsed = static_cast<size_t>(s - sbuf);
+     safe_free(sbuf);
+ 
+-    if (!complete)
++    if (!complete) {
+         wordlistDestroy(&head);
++        return false;
++    }
+ 
+-    if (codep)
+-        *codep = code;
+-
+-    return head;
++    ctrl.message = head;
++    assert(ctrl.replycode >= 0);
++    assert(ctrl.last_reply);
++    assert(ctrl.message);
++    return true;
+ }
+ 
+ }; // namespace Ftp
+@@ -113,7 +113,7 @@ class ServerStateData: public ::ServerStateData
+     virtual void doneSendingRequestBody();
+ 
+ private:
+-    static wordlist *parseControlReply(char *buf, size_t len, int *codep, size_t *used);
++    bool parseControlReply(size_t &bytesUsed);
+ 
+     CBDATA_CLASS2(ServerStateData);
+ };
+@@ -163,6 +163,7 @@ static const HttpHeaderFieldAttrs HeadersAttrs[] = {
+     {"Front-End-Https", HDR_FRONT_END_HTTPS, ftStr},
+     {"FTP-Command", HDR_FTP_COMMAND, ftStr},
+     {"FTP-Arguments", HDR_FTP_ARGUMENTS, ftStr},
++    {"FTP-Pre", HDR_FTP_PRE, ftStr},
+     {"FTP-Status", HDR_FTP_STATUS, ftInt},
+     {"FTP-Reason", HDR_FTP_REASON, ftStr},
+     {"Other:", HDR_OTHER, ftStr}	/* ':' will not allow matches */
+@@ -148,6 +148,7 @@ typedef enum {
+     HDR_FRONT_END_HTTPS,                /**< MS Exchange custom header we may have to add */
+     HDR_FTP_COMMAND,                    /**< Internal header for FTP command */
+     HDR_FTP_ARGUMENTS,                  /**< Internal header for FTP command arguments */
++    HDR_FTP_PRE,                        /**< Custom: Contains leading FTP control response lines */
+     HDR_FTP_STATUS,                     /**< Internal header for FTP reply status */
+     HDR_FTP_REASON,                     /**< Internal header for FTP reply reason */
+     HDR_OTHER,                          /**< internal tag value for "unknown" headers */
+@@ -300,6 +301,10 @@ class HttpHeader
+ };
+ 
+ int httpHeaderParseQuotedString(const char *start, const int len, String *val);
++
++/// quotes string using RFC 2616 quoted-string rules
++String httpHeaderQuoteString(const char *raw);
++
+ int httpHeaderHasByNameListMember(const HttpHeader * hdr, const char *name, const char *member, const char separator);
+ void httpHeaderUpdate(HttpHeader * old, const HttpHeader * fresh, const HttpHeaderMask * denied_mask);
+ void httpHeaderCalcMask(HttpHeaderMask * mask, http_hdr_type http_hdr_type_enums[], size_t count);
+@@ -299,6 +299,36 @@ httpHeaderParseQuotedString(const char *start, const int len, String *val)
+     return 1;
+ }
+ 
++// TODO: Optimize using SBuf
++String
++httpHeaderQuoteString(const char *raw)
++{
++    assert(raw);
++
++    // HTTPbis says Senders SHOULD NOT escape octets in quoted-strings that
++    // do not require escaping (i.e., except DQUOTE and the backslash octet).
++    bool needInnerQuote = false;
++    for (const char *s = raw; !needInnerQuote &&  *s; ++s)
++        needInnerQuote = *s == '"' || *s == '\\';
++
++    static String quotedStr;
++    quotedStr.clean();
++    quotedStr.append('"');
++
++    if (needInnerQuote) {
++        for (const char *s = raw; *s; ++s) {
++            if (*s == '"' || *s == '\\')
++                quotedStr.append('\\');
++            quotedStr.append(*s);
++        }
++    } else {
++        quotedStr.append(raw);
++    }
++    
++    quotedStr.append('"');
++    return quotedStr;
++}
++
+ /**
+  * Checks the anonymizer (header_access) configuration.
+  *
+@@ -5437,23 +5437,19 @@ FtpPrintReply(MemBuf &mb, const HttpReply *reply, const char *const prefix)
+ {
+     const HttpHeader &header = reply->header;
+ 
+-    char status[4];
+-    if (header.has(HDR_FTP_STATUS))
+-        snprintf(status, sizeof(status), "%i", header.getInt(HDR_FTP_STATUS));
+-    else
+-        status[0] = '\0';
+-
+     HttpHeaderPos pos = HttpHeaderInitPos;
+-    const HttpHeaderEntry *e = header.getEntry(&pos);
+-    while (e) {
+-        const HttpHeaderEntry *const next = header.getEntry(&pos);
+-        if (e->id == HDR_FTP_REASON) {
+-            const bool isLastLine = next == NULL || next->id != HDR_FTP_REASON;
+-            const int separator = status[0] == '\0' || isLastLine ? ' ' : '-';
+-            mb.Printf("%s%s%c%s\r\n", prefix, status, separator,
+-                      e->value.termedBuf());
++    while (const HttpHeaderEntry *e = header.getEntry(&pos)) {
++        if (e->id == HDR_FTP_PRE) {
++            String raw;
++            if (httpHeaderParseQuotedString(e->value.rawBuf(), e->value.size(), &raw))
++                mb.Printf("%s\r\n", raw.termedBuf());
+         }
+-        e = next;
++    }
++
++    if (header.has(HDR_FTP_STATUS)) {
++        const char *reason = header.getStr(HDR_FTP_REASON);
++        mb.Printf("%i %s\r\n", header.getInt(HDR_FTP_STATUS),
++                  (reason ? reason : 0));
+     }
+ }
+ 

@@ -1,191 +1,1126 @@
-----++++src/FwdState.cc
-@@ -123,7 +123,8 @@ void
- FwdState::closeServerConnection(const char *reason)
+@@ -0,0 +1,266 @@
++/*
++ * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#include "squid.h"
++#include "client_side.h"
++#include "client_side_request.h"
++#include "client_side_reply.h"
++#include "ClientRequestContext.h"
++#include "Downloader.h"
++#include "http/one/RequestParser.h"
++#include "http/Stream.h"
++
++CBDATA_CLASS_INIT(Downloader);
++
++/// Used to hold and pass the required info and buffers to the
++/// clientStream callbacks
++class DownloaderContext: public RefCountable
++{
++    MEMPROXY_CLASS(DownloaderContext);
++
++public:
++    typedef RefCount<DownloaderContext> Pointer;
++
++    DownloaderContext(Downloader *dl, ClientHttpRequest *h);
++    ~DownloaderContext();
++    void finished();
++
++    CbcPointer<Downloader> downloader;
++    ClientHttpRequest *http;
++    char requestBuffer[HTTP_REQBUF_SZ];
++};
++
++DownloaderContext::DownloaderContext(Downloader *dl, ClientHttpRequest *h):
++    downloader(dl),
++    http(h)
++{
++    debugs(33, 6, "DownloaderContext constructed, this=" << (void*)this);
++}
++
++DownloaderContext::~DownloaderContext()
++{
++    debugs(33, 6, "DownloaderContext destructed, this=" << (void*)this);
++    if (http)
++        finished();
++}
++
++void
++DownloaderContext::finished()
++{
++    delete http;
++    http = nullptr;
++}
++
++void
++Downloader::CbDialer::print(std::ostream &os) const
++{
++    os << " Http Status:" << status << Raw("body data", object.rawContent(), 64).hex();
++}
++
++Downloader::Downloader(SBuf &url, AsyncCall::Pointer &aCallback, unsigned int level):
++    AsyncJob("Downloader"),
++    url_(url),
++    callback_(aCallback),
++    level_(level)
++{
++}
++
++Downloader::~Downloader()
++{
++}
++
++bool
++Downloader::doneAll() const
++{
++    return (!callback_ || callback_->canceled()) && AsyncJob::doneAll();
++}
++
++static void
++downloaderRecipient(clientStreamNode * node, ClientHttpRequest * http,
++                    HttpReply * rep, StoreIOBuffer receivedData)
++{
++    debugs(33, 6, MYNAME);
++     /* Test preconditions */
++    assert(node);
++
++    /* TODO: handle this rather than asserting
++     * - it should only ever happen if we cause an abort and
++     * the callback chain loops back to here, so we can simply return.
++     * However, that itself shouldn't happen, so it stays as an assert for now.
++     */
++    assert(cbdataReferenceValid(node));
++    assert(!node->node.next);
++    DownloaderContext::Pointer context = dynamic_cast<DownloaderContext *>(node->data.getRaw());
++    assert(context);
++
++    if (context->downloader.valid())
++        context->downloader->handleReply(node, http, rep, receivedData);
++}
++
++static void
++downloaderDetach(clientStreamNode * node, ClientHttpRequest * http)
++{
++    debugs(33, 5, MYNAME);
++    clientStreamDetach(node, http);
++}
++
++/// Initializes and starts the HTTP GET request to the remote server
++bool
++Downloader::buildRequest()
++{ 
++    const HttpRequestMethod method = Http::METHOD_GET;
++
++    char *uri = xstrdup(url_.c_str());
++    HttpRequest *const request = HttpRequest::CreateFromUrl(uri, method);
++    if (!request) {
++        debugs(33, 5, "Invalid URI: " << url_);
++        xfree(uri);
++        return false; //earlyError(...)
++    }
++    request->http_ver = Http::ProtocolVersion();
++    request->header.putStr(Http::HdrType::HOST, request->url.host());
++    request->header.putTime(Http::HdrType::DATE, squid_curtime);
++    request->flags.internalClient = true;
++    request->client_addr.setNoAddr();
++#if FOLLOW_X_FORWARDED_FOR
++    request->indirect_client_addr.setNoAddr();
++#endif /* FOLLOW_X_FORWARDED_FOR */
++    request->my_addr.setNoAddr();   /* undefined for internal requests */
++    request->my_addr.port(0);
++    request->downloader = this;
++
++    debugs(11, 2, "HTTP Client Downloader " << this << "/" << id);
++    debugs(11, 2, "HTTP Client REQUEST:\n---------\n" <<
++           request->method << " " << url_ << " " << request->http_ver << "\n" <<
++           "\n----------");
++
++    ClientHttpRequest *const http = new ClientHttpRequest(nullptr);
++    http->request = request;
++    HTTPMSGLOCK(http->request);
++    http->req_sz = 0;
++    http->uri = uri;
++    setLogUri (http, urlCanonicalClean(request));
++
++    context_ = new DownloaderContext(this, http);
++    StoreIOBuffer tempBuffer;
++    tempBuffer.data = context_->requestBuffer;
++    tempBuffer.length = HTTP_REQBUF_SZ;
++
++    ClientStreamData newServer = new clientReplyContext(http);
++    ClientStreamData newClient = context_.getRaw();
++    clientStreamInit(&http->client_stream, clientGetMoreData, clientReplyDetach,
++                     clientReplyStatus, newServer, downloaderRecipient,
++                     downloaderDetach, newClient, tempBuffer);
++
++    // Build a ClientRequestContext to start doCallouts
++    http->calloutContext = new ClientRequestContext(http);
++    http->doCallouts();
++    return true;
++}
++
++void
++Downloader::start()
++{
++    if (!buildRequest())
++        callBack(Http::scInternalServerError);
++}
++
++void
++Downloader::handleReply(clientStreamNode * node, ClientHttpRequest *http, HttpReply *reply, StoreIOBuffer receivedData)
++{
++    DownloaderContext::Pointer callerContext = dynamic_cast<DownloaderContext *>(node->data.getRaw());
++    // TODO: remove the following check:
++    assert(callerContext == context_);
++
++    debugs(33, 4, "Received " << receivedData.length <<
++           " object data, offset: " << receivedData.offset <<
++           " error flag:" << receivedData.flags.error);
++
++    const bool failed = receivedData.flags.error;
++    if (failed) {
++        callBack(Http::scInternalServerError);
++        return;
++    }
++
++    const int64_t existingContent = reply ? reply->content_length : 0;
++    const size_t maxSize = MaxObjectSize > SBuf::maxSize ? SBuf::maxSize : MaxObjectSize;
++    const bool tooLarge = (existingContent > -1 && existingContent > static_cast<int64_t>(maxSize)) ||
++                          (maxSize < object_.length()) ||
++                          ((maxSize - object_.length()) < receivedData.length);
++
++    if (tooLarge) {
++        callBack(Http::scInternalServerError);
++        return;
++    }
++
++    object_.append(receivedData.data, receivedData.length);
++    http->out.size += receivedData.length;
++    http->out.offset += receivedData.length;
++
++    switch (clientStreamStatus(node, http)) {
++    case STREAM_NONE: {
++        debugs(33, 3, "Get more data");
++        StoreIOBuffer tempBuffer;
++        tempBuffer.offset = http->out.offset;
++        tempBuffer.data = context_->requestBuffer;
++        tempBuffer.length = HTTP_REQBUF_SZ;
++        clientStreamRead(node, http, tempBuffer);
++    }
++        break;
++    case STREAM_COMPLETE:
++        debugs(33, 3, "Object data transfer successfully complete");
++        callBack(Http::scOkay);
++        break;
++    case STREAM_UNPLANNED_COMPLETE:
++        debugs(33, 3, "Object data transfer failed: STREAM_UNPLANNED_COMPLETE");
++        callBack(Http::scInternalServerError);
++        break;
++    case STREAM_FAILED:
++        debugs(33, 3, "Object data transfer failed: STREAM_FAILED");
++        callBack(Http::scInternalServerError);
++        break;
++    default:
++        fatal("unreachable code");
++    }
++}
++
++void
++Downloader::downloadFinished()
++{
++    debugs(33, 7, this);
++    // We cannot delay http destruction until refcounting deletes 
++    // DownloaderContext. The http object destruction will cause 
++    // clientStream cleanup and will release the refcount to context_
++    // object hold by clientStream structures.
++    context_->finished();
++    context_ = nullptr;
++    Must(done());
++}
++
++/// Schedules for execution the "callback" with parameters the status
++/// and object.
++void
++Downloader::callBack(Http::StatusCode const statusCode)
++{
++     CbDialer *dialer = dynamic_cast<CbDialer*>(callback_->getDialer());
++     Must(dialer);
++     dialer->status = statusCode;
++     if (statusCode == Http::scOkay)
++         dialer->object = object_;
++     ScheduleCallHere(callback_);
++     callback_ = nullptr;
++
++     // Calling deleteThis method here to finish Downloader
++     // may result to squid crash.
++     // This method called by handleReply method which maybe called
++     // by ClientHttpRequest::doCallouts. The doCallouts after this object
++     // deleted, may operate on non valid objects.
++     // Schedule an async call here just to force squid to delete this object.
++     CallJobHere(33, 7, CbcPointer<Downloader>(this), Downloader, downloadFinished);
++}
++
+@@ -0,0 +1,82 @@
++/*
++ * Copyright (C) 1996-2016 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_DOWNLOADER_H
++#define SQUID_DOWNLOADER_H
++
++#include "base/AsyncJob.h"
++#include "defines.h"
++#include "http/forward.h"
++#include "http/StatusCode.h"
++#include "sbuf/SBuf.h"
++
++class ClientHttpRequest;
++class StoreIOBuffer;
++class clientStreamNode;
++class DownloaderContext;
++typedef RefCount<DownloaderContext> DownloaderContextPointer;
++
++/// The Downloader class fetches SBuf-storable things for other Squid
++/// components/transactions using internal requests. For example, it is used
++/// to fetch missing intermediate certificates when validating origin server
++/// certificate chains.
++class Downloader: virtual public AsyncJob
++{
++    CBDATA_CLASS(Downloader);
++public:
++
++    /// Callback data to use with Downloader callbacks.
++    class CbDialer: public CallDialer {
++    public:
++        CbDialer(): status(Http::scNone) {}
++        virtual ~CbDialer() {}
++
++        /* CallDialer API */
++        virtual bool canDial(AsyncCall &call) = 0;
++        virtual void dial(AsyncCall &call) = 0;
++        virtual void print(std::ostream &os) const;
++
++        SBuf object;
++        Http::StatusCode status;
++    };
++
++    Downloader(SBuf &url, AsyncCall::Pointer &aCallback, unsigned int level = 0);
++    virtual ~Downloader();
++
++    /// delays destruction to protect doCallouts()
++    void downloadFinished();
++
++    /// The nested level of Downloader object (downloads inside downloads).
++    unsigned int nestedLevel() const {return level_;}
++    
++    void handleReply(clientStreamNode *, ClientHttpRequest *, HttpReply *, StoreIOBuffer);
++
++protected:
++
++    /* AsyncJob API */
++    virtual bool doneAll() const;
++    virtual void start();
++
++private:
++
++    bool buildRequest();
++    void callBack(Http::StatusCode const status);
++
++    /// The maximum allowed object size.
++    static const size_t MaxObjectSize = 1*1024*1024;
++
++    SBuf url_; ///< the url to download
++    AsyncCall::Pointer callback_; ///< callback to call when download finishes
++    SBuf object_; ///< the object body data
++    const unsigned int level_; ///< holds the nested downloads level
++
++    /// Pointer to an object that stores the clientStream required info
++    DownloaderContextPointer context_;
++};
++
++#endif
+@@ -14,6 +14,7 @@
+ #include "acl/FilledChecklist.h"
+ #include "client_side.h"
+ #include "dns/LookupDetails.h"
++#include "Downloader.h"
+ #include "err_detail_type.h"
+ #include "globals.h"
+ #include "gopher.h"
+@@ -250,6 +251,8 @@ HttpRequest::inheritProperties(const HttpMsg *aMsg)
+     // main property is which connection the request was received on (if any)
+     clientConnectionManager = aReq->clientConnectionManager;
+ 
++    downloader = aReq->downloader;
++
+     notes = aReq->notes;
+ 
+     sources = aReq->sources;
+@@ -34,6 +34,7 @@
+ #endif
+ 
+ class ConnStateData;
++class Downloader;
+ 
+ /*  Http Request */
+ void httpRequestPack(void *obj, Packable *p);
+@@ -212,6 +213,9 @@ class HttpRequest: public HttpMsg
+      */
+     CbcPointer<ConnStateData> clientConnectionManager;
+ 
++    /// The Downloader object which initiated the HTTP request if any
++    CbcPointer<Downloader> downloader;
++
+     /// forgets about the cached Range header (for a reason)
+     void ignoreRange(const char *reason);
+     int64_t getRangeOffsetLimit(); /* the result of this function gets cached in rangeOffsetLimit */
+@@ -272,6 +272,8 @@ squid_SOURCES = \
+ 	dlink.h \
+ 	dlink.cc \
+ 	$(DNSSOURCE) \
++	Downloader.cc \
++	Downloader.h \
+ 	enums.h \
+ 	err_type.h \
+ 	err_detail_type.h \
+@@ -124,8 +124,9 @@ void AsyncJob::callStart(AsyncCall &call)
+ }
+ 
+ void
+-AsyncJob::callException(const std::exception &)
++AsyncJob::callException(const std::exception &ex)
  {
-     debugs(17, 3, &quot;because &quot; &lt;&lt; reason &lt;&lt; &quot;; &quot; &lt;&lt; serverConn);
--    comm_remove_close_handler(serverConn-&gt;fd, fwdServerClosedWrapper, this);
-+    comm_remove_close_handler(serverConn-&gt;fd, closeHandler);
-+    closeHandler = NULL;
-     fwdPconnPool-&gt;noteUses(fd_table[serverConn-&gt;fd].pconn.uses);
-     serverConn-&gt;close();
- }
-@@ -456,7 +457,8 @@ FwdState::unregister(Comm::ConnectionPointer &amp;conn)
-     debugs(17, 3, HERE &lt;&lt; entry-&gt;url() );
-     assert(serverConnection() == conn);
-     assert(Comm::IsConnOpen(conn));
--    comm_remove_close_handler(conn-&gt;fd, fwdServerClosedWrapper, this);
-+    comm_remove_close_handler(conn-&gt;fd, closeHandler);
-+    closeHandler = NULL;
-     serverConn = NULL;
++    debugs(93, 2, ex.what());
+     // we must be called asynchronously and hence, the caller must lock us
+     Must(cbdataReferenceValid(toCbdata()));
+ 
+@@ -2153,21 +2153,28 @@ clientReplyContext::sendMoreData (StoreIOBuffer result)
+ 
+     StoreEntry *entry = http->storeEntry();
+ 
+-    ConnStateData * conn = http->getConn();
++    if (ConnStateData * conn = http->getConn()) {
++        if (!conn->isOpen()) {
++            debugs(33,3, "not sending more data to closing connection " << conn->clientConnection);
++            return;
++        }
++        if (conn->pinning.zeroReply) {
++            debugs(33,3, "not sending more data after a pinned zero reply " << conn->clientConnection);
++            return;
++        }
+ 
+-    // too late, our conn is closing
+-    // TODO: should we also quit?
+-    if (conn == NULL) {
+-        debugs(33,3, "not sending more data to a closed connection" );
+-        return;
+-    }
+-    if (!conn->isOpen()) {
+-        debugs(33,3, "not sending more data to closing connection " << conn->clientConnection);
+-        return;
+-    }
+-    if (conn->pinning.zeroReply) {
+-        debugs(33,3, "not sending more data after a pinned zero reply " << conn->clientConnection);
+-        return;
++        if (reqofs==0 && !http->logType.isTcpHit()) {
++            if (Ip::Qos::TheConfig.isHitTosActive()) {
++                Ip::Qos::doTosLocalMiss(conn->clientConnection, http->request->hier.code);
++            }
++            if (Ip::Qos::TheConfig.isHitNfmarkActive()) {
++                Ip::Qos::doNfmarkLocalMiss(conn->clientConnection, http->request->hier.code);
++            }
++        }
++
++        debugs(88, 5, conn->clientConnection <<
++               " '" << entry->url() << "'" <<
++               " out.offset=" << http->out.offset);
+     }
+ 
+     char *buf = next()->readBuffer.data;
+@@ -2178,15 +2185,6 @@ clientReplyContext::sendMoreData (StoreIOBuffer result)
+         memcpy(buf, result.data, result.length);
+     }
+ 
+-    if (reqofs==0 && !http->logType.isTcpHit() && Comm::IsConnOpen(conn->clientConnection)) {
+-        if (Ip::Qos::TheConfig.isHitTosActive()) {
+-            Ip::Qos::doTosLocalMiss(conn->clientConnection, http->request->hier.code);
+-        }
+-        if (Ip::Qos::TheConfig.isHitNfmarkActive()) {
+-            Ip::Qos::doNfmarkLocalMiss(conn->clientConnection, http->request->hier.code);
+-        }
+-    }
+-
+     /* We've got the final data to start pushing... */
+     flags.storelogiccomplete = 1;
+ 
+@@ -2205,10 +2203,6 @@ clientReplyContext::sendMoreData (StoreIOBuffer result)
+     debugs(88, 5, "clientReplyContext::sendMoreData: " << http->uri << ", " <<
+            reqofs << " bytes (" << result.length <<
+            " new bytes)");
+-    debugs(88, 5, "clientReplyContext::sendMoreData:"
+-           << conn->clientConnection <<
+-           " '" << entry->url() << "'" <<
+-           " out.offset=" << http->out.offset);
+ 
+     /* update size of the request */
+     reqsize = reqofs;
+@@ -1407,6 +1407,11 @@ ClientRequestContext::checkNoCacheDone(const allow_t &answer)
+ bool
+ ClientRequestContext::sslBumpAccessCheck()
+ {
++    if (!http->getConn()) {
++        http->al->ssl.bumpMode = Ssl::bumpEnd; // SslBump does not apply; log -
++        return false;
++    }
++
+     // If SSL connection tunneling or bumping decision has been made, obey it.
+     const Ssl::BumpMode bumpMode = http->getConn()->sslBumpMode;
+     if (bumpMode != Ssl::bumpEnd) {
+@@ -326,6 +326,7 @@ Security::HandshakeParser::parseHandshakeMessage()
+         return;
+     case HandshakeType::hskCertificate:
+         Must(state < atCertificatesReceived);
++        parseServerCertificates(message.msg_body);
+         state = atCertificatesReceived;
+         return;
+     case HandshakeType::hskServerHelloDone:
+@@ -534,13 +535,43 @@ Security::HandshakeParser::parseHello(const SBuf &data)
+     return false; // unreached
  }
  
-@@ -687,7 +689,7 @@ FwdState::connectDone(const Comm::ConnectionPointer &amp;conn, Comm::Flag status, in
-     serverConn = conn;
-     debugs(17, 3, HERE &lt;&lt; serverConnection() &lt;&lt; &quot;: &#39;&quot; &lt;&lt; entry-&gt;url() &lt;&lt; &quot;&#39;&quot; );
++void
++Security::HandshakeParser::ParseCertificate(const SBuf &raw, Security::CertPointer &pCert)
++{
+ #if USE_OPENSSL
++    auto x509Start = reinterpret_cast<const unsigned char *>(raw.rawContent());
++    auto x509Pos = x509Start;
++    X509 *x509 = d2i_X509(nullptr, &x509Pos, raw.length());
++    Must(x509); // successfully parsed
++    Must(x509Pos == x509Start + raw.length()); // no leftovers
++    pCert.resetAndLock(x509);
++#endif
++}
++
++void
++Security::HandshakeParser::parseServerCertificates(const SBuf &raw)
++{
++    Parser::BinaryTokenizer tkList(raw);
++    const SBuf clist = tkList.pstring24("CertificateList");
++    Must(tkList.atEnd()); // no leftovers after all certificates
++
++    Parser::BinaryTokenizer tkItems(clist);
++    while (!tkItems.atEnd()) {
++        Security::CertPointer cert;
++        ParseCertificate(tkItems.pstring24("Certificate"), cert);
++        serverCertificates.push_back(cert);
++        debugs(83, 7, "parsed " << serverCertificates.size() << " certificates so far");
++    }
++
++}
  
--    comm_add_close_handler(serverConnection()-&gt;fd, fwdServerClosedWrapper, this);
-+    closeHandler = comm_add_close_handler(serverConnection()-&gt;fd, fwdServerClosedWrapper, this);
+ /// A helper function to create a set of all supported TLS extensions
+ static
+ Security::Extensions
+ Security::SupportedExtensions()
+ {
++#if USE_OPENSSL
++
+     // optimize lookup speed by reserving the number of values x3, approximately
+     Security::Extensions extensions(64);
+ 
+@@ -624,15 +655,9 @@ Security::SupportedExtensions()
+ #endif
+ 
+     return extensions; // might be empty
+-}
+-
+ #else
+ 
+-static
+-Security::Extensions
+-Security::SupportedExtensions()
+-{
+     return Extensions(); // no extensions are supported without OpenSSL
+-}
+ #endif
++}
+ 
+@@ -12,6 +12,7 @@
+ #include "anyp/ProtocolVersion.h"
+ #include "base/YesNoNone.h"
+ #include "parser/BinaryTokenizer.h"
++#include "security/forward.h"
+ 
+ #include <unordered_set>
+ 
+@@ -68,6 +69,8 @@ class HandshakeParser
+ 
+     TlsDetails::Pointer details; ///< TLS handshake meta info or nil.
+ 
++    Security::CertList serverCertificates; ///< parsed certificates chain
++
+     ParserState state; ///< current parsing state.
+ 
+     bool resumingSession; ///< True if this is a resuming session
+@@ -97,6 +100,9 @@ class HandshakeParser
+     void parseCiphers(const SBuf &raw);
+     void parseV23Ciphers(const SBuf &raw);
+ 
++    void parseServerCertificates(const SBuf &raw);
++    static void ParseCertificate(const SBuf &raw, CertPointer &cert);
++
+     unsigned int currentContentType; ///< The current TLS/SSL record content type
+ 
+     const char *done; ///< not nil if we got what we were looking for
+@@ -11,8 +11,10 @@
+ #include "squid.h"
+ #include "acl/FilledChecklist.h"
+ #include "comm/Loops.h"
++#include "Downloader.h"
+ #include "errorpage.h"
+ #include "fde.h"
++#include "http/Stream.h"
+ #include "HttpRequest.h"
+ #include "security/NegotiationHistory.h"
+ #include "security/PeerConnector.h"
+@@ -33,7 +35,8 @@ Security::PeerConnector::PeerConnector(const Comm::ConnectionPointer &aServerCon
+     callback(aCallback),
+     negotiationTimeout(timeout),
+     startTime(squid_curtime),
+-    useCertValidator_(true)
++    useCertValidator_(true),
++    certsDownloads(0)
+ {
+     debugs(83, 5, "Security::PeerConnector constructed, this=" << (void*)this);
+     // if this throws, the caller's cb dialer is not our CbDialer
+@@ -384,8 +387,30 @@ Security::PeerConnector::handleNegotiateError(const int ret)
+ void
+ Security::PeerConnector::noteWantRead()
+ {
+-    setReadTimeout();
+     const int fd = serverConnection()->fd;
++#if USE_OPENSSL
++    Security::SessionPtr ssl = fd_table[fd].ssl.get();
++    BIO *b = SSL_get_rbio(ssl);
++    Ssl::ServerBio *srvBio = static_cast<Ssl::ServerBio *>(b->ptr);
++    if (srvBio->holdRead()) {
++        if (srvBio->gotHello()) {
++            if (checkForMissingCertificates())
++                return; // Wait to download certificates before proceed.
++
++            srvBio->holdRead(false);
++            // schedule a negotiateSSl to allow openSSL parse received data
++            Security::PeerConnector::NegotiateSsl(fd, this);
++            return;
++        } else if (srvBio->gotHelloFailed()) {
++            srvBio->holdRead(false);
++            debugs(83, DBG_IMPORTANT, "Error parsing SSL Server Hello Message on FD " << fd);
++            // schedule a negotiateSSl to allow openSSL parse received data
++            Security::PeerConnector::NegotiateSsl(fd, this);
++            return;
++        }
++    }
++#endif
++    setReadTimeout();
+     Comm::SetSelect(fd, COMM_SELECT_READ, &NegotiateSsl, this, 0);
+ }
+ 
+@@ -515,3 +540,105 @@ Security::PeerConnector::status() const
+     return buf.content();
+ }
+ 
++#if USE_OPENSSL
++/// CallDialer to allow use Downloader objects within PeerConnector class.
++class PeerConnectorCertDownloaderDialer: public Downloader::CbDialer
++{
++public:
++    typedef void (Security::PeerConnector::*Method)(SBuf &object, int status);
++
++    PeerConnectorCertDownloaderDialer(Method method, Security::PeerConnector *pc):
++        method_(method),
++        peerConnector_(pc) {}
++
++    /* CallDialer API */
++    virtual bool canDial(AsyncCall &call) { return peerConnector_.valid(); }
++    virtual void dial(AsyncCall &call) { ((&(*peerConnector_))->*method_)(object, status); }
++    Method method_; ///< The Security::PeerConnector method to dial
++    CbcPointer<Security::PeerConnector> peerConnector_; ///< The Security::PeerConnector object
++};
++
++void
++Security::PeerConnector::startCertDownloading(SBuf &url)
++{
++    AsyncCall::Pointer certCallback = asyncCall(81, 4,
++                                            "Security::PeerConnector::certDownloadingDone",
++                                            PeerConnectorCertDownloaderDialer(&Security::PeerConnector::certDownloadingDone, this));
++
++    const Downloader *csd = dynamic_cast<const Downloader*>(request->downloader.valid());
++    Downloader *dl = new Downloader(url, certCallback, csd ? csd->nestedLevel() + 1 : 1);
++    AsyncJob::Start(dl);
++}
++
++void
++Security::PeerConnector::certDownloadingDone(SBuf &obj, int downloadStatus)
++{
++    ++certsDownloads;
++    debugs(81, 5, "Certificate downloading status: " << downloadStatus << " certificate size: " << obj.length());
++
++    // get ServerBio from SSL object
++    const int fd = serverConnection()->fd;
++    Security::SessionPtr ssl = fd_table[fd].ssl.get();
++    BIO *b = SSL_get_rbio(ssl);
++    Ssl::ServerBio *srvBio = static_cast<Ssl::ServerBio *>(b->ptr);
++
++    // Parse Certificate. Assume that it is in DER format.
++    // According to RFC 4325:
++    //  The server must provide a DER encoded certificate or a collection
++    // collection of certificates in a "certs-only" CMS message.
++    //  The applications MUST accept DER encoded certificates and SHOULD
++    // be able to accept collection of certificates.
++    // TODO: support collection of certificates
++    const unsigned char *raw = (const unsigned char*)obj.rawContent();
++    if (X509 *cert = d2i_X509(NULL, &raw, obj.length())) {
++        char buffer[1024];
++        debugs(81, 5, "Retrieved certificate: " << X509_NAME_oneline(X509_get_subject_name(cert), buffer, 1024));
++        const Security::CertList &certsList = srvBio->serverCertificatesIfAny();
++        if (const char *issuerUri = Ssl::uriOfIssuerIfMissing(cert,  certsList)) {
++            urlsOfMissingCerts.push(SBuf(issuerUri));
++        }
++        Ssl::SSL_add_untrusted_cert(ssl, cert);
++    }
++
++    // Check if there are URIs to download from and if yes start downloading
++    // the first in queue.
++    if (urlsOfMissingCerts.size() && certsDownloads <= MaxCertsDownloads) {
++        startCertDownloading(urlsOfMissingCerts.front());
++        urlsOfMissingCerts.pop();
++        return;
++    }
++
++    srvBio->holdRead(false);
++    Security::PeerConnector::NegotiateSsl(serverConnection()->fd, this);
++}
++
++bool
++Security::PeerConnector::checkForMissingCertificates()
++{
++    // Check for nested SSL certificates downloads. For example when the
++    // certificate located in an SSL site which requires to download a
++    // a missing certificate (... from an SSL site which requires to ...).
++
++    const Downloader *csd = request->downloader.get();
++    if (csd && csd->nestedLevel() >= MaxNestedDownloads)
++        return false;
++
++    const int fd = serverConnection()->fd;
++    Security::SessionPtr ssl = fd_table[fd].ssl.get();
++    BIO *b = SSL_get_rbio(ssl);
++    Ssl::ServerBio *srvBio = static_cast<Ssl::ServerBio *>(b->ptr);
++    const Security::CertList &certs = srvBio->serverCertificatesIfAny();
++
++    if (certs.size()) {
++        debugs(83, 5, "SSL server sent " << certs.size() << " certificates");
++        Ssl::missingChainCertificatesUrls(urlsOfMissingCerts, certs);
++        if (urlsOfMissingCerts.size()) {
++            startCertDownloading(urlsOfMissingCerts.front());
++            urlsOfMissingCerts.pop();
++            return true;
++        }
++    }
++
++    return false;
++}
++#endif //USE_OPENSSL
+@@ -20,6 +20,7 @@
+ #endif
+ 
+ #include <iosfwd>
++#include <queue>
+ 
+ class HttpRequest;
+ class ErrorState;
+@@ -125,6 +126,20 @@ class PeerConnector: virtual public AsyncJob
+     /// Squid COMM_SELECT_READ handler.
+     void noteWantRead();
+ 
++#if USE_OPENSSL
++    /// Run the certificates list sent by the SSL server and check if there
++    /// are missing certificates. Adds to the urlOfMissingCerts list the 
++    /// URLS of missing certificates if this information provided by the
++    /// issued certificates with Authority Info Access extension.
++    bool checkForMissingCertificates();
++
++    /// Start downloading procedure for the given URL.
++    void startCertDownloading(SBuf &url);
++
++    /// Called by Downloader after a certificate object downloaded.
++    void certDownloadingDone(SBuf &object, int status);
++#endif
++
+     /// Called when the openSSL SSL_connect function needs to write data to
+     /// the remote SSL server. Sets the Squid COMM_SELECT_WRITE handler.
+     virtual void noteWantWrite();
+@@ -178,10 +193,19 @@ class PeerConnector: virtual public AsyncJob
+ 
+     /// A wrapper function for negotiateSsl for use with Comm::SetSelect
+     static void NegotiateSsl(int fd, void *data);
++
++    /// The maximum allowed missing certificates downloads.
++    static const unsigned int MaxCertsDownloads = 10;
++    /// The maximum allowed nested certificates downloads.
++    static const unsigned int MaxNestedDownloads = 3;
++
+     AsyncCall::Pointer closeHandler; ///< we call this when the connection closed
+     time_t negotiationTimeout; ///< the SSL connection timeout to use
+     time_t startTime; ///< when the peer connector negotiation started
+     bool useCertValidator_; ///< whether the certificate validator should bypassed
++    /// The list of URLs where missing certificates should be downloaded.
++    std::queue<SBuf> urlsOfMissingCerts;
++    unsigned int certsDownloads; ///< the number of downloaded missing certificates
+ };
+ 
+ } // namespace Security
+@@ -62,6 +62,8 @@ typedef Security::LockingPointer<struct gnutls_x509_crl_int, gnutls_x509_crl_dei
+ typedef void *CrlPointer;
+ #endif
+ 
++typedef std::list<Security::CertPointer> CertList;
++
+ typedef std::list<Security::CrlPointer> CertRevokeList;
  
  #if USE_OPENSSL
-     if (!request-&gt;flags.pinned) {
-@@ -865,7 +867,8 @@ FwdState::connectStart()
-             request-&gt;flags.pinned = true;
-             if (pinned_connection-&gt;pinnedAuth())
-                 request-&gt;flags.auth = true;
--            comm_add_close_handler(serverConn-&gt;fd, fwdServerClosedWrapper, this);
-+
-+            closeHandler = comm_add_close_handler(serverConn-&gt;fd,  fwdServerClosedWrapper, this);
- 
-             syncWithServerConn(pinned_connection-&gt;pinning.host);
- 
-@@ -904,7 +907,7 @@ FwdState::connectStart()
-         debugs(17, 3, HERE &lt;&lt; &quot;reusing pconn &quot; &lt;&lt; serverConnection());
-         ++n_tries;
- 
--        comm_add_close_handler(serverConnection()-&gt;fd, fwdServerClosedWrapper, this);
-+        closeHandler = comm_add_close_handler(serverConnection()-&gt;fd,  fwdServerClosedWrapper, this);
- 
-         syncWithServerConn(request-&gt;url.host());
- 
-----++++src/FwdState.h
-@@ -153,6 +153,8 @@ class FwdState : public RefCountable
- 
-     Comm::ConnectionPointer serverConn; ///&lt; a successfully opened connection to a server.
- 
-+    AsyncCall::Pointer closeHandler; ///&lt; The serverConn close handler
-+
-     /// possible pconn race states
-     typedef enum { raceImpossible, racePossible, raceHappened } PconnRace;
-     PconnRace pconnRace; ///&lt; current pconn race state
-----++++src/clients/Client.h
-@@ -104,7 +104,9 @@ class Client:
-     virtual void sentRequestBody(const CommIoCbParams &amp;io) = 0;
-     virtual void doneSendingRequestBody() = 0;
- 
--    virtual void closeServer() = 0;            /**&lt; end communication with the server */
-+    /// Use this to end communication with the server. The call cancels our
-+    /// closure handler and tells FwdState to forget about the connection.
-+    virtual void closeServer() = 0;
-     virtual bool doneWithServer() const = 0;   /**&lt; did we end communication? */
-     /// whether we may receive more virgin response body bytes
-     virtual bool mayReadVirginReplyBody() const = 0;
-----++++src/comm.cc
-@@ -972,7 +972,7 @@ comm_udp_sendto(int fd,
-     return Comm::COMM_ERROR;
- }
- 
--void
-+AsyncCall::Pointer
- comm_add_close_handler(int fd, CLCB * handler, void *data)
+@@ -203,8 +203,10 @@ Ssl::ServerBio::ServerBio(const int anFd):
+     allowSplice(false),
+     allowBump(false),
+     holdWrite_(false),
++    holdRead_(true),
+     record_(false),
+     parsedHandshake(false),
++    parseError(false),
+     bumpMode_(bumpNone),
+     rbufConsumePos(0)
  {
-     debugs(5, 5, &quot;comm_add_close_handler: FD &quot; &lt;&lt; fd &lt;&lt; &quot;, handler=&quot; &lt;&lt;
-@@ -981,6 +981,7 @@ comm_add_close_handler(int fd, CLCB * handler, void *data)
-     AsyncCall::Pointer call=commCbCall(5,4, &quot;SomeCloseHandler&quot;,
-                                        CommCloseCbPtrFun(handler, data));
-     comm_add_close_handler(fd, call);
-+    return call;
- }
- 
- void
-----++++src/comm.h
-@@ -79,7 +79,7 @@ int ignoreErrno(int);
- void commCloseAllSockets(void);
- void checkTimeouts(void);
- 
--void comm_add_close_handler(int fd, CLCB *, void *);
-+AsyncCall::Pointer comm_add_close_handler(int fd, CLCB *, void *);
- void comm_add_close_handler(int fd, AsyncCall::Pointer &amp;);
- void comm_remove_close_handler(int fd, CLCB *, void *);
- void comm_remove_close_handler(int fd, AsyncCall::Pointer &amp;);
-----++++src/http.cc
-@@ -166,7 +166,8 @@ HttpStateData::httpTimeout(const CommTimeoutCbParams &amp;)
-         fwd-&gt;fail(new ErrorState(ERR_READ_TIMEOUT, Http::scGatewayTimeout, fwd-&gt;request));
+@@ -271,6 +273,13 @@ Ssl::ServerBio::readAndParse(char *buf, const int size, BIO *table)
+     catch (const std::exception &ex) {
+         debugs(83, 2, "parsing error on FD " << fd_ << ": " << ex.what());
+         parsedHandshake = true; // done parsing (due to an error)
++        parseError = true;
++    }
++
++    if (holdRead_) {
++         debugs(83, 7, "Hold flag is set, retry latter. (Hold " << size << "bytes)");
++         BIO_set_retry_read(table);
++         return -1;
      }
  
--    serverConnection-&gt;close();
-+    closeServer();
-+    mustStop(&quot;HttpStateData::httpTimeout&quot;);
+     return giveBuffered(buf, size);
+@@ -138,6 +138,10 @@ class ServerBio: public Bio
+     bool holdWrite() const {return holdWrite_;}
+     /// Enables or disables the write hold state
+     void holdWrite(bool h) {holdWrite_ = h;}
++    /// The read hold state
++    bool holdRead() const {return holdRead_;}
++    /// Enables or disables the read hold state
++    void holdRead(bool h) {holdRead_ = h;}
+     /// Enables or disables the input data recording, for internal analysis.
+     void recordInput(bool r) {record_ = r;}
+     /// Whether we can splice or not the SSL stream
+@@ -148,6 +152,15 @@ class ServerBio: public Bio
+     void mode(Ssl::BumpMode m) {bumpMode_ = m;}
+     Ssl::BumpMode bumpMode() {return bumpMode_;} ///< return the bumping mode
+ 
++    /// \retval true if the Server hello message received
++    bool gotHello() const { return (parsedHandshake && !parseError); }
++
++    /// Return true if the Server Hello parsing failed
++    bool gotHelloFailed() const { return (parsedHandshake && parseError); }
++
++    /// \return the server certificates list if received and parsed correctly
++    const Security::CertList &serverCertificatesIfAny() { return parser_.serverCertificates; }
++
+     /// \return the TLS Details advertised by TLS server.
+     const Security::TlsDetails::Pointer &receivedHelloDetails() const {return parser_.details;}
+ 
+@@ -167,8 +180,10 @@ class ServerBio: public Bio
+     bool allowSplice; ///< True if the SSL stream can be spliced
+     bool allowBump;  ///< True if the SSL stream can be bumped
+     bool holdWrite_;  ///< The write hold state of the bio.
++    bool holdRead_;  ///< The read hold state of the bio.
+     bool record_; ///< If true the input data recorded to rbuf for internal use
+     bool parsedHandshake; ///< whether we are done parsing TLS Hello
++    bool parseError; ///< error while parsing server hello message
+     Ssl::BumpMode bumpMode_;
+ 
+     /// The size of data stored in rbuf which passed to the openSSL
+@@ -33,6 +33,9 @@
+ 
+ #include <cerrno>
+ 
++// TODO: Move ssl_ex_index_* global variables from global.cc here.
++int ssl_ex_index_ssl_untrusted_chain = -1;
++
+ Ipc::MemMap *Ssl::SessionCache = NULL;
+ const char *Ssl::SessionCacheName = "ssl_session_cache";
+ 
+@@ -470,6 +473,7 @@ Ssl::Initialize(void)
+     ssl_ex_index_ssl_errors =  SSL_get_ex_new_index(0, (void *) "ssl_errors", NULL, NULL, &ssl_free_SslErrors);
+     ssl_ex_index_ssl_cert_chain = SSL_get_ex_new_index(0, (void *) "ssl_cert_chain", NULL, NULL, &ssl_free_CertChain);
+     ssl_ex_index_ssl_validation_counter = SSL_get_ex_new_index(0, (void *) "ssl_validation_counter", NULL, NULL, &ssl_free_int);
++    ssl_ex_index_ssl_untrusted_chain = SSL_get_ex_new_index(0, (void *) "ssl_untrusted_chain", NULL, NULL, &ssl_free_CertChain);
  }
  
- /// Remove an existing public store entry if the incoming response (to be
-@@ -1234,8 +1235,8 @@ HttpStateData::readReply(const CommIoCbParams &amp;io)
-         err-&gt;xerrno = rd.xerrno;
-         fwd-&gt;fail(err);
-         flags.do_next_read = false;
--        io.conn-&gt;close();
--
-+        closeServer();
-+        mustStop("HttpStateData::readReply");
-         return;
+ #if defined(SSL3_FLAGS_NO_RENEGOTIATE_CIPHERS)
+@@ -1090,6 +1094,32 @@ void Ssl::addChainToSslContext(Security::ContextPtr sslContext, STACK_OF(X509) *
      }
- 
-@@ -1335,7 +1336,8 @@ HttpStateData::continueAfterParsingHeader()
-     entry-&gt;reset();
-     fwd-&gt;fail(new ErrorState(error, Http::scBadGateway, fwd-&gt;request));
-     flags.do_next_read = false;
--    serverConnection-&gt;close();
-+    closeServer();
-+    mustStop(&quot;HttpStateData::continueAfterParsingHeader&quot;);
-     return false; // quit on error
  }
  
-@@ -1599,7 +1601,8 @@ HttpStateData::wroteLast(const CommIoCbParams &amp;io)
-         ErrorState *err = new ErrorState(ERR_WRITE_ERROR, Http::scBadGateway, fwd-&gt;request);
-         err-&gt;xerrno = io.xerrno;
-         fwd-&gt;fail(err);
--        serverConnection-&gt;close();
-+        closeServer();
-+        mustStop(&quot;HttpStateData::wroteLast&quot;);
-         return;
-     }
- 
-@@ -1627,7 +1630,6 @@ HttpStateData::sendComplete()
-     request-&gt;hier.peer_http_request_sent = current_time;
- }
- 
--// Close the HTTP server connection. Used by serverComplete().
- void
- HttpStateData::closeServer()
++static const char *
++hasAuthorityInfoAccessCaIssuers(X509 *cert)
++{
++    AUTHORITY_INFO_ACCESS *info;
++    if (!cert)
++        return nullptr;
++    info = static_cast<AUTHORITY_INFO_ACCESS *>(X509_get_ext_d2i(cert, NID_info_access, NULL, NULL));
++    if (!info)
++        return nullptr;
++
++    static char uri[MAX_URL];
++    uri[0] = '\0';
++
++    for (int i = 0; i < sk_ACCESS_DESCRIPTION_num(info); i++) {
++        ACCESS_DESCRIPTION *ad = sk_ACCESS_DESCRIPTION_value(info, i);
++        if (OBJ_obj2nid(ad->method) == NID_ad_ca_issuers) {
++            if (ad->location->type == GEN_URI) {
++                xstrncpy(uri, reinterpret_cast<char *>(ASN1_STRING_data(ad->location->d.uniformResourceIdentifier)), sizeof(uri));
++            }
++            break;
++        }
++    }
++    AUTHORITY_INFO_ACCESS_free(info);
++    return uri[0] != '\0' ? uri : nullptr;
++}
++
+ bool
+ Ssl::loadCerts(const char *certsFile, Ssl::CertsIndexedList &list)
  {
-@@ -2426,7 +2428,8 @@ HttpStateData::handleMoreRequestBodyAvailable()
-             debugs(11, DBG_IMPORTANT, &quot;http handleMoreRequestBodyAvailable: Likely proxy abuse detected &#39;&quot; &lt;&lt; request-&gt;client_addr &lt;&lt; &quot;&#39; -&gt; &#39;&quot; &lt;&lt; entry-&gt;url() &lt;&lt; &quot;&#39;&quot; );
+@@ -1110,9 +1140,10 @@ Ssl::loadCerts(const char *certsFile, Ssl::CertsIndexedList &list)
+     return true;
+ }
  
-             if (virginReply()-&gt;sline.status() == Http::scInvalidHeader) {
--                serverConnection-&gt;close();
-+                closeServer();
-+                mustStop(&quot;HttpStateData::handleMoreRequestBodyAvailable&quot;);
-                 return;
-             }
+-/// quickly find a certificate with a given issuer in Ssl::CertsIndexedList.
++/// quickly find the issuer certificate of a certificate cert in the
++/// Ssl::CertsIndexedList list
+ static X509 *
+-findCertByIssuerFast(X509_STORE_CTX *ctx, Ssl::CertsIndexedList &list, X509 *cert)
++findCertIssuerFast(Ssl::CertsIndexedList &list, X509 *cert)
+ {
+     static char buffer[2048];
+ 
+@@ -1124,21 +1155,80 @@ findCertByIssuerFast(X509_STORE_CTX *ctx, Ssl::CertsIndexedList &list, X509 *cer
+     const auto ret = list.equal_range(SBuf(buffer));
+     for (Ssl::CertsIndexedList::iterator it = ret.first; it != ret.second; ++it) {
+         X509 *issuer = it->second;
+-        if (ctx->check_issued(ctx, cert, issuer)) {
++        if (X509_check_issued(cert, issuer)) {
+             return issuer;
          }
-----++++src/http/StatusCode.cc
-@@ -212,6 +212,10 @@ Http::StatusCodeString(const Http::StatusCode status)
-         return &quot;Request Header Fields Too Large&quot;;
-         break;
+     }
+     return NULL;
+ }
  
-+    case scUnavailableForLegalReasons:
-+        return &quot;Unavailable For Legal Reasons&quot;;
-+        break;
+-/// slowly find a certificate with a given issuer using linear search
++/// slowly find the issuer certificate of a given cert using linear search
++static bool
++findCertIssuer(Security::CertList const &list, X509 *cert)
++{
++    for (Security::CertList::const_iterator it = list.begin(); it != list.end(); ++it) {
++        if (X509_check_issued(it->get(), cert) == X509_V_OK)
++            return true;
++    }
++    return false;
++}
 +
-     // 500-599
-     case Http::scInternalServerError:
-         return &quot;Internal Server Error&quot;;
-----++++src/http/StatusCode.h
-@@ -66,6 +66,7 @@ typedef enum {
-     scPreconditionRequired = 428,   /**&lt; RFC6585 */
-     scTooManyRequests = 429,        /**&lt; RFC6585 */
-     scRequestHeaderFieldsTooLarge = 431, /**&lt; RFC6585 */
-+    scUnavailableForLegalReasons = 451, /**&lt; RFC7725 */
-     scInternalServerError = 500,
-     scNotImplemented = 501,
-     scBadGateway = 502,
-----++++src/tests/stub_comm.cc
-@@ -57,7 +57,7 @@ int commUnsetConnTimeout(const Comm::ConnectionPointer &amp;conn) STUB_RETVAL(-1)
- int ignoreErrno(int ierrno) STUB_RETVAL(-1)
- void commCloseAllSockets(void) STUB
- void checkTimeouts(void) STUB
--void comm_add_close_handler(int fd, CLCB *, void *) STUB
-+AsyncCall::Pointer comm_add_close_handler(int fd, CLCB *, void *) STUB
- void comm_add_close_handler(int fd, AsyncCall::Pointer &amp;) STUB
- void comm_remove_close_handler(int fd, CLCB *, void *) STUB
- void comm_remove_close_handler(int fd, AsyncCall::Pointer &amp;)STUB
-----++++GitHub
++const char *
++Ssl::uriOfIssuerIfMissing(X509 *cert, Security::CertList const &serverCertificates)
++{
++    if (!cert || !serverCertificates.size())
++        return nullptr;
++
++    if (!findCertIssuer(serverCertificates, cert)) {
++        //if issuer is missing
++        if (!findCertIssuerFast(SquidUntrustedCerts, cert)) {
++            // and issuer not found in local untrusted certificates database 
++            if (const char *issuerUri = hasAuthorityInfoAccessCaIssuers(cert)) {
++                // There is a URI where we can download a certificate.
++                return issuerUri;
++            }
++        }
++    }
++    return nullptr;
++}
++
++void
++Ssl::missingChainCertificatesUrls(std::queue<SBuf> &URIs, Security::CertList const &serverCertificates)
++{
++    if (!serverCertificates.size())
++        return;
++
++    for (const auto &i : serverCertificates) {
++        if (const char *issuerUri = uriOfIssuerIfMissing(i.get(), serverCertificates))
++            URIs.push(SBuf(issuerUri));
++    }
++}
++
++void
++Ssl::SSL_add_untrusted_cert(SSL *ssl, X509 *cert)
++{
++    STACK_OF(X509) *untrustedStack = static_cast <STACK_OF(X509) *>(SSL_get_ex_data(ssl, ssl_ex_index_ssl_untrusted_chain));
++    if (!untrustedStack) {
++        untrustedStack = sk_X509_new_null();
++        if (!SSL_set_ex_data(ssl, ssl_ex_index_ssl_untrusted_chain, untrustedStack)) {
++            sk_X509_pop_free(untrustedStack, X509_free);
++            throw TextException("Failed to attach untrusted certificates chain");
++        }
++    }
++    sk_X509_push(untrustedStack, cert);
++}
++
++/// Search for the issuer certificate of cert in sk list.
+ static X509 *
+-findCertByIssuerSlowly(X509_STORE_CTX *ctx, STACK_OF(X509) *sk, X509 *cert)
++sk_x509_findIssuer(STACK_OF(X509) *sk, X509 *cert)
+ {
++    if (!sk)
++        return NULL;
++
+     const int skItemsNum = sk_X509_num(sk);
+     for (int i = 0; i < skItemsNum; ++i) {
+         X509 *issuer = sk_X509_value(sk, i);
+-        if (ctx->check_issued(ctx, cert, issuer))
++        if (X509_check_issued(issuer, cert) == X509_V_OK)
+             return issuer;
+     }
+     return NULL;
+@@ -1154,16 +1244,16 @@ completeIssuers(X509_STORE_CTX *ctx, STACK_OF(X509) *untrustedCerts)
+     X509 *current = ctx->cert;
+     int i = 0;
+     for (i = 0; current && (i < depth); ++i) {
+-        if (ctx->check_issued(ctx, current, current)) {
++        if (X509_check_issued(current, current)) {
+             // either ctx->cert is itself self-signed or untrustedCerts
+             // aready contain the self-signed current certificate
+             break;
+         }
+ 
+         // untrustedCerts is short, not worth indexing
+-        X509 *issuer = findCertByIssuerSlowly(ctx, untrustedCerts, current);
++        X509 *issuer = sk_x509_findIssuer(untrustedCerts, current);
+         if (!issuer) {
+-            if ((issuer = findCertByIssuerFast(ctx, SquidUntrustedCerts, current)))
++            if ((issuer = findCertIssuerFast(SquidUntrustedCerts, current)))
+                 sk_X509_push(untrustedCerts, issuer);
+         }
+         current = issuer;
+@@ -1179,12 +1269,25 @@ untrustedToStoreCtx_cb(X509_STORE_CTX *ctx,void *data)
+ {
+     debugs(83, 4,  "Try to use pre-downloaded intermediate certificates\n");
+ 
++    SSL *ssl = static_cast<SSL *>(X509_STORE_CTX_get_ex_data(ctx, SSL_get_ex_data_X509_STORE_CTX_idx()));
++    STACK_OF(X509) *sslUntrustedStack = static_cast <STACK_OF(X509) *>(SSL_get_ex_data(ssl, ssl_ex_index_ssl_untrusted_chain));
++
+     // OpenSSL already maintains ctx->untrusted but we cannot modify
+     // internal OpenSSL list directly. We have to give OpenSSL our own
+     // list, but it must include certificates on the OpenSSL ctx->untrusted
+     STACK_OF(X509) *oldUntrusted = ctx->untrusted;
+     STACK_OF(X509) *sk = sk_X509_dup(oldUntrusted); // oldUntrusted is always not NULL
+-    completeIssuers(ctx, sk);
++
++    for (int i = 0; i < sk_X509_num(sslUntrustedStack); ++i) {
++        X509 *cert = sk_X509_value(sslUntrustedStack, i);
++        sk_X509_push(sk, cert);
++    }
++
++    // If the local untrusted certificates internal database is used
++    // run completeIssuers to add missing certificates if possible.
++    if (SquidUntrustedCerts.size() > 0)
++        completeIssuers(ctx, sk);
++
+     X509_STORE_CTX_set_chain(ctx, sk); // No locking/unlocking, just sets ctx->untrusted
+     int ret = X509_verify_cert(ctx);
+     X509_STORE_CTX_set_chain(ctx, oldUntrusted); // Set back the old untrusted list
+@@ -1195,10 +1298,7 @@ untrustedToStoreCtx_cb(X509_STORE_CTX *ctx,void *data)
+ void
+ Ssl::useSquidUntrusted(SSL_CTX *sslContext)
+ {
+-    if (SquidUntrustedCerts.size() > 0)
+-        SSL_CTX_set_cert_verify_callback(sslContext, untrustedToStoreCtx_cb, NULL);
+-    else
+-        SSL_CTX_set_cert_verify_callback(sslContext, NULL, NULL);
++    SSL_CTX_set_cert_verify_callback(sslContext, untrustedToStoreCtx_cb, NULL);
+ }
+ 
+ bool
+@@ -28,6 +28,7 @@
+ #if HAVE_OPENSSL_ENGINE_H
+ #include <openssl/engine.h>
+ #endif
++#include <queue>
+ #include <map>
+ 
+ /**
+@@ -183,6 +184,46 @@ inline const char *bumpMode(int bm)
+     return (0 <= bm && bm < Ssl::bumpEnd) ? Ssl::BumpModeStr[bm] : NULL;
+ }
+ 
++/// certificates indexed by issuer name
++typedef std::multimap<SBuf, X509 *> CertsIndexedList;
++
++/**
++ * Load PEM-encoded certificates from the given file.
++ */
++bool loadCerts(const char *certsFile, Ssl::CertsIndexedList &list);
++
++/**
++ * Load PEM-encoded certificates to the squid untrusteds certificates
++ * internal DB from the given file.
++ */
++bool loadSquidUntrusted(const char *path);
++
++/**
++ * Removes all certificates from squid untrusteds certificates
++ * internal DB and frees all memory
++ */
++void unloadSquidUntrusted();
++
++/**
++ * Add the certificate cert to ssl object untrusted certificates.
++ * Squid uses an attached to SSL object list of untrusted certificates,
++ * with certificates which can be used to complete incomplete chains sent
++ * by the SSL server.
++ */
++void SSL_add_untrusted_cert(SSL *ssl, X509 *cert);
++
++/**
++ * Searches in serverCertificates list for the cert issuer and if not found
++ * and Authority Info Access of cert provides a URI return it.
++ */
++const char *uriOfIssuerIfMissing(X509 *cert,  Security::CertList const &serverCertificates);
++
++/**
++ * Fill URIs queue with the uris of missing certificates from serverCertificate chain
++ * if this information provided by Authority Info Access.
++ */
++void missingChainCertificatesUrls(std::queue<SBuf> &URIs, Security::CertList const &serverCertificates);
++
+ /**
+   \ingroup ServerProtocolSSLAPI
+   * Generate a certificate to be used as untrusted signing certificate, based on a trusted CA

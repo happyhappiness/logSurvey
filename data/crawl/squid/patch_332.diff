@@ -1,0 +1,587 @@
+@@ -304,7 +304,7 @@ HttpRequest::sanityCheckStartLine(MemBuf *buf, const size_t hdr_len, Http::Statu
+     }
+ 
+     /* See if the request buffer starts with a known HTTP request method. */
+-    if (HttpRequestMethod(buf->content(),NULL) == Http::METHOD_NONE) {
++    if (HttpRequestMethod(buf->content()) == Http::METHOD_NONE) {
+         debugs(73, 3, "HttpRequest::sanityCheckStartLine: did not find HTTP request method");
+         *error = Http::scInvalidHeader;
+         return false;
+@@ -317,7 +317,8 @@ bool
+ HttpRequest::parseFirstLine(const char *start, const char *end)
+ {
+     const char *t = start + strcspn(start, w_space);
+-    method = HttpRequestMethod(start, t);
++    SBuf m(start, start-t);
++    method = HttpRequestMethod(m);
+ 
+     if (method == Http::METHOD_NONE)
+         return false;
+@@ -91,7 +91,7 @@ ACLMethodData::parse()
+     while ((t = strtokFile())) {
+         if (strcmp(t, "PURGE") == 0)
+             ++ThePurgeCount; // configuration code wants to know
+-        CbDataList<HttpRequestMethod> *q = new CbDataList<HttpRequestMethod> (HttpRequestMethod(t, NULL));
++        CbDataList<HttpRequestMethod> *q = new CbDataList<HttpRequestMethod> (HttpRequestMethod(t));
+         *(Tail) = q;
+         Tail = &q->next;
+     }
+@@ -2198,6 +2198,11 @@ parseHttpRequest(ConnStateData *csd, Http1::RequestParser &hp)
+     {
+         const bool parsedOk = hp.parse();
+ 
++        if (hp.doneBytes()) {
++            // we are done with some of the buffer. update the ConnStateData copy now.
++            csd->in.buf = hp.buf;
++        }
++
+         if (!hp.isDone()) {
+             debugs(33, 5, "Incomplete request, waiting for end of request line");
+             return NULL;
+@@ -2827,17 +2832,12 @@ ConnStateData::clientParseRequests()
+         // a) dont have one already
+         // b) have completed the previous request parsing already
+         if (!parser_ || parser_->isDone())
+-            parser_ = new Http1::RequestParser(in.buf.c_str(), in.buf.length());
++            parser_ = new Http1::RequestParser(in.buf);
+         else // update the buffer space being parsed
+-            parser_->bufsiz = in.buf.length();
++            parser_->buf = in.buf;
+ 
+         /* Process request */
+         ClientSocketContext *context = parseHttpRequest(this, *parser_);
+-        if (parser_->doneBytes()) {
+-            // we are done with some of the buffer. consume it now.
+-            connNoteUseOfBuffer(this, parser_->doneBytes());
+-            parser_->noteBufferShift(parser_->doneBytes());
+-        }
+         PROF_stop(parseHttpRequest);
+ 
+         /* status -1 or 1 */
+@@ -748,7 +748,7 @@ htcpUnpackSpecifier(char *buf, int sz)
+     /*
+      * Parse the request
+      */
+-    method = HttpRequestMethod(s->method, NULL);
++    method = HttpRequestMethod(s->method);
+ 
+     s->request = HttpRequest::CreateFromUrlAndMethod(s->uri, method == Http::METHOD_NONE ? HttpRequestMethod(Http::METHOD_GET) : method);
+ 
+@@ -11,8 +11,7 @@ Http::One::Parser::clear()
+ {
+     parsingStage_ = HTTP_PARSE_NONE;
+     buf = NULL;
+-    bufsiz = 0;
+-    parseOffset_ = 0;
++    parsedCount_ = 0;
+     msgProtocol_ = AnyP::ProtocolVersion();
+     mimeHeaderBlock_.clear();
+ }
+@@ -31,28 +30,13 @@ Http::One::RequestParser::clear()
+ }
+ 
+ void
+-Http::One::Parser::reset(const char *aBuf, int len)
++Http::One::Parser::reset(const SBuf &aBuf)
+ {
+     clear(); // empty the state.
+     parsingStage_ = HTTP_PARSE_NEW;
+-    parseOffset_ = 0;
++    parsedCount_ = 0;
+     buf = aBuf;
+-    bufsiz = len;
+-    debugs(74, DBG_DATA, "Parse " << Raw("buf", buf, bufsiz));
+-}
+-
+-void
+-Http::One::RequestParser::noteBufferShift(int64_t n)
+-{
+-    // if parsing done, ignore buffer changes.
+-    if (parsingStage_ == HTTP_PARSE_DONE)
+-        return;
+-
+-    // shift the parser resume point to match buffer content change
+-    parseOffset_ -= n;
+-
+-    // and remember where to stop before performing buffered data overreads
+-    bufsiz -= n;
++    debugs(74, DBG_DATA, "Parse buf={length=" << aBuf.length() << ", data='" << aBuf << "'}");
+ }
+ 
+ /**
+@@ -78,13 +62,16 @@ Http::One::RequestParser::skipGarbageLines()
+ {
+ #if WHEN_RFC_COMPLIANT // CRLF or bare-LF is what RFC 2616 tolerant parsers do ...
+     if (Config.onoff.relaxed_header_parser) {
+-        if (Config.onoff.relaxed_header_parser < 0 && (buf[parseOffset_] == '\r' || buf[parseOffset_] == '\n'))
++        if (Config.onoff.relaxed_header_parser < 0 && (buf[0] == '\r' || buf[0] == '\n'))
+             debugs(74, DBG_IMPORTANT, "WARNING: Invalid HTTP Request: " <<
+                    "CRLF bytes received ahead of request-line. " <<
+                    "Ignored due to relaxed_header_parser.");
+         // Be tolerant of prefix empty lines
+         // ie any series of either \n or \r\n with no other characters and no repeated \r
+-        for (; parseOffset_ < (size_t)bufsiz && (buf[parseOffset_] == '\n' || ((buf[parseOffset_] == '\r' && (buf[parseOffset_+1] == '\n')); ++parseOffset_);
++        while (!buf.isEmpty() && (buf[0] == '\n' || (buf[0] == '\r' && buf[1] == '\n'))) {
++            buf.consume(1);
++            ++parsedCount_;
++        }
+     }
+ #endif
+ 
+@@ -96,12 +83,15 @@ Http::One::RequestParser::skipGarbageLines()
+      */
+ #if USE_HTTP_VIOLATIONS
+     if (Config.onoff.relaxed_header_parser) {
+-        if (Config.onoff.relaxed_header_parser < 0 && buf[parseOffset_] == ' ')
++        if (Config.onoff.relaxed_header_parser < 0 && buf[0] == ' ')
+             debugs(74, DBG_IMPORTANT, "WARNING: Invalid HTTP Request: " <<
+                    "Whitespace bytes received ahead of method. " <<
+                    "Ignored due to relaxed_header_parser.");
+         // Be tolerant of prefix spaces (other bytes are valid method values)
+-        for (; parseOffset_ < (size_t)bufsiz && buf[parseOffset_] == ' '; ++parseOffset_);
++        while (!buf.isEmpty() && buf[0] == ' ') {
++            buf.consume(1);
++            ++parsedCount_;
++        }
+     }
+ #endif
+ }
+@@ -128,14 +118,14 @@ Http::One::RequestParser::parseRequestFirstLine()
+     int first_whitespace = -1, last_whitespace = -1; // track the first and last SP byte
+     int line_end = -1; // tracks the last byte BEFORE terminal \r\n or \n sequence
+ 
+-    debugs(74, 5, "parsing possible request: bufsiz=" << bufsiz << ", offset=" << parseOffset_);
+-    debugs(74, DBG_DATA, Raw("(buf+offset)", buf+parseOffset_, bufsiz-parseOffset_));
++    debugs(74, 5, "parsing possible request: buf.length=" << buf.length() << ", offset=" << parsedCount_);
++    debugs(74, DBG_DATA, buf);
+ 
+     // Single-pass parse: (provided we have the whole line anyways)
+ 
+-    req.start = parseOffset_; // avoid re-parsing any portion we managed to complete
++    req.start = 0;
+     req.end = -1;
+-    for (int i = 0; i < bufsiz; ++i) {
++    for (SBuf::size_type i = 0; i < buf.length(); ++i) {
+         // track first and last whitespace (SP only)
+         if (buf[i] == ' ') {
+             last_whitespace = i;
+@@ -154,7 +144,7 @@ Http::One::RequestParser::parseRequestFirstLine()
+             line_end = i - 1;
+             break;
+         }
+-        if (i < bufsiz - 1 && buf[i] == '\r') {
++        if (i < buf.length() - 1 && buf[i] == '\r') {
+             if (Config.onoff.relaxed_header_parser) {
+                 if (Config.onoff.relaxed_header_parser < 0 && buf[i + 1] == '\r')
+                     debugs(74, DBG_IMPORTANT, "WARNING: Invalid HTTP Request: " <<
+@@ -164,7 +154,7 @@ Http::One::RequestParser::parseRequestFirstLine()
+                 // Be tolerant of invalid multiple \r prior to terminal \n
+                 if (buf[i + 1] == '\n' || buf[i + 1] == '\r')
+                     line_end = i - 1;
+-                while (i < bufsiz - 1 && buf[i + 1] == '\r')
++                while (i < buf.length() - 1 && buf[i + 1] == '\r')
+                     ++i;
+ 
+                 if (buf[i + 1] == '\n') {
+@@ -188,7 +178,7 @@ Http::One::RequestParser::parseRequestFirstLine()
+ 
+     if (req.end == -1) {
+         // DoS protection against long first-line
+-        if ( (size_t)bufsiz >= Config.maxRequestHeaderSize) {
++        if ((size_t)buf.length() >= Config.maxRequestHeaderSize) {
+             debugs(33, 5, "Too large request-line");
+             // XXX: return URL-too-log status code if second_whitespace is not yet found.
+             request_parse_status = Http::scHeaderTooLarge;
+@@ -234,7 +224,8 @@ Http::One::RequestParser::parseRequestFirstLine()
+     }
+ 
+     /* Set method_ */
+-    method_ = HttpRequestMethod(&buf[req.m_start], &buf[req.m_end]+1);
++    SBuf tmp = buf.substr(req.m_start, req.m_end - req.m_start + 1);
++    method_ = HttpRequestMethod(tmp);
+ 
+     // First non-whitespace after first SP = beginning of URL+Version
+     if (second_word > line_end || second_word < req.start) {
+@@ -248,6 +239,7 @@ Http::One::RequestParser::parseRequestFirstLine()
+     if (last_whitespace < second_word && last_whitespace >= req.start) {
+         msgProtocol_ = Http::ProtocolVersion(0,9);
+         req.u_end = line_end;
++        uri_ = buf.substr(req.u_start, req.u_end - req.u_start + 1);
+         request_parse_status = Http::scOkay; // HTTP/0.9
+         return 1;
+     } else {
+@@ -260,7 +252,7 @@ Http::One::RequestParser::parseRequestFirstLine()
+         request_parse_status = Http::scBadRequest; // missing URI
+         return -1;
+     }
+-    uri_.assign(&buf[req.u_start], req.u_end - req.u_start + 1);
++    uri_ = buf.substr(req.u_start, req.u_end - req.u_start + 1);
+ 
+     // Last whitespace SP = before start of protocol/version
+     if (last_whitespace >= line_end) {
+@@ -272,7 +264,7 @@ Http::One::RequestParser::parseRequestFirstLine()
+ 
+     // We only accept HTTP protocol requests right now.
+     // TODO: accept other protocols; RFC 2326 (RTSP protocol) etc
+-    if ((req.v_end - req.v_start +1) < 5 || strncasecmp(&buf[req.v_start], "HTTP/", 5) != 0) {
++    if ((req.v_end - req.v_start +1) < 5 || buf.substr(req.v_start, 5).caseCmp(SBuf("HTTP/")) != 0) {
+ #if USE_HTTP_VIOLATIONS
+         // being lax; old parser accepted strange versions
+         // there is a LOT of cases which are ambiguous, therefore we cannot use relaxed_header_parser here.
+@@ -347,79 +339,72 @@ Http::One::RequestParser::parseRequestFirstLine()
+     request_parse_status = Http::scOkay;
+     return 1;
+ }
+-#include <cstdio>
++
+ bool
+ Http::One::RequestParser::parse()
+ {
+     // stage 1: locate the request-line
+     if (parsingStage_ == HTTP_PARSE_NEW) {
+-fprintf(stderr, "parse GARBAGE: '%s'\n", buf);
+         skipGarbageLines();
+-fprintf(stderr, "parse GBG A(%d) < B(%u)\n", bufsiz, parseOffset_);
+ 
+         // if we hit something before EOS treat it as a message
+-        if ((size_t)bufsiz > parseOffset_)
++        if (!buf.isEmpty())
+             parsingStage_ = HTTP_PARSE_FIRST;
+         else
+             return false;
+     }
+ 
+     // stage 2: parse the request-line
+     if (parsingStage_ == HTTP_PARSE_FIRST) {
+-fprintf(stderr, "parse FIRST: '%s'\n", buf);
+         PROF_start(HttpParserParseReqLine);
+         const int retcode = parseRequestFirstLine();
+-        debugs(74, 5, "request-line: retval " << retcode << ": from " << req.start << "->" << req.end << " " << Raw("line", &buf[req.start], req.end-req.start));
++        debugs(74, 5, "request-line: retval " << retcode << ": from " << req.start << "->" << req.end <<
++               " line={" << buf.length() << ", data='" << buf << "'}");
+         debugs(74, 5, "request-line: method " << req.m_start << "->" << req.m_end << " (" << method_ << ")");
+         debugs(74, 5, "request-line: url " << req.u_start << "->" << req.u_end << " (" << uri_ << ")");
+         debugs(74, 5, "request-line: proto " << req.v_start << "->" << req.v_end << " (" << msgProtocol_ << ")");
+-        debugs(74, 5, "Parser: parse-offset=" << parseOffset_);
++        debugs(74, 5, "Parser: bytes processed=" << parsedCount_);
+         PROF_stop(HttpParserParseReqLine);
+ 
+         // syntax errors already
+         if (retcode < 0) {
+             parsingStage_ = HTTP_PARSE_DONE;
+-fprintf(stderr, "parse FIRST DONE (error)\n");
+             return false;
+         }
+ 
+         // first-line (or a look-alike) found successfully.
+         if (retcode > 0) {
+-            parseOffset_ += firstLineSize(); // first line bytes including CRLF terminator are now done.
++            buf.consume(firstLineSize());// first line bytes including CRLF terminator are now done.
++            parsedCount_ += firstLineSize();
+             parsingStage_ = HTTP_PARSE_MIME;
+-fprintf(stderr, "parse FIRST (next: MIME)\n");
+         }
+-else fprintf(stderr, "parse FIRST: ret=%d\n",retcode);
+     }
+ 
+     // stage 3: locate the mime header block
+     if (parsingStage_ == HTTP_PARSE_MIME) {
+-fprintf(stderr, "parse MIME: '%s'\n", buf);
+         // HTTP/1.x request-line is valid and parsing completed.
+         if (msgProtocol_.major == 1) {
+             /* NOTE: HTTP/0.9 requests do not have a mime header block.
+              *       So the rest of the code will need to deal with '0'-byte headers
+              *       (ie, none, so don't try parsing em)
+              */
+             int64_t mimeHeaderBytes = 0;
+-            if ((mimeHeaderBytes = headersEnd(buf+parseOffset_, bufsiz-parseOffset_)) == 0) {
+-                if (bufsiz-parseOffset_ >= Config.maxRequestHeaderSize) {
++            if ((mimeHeaderBytes = headersEnd(buf.c_str(), buf.length())) == 0) {
++                if (buf.length()+firstLineSize() >= Config.maxRequestHeaderSize) {
+                     debugs(33, 5, "Too large request");
+                     request_parse_status = Http::scHeaderTooLarge;
+                     parsingStage_ = HTTP_PARSE_DONE;
+-fprintf(stderr, "parse DONE: HTTP/1.x\n");
+-                } else {
++                } else
+                     debugs(33, 5, "Incomplete request, waiting for end of headers");
+-fprintf(stderr, "parse MIME incomplete\n");
+-}                return false;
++                return false;
+             }
+-            mimeHeaderBlock_.assign(&buf[req.end+1], mimeHeaderBytes);
+-            parseOffset_ += mimeHeaderBytes; // done with these bytes now.
++            mimeHeaderBlock_ = buf.substr(req.end+1, mimeHeaderBytes);
++            buf.consume(mimeHeaderBytes); // done with these bytes now.
++            parsedCount_ += mimeHeaderBytes;
+ 
+-        } else {
++        } else
+             debugs(33, 3, "Missing HTTP/1.x identifier");
+-fprintf(stderr, "parse MIME: HTTP/0.9\n");
+-}
++
+         // NP: we do not do any further stages here yet so go straight to DONE
+         parsingStage_ = HTTP_PARSE_DONE;
+ 
+@@ -13,11 +13,11 @@ namespace One {
+ 
+ // Parser states
+ enum ParseState {
+-    HTTP_PARSE_NONE =0,  ///< nothing. completely unset state.
+-    HTTP_PARSE_NEW =1,   ///< initialized, but nothing usefully parsed yet
++    HTTP_PARSE_NONE,     ///< nothing. completely unset state.
++    HTTP_PARSE_NEW,      ///< initialized, but nothing usefully parsed yet
+     HTTP_PARSE_FIRST,    ///< HTTP/1 message first line
+-    HTTP_PARSE_MIME,     ///< mime header block
+-    HTTP_PARSE_DONE      ///< completed with parsing a full request header
++    HTTP_PARSE_MIME,     ///< HTTP/1 mime header block
++    HTTP_PARSE_DONE      ///< parsed a message header, or reached a terminal syntax error
+ };
+ 
+ /** HTTP protocol parser.
+@@ -38,21 +38,14 @@ class Parser : public RefCountable
+      * NOTE: This is *not* the buffer size, just the parse-able data length.
+      * The parse routines may be called again later with more data.
+      */
+-    Parser(const char *aBuf, int len) { reset(aBuf,len); }
++    Parser(const SBuf &aBuf) { reset(aBuf); }
+ 
+     /// Set this parser back to a default state.
+     /// Will DROP any reference to a buffer (does not free).
+     virtual void clear();
+ 
+     /// Reset the parser for use on a new buffer.
+-    void reset(const char *aBuf, int len);
+-
+-    /** Adjust parser state to account for a buffer shift of n bytes.
+-     *
+-     * The leftmost n bytes bytes have been dropped and all other
+-     * bytes shifted left n positions.
+-     */
+-    virtual void noteBufferShift(const int64_t n) = 0;
++    void reset(const SBuf &aBuf);
+ 
+     /** Whether the parser is already done processing the buffer.
+      * Use to determine between incomplete data and errors results
+@@ -61,7 +54,7 @@ class Parser : public RefCountable
+     bool isDone() const {return parsingStage_==HTTP_PARSE_DONE;}
+ 
+     /// number of bytes at the start of the buffer which are no longer needed
+-    int64_t doneBytes() const {return (int64_t)parseOffset_;}
++    int64_t doneBytes() const {return (int64_t)parsedCount_;}
+ 
+     /// size in bytes of the first line including CRLF terminator
+     virtual int64_t firstLineSize() const = 0;
+@@ -92,20 +85,19 @@ class Parser : public RefCountable
+     char *getHeaderField(const char *name);
+ 
+ public:
+-    const char *buf;
+-    int bufsiz;
++    SBuf buf;
+ 
+ protected:
+     /// what stage the parser is currently up to
+     ParseState parsingStage_;
+ 
+-    /// what protocol label has been found in the first line
+-    AnyP::ProtocolVersion msgProtocol_;
++    /// total count of bytes parsed and consumed by the parser so far
++    size_t parsedCount_;
+ 
+-    /// byte offset for non-parsed region of the buffer
+-    size_t parseOffset_;
++    /// what protocol label has been found in the first line (if any)
++    AnyP::ProtocolVersion msgProtocol_;
+ 
+-    /// buffer holding the mime headers
++    /// buffer holding the mime headers (if any)
+     SBuf mimeHeaderBlock_;
+ };
+ 
+@@ -122,9 +114,8 @@ class RequestParser : public Http1::Parser
+ public:
+     /* Http::One::Parser API */
+     RequestParser() : Parser() {}
+-    RequestParser(const char *aBuf, int len) : Parser(aBuf, len) {}
++    RequestParser(const SBuf &aBuf) : Parser(aBuf) {}
+     virtual void clear();
+-    virtual void noteBufferShift(const int64_t n);
+     virtual int64_t firstLineSize() const {return req.end - req.start + 1;}
+     virtual bool parse();
+ 
+@@ -134,8 +125,9 @@ class RequestParser : public Http1::Parser
+     /// the request-line URI if this is a request message, or an empty string.
+     const SBuf &requestUri() const {return uri_;}
+ 
+-    /** HTTP status code to be used on the invalid-request error page
+-     * Http::scNone indicates incomplete parse, Http::scOkay indicates no error.
++    /** HTTP status code to be used on the invalid-request error page.
++     * Http::scNone indicates incomplete parse,
++     * Http::scOkay indicates no error.
+      */
+     Http::StatusCode request_parse_status;
+ 
+@@ -16,22 +16,17 @@ operator++ (Http::MethodType &aMethod)
+ }
+ 
+ /**
+- * Construct a HttpRequestMethod from a NULL terminated string such as "GET"
+- * or from a range of chars, * such as "GET" from "GETFOOBARBAZ"
+- * (pass in pointer to G and pointer to F.)
++ * Construct a HttpRequestMethod from a C-string such as "GET"
++ * Assumes the string is either nul-terminated or contains whitespace
++ *
++ * \deprecated use SBuf constructor instead
+  */
+-HttpRequestMethod::HttpRequestMethod(char const *begin, char const *end) : theMethod(Http::METHOD_NONE)
++HttpRequestMethod::HttpRequestMethod(char const *begin) : theMethod(Http::METHOD_NONE)
+ {
+     if (begin == NULL)
+         return;
+ 
+-    /*
+-     * if e is NULL, b must be NULL terminated and we
+-     * make e point to the first whitespace character
+-     * after b.
+-     */
+-    if (NULL == end)
+-        end = begin + strcspn(begin, w_space);
++    char const *end = begin + strcspn(begin, w_space);
+ 
+     if (end == begin)
+         return;
+@@ -56,6 +51,39 @@ HttpRequestMethod::HttpRequestMethod(char const *begin, char const *end) : theMe
+     theImage.assign(begin, end-begin);
+ }
+ 
++/**
++ * Construct a HttpRequestMethod from an SBuf string such as "GET"
++ * or from a range of chars such as "GET" from "GETFOOBARBAZ"
++ *
++ * Assumes the s parameter contains only the method string
++ */
++HttpRequestMethod::HttpRequestMethod(const SBuf &s) : theMethod(Http::METHOD_NONE)
++{
++    if (s.isEmpty())
++        return;
++
++    // XXX: still check for missing method name?
++
++    // TODO: Optimize this linear search.
++    for (++theMethod; theMethod < Http::METHOD_ENUM_END; ++theMethod) {
++        // RFC 2616 section 5.1.1 - Method names are case-sensitive
++        // NP: this is not a HTTP_VIOLATIONS case since there is no MUST/SHOULD involved.
++        if (0 == image().caseCmp(s)) {
++
++            // relaxed parser allows mixed-case and corrects them on output
++            if (Config.onoff.relaxed_header_parser)
++                return;
++
++            if (0 == image().cmp(s))
++                return;
++        }
++    }
++
++    // if method not found and method string is not null then it is other method
++    theMethod = Http::METHOD_OTHER;
++    theImage = s;
++}
++
+ const SBuf &
+ HttpRequestMethod::image() const
+ {
+@@ -20,14 +20,8 @@ class HttpRequestMethod : public RefCountable
+ public:
+     HttpRequestMethod() : theMethod(Http::METHOD_NONE), theImage() {}
+     HttpRequestMethod(Http::MethodType const aMethod) : theMethod(aMethod), theImage() {}
+-
+-    /**
+-     \param begin    string to convert to request method.
+-     \param end      end of the method string (relative to begin). Use NULL if this is unknown.
+-     *
+-     \note DO NOT give end a default (ie NULL). That will cause silent char* conversion clashes.
+-     */
+-    HttpRequestMethod(char const * begin, char const * end);
++    explicit HttpRequestMethod(char const *);
++    explicit HttpRequestMethod(const SBuf &);
+ 
+     HttpRequestMethod & operator = (const HttpRequestMethod& aMethod) {
+         theMethod = aMethod.theMethod;
+@@ -18,7 +18,7 @@ Mgr::ActionParams::ActionParams(const Ipc::TypedMsgHdr &msg)
+ 
+     String method;
+     msg.getString(method);
+-    httpMethod = HttpRequestMethod(method.termedBuf(), NULL);
++    httpMethod = HttpRequestMethod(method.termedBuf());
+ 
+     msg.getPod(httpFlags);
+     msg.getString(httpOrigin);
+@@ -19,10 +19,10 @@ void
+ testHttpRequestMethod::testConstructCharStart()
+ {
+     /* parse an empty string -> Http::METHOD_NONE */
+-    CPPUNIT_ASSERT(HttpRequestMethod(NULL,NULL) == Http::METHOD_NONE);
++    CPPUNIT_ASSERT(HttpRequestMethod(NULL) == Http::METHOD_NONE);
+     /* parsing a literal should work */
+-    CPPUNIT_ASSERT(HttpRequestMethod("GET", NULL) == Http::METHOD_GET);
+-    CPPUNIT_ASSERT(HttpRequestMethod("QWERTY", NULL) == Http::METHOD_OTHER);
++    CPPUNIT_ASSERT(HttpRequestMethod("GET") == Http::METHOD_GET);
++    CPPUNIT_ASSERT(HttpRequestMethod("QWERTY") == Http::METHOD_OTHER);
+ }
+ 
+ /*
+@@ -33,12 +33,12 @@ testHttpRequestMethod::testConstructCharStartEnd()
+ {
+     char const * buffer;
+     /* parse an empty string -> Http::METHOD_NONE */
+-    CPPUNIT_ASSERT(HttpRequestMethod(NULL, NULL) == Http::METHOD_NONE);
++    CPPUNIT_ASSERT(HttpRequestMethod(NULL) == Http::METHOD_NONE);
+     /* parsing a literal should work */
+-    CPPUNIT_ASSERT(HttpRequestMethod("GET", NULL) == Http::METHOD_GET);
++    CPPUNIT_ASSERT(HttpRequestMethod("GET") == Http::METHOD_GET);
+     /* parsing with an explicit end should work */
+     buffer = "POSTPLUS";
+-    CPPUNIT_ASSERT(HttpRequestMethod(buffer, buffer + 4) == Http::METHOD_POST);
++    CPPUNIT_ASSERT(HttpRequestMethod(SBuf(buffer, 4)) == Http::METHOD_POST);
+ }
+ 
+ /*
+@@ -84,15 +84,15 @@ testHttpRequestMethod::testImage()
+ {
+     // relaxed RFC-compliance parse HTTP methods are upgraded to correct case
+     Config.onoff.relaxed_header_parser = 1;
+-    CPPUNIT_ASSERT_EQUAL(SBuf("POST"), HttpRequestMethod("POST",NULL).image());
+-    CPPUNIT_ASSERT_EQUAL(SBuf("POST"), HttpRequestMethod("pOsT",NULL).image());
+-    CPPUNIT_ASSERT_EQUAL(SBuf("POST"), HttpRequestMethod("post",NULL).image());
++    CPPUNIT_ASSERT_EQUAL(SBuf("POST"), HttpRequestMethod("POST").image());
++    CPPUNIT_ASSERT_EQUAL(SBuf("POST"), HttpRequestMethod("pOsT").image());
++    CPPUNIT_ASSERT_EQUAL(SBuf("POST"), HttpRequestMethod("post").image());
+ 
+     // strict RFC-compliance parse HTTP methods are case sensitive
+     Config.onoff.relaxed_header_parser = 0;
+-    CPPUNIT_ASSERT_EQUAL(SBuf("POST"), HttpRequestMethod("POST",NULL).image());
+-    CPPUNIT_ASSERT_EQUAL(SBuf("pOsT"), HttpRequestMethod("pOsT",NULL).image());
+-    CPPUNIT_ASSERT_EQUAL(SBuf("post"), HttpRequestMethod("post",NULL).image());
++    CPPUNIT_ASSERT_EQUAL(SBuf("POST"), HttpRequestMethod("POST").image());
++    CPPUNIT_ASSERT_EQUAL(SBuf("pOsT"), HttpRequestMethod("pOsT").image());
++    CPPUNIT_ASSERT_EQUAL(SBuf("post"), HttpRequestMethod("post").image());
+ }
+ 
+ /*
+@@ -129,12 +129,12 @@ testHttpRequestMethod::testStream()
+     // relaxed RFC-compliance parse HTTP methods are upgraded to correct case
+     Config.onoff.relaxed_header_parser = 1;
+     std::ostringstream buffer;
+-    buffer << HttpRequestMethod("get", NULL);
++    buffer << HttpRequestMethod("get");
+     CPPUNIT_ASSERT_EQUAL(String("GET"), String(buffer.str().c_str()));
+ 
+     // strict RFC-compliance parse HTTP methods are case sensitive
+     Config.onoff.relaxed_header_parser = 0;
+     std::ostringstream buffer2;
+-    buffer2 << HttpRequestMethod("get", NULL);
++    buffer2 << HttpRequestMethod("get");
+     CPPUNIT_ASSERT_EQUAL(String("get"), String(buffer2.str().c_str()));
+ }

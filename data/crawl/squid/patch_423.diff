@@ -1,0 +1,397 @@
+@@ -53,6 +53,7 @@ class ServerStateData: public Ftp::ServerStateData
+         BEGIN,
+         SENT_COMMAND,
+         SENT_PASV,
++        SENT_PORT,
+         SENT_DATA_REQUEST,
+         READING_DATA,
+         UPLOADING_DATA,
+@@ -64,6 +65,7 @@ class ServerStateData: public Ftp::ServerStateData
+     void sendCommand();
+     void readReply();
+     void readPasvReply();
++    void readPortReply();
+     void readDataReply();
+     void readTransferDoneReply();
+ 
+@@ -79,6 +81,7 @@ const ServerStateData::SM_FUNC ServerStateData::SM_FUNCS[] = {
+     &ServerStateData::readGreeting, // BEGIN
+     &ServerStateData::readReply, // SENT_COMMAND
+     &ServerStateData::readPasvReply, // SENT_PASV
++    &ServerStateData::readPortReply, // SENT_PORT
+     &ServerStateData::readDataReply, // SENT_DATA_REQUEST
+     &ServerStateData::readTransferDoneReply, // READING_DATA
+     &ServerStateData::readReply, // UPLOADING_DATA
+@@ -388,7 +391,9 @@ ServerStateData::sendCommand()
+ 
+     writeCommand(mb.content());
+ 
+-    state = clientState() == ConnStateData::FTP_HANDLE_PASV ? SENT_PASV :
++    state =
++        clientState() == ConnStateData::FTP_HANDLE_PASV ? SENT_PASV :
++        clientState() == ConnStateData::FTP_HANDLE_PORT ? SENT_PORT :
+         clientState() == ConnStateData::FTP_HANDLE_DATA_REQUEST ? SENT_DATA_REQUEST :
+         clientState() == ConnStateData::FTP_HANDLE_UPLOAD_REQUEST ? SENT_DATA_REQUEST :
+         SENT_COMMAND;
+@@ -421,6 +426,22 @@ ServerStateData::readPasvReply()
+         forwardError();
+ }
+ 
++/// In fact, we are handling a PASV reply here (XXX: remove duplication)
++void
++ServerStateData::readPortReply()
++{
++    assert(clientState() == ConnStateData::FTP_HANDLE_PORT);
++
++    if (100 <= ctrl.replycode && ctrl.replycode < 200)
++        return; // ignore preliminary replies
++
++    if (handlePasvReply()) {
++        fwd->request->clientConnectionManager->ftp.serverDataAddr = data.addr;
++        forwardReply();
++    } else
++        forwardError();
++}
++
+ void
+ ServerStateData::readDataReply()
+ {
+@@ -373,13 +373,7 @@ bool
+ ServerStateData::handlePasvReply()
+ {
+     int code = ctrl.replycode;
+-    int h1, h2, h3, h4;
+-    int p1, p2;
+-    int n;
+-    unsigned short port;
+-    Ip::Address ipa_remote;
+     char *buf;
+-    LOCAL_ARRAY(char, ipaddr, 1024);
+     debugs(9, 3, HERE);
+ 
+     if (code != 227) {
+@@ -393,43 +387,14 @@ ServerStateData::handlePasvReply()
+ 
+     buf = ctrl.last_reply + strcspn(ctrl.last_reply, "0123456789");
+ 
+-    n = sscanf(buf, "%d,%d,%d,%d,%d,%d", &h1, &h2, &h3, &h4, &p1, &p2);
+-
+-    if (n != 6 || p1 < 0 || p2 < 0 || p1 > 255 || p2 > 255) {
+-        debugs(9, DBG_IMPORTANT, "Unsafe PASV reply from " <<
+-               ctrl.conn->remote << ": " << ctrl.last_reply);
+-        return false;
+-    }
+-
+-    snprintf(ipaddr, 1024, "%d.%d.%d.%d", h1, h2, h3, h4);
+-
+-    ipa_remote = ipaddr;
+-
+-    if ( ipa_remote.IsAnyAddr() ) {
++    const char *forceIp = Config.Ftp.sanitycheck ?
++                          fd_table[ctrl.conn->fd].ipaddr : NULL;
++    if (!Ftp::ParseIpPort(buf, forceIp, data.addr)) {
+         debugs(9, DBG_IMPORTANT, "Unsafe PASV reply from " <<
+                ctrl.conn->remote << ": " << ctrl.last_reply);
+         return false;
+     }
+ 
+-    port = ((p1 << 8) + p2);
+-
+-    if (0 == port) {
+-        debugs(9, DBG_IMPORTANT, "Unsafe PASV reply from " <<
+-               ctrl.conn->remote << ": " << ctrl.last_reply);
+-        return false;
+-    }
+-
+-    if (Config.Ftp.sanitycheck) {
+-        if (port < 1024) {
+-            debugs(9, DBG_IMPORTANT, "Unsafe PASV reply from " <<
+-                   ctrl.conn->remote << ": " << ctrl.last_reply);
+-            return false;
+-        }
+-    }
+-
+-    data.addr = Config.Ftp.sanitycheck ? fd_table[ctrl.conn->fd].ipaddr : ipaddr;
+-    data.addr.SetPort(port);
+-
+     return true;
+ }
+ 
+@@ -853,3 +818,38 @@ ServerStateData::parseControlReply(char *buf, size_t len, int *codep, size_t *us
+ }
+ 
+ }; // namespace Ftp
++
++
++bool
++Ftp::ParseIpPort(const char *buf, const char *forceIp, Ip::Address &addr)
++{
++    int h1, h2, h3, h4;
++    int p1, p2;
++    const int n = sscanf(buf, "%d,%d,%d,%d,%d,%d",
++                         &h1, &h2, &h3, &h4, &p1, &p2);
++
++    if (n != 6 || p1 < 0 || p2 < 0 || p1 > 255 || p2 > 255)
++        return false;
++
++    if (forceIp) {
++        addr = forceIp; // but the above code still validates the IP we got
++    } else {
++        static char ipBuf[1024];
++        snprintf(ipBuf, sizeof(ipBuf), "%d.%d.%d.%d", h1, h2, h3, h4);
++        addr = ipBuf;
++
++        if (addr.IsAnyAddr())
++            return false;
++    }
++
++    const int port = ((p1 << 8) + p2);
++
++    if (port <= 0)
++        return false;
++
++    if (Config.Ftp.sanitycheck && port < 1024)
++        return false;
++
++    addr.SetPort(port);
++    return true;
++}
+@@ -113,6 +113,9 @@ class ServerStateData: public ::ServerStateData
+     CBDATA_CLASS2(ServerStateData);
+ };
+ 
++/// parses and validates "A1,A2,A3,A4,P1,P2" IP,port sequence
++bool ParseIpPort(const char *buf, const char *forceIp, Ip::Address &addr);
++
+ }; // namespace Ftp
+ 
+ #endif /* SQUID_FTP_SERVER_H */
+@@ -93,6 +93,7 @@
+ #include "clientStream.h"
+ #include "comm.h"
+ #include "comm/Connection.h"
++#include "comm/ConnOpener.h"
+ #include "comm/Loops.h"
+ #include "comm/TcpAcceptor.h"
+ #include "comm/Write.h"
+@@ -255,10 +256,12 @@ static void FtpCloseDataConnection(ConnStateData *conn);
+ static void FtpWriteGreeting(ConnStateData *conn);
+ static ClientSocketContext *FtpParseRequest(ConnStateData *connState, HttpRequestMethod *method_p, Http::ProtocolVersion *http_ver);
+ static bool FtpHandleUserRequest(ConnStateData *connState, const String &cmd, String &params);
++static CNCB FtpHandleConnectDone;
+ 
+ static void FtpHandleReply(ClientSocketContext *context, HttpReply *reply, StoreIOBuffer data);
+ typedef void FtpReplyHandler(ClientSocketContext *context, const HttpReply *reply, StoreIOBuffer data);
+ static FtpReplyHandler FtpHandlePasvReply;
++static FtpReplyHandler FtpHandlePortReply;
+ static FtpReplyHandler FtpHandleErrorReply;
+ static FtpReplyHandler FtpHandleDataReply;
+ static FtpReplyHandler FtpHandleUploadReply;
+@@ -2951,22 +2954,37 @@ ConnStateData::processFtpRequest(ClientSocketContext *const context)
+     assert(http != NULL);
+     HttpRequest *const request = http->request;
+     assert(request != NULL);
++    debugs(33, 9, request);
++
+     HttpHeader &header = request->header;
+     assert(header.has(HDR_FTP_COMMAND));
+     String &cmd = header.findEntry(HDR_FTP_COMMAND)->value;
+     assert(header.has(HDR_FTP_ARGUMENTS));
+     String &params = header.findEntry(HDR_FTP_ARGUMENTS)->value;
+ 
+-    if (!FtpHandleRequest(context, cmd, params)) {
++    const bool fwd = !http->storeEntry() &&
++                     FtpHandleRequest(context, cmd, params);
++
++    if (http->storeEntry() != NULL) {
++        debugs(33, 4, "got an immediate response");
+         assert(http->storeEntry() != NULL);
+         clientSetKeepaliveFlag(http);
+         context->pullData();
+-        return;
++    } else if (fwd) {
++        debugs(33, 4, "forwarding request to server side");
++        assert(http->storeEntry() == NULL);
++        clientProcessRequest(this, &parser_, context, request->method,
++                             request->http_ver);
++    } else {
++        debugs(33, 4, "will resume processing later");
+     }
++}
+ 
+-    assert(http->storeEntry() == NULL);
+-    clientProcessRequest(this, &parser_, context, request->method,
+-                         request->http_ver);
++void
++ConnStateData::resumeFtpRequest(ClientSocketContext *const context)
++{
++    debugs(33, 4, "resuming");
++    processFtpRequest(context);
+ }
+ 
+ static void
+@@ -5079,6 +5097,7 @@ FtpHandleReply(ClientSocketContext *context, HttpReply *reply, StoreIOBuffer dat
+         NULL, // FTP_BEGIN
+         NULL, // FTP_CONNECTED
+         FtpHandlePasvReply, // FTP_HANDLE_PASV
++        FtpHandlePortReply, // FTP_HANDLE_PORT
+         FtpHandleDataReply, // FTP_HANDLE_DATA_REQUEST
+         FtpHandleUploadReply, // FTP_HANDLE_DATA_REQUEST
+         FtpHandleErrorReply // FTP_ERROR
+@@ -5150,6 +5169,19 @@ FtpHandlePasvReply(ClientSocketContext *context, const HttpReply *reply, StoreIO
+     FtpWriteReply(context, mb);
+ }
+ 
++static void
++FtpHandlePortReply(ClientSocketContext *context, const HttpReply *reply, StoreIOBuffer data)
++{
++    if (context->http->request->errType != ERR_NONE) {
++        FtpWriteCustomReply(context, 502, "Server does not support PASV (converted from PORT)", reply);
++        return;
++    }
++
++    FtpWriteCustomReply(context, 200, "PORT successfully converted to PASV.");
++
++    // and wait for RETR
++}
++
+ static void
+ FtpHandleErrorReply(ClientSocketContext *context, const HttpReply *reply, StoreIOBuffer data)
+ {
+@@ -5442,11 +5474,54 @@ FtpHandlePasvRequest(ClientSocketContext *context, String &cmd, String &params)
+     return true;
+ }
+ 
++#include "FtpServer.h" /* XXX: For Ftp::ParseIpPort() */
++
+ bool
+ FtpHandlePortRequest(ClientSocketContext *context, String &cmd, String &params)
+ {
+-    FtpSetReply(context, 502, "Command not supported");
+-    return false;
++    if (!params.size()) {
++        FtpSetReply(context, 501, "Missing parameter");
++        return false;
++    }
++
++    Ip::Address cltAddr;
++    if (!Ftp::ParseIpPort(params.termedBuf(), NULL, cltAddr)) {
++        FtpSetReply(context, 501, "Invalid parameter");
++        return false;
++    }
++
++    FtpCloseDataConnection(context->getConn());
++    debugs(11, 3, "will actively connect to " << cltAddr);
++
++    Comm::ConnectionPointer conn = new Comm::Connection();
++    conn->remote = cltAddr;
++
++    // TODO: should we use getOutgoingAddress() here instead?
++    if (conn->remote.IsIPv4())
++        conn->local.SetIPv4();
++
++    // RFC 959 requires active FTP connections to originate from port 20
++    // but that would preclude us from supporting concurrent transfers! (XXX?)
++    // conn->flags |= COMM_DOBIND;
++    // conn->local.SetPort(20);
++
++    context->getConn()->ftp.dataConn = conn;
++    context->getConn()->ftp.uploadAvailSize = 0; // XXX: FtpCloseDataConnection should do that
++
++    context->getConn()->ftp.state = ConnStateData::FTP_HANDLE_PORT;
++
++    // convert client PORT command to Squid PASV command because Squid
++    // does not support active FTP transfers on the server side (yet?)
++    ClientHttpRequest *const http = context->http;
++    assert(http != NULL);
++    HttpRequest *const request = http->request;
++    assert(request != NULL);
++    HttpHeader &header = request->header;
++    header.delById(HDR_FTP_COMMAND);
++    header.putStr(HDR_FTP_COMMAND, "PASV");
++    header.delById(HDR_FTP_ARGUMENTS);
++    header.putStr(HDR_FTP_ARGUMENTS, "");
++    return true; // forward our fake PASV request
+ }
+ 
+ bool
+@@ -5474,15 +5549,49 @@ FtpHandleUploadRequest(ClientSocketContext *context, String &cmd, String &params
+ bool
+ FtpCheckDataConnection(ClientSocketContext *context)
+ {
+-    const ConnStateData *const connState = context->getConn();
++    ConnStateData *const connState = context->getConn();
+     if (Comm::IsConnOpen(connState->ftp.dataConn))
+         return true;
+ 
+-    if (!Comm::IsConnOpen(connState->ftp.dataListenConn))
+-        FtpSetReply(context, 425, "Use PASV first");
+-    else
++    if (Comm::IsConnOpen(connState->ftp.dataListenConn)) {
+         FtpSetReply(context, 425, "Data connection is not established");
+-    return false;
++        return false;
++    }
++
++    if (connState->ftp.dataConn->remote.IsAnyAddr()) {
++        // XXX: use client address and default port instead.
++        FtpSetReply(context, 425, "Use PORT first");
++        return false;
++    }
++
++    // active transfer: open a connection from Squid to client
++    AsyncCall::Pointer connector = context->getConn()->ftp.connector =
++        commCbCall(17, 3, "FtpConnectDoneWrapper", 
++                   CommConnectCbPtrFun(FtpHandleConnectDone, context));
++
++    Comm::ConnOpener *cs = new Comm::ConnOpener(connState->ftp.dataConn,
++                                                connector,
++                                                Config.Timeout.connect);
++    AsyncJob::Start(cs);
++    return false; // ConnStateData::processFtpRequest waits FtpHandleConnectDone
++}
++
++void
++FtpHandleConnectDone(const Comm::ConnectionPointer &conn, comm_err_t status, int xerrno, void *data)
++{
++    ClientSocketContext *context = static_cast<ClientSocketContext*>(data);
++    context->getConn()->ftp.connector = NULL;
++
++    if (status != COMM_OK) {
++        conn->close();
++        FtpSetReply(context, 425, "Cannot open data connection.");
++        assert(context->http && context->http->storeEntry() != NULL);
++    } else {
++        context->getConn()->ftp.dataConn = conn;
++        context->getConn()->ftp.uploadAvailSize = 0;
++        assert(Comm::IsConnOpen(context->getConn()->ftp.dataConn));
++    }
++    context->getConn()->resumeFtpRequest(context);
+ }
+ 
+ void
+@@ -339,6 +339,7 @@ class ConnStateData : public BodyProducer, public HttpControlMsgSink
+         FTP_BEGIN,
+         FTP_CONNECTED,
+         FTP_HANDLE_PASV,
++        FTP_HANDLE_PORT,
+         FTP_HANDLE_DATA_REQUEST,
+         FTP_HANDLE_UPLOAD_REQUEST,
+         FTP_ERROR
+@@ -352,6 +353,7 @@ class ConnStateData : public BodyProducer, public HttpControlMsgSink
+         Ip::Address serverDataAddr;
+         char uploadBuf[CLIENT_REQ_BUF_SZ];
+         size_t uploadAvailSize;
++        AsyncCall::Pointer connector; ///< set when we are actively connecting
+         AsyncCall::Pointer reader; ///< set when we are reading FTP data
+     } ftp;
+ 
+@@ -398,6 +400,8 @@ class ConnStateData : public BodyProducer, public HttpControlMsgSink
+ 
+     void finishDechunkingRequest(bool withSuccess);
+ 
++    void resumeFtpRequest(ClientSocketContext *const context);
++
+ protected:
+     void startDechunkingRequest();
+     void abortChunkedRequestBody(const err_type error);

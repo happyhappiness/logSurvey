@@ -1,0 +1,677 @@
+@@ -751,10 +751,6 @@ if test "x$squid_opt_enable_storeio" = "xauto"; then
+   SQUID_LOOK_FOR_MODULES([$srcdir/src/fs],[squid_storeio_module_candidates])
+   # disable coss
+   squid_storeio_module_candidates=`echo $squid_storeio_module_candidates|sed 's/coss//'`
+-  if test "x$ac_cv_search_shm_open" = "xno" ; then
+-    # disable rock
+-    squid_storeio_module_candidates=`echo $squid_storeio_module_candidates|sed 's/rock//'`
+-  fi
+   AC_MSG_RESULT([$squid_storeio_module_candidates])
+ fi
+ 
+@@ -786,12 +782,9 @@ for fs in $squid_storeio_module_candidates none; do
+       STORE_TESTS="$STORE_TESTS tests/testCoss$EXEEXT"
+       ;;
+     rock)
+-	if ! test "x$squid_disk_module_candidates_IpcIo" = "xyes" -a \
+-	  "x$squid_disk_module_candidates_Blocking" = "xyes"; then
+-	  AC_MSG_ERROR([Storage module Rock requires IpcIo and Blocking DiskIO modules])
+-	fi
+-	if test "x$ac_cv_search_shm_open" = "xno" ; then
+-	  AC_MSG_ERROR([Storage module Rock requires shared memory support])
++	if test "x$squid_disk_module_candidates_IpcIo" != "xyes" -a \
++	  "x$squid_disk_module_candidates_Blocking" != "xyes"; then
++	  AC_MSG_ERROR([Storage module Rock requires IpcIo or Blocking DiskIO module])
+ 	fi
+ 	;;
+     ufs)
+@@ -831,31 +831,34 @@ DiskerClose(const String &path)
+ 
+ 
+ /// initializes shared memory segments used by IpcIoFile
+-class IpcIoRr: public RegisteredRunner
++class IpcIoRr: public Ipc::Mem::RegisteredRunner
+ {
+ public:
+     /* RegisteredRunner API */
+     IpcIoRr(): owner(NULL) {}
+-    virtual void run(const RunnerRegistry &);
+     virtual ~IpcIoRr();
+ 
++protected:
++    virtual void create(const RunnerRegistry &);
++
+ private:
+     Ipc::FewToFewBiQueue::Owner *owner;
+ };
+ 
+ RunnerRegistrationEntry(rrAfterConfig, IpcIoRr);
+ 
+ 
+-void IpcIoRr::run(const RunnerRegistry &)
++void IpcIoRr::create(const RunnerRegistry &)
+ {
+     if (!UsingSmp())
+         return;
+ 
+-    if (IamMasterProcess()) {
+-        Must(!owner);
+-        // XXX: make capacity configurable
+-        owner = Ipc::FewToFewBiQueue::Init(ShmLabel, Config.workers, 1, Config.cacheSwap.n_configured, 1 + Config.workers, sizeof(IpcIoMsg), 1024);
+-    }
++    Must(!owner);
++    // XXX: make capacity configurable
++    owner = Ipc::FewToFewBiQueue::Init(ShmLabel, Config.workers, 1,
++                                       Config.cacheSwap.n_strands,
++                                       1 + Config.workers, sizeof(IpcIoMsg),
++                                       1024);
+ }
+ 
+ IpcIoRr::~IpcIoRr()
+@@ -2162,6 +2162,7 @@ tests_testHttpRequest_SOURCES = \
+ 	tests/testHttpRequestMethod.h \
+ 	tests/testHttpRequestMethod.cc \
+ 	tests/testMain.cc \
++	tests/stub_DiskIOModule.cc \
+ 	tests/stub_main_cc.cc \
+ 	tests/stub_ipc_Forwarder.cc \
+ 	time.cc \
+@@ -343,22 +343,25 @@ MemStore::EntryLimit()
+ 
+ 
+ /// initializes shared memory segments used by MemStore
+-class MemStoreRr: public RegisteredRunner
++class MemStoreRr: public Ipc::Mem::RegisteredRunner
+ {
+ public:
+     /* RegisteredRunner API */
+     MemStoreRr(): owner(NULL) {}
+     virtual void run(const RunnerRegistry &);
+     virtual ~MemStoreRr();
+ 
++protected:
++    virtual void create(const RunnerRegistry &);
++
+ private:
+     MemStoreMap::Owner *owner;
+ };
+ 
+ RunnerRegistrationEntry(rrAfterConfig, MemStoreRr);
+ 
+ 
+-void MemStoreRr::run(const RunnerRegistry &)
++void MemStoreRr::run(const RunnerRegistry &r)
+ {
+     // decide whether to use a shared memory cache if the user did not specify
+     if (!Config.memShared.configured()) {
+@@ -370,18 +373,24 @@ void MemStoreRr::run(const RunnerRegistry &)
+         fatal("memory_cache_shared is on, but no support for atomic operations detected");
+     } else if (Config.memShared && !Ipc::Mem::Segment::Enabled()) {
+         fatal("memory_cache_shared is on, but no support for shared memory detected");
++    } else if (Config.memShared && !UsingSmp()) {
++        debugs(20, DBG_IMPORTANT, "WARNING: memory_cache_shared is on, but only"
++               " a single worker is running");
+     }
+ 
++    Ipc::Mem::RegisteredRunner::run(r);
++}
++
++void MemStoreRr::create(const RunnerRegistry &)
++{
+     if (!Config.memShared)
+         return;
+ 
+-    if (IamMasterProcess()) {
+-        Must(!owner);
+-        const int64_t entryLimit = MemStore::EntryLimit();
+-        if (entryLimit <= 0)
+-            return; // no memory cache configured or a misconfiguration
+-        owner = MemStoreMap::Init(ShmLabel, entryLimit);
+-    }
++    Must(!owner);
++    const int64_t entryLimit = MemStore::EntryLimit();
++    if (entryLimit <= 0)
++        return; // no memory cache configured or a misconfiguration
++    owner = MemStoreMap::Init(ShmLabel, entryLimit);
+ }
+ 
+ MemStoreRr::~MemStoreRr()
+@@ -40,7 +40,7 @@
+ 
+ SwapDir::SwapDir(char const *aType): theType(aType),
+         max_size(0),
+-        path(NULL), index(-1), min_objsize(0), max_objsize (-1),
++        path(NULL), index(-1), disker(-1), min_objsize(0), max_objsize (-1),
+         repl(NULL), removals(0), scanned(0),
+         cleanLog(NULL)
+ {
+@@ -198,7 +198,7 @@ SwapDir::active() const
+         return true;
+ 
+     // we are inside a disker dedicated to this disk
+-    if (IamDiskProcess() && index == (KidIdentifier-1 - Config.workers))
++    if (KidIdentifier == disker)
+         return true;
+ 
+     return false; // Coordinator, wrong disker, etc.
+@@ -179,6 +179,7 @@ class SwapDir : public Store
+ public:
+     char *path;
+     int index;			/* This entry's index into the swapDirs array */
++    int disker; ///< disker kid id dedicated to this SwapDir or -1
+     int64_t min_objsize;
+     int64_t max_objsize;
+     RemovalPolicy *repl;
+@@ -44,7 +44,6 @@ void
+ DeactivateRegistered(const RunnerRegistry &registryId)
+ {
+     Runners &runners = GetRunners(registryId);
+-    typedef Runners::iterator RRI;
+     while (!runners.empty()) {
+         delete runners.back();
+         runners.pop_back();
+@@ -56,6 +56,7 @@
+ #endif
+ #include "ConfigParser.h"
+ #include "CpuAffinityMap.h"
++#include "DiskIO/DiskIOModule.h"
+ #include "eui/Config.h"
+ #if USE_SQUID_ESI
+ #include "esi/Parser.h"
+@@ -599,6 +600,12 @@ configDoConfigure(void)
+         /* Memory-only cache probably in effect. */
+         /* turn off the cache rebuild delays... */
+         StoreController::store_dirs_rebuilding = 0;
++    } else if (InDaemonMode()) { // no diskers in non-daemon mode
++        for (int i = 0; i < Config.cacheSwap.n_configured; ++i) {
++            const RefCount<SwapDir> sd = Config.cacheSwap.swapDirs[i];
++            if (sd->needsDiskStrand())
++                sd->disker = Config.workers + (++Config.cacheSwap.n_strands);
++        }
+     }
+ 
+     if (Debug::rotateNumber < 0) {
+@@ -1987,9 +1994,6 @@ parse_cachedir(SquidConfig::_cacheSwap * swap)
+ 
+     ++swap->n_configured;
+ 
+-    if (sd->needsDiskStrand())
+-        ++swap->n_strands;
+-
+     /* Update the max object size */
+     update_maxobjsize();
+ }
+@@ -215,7 +215,7 @@ Rock::SwapDir::init()
+     Must(!map);
+     map = new DirMap(path);
+ 
+-    const char *ioModule = UsingSmp() ? "IpcIo" : "Blocking";
++    const char *ioModule = needsDiskStrand() ? "IpcIo" : "Blocking";
+     if (DiskIOModule *m = DiskIOModule::Find(ioModule)) {
+         debugs(47,2, HERE << "Using DiskIO module: " << ioModule);
+         io = m->createStrategy();
+@@ -239,7 +239,10 @@ Rock::SwapDir::init()
+ bool
+ Rock::SwapDir::needsDiskStrand() const
+ {
+-    return true;
++    const bool wontEvenWorkWithoutDisker = Config.workers > 1;
++    const bool wouldWorkBetterWithDisker = DiskIOModule::Find("IpcIo");
++    return InDaemonMode() && (wontEvenWorkWithoutDisker ||
++        wouldWorkBetterWithDisker);
+ }
+ 
+ void
+@@ -400,28 +403,25 @@ Rock::SwapDir::validateOptions()
+     if (max_objsize <= 0)
+         fatal("Rock store requires a positive max-size");
+ 
+-#if THIS_CODE_IS_FIXED_AND_MOVED
+-    // XXX: should not use map as it is not yet created
+-    // XXX: max_size is in Bytes now
+-    // XXX: Use DBG_IMPORTANT (and DBG_CRITICAL if opt_parse_cfg_only?)
+-    // TODO: Shrink max_size to avoid waste?
+-    const int64_t mapRoundWasteMx = max_objsize*sizeof(long)*8;
+-    const int64_t sizeRoundWasteMx = 1024; // max_size stored in KB
+-    const int64_t roundingWasteMx = max(mapRoundWasteMx, sizeRoundWasteMx);
+-    const int64_t totalWaste = maxSize() - diskOffsetLimit();
+-    assert(diskOffsetLimit() <= maxSize());
++    const int64_t maxSizeRoundingWaste = 1024 * 1024; // size is configured in MB
++    const int64_t maxObjectSizeRoundingWaste = maxObjectSize();
++    const int64_t maxRoundingWaste =
++        max(maxSizeRoundingWaste, maxObjectSizeRoundingWaste);
++    const int64_t usableDiskSize = diskOffset(entryLimitAllowed());
++    const int64_t diskWasteSize = maxSize() - usableDiskSize;
++    Must(diskWasteSize >= 0);
+ 
+     // warn if maximum db size is not reachable due to sfileno limit
+-    if (map->entryLimit() == entryLimitHigh() && totalWaste > roundingWasteMx) {
+-        debugs(47, 0, "Rock store cache_dir[" << index << "]:");
+-        debugs(47, 0, "\tmaximum number of entries: " << map->entryLimit());
+-        debugs(47, 0, "\tmaximum entry size: " << max_objsize << " bytes");
+-        debugs(47, 0, "\tmaximum db size: " << maxSize() << " bytes");
+-        debugs(47, 0, "\tusable db size:  " << diskOffsetLimit() << " bytes");
+-        debugs(47, 0, "\tdisk space waste: " << totalWaste << " bytes");
+-        debugs(47, 0, "WARNING: Rock store config wastes space.");
++    if (entryLimitAllowed() == entryLimitHigh() &&
++        diskWasteSize >= maxRoundingWaste) {
++        debugs(47, DBG_CRITICAL, "Rock store cache_dir[" << index << "] '" << path << "':");
++        debugs(47, DBG_CRITICAL, "\tmaximum number of entries: " << entryLimitAllowed());
++        debugs(47, DBG_CRITICAL, "\tmaximum object size: " << maxObjectSize() << " Bytes");
++        debugs(47, DBG_CRITICAL, "\tmaximum db size: " << maxSize() << " Bytes");
++        debugs(47, DBG_CRITICAL, "\tusable db size:  " << usableDiskSize << " Bytes");
++        debugs(47, DBG_CRITICAL, "\tdisk space waste: " << diskWasteSize << " Bytes");
++        debugs(47, DBG_CRITICAL, "WARNING: Rock store config wastes space.");
+     }
+-#endif
+ }
+ 
+ void
+@@ -468,7 +468,8 @@ Rock::SwapDir::canStore(const StoreEntry &e, int64_t diskSpaceNeeded, int &load)
+ 
+     // Do not start I/O transaction if there are less than 10% free pages left.
+     // TODO: reserve page instead
+-    if (Ipc::Mem::PageLevel(Ipc::Mem::PageId::ioPage) >= 0.9 * Ipc::Mem::PageLimit(Ipc::Mem::PageId::ioPage)) {
++    if (needsDiskStrand() &&
++        Ipc::Mem::PageLevel(Ipc::Mem::PageId::ioPage) >= 0.9 * Ipc::Mem::PageLimit(Ipc::Mem::PageId::ioPage)) {
+         debugs(47, 5, HERE << "too few shared pages for IPC I/O left");
+         return false;
+     }
+@@ -561,7 +562,8 @@ Rock::SwapDir::openStoreIO(StoreEntry &e, StoreIOState::STFNCB *cbFile, StoreIOS
+ 
+     // Do not start I/O transaction if there are less than 10% free pages left.
+     // TODO: reserve page instead
+-    if (Ipc::Mem::PageLevel(Ipc::Mem::PageId::ioPage) >= 0.9 * Ipc::Mem::PageLimit(Ipc::Mem::PageId::ioPage)) {
++    if (needsDiskStrand() &&
++        Ipc::Mem::PageLevel(Ipc::Mem::PageId::ioPage) >= 0.9 * Ipc::Mem::PageLimit(Ipc::Mem::PageId::ioPage)) {
+         debugs(47, 5, HERE << "too few shared pages for IPC I/O left");
+         return NULL;
+     }
+@@ -810,30 +812,30 @@ Rock::SwapDir::statfs(StoreEntry &e) const
+ 
+ 
+ /// initializes shared memory segments used by Rock::SwapDir
+-class RockSwapDirRr: public RegisteredRunner
++class RockSwapDirRr: public Ipc::Mem::RegisteredRunner
+ {
+ public:
+     /* RegisteredRunner API */
+-    virtual void run(const RunnerRegistry &);
+     virtual ~RockSwapDirRr();
+ 
++protected:
++    virtual void create(const RunnerRegistry &);
++
+ private:
+     Vector<Rock::SwapDir::DirMap::Owner *> owners;
+ };
+ 
+ RunnerRegistrationEntry(rrAfterConfig, RockSwapDirRr);
+ 
+ 
+-void RockSwapDirRr::run(const RunnerRegistry &)
++void RockSwapDirRr::create(const RunnerRegistry &)
+ {
+-    if (IamMasterProcess()) {
+-        Must(owners.empty());
+-        for (int i = 0; i < Config.cacheSwap.n_configured; ++i) {
+-            if (const Rock::SwapDir *const sd = dynamic_cast<Rock::SwapDir *>(INDEXSD(i))) {
+-                // TODO: check whether entryLimitAllowed() has map here
+-                Rock::SwapDir::DirMap::Owner *const owner = Rock::SwapDir::DirMap::Init(sd->path, sd->entryLimitAllowed());
+-                owners.push_back(owner);
+-            }
++    Must(owners.empty());
++    for (int i = 0; i < Config.cacheSwap.n_configured; ++i) {
++        if (const Rock::SwapDir *const sd = dynamic_cast<Rock::SwapDir *>(INDEXSD(i))) {
++            Rock::SwapDir::DirMap::Owner *const owner =
++                Rock::SwapDir::DirMap::Init(sd->path, sd->entryLimitAllowed());
++            owners.push_back(owner);
+         }
+     }
+ }
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include "config.h"
++#include "base/TextException.h"
+ #include "ipc/Kids.h"
+ #include "protos.h"
+ 
+@@ -33,8 +34,7 @@ void Kids::init()
+     }
+ 
+     // add Kid records for all disk processes
+-    // (XXX: some cache_dirs do not need this)
+-    for (int i = 0; i < Config.cacheSwap.n_configured; ++i) {
++    for (int i = 0; i < Config.cacheSwap.n_strands; ++i) {
+         snprintf(kid_name, sizeof(kid_name), "(squid-disk-%d)", (int)(storage.size()+1));
+         storage.push_back(Kid(kid_name));
+     }
+@@ -44,6 +44,8 @@ void Kids::init()
+         snprintf(kid_name, sizeof(kid_name), "(squid-coord-%d)", (int)(storage.size()+1));
+         storage.push_back(Kid(kid_name));
+     }
++
++    Must(storage.size() == static_cast<size_t>(NumberOfKids()));
+ }
+ 
+ /// returns kid by pid
+@@ -85,12 +85,14 @@ Ipc::Mem::PageLevel(const int purpose)
+ }
+ 
+ /// initializes shared memory pages
+-class SharedMemPagesRr: public RegisteredRunner
++class SharedMemPagesRr: public Ipc::Mem::RegisteredRunner
+ {
+ public:
+     /* RegisteredRunner API */
+     SharedMemPagesRr(): owner(NULL) {}
+     virtual void run(const RunnerRegistry &);
++    virtual void create(const RunnerRegistry &);
++    virtual void open(const RunnerRegistry &);
+     virtual ~SharedMemPagesRr();
+ 
+ private:
+@@ -100,7 +102,8 @@ class SharedMemPagesRr: public RegisteredRunner
+ RunnerRegistrationEntry(rrAfterConfig, SharedMemPagesRr);
+ 
+ 
+-void SharedMemPagesRr::run(const RunnerRegistry &)
++void
++SharedMemPagesRr::run(const RunnerRegistry &r)
+ {
+     if (!UsingSmp())
+         return;
+@@ -119,11 +122,20 @@ void SharedMemPagesRr::run(const RunnerRegistry &)
+         return;
+     }
+ 
+-    if (IamMasterProcess()) {
+-        Must(!owner);
+-        owner = Ipc::Mem::PagePool::Init(PagePoolId, Ipc::Mem::PageLimit(), Ipc::Mem::PageSize());
+-    }
++    Ipc::Mem::RegisteredRunner::run(r);
++}
+ 
++void
++SharedMemPagesRr::create(const RunnerRegistry &)
++{
++    Must(!owner);
++    owner = Ipc::Mem::PagePool::Init(PagePoolId, Ipc::Mem::PageLimit(),
++                                     Ipc::Mem::PageSize());
++}
++
++void
++SharedMemPagesRr::open(const RunnerRegistry &)
++{
+     Must(!ThePagePool);
+     ThePagePool = new Ipc::Mem::PagePool(PagePoolId);
+ }
+@@ -16,8 +16,24 @@
+ #include <sys/stat.h>
+ #include <unistd.h>
+ 
++void *
++Ipc::Mem::Segment::reserve(size_t chunkSize)
++{
++    Must(theMem);
++    // check for overflows
++    // chunkSize >= 0 may result in warnings on systems where off_t is unsigned
++    assert(!chunkSize || static_cast<off_t>(chunkSize) > 0);
++    assert(static_cast<off_t>(chunkSize) <= theSize);
++    assert(theReserved <= theSize - static_cast<off_t>(chunkSize));
++    void *result = reinterpret_cast<char*>(theMem) + theReserved;
++    theReserved += chunkSize;
++    return result;
++}
++
++#if HAVE_SHM
++
+ Ipc::Mem::Segment::Segment(const char *const id):
+-        theName(GenerateName(id)), theFD(-1), theMem(NULL),
++        theFD(-1), theName(GenerateName(id)), theMem(NULL),
+         theSize(0), theReserved(0), doUnlink(false)
+ {
+ }
+@@ -33,14 +49,11 @@ Ipc::Mem::Segment::~Segment()
+         unlink();
+ }
+ 
++// fake Ipc::Mem::Segment::Enabled (!HAVE_SHM) is more selective
+ bool
+ Ipc::Mem::Segment::Enabled()
+ {
+-#if HAVE_SHM
+     return true;
+-#else
+-    return false;
+-#endif
+ }
+ 
+ void
+@@ -135,20 +148,6 @@ Ipc::Mem::Segment::unlink()
+         debugs(54, 3, HERE << "unlinked " << theName << " segment");
+ }
+ 
+-void *
+-Ipc::Mem::Segment::reserve(size_t chunkSize)
+-{
+-    Must(theMem);
+-    // check for overflows
+-    // chunkSize >= 0 may result in warnings on systems where off_t is unsigned
+-    assert(!chunkSize || static_cast<off_t>(chunkSize) > 0);
+-    assert(static_cast<off_t>(chunkSize) <= theSize);
+-    assert(theReserved <= theSize - static_cast<off_t>(chunkSize));
+-    void *result = reinterpret_cast<char*>(theMem) + theReserved;
+-    theReserved += chunkSize;
+-    return result;
+-}
+-
+ /// determines the size of the underlying "file"
+ off_t
+ Ipc::Mem::Segment::statSize(const char *context) const
+@@ -184,3 +183,96 @@ Ipc::Mem::Segment::GenerateName(const char *id)
+     name.append(id);
+     return name;
+ }
++
++#else // HAVE_SHM
++
++#include <map>
++
++typedef std::map<String, Ipc::Mem::Segment *> SegmentMap;
++static SegmentMap Segments;
++
++Ipc::Mem::Segment::Segment(const char *const id):
++    theName(id), theMem(NULL), theSize(0), theReserved(0), doUnlink(false)
++{
++}
++
++Ipc::Mem::Segment::~Segment()
++{
++    if (doUnlink) {
++        delete [] static_cast<char *>(theMem);
++        debugs(54, 3, HERE << "deleted " << theName << " segment");
++    }
++}
++
++bool
++Ipc::Mem::Segment::Enabled()
++{
++    return !InDaemonMode() || (!UsingSmp() && IamWorkerProcess());
++}
++
++void
++Ipc::Mem::Segment::create(const off_t aSize)
++{
++    assert(aSize > 0);
++    assert(!theMem);
++    checkSupport("Fake segment creation");
++
++    const bool inserted = Segments.insert(std::make_pair(theName, this)).second;
++    if (!inserted)
++        fatalf("Duplicate fake segment creation: %s", theName.termedBuf());
++
++    theMem = new char[aSize];
++    theSize = aSize;
++    doUnlink = true;
++
++    debugs(54, 3, HERE << "created " << theName << " fake segment: " << theSize);
++}
++
++void
++Ipc::Mem::Segment::open()
++{
++    assert(!theMem);
++    checkSupport("Fake segment open");
++
++    const SegmentMap::const_iterator i = Segments.find(theName);
++    if (i == Segments.end())
++        fatalf("Fake segment not found: %s", theName.termedBuf());
++
++    const Segment &segment = *i->second;
++    theMem = segment.theMem;
++    theSize = segment.theSize;
++
++    debugs(54, 3, HERE << "opened " << theName << " fake segment: " << theSize);
++}
++
++void
++Ipc::Mem::Segment::checkSupport(const char *const context)
++{
++    if (!Enabled()) {
++        debugs(54, 5, HERE << "True shared memory segments are not supported. "
++               "Cannot fake shared segments in SMP config.");
++        fatalf("%s failed", context);
++    }
++}
++
++#endif // HAVE_SHM
++
++void
++Ipc::Mem::RegisteredRunner::run(const RunnerRegistry &r)
++{
++    // If Squid is built with real segments, we create() real segments
++    // in the master process only.  Otherwise, we create() fake
++    // segments in each worker process.  We assume that only workers
++    // need and can work with fake segments.
++#if HAVE_SHM
++    if (IamMasterProcess())
++#else
++    if (IamWorker())
++#endif
++        create(r);
++
++    // we assume that master process does not need shared segments
++    // unless it is also a worker
++    if (!InDaemonMode() || !IamMasterProcess())
++        open(r);
++}
+@@ -6,6 +6,7 @@
+ #ifndef SQUID_IPC_MEM_SEGMENT_H
+ #define SQUID_IPC_MEM_SEGMENT_H
+ 
++#include "base/RunnersRegistry.h"
+ #include "SquidString.h"
+ 
+ namespace Ipc
+@@ -25,8 +26,7 @@ class Segment
+     /// Whether shared memory support is available
+     static bool Enabled();
+ 
+-    /// Create a new shared memory segment. Fails if a segment with
+-    /// the same name already exists. Unlinks the segment on destruction.
++    /// Create a new shared memory segment. Unlinks the segment on destruction.
+     void create(const off_t aSize);
+     void open(); ///< Open an existing shared memory segment.
+ 
+@@ -37,25 +37,51 @@ class Segment
+ 
+ 
+ private:
++
++    // not implemented
++    Segment(const Segment &);
++    Segment &operator =(const Segment &);
++
++#if HAVE_SHM
++
+     void attach();
+     void detach();
+     void unlink(); ///< unlink the segment
+     off_t statSize(const char *context) const;
+ 
+     static String GenerateName(const char *id);
+ 
+-    // not implemented
+-    Segment(const Segment &);
+-    Segment &operator =(const Segment &);
++    int theFD; ///< shared memory segment file descriptor
++
++#else // HAVE_SHM
++
++    void checkSupport(const char *const context);
++
++#endif // HAVE_SHM
+ 
+     const String theName; ///< shared memory segment file name
+-    int theFD; ///< shared memory segment file descriptor
+     void *theMem; ///< pointer to mmapped shared memory segment
+     off_t theSize; ///< shared memory segment size
+     off_t theReserved; ///< the total number of reserve()d bytes
+     bool doUnlink; ///< whether the segment should be unlinked on destruction
+ };
+ 
++/// Base class for runners that create and open shared memory segments.
++/// First may run create() method and then open().
++class RegisteredRunner: public ::RegisteredRunner
++{
++public:
++    /* RegisteredRunner API */
++    virtual void run(const RunnerRegistry &r);
++
++protected:
++    /// called when the runner should create a new memory segment
++    virtual void create(const RunnerRegistry &) = 0;
++    /// called when the runner should open a previously created segment,
++    /// not needed if segments are opened in constructor or init methods
++    virtual void open(const RunnerRegistry &) {}
++};
++
+ } // namespace Mem
+ 
+ } // namespace Ipc
+@@ -75,6 +75,13 @@ IamMasterProcess()
+     return false;
+ }
+ 
++bool
++InDaemonMode()
++{
++    fprintf(stderr, "Not implemented");
++    return false;
++}
++
+ bool
+ UsingSmp()
+ {
+@@ -211,7 +211,9 @@ main(int argc, char *argv[])
+     int keep_alive = 0;
+     int opt_noaccept = 0;
+     int opt_verbose = 0;
+-    int www_neg, proxy_neg;
++#if HAVE_GSSAPI
++    int www_neg = 0, proxy_neg = 0;
++#endif
+     const char *hostname, *localhost;
+     Ip::Address iaddr;
+     char url[BUFSIZ], msg[MESSAGELEN], buf[BUFSIZ];
+@@ -243,8 +245,6 @@ main(int argc, char *argv[])
+     ping = 0;
+     pcount = 0;
+     ping_int = 1 * 1000;
+-    www_neg = 0;
+-    proxy_neg = 0;
+ 
+     if (argc < 2) {
+         usage(argv[0]);		/* need URL */

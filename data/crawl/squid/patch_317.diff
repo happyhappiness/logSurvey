@@ -1,0 +1,363 @@
+@@ -43,6 +43,7 @@ The 3.5 change history can be <url url="http://www.squid-cache.org/Versions/v3/3
+ 	<item>Support named services
+ 	<item>Upgraded squidclient tool
+ 	<item>Helper support for concurrency channels
++	<item>Support PROXY protocol
+ </itemize>
+ 
+ Most user-facing changes are reflected in squid.conf (see below).
+@@ -163,6 +164,27 @@ Most user-facing changes are reflected in squid.conf (see below).
+    With these helpers concurrency may now be set to 0 or any higher number as desired.
+ 
+ 
++<sect1>Support PROXY protocol
++<p>More info at <url url="http://www.haproxy.org/download/1.5/doc/proxy-protocol.txt">
++
++<p>PROXY protocol provides a simple way for proxies and tunnels of any kind to
++   relay the original client source details without having to alter or understand
++   the protocol being relayed on the connection.
++
++<p>Squid currently supports receiving version 1 of the protocol.
++
++<p>Squid can be configured by adding an <em>http_port</em> or <em>https_port</em>
++   with the <em>proxy-surrogate</em> mode flag. The <em>proxy_forwarded_access</em>
++   must also be configured with <em>src</em> ACLs to whitelist proxies which are
++   trusted to send correct client details.
++
++<p>
++<verbatim>
++ http_port 3128 proxy-surrogate
++ proxy_forwarded_access allow localhost
++</verbatim>
++
++
+ <sect>Changes to squid.conf since Squid-3.4
+ <p>
+ There have been changes to Squid's configuration file since Squid-3.4.
+@@ -194,6 +216,10 @@ This section gives a thorough account of those changes in three categories:
+ 	<p>Ported from Squid-2 with no configuration or visible behaviour changes.
+            Collapsing of requests is performed across SMP workers.
+ 
++	<tag>proxy_forwarded_access</tag>
++	<p>Renamed from <em>follow_x_forwarded_for</em> and extended to control more
++	   ways for locating the indirect (original) client IP details.
++
+ 	<tag>send_hit</tag>
+ 	<p>New configuration directive to enable/disable sending cached content
+ 	   based on ACL selection. ACL can be based on client request or cached
+@@ -311,6 +337,9 @@ This section gives a thorough account of those changes in three categories:
+ 	<tag>dns_children</tag>
+ 	<p>DNS external helper interface has been removed.
+ 
++	<tag>follow_x_forwarded_for</tag>
++	<p>Renamed <em>proxy_forwarded_access</em> and extended.
++
+ </descrip>
+ 
+ 
+@@ -18,6 +18,11 @@ draft-wilson-wccp-v2-12-oct-2001.txt
+ draft-vinod-carp-v1-03.txt
+ 	Microsoft CARP peering algorithm
+ 
++proxy-protocol.txt
++	Documents Proxy Protocol 1.5, for communicating original client IP
++	details between consenting proxies and servers even when
++	transparent interception is taking place.
++
+ rfc0959.txt
+ 	FTP
+ 
+@@ -25,6 +25,16 @@ class TrafficMode
+      */
+     bool accelSurrogate;
+ 
++    /** marks ports receiving PROXY protocol traffic
++     *
++     * Indicating the following are required:
++     *  - PROXY protocol magic header
++     *  - src/dst IP retrieved from magic PROXY header
++     *  - reverse-proxy traffic prohibited
++     *  - intercepted traffic prohibited
++     */
++    bool proxySurrogate;
++
+     /** marks NAT intercepted traffic
+      *
+      * Indicating the following are required:
+@@ -3597,14 +3597,14 @@ parse_port_option(AnyP::PortCfg * s, char *token)
+     /* modes first */
+ 
+     if (strcmp(token, "accel") == 0) {
+-        if (s->flags.isIntercepted()) {
++        if (s->flags.isIntercepted() || s->flags.proxySurrogate) {
+             debugs(3, DBG_CRITICAL, "FATAL: http(s)_port: Accelerator mode requires its own port. It cannot be shared with other modes.");
+             self_destruct();
+         }
+         s->flags.accelSurrogate = true;
+         s->vhost = true;
+     } else if (strcmp(token, "transparent") == 0 || strcmp(token, "intercept") == 0) {
+-        if (s->flags.accelSurrogate || s->flags.tproxyIntercept) {
++        if (s->flags.accelSurrogate || s->flags.tproxyIntercept || s->flags.proxySurrogate) {
+             debugs(3, DBG_CRITICAL, "FATAL: http(s)_port: Intercept mode requires its own interception port. It cannot be shared with other modes.");
+             self_destruct();
+         }
+@@ -3614,7 +3614,7 @@ parse_port_option(AnyP::PortCfg * s, char *token)
+         debugs(3, DBG_IMPORTANT, "Starting Authentication on port " << s->s);
+         debugs(3, DBG_IMPORTANT, "Disabling Authentication on port " << s->s << " (interception enabled)");
+     } else if (strcmp(token, "tproxy") == 0) {
+-        if (s->flags.natIntercept || s->flags.accelSurrogate) {
++        if (s->flags.natIntercept || s->flags.accelSurrogate || s->flags.proxySurrogate) {
+             debugs(3,DBG_CRITICAL, "FATAL: http(s)_port: TPROXY option requires its own interception port. It cannot be shared with other modes.");
+             self_destruct();
+         }
+@@ -3628,6 +3628,13 @@ parse_port_option(AnyP::PortCfg * s, char *token)
+             self_destruct();
+         }
+ 
++    } else if (strcmp(token, "proxy-surrogate") == 0) {
++        if (s->flags.natIntercept || s->flags.accelSurrogate  || s->flags.tproxyIntercept) {
++            debugs(3,DBG_CRITICAL, "FATAL: http(s)_port: proxy-surrogate option requires its own port. It cannot be shared with other modes.");
++            self_destruct();
++        }
++        s->flags.proxySurrogate = true;
++
+     } else if (strncmp(token, "defaultsite=", 12) == 0) {
+         if (!s->flags.accelSurrogate) {
+             debugs(3, DBG_CRITICAL, "FATAL: http(s)_port: defaultsite option requires Acceleration mode flag.");
+@@ -3870,6 +3877,9 @@ dump_generic_port(StoreEntry * e, const char *n, const AnyP::PortCfg * s)
+     else if (s->flags.tproxyIntercept)
+         storeAppendPrintf(e, " tproxy");
+ 
++    else if (s->flags.proxySurrogate)
++        storeAppendPrintf(e, " proxy-surrogate");
++
+     else if (s->flags.accelSurrogate) {
+         storeAppendPrintf(e, " accel");
+ 
+@@ -1090,15 +1090,23 @@ acl CONNECT method CONNECT
+ NOCOMMENT_END
+ DOC_END
+ 
+-NAME: follow_x_forwarded_for
++NAME: proxy_forwarded_access follow_x_forwarded_for
+ TYPE: acl_access
+-IFDEF: FOLLOW_X_FORWARDED_FOR
+ LOC: Config.accessList.followXFF
+ DEFAULT_IF_NONE: deny all
+-DEFAULT_DOC: X-Forwarded-For header will be ignored.
++DEFAULT_DOC: indirect client IP will not be accepted.
+ DOC_START
+-	Allowing or Denying the X-Forwarded-For header to be followed to
+-	find the original source of a request.
++	Determine which client proxies can be trusted to provide correct
++	information regarding real client IP address.
++
++	The original source details can be relayed in:
++		HTTP message Forwarded header, or
++		HTTP message X-Forwarded-For header, or
++		PROXY protocol connection header.
++
++	Allowing or Denying the X-Forwarded-For or Forwarded headers to
++	be followed to find the original source of a request. Or permitting
++	a client proxy to connect using PROXY protocol.
+ 
+ 	Requests may pass through a chain of several other proxies
+ 	before reaching us.  The X-Forwarded-For header will contain a
+@@ -1531,6 +1539,11 @@ DOC_START
+ 
+ 	   accel	Accelerator / reverse proxy mode
+ 
++	   proxy-surrogate
++			Support for PROXY protocol version 1 connections.
++			The proxy_forwarded_access is required to whitelist
++			downstream proxies which can be trusted.
++
+ 	   ssl-bump	For each CONNECT request allowed by ssl_bump ACLs,
+ 			establish secure connection with the client and with
+ 			the server, decrypt HTTPS messages as they pass through
+@@ -119,6 +119,7 @@
+ #include "MemBuf.h"
+ #include "MemObject.h"
+ #include "mime_header.h"
++#include "parser/Tokenizer.h"
+ #include "profiler/Profiler.h"
+ #include "rfc1738.h"
+ #include "SquidConfig.h"
+@@ -2903,6 +2904,139 @@ ConnStateData::concurrentRequestQueueFilled() const
+     return false;
+ }
+ 
++/**
++ * Perform follow_x_forwarded_for ACL tests on the
++ * client which connected to PROXY protocol port.
++ */
++void
++ConnStateData::proxyProtocolValidateClient()
++{
++    ACLFilledChecklist ch(Config.accessList.followXFF, NULL, clientConnection->rfc931);
++    ch.src_addr = clientConnection->remote;
++    ch.my_addr = clientConnection->local;
++    // TODO: we should also pass the port details for myportname here.
++
++    if (ch.fastCheck() != ACCESS_ALLOWED) {
++        // terminate the connection. invalid input.
++        stopReceiving("PROXY client not permitted by ACLs");
++        stopSending("PROXY client not permitted by ACLs");
++    }
++}
++
++/**
++ * Perform cleanup on PROXY protocol errors.
++ * If header parsing hits a fatal error terminate the connection,
++ * otherwise wait for more data.
++ */
++bool
++ConnStateData::proxyProtocolError(bool fatalError)
++{
++    if (fatalError) {
++        // terminate the connection. invalid input.
++        stopReceiving("PROXY protocol error");
++        stopSending("PROXY protocol error");
++    }
++    return false;
++}
++
++/**
++ * Parse the connection read buffer for PROXY protocol header.
++ * Only version 1 header currently supported.
++ */
++bool
++ConnStateData::parseProxyProtocolMagic()
++{
++    // magic octet prefix for PROXY protocol version 1
++    // http://www.haproxy.org/download/1.5/doc/proxy-protocol.txt
++    static const SBuf proxy1magic("PROXY ");
++
++    // detect and parse PROXY protocol version 1 header
++    if (in.buf.startsWith(proxy1magic)) {
++        ::Parser::Tokenizer tok(in.buf);
++        tok.skip(proxy1magic);
++
++        SBuf tcpVersion;
++        if (!tok.prefix(tcpVersion, CharacterSet::ALPHA+CharacterSet::DIGIT))
++            return proxyProtocolError(tok.atEnd());
++
++        if (!tcpVersion.cmp("UNKNOWN")) {
++            // skip to first LF (assumes it is part of CRLF)
++            const SBuf::size_type pos = in.buf.findFirstOf(CharacterSet::LF);
++            if (pos != SBuf::npos) {
++                if (in.buf[pos-1] != '\r')
++                    return proxyProtocolError(false); // invalid terminator
++                // found valid but unusable header
++                in.buf.consume(pos);
++                needProxyProtocolHeader_ = false;
++                return true;
++            }
++            // else, no LF found
++
++            // protocol error only if there are more than 107 bytes prefix header
++            return proxyProtocolError(in.buf.length() > 107);
++
++        } else if (!tcpVersion.cmp("TCP",3)) {
++
++            // skip SP after protocol version
++            if (!tok.skip(' '))
++                return proxyProtocolError(tok.atEnd());
++
++            SBuf ipa, ipb;
++            int64_t porta, portb;
++            const CharacterSet ipChars =  CharacterSet("IP Address",".:") + CharacterSet::HEXDIG;
++
++            // parse  src-IP SP dst-IP SP src-port SP dst-port CRLF
++            if (!tok.prefix(ipa, ipChars) || !tok.skip(' ') ||
++               !tok.prefix(ipb, ipChars) || !tok.skip(' ') ||
++               !tok.int64(porta) || !tok.skip(' ') ||
++               !tok.int64(portb) || !tok.skip('\r') || !tok.skip('\n'))
++                return proxyProtocolError(!tok.atEnd());
++
++            // XXX parse IP and port strings
++            Ip::Address originalClient, originalDest;
++
++            if (!originalClient.GetHostByName(ipa.c_str()))
++                return proxyProtocolError(true);
++
++            if (!originalDest.GetHostByName(ipb.c_str()))
++                return false;
++
++            if (porta > 0 && porta <= 0xFFFF) // max uint16_t
++                originalClient.port(static_cast<uint16_t>(porta));
++            else
++                return proxyProtocolError(true);
++
++            if (portb > 0 && portb <= 0xFFFF) // max uint16_t
++                originalDest.port(static_cast<uint16_t>(portb));
++            else
++                return proxyProtocolError(true);
++
++            in.buf = tok.remaining(); // sync buffers
++            needProxyProtocolHeader_ = false; // found successfully
++
++            // we have original client and destination details now
++            // replace the tcpClient connection values
++            debugs(33, 5, "PROXY protocol on connection " << clientConnection);
++            clientConnection->local = originalDest;
++            clientConnection->remote = originalClient;
++            debugs(33, 5, "PROXY upgrade: " << clientConnection);
++
++            // repeat fetch ensuring the new client FQDN can be logged
++            if (Config.onoff.log_fqdn)
++                fqdncache_gethostbyaddr(clientConnection->remote, FQDN_LOOKUP_IF_MISS);
++
++            return true;
++        }
++
++    } else if (in.buf.length() >= proxy1magic.length()) {
++        // input other than the PROXY header is a protocol error
++        return proxyProtocolError(true);
++    }
++
++    // not enough bytes to parse yet.
++    return false;
++}
++
+ /**
+  * Attempt to parse one or more requests from the input buffer.
+  * If a request is successfully parsed, even if the next request
+@@ -2931,6 +3065,11 @@ ConnStateData::clientParseRequests()
+ 
+         /* Begin the parsing */
+         PROF_start(parseHttpRequest);
++
++        // try to parse the PROXY protocol header magic bytes
++        if (needProxyProtocolHeader_ && !parseProxyProtocolMagic())
++            break;
++
+         HttpParserInit(&parser_, in.buf.c_str(), in.buf.length());
+ 
+         /* Process request */
+@@ -3321,6 +3460,10 @@ ConnStateData::ConnStateData(const MasterXaction::Pointer &xact) :
+     clientdbEstablished(clientConnection->remote, 1);
+ 
+     flags.readMore = true;
++
++    needProxyProtocolHeader_ = xact->squidPort->flags.proxySurrogate;
++    if (needProxyProtocolHeader_)
++        proxyProtocolValidateClient(); // will close the connection on failure
+ }
+ 
+ /** Handle a new connection on HTTP socket. */
+@@ -389,6 +389,14 @@ class ConnStateData : public BodyProducer, public HttpControlMsgSink
+     void clientAfterReadingRequests();
+     bool concurrentRequestQueueFilled() const;
+ 
++    /* PROXY protocol functionality */
++    void proxyProtocolValidateClient();
++    bool parseProxyProtocolMagic();
++    bool proxyProtocolError(bool isFatal);
++
++    /// whether PROXY protocol header is still expected on this port
++    bool needProxyProtocolHeader_;
++
+ #if USE_AUTH
+     /// some user details that can be used to perform authentication on this connection
+     Auth::UserRequest::Pointer auth_;

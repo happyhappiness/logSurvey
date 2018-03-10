@@ -1,0 +1,756 @@
+@@ -1808,7 +1808,7 @@ DOC_START
+ 			    NO_TLSv1_2  Disallow the use of TLSv1.2
+ 			    SINGLE_DH_USE Always create a new key when using
+ 				      temporary/ephemeral DH key exchanges
+-			    SSL_OP_NO_TICKET Disables TLS tickets extension
++			    NO_TICKET Disables TLS tickets extension
+ 			    ALL       Enable various bug workarounds
+ 				      suggested as "harmless" by OpenSSL
+ 				      Be warned that this reduces SSL/TLS
+@@ -50,7 +50,8 @@ void Kid::start(pid_t cpid)
+ }
+ 
+ /// called when kid terminates, sets exiting status
+-void Kid::stop(status_type theExitStatus)
++void
++Kid::stop(PidStatus const theExitStatus)
+ {
+     assert(running());
+     assert(startTime != 0);
+@@ -10,17 +10,13 @@
+ #define SQUID_IPC_KID_H
+ 
+ #include "SquidString.h"
++#include "tools.h"
+ 
+ /// Squid child, including current forked process info and
+ /// info persistent across restarts
+ class Kid
+ {
+ public:
+-#if _SQUID_NEXT_
+-    typedef union wait status_type;
+-#else
+-    typedef int status_type;
+-#endif
+ 
+     /// keep restarting until the number of bad failures exceed this limit
+     enum { badFailureLimit = 4 };
+@@ -37,7 +33,7 @@ class Kid
+     void start(pid_t cpid);
+ 
+     /// called when kid terminates, sets exiting status
+-    void stop(status_type exitStatus);
++    void stop(PidStatus const exitStatus);
+ 
+     /// returns true if tracking of kid is stopped
+     bool running() const;
+@@ -84,7 +80,7 @@ class Kid
+     pid_t  pid; ///< current (for a running kid) or last (for stopped kid) PID
+     time_t startTime; ///< last start time
+     bool   isRunning; ///< whether the kid is assumed to be alive
+-    status_type status; ///< exit status of a stopped kid
++    PidStatus status; ///< exit status of a stopped kid
+ };
+ 
+ // TODO: processes may not be kids; is there a better place to put this?
+@@ -151,6 +151,7 @@ static volatile int do_reconfigure = 0;
+ static volatile int do_rotate = 0;
+ static volatile int do_shutdown = 0;
+ static volatile int shutdown_status = 0;
++static volatile int do_handle_stopped_child = 0;
+ 
+ static int RotateSignal = -1;
+ static int ReconfigureSignal = -1;
+@@ -195,6 +196,12 @@ class SignalEngine: public AsyncEngine
+ {
+ 
+ public:
++#if KILL_PARENT_OPT
++    SignalEngine(): parentKillNotified(false) {
++        parentPid = getppid();
++    }
++#endif
++
+     virtual int checkEvents(int timeout);
+ 
+ private:
+@@ -204,6 +211,12 @@ class SignalEngine: public AsyncEngine
+     }
+ 
+     void doShutdown(time_t wait);
++    void handleStoppedChild();
++
++#if KILL_PARENT_OPT
++    bool parentKillNotified;
++    pid_t parentPid;
++#endif
+ };
+ 
+ int
+@@ -221,11 +234,10 @@ SignalEngine::checkEvents(int)
+         doShutdown(do_shutdown > 0 ? (int) Config.shutdownLifetime : 0);
+         do_shutdown = 0;
+     }
+-    BroadcastSignalIfAny(DebugSignal);
+-    BroadcastSignalIfAny(RotateSignal);
+-    BroadcastSignalIfAny(ReconfigureSignal);
+-    BroadcastSignalIfAny(ShutdownSignal);
+-
++    if (do_handle_stopped_child) {
++        do_handle_stopped_child = 0;
++        handleStoppedChild();
++    }
+     PROF_stop(SignalEngine_checkEvents);
+     return EVENT_IDLE;
+ }
+@@ -236,23 +248,63 @@ SignalEngine::doShutdown(time_t wait)
+     debugs(1, DBG_IMPORTANT, "Preparing for shutdown after " << statCounter.client_http.requests << " requests");
+     debugs(1, DBG_IMPORTANT, "Waiting " << wait << " seconds for active connections to finish");
+ 
+-    shutting_down = 1;
++#if KILL_PARENT_OPT
++    if (!IamMasterProcess() && !parentKillNotified && ShutdownSignal > 0 && parentPid > 1) {
++        debugs(1, DBG_IMPORTANT, "Killing master process, pid " << parentPid);
++        if (kill(parentPid, ShutdownSignal) < 0)
++            debugs(1, DBG_IMPORTANT, "kill " << parentPid << ": " << xstrerror());
++        parentKillNotified = true;
++    }
++#endif
+ 
+-#if USE_WIN32_SERVICE
+-    WIN32_svcstatusupdate(SERVICE_STOP_PENDING, (wait + 1) * 1000);
++    if (shutting_down) {
++#if !KILL_PARENT_OPT
++        // Already a shutdown signal has received and shutdown is in progress.
++        // Shutdown as soon as possible.
++        wait = 0;
+ #endif
++    } else {
++        shutting_down = 1;
+ 
+-    /* run the closure code which can be shared with reconfigure */
+-    serverConnectionsClose();
++        /* run the closure code which can be shared with reconfigure */
++        serverConnectionsClose();
+ #if USE_AUTH
+-    /* detach the auth components (only do this on full shutdown) */
+-    Auth::Scheme::FreeAll();
++        /* detach the auth components (only do this on full shutdown) */
++        Auth::Scheme::FreeAll();
++#endif
++
++        RunRegisteredHere(RegisteredRunner::startShutdown);
++    }
++
++#if USE_WIN32_SERVICE
++    WIN32_svcstatusupdate(SERVICE_STOP_PENDING, (wait + 1) * 1000);
+ #endif
+ 
+-    RunRegisteredHere(RegisteredRunner::startShutdown);
+     eventAdd("SquidShutdown", &StopEventLoop, this, (double) (wait + 1), 1, false);
+ }
+ 
++void
++SignalEngine::handleStoppedChild()
++{
++#if !_SQUID_WINDOWS_
++    PidStatus status;
++    pid_t pid;
++
++    do {
++        pid = WaitForAnyPid(status, WNOHANG);
++
++#if HAVE_SIGACTION
++
++    } while (pid > 0);
++
++#else
++
++    }
++    while (pid > 0 || (pid < 0 && errno == EINTR));
++#endif
++#endif
++}
++
+ static void
+ usage(void)
+ {
+@@ -626,6 +678,21 @@ reconfigure(int sig)
+ #endif
+ }
+ 
++/// Shutdown signal handler for master process
++void
++master_shutdown(int sig)
++{
++    do_shutdown = 1;
++    ShutdownSignal = sig;
++
++#if !_SQUID_WINDOWS_
++#if !HAVE_SIGACTION
++    signal(sig, master_shutdown);
++#endif
++#endif
++
++}
++
+ void
+ shut_down(int sig)
+ {
+@@ -637,29 +704,20 @@ shut_down(int sig)
+ #endif
+ 
+ #if !_SQUID_WINDOWS_
+-    const pid_t ppid = getppid();
+-
+-    if (!IamMasterProcess() && ppid > 1) {
+-        // notify master that we are shutting down
+-        if (kill(ppid, SIGUSR1) < 0)
+-            debugs(1, DBG_IMPORTANT, "Failed to send SIGUSR1 to master process,"
+-                   " pid " << ppid << ": " << xstrerror());
+-    }
+-
+-#if KILL_PARENT_OPT
+-    if (!IamMasterProcess() && ppid > 1) {
+-        debugs(1, DBG_IMPORTANT, "Killing master process, pid " << ppid);
+-
+-        if (kill(ppid, sig) < 0)
+-            debugs(1, DBG_IMPORTANT, "kill " << ppid << ": " << xstrerror());
+-    }
+-#endif /* KILL_PARENT_OPT */
+-
+-#if SA_RESETHAND == 0
+-    signal(SIGTERM, SIG_DFL);
++#if !HAVE_SIGACTION
++    signal(sig, shut_down);
++#endif
++#endif
++}
+ 
+-    signal(SIGINT, SIG_DFL);
++void
++sig_child(int sig)
++{
++    do_handle_stopped_child = 1;
+ 
++#if !_SQUID_WINDOWS_
++#if !HAVE_SIGACTION
++    signal(sig, sig_child);
+ #endif
+ #endif
+ }
+@@ -881,7 +939,8 @@ mainReconfigureFinish(void *)
+             eventDelete(start_announce, NULL);
+     }
+ 
+-    writePidFile();     /* write PID file */
++    if (!InDaemonMode())
++        writePidFile(); /* write PID file */
+ 
+     reconfiguring = 0;
+ }
+@@ -1132,7 +1191,7 @@ mainInitialize(void)
+     if (Config.chroot_dir)
+         no_suid();
+ 
+-    if (!configured_once)
++    if (!configured_once && !InDaemonMode())
+         writePidFile();     /* write PID file */
+ 
+ #if defined(_SQUID_LINUX_THREADS_)
+@@ -1151,13 +1210,13 @@ mainInitialize(void)
+ 
+     squid_signal(SIGHUP, reconfigure, SA_RESTART);
+ 
+-    squid_signal(SIGTERM, shut_down, SA_NODEFER | SA_RESETHAND | SA_RESTART);
++    squid_signal(SIGTERM, shut_down, SA_RESTART);
+ 
+-    squid_signal(SIGINT, shut_down, SA_NODEFER | SA_RESETHAND | SA_RESTART);
++    squid_signal(SIGINT, shut_down, SA_RESTART);
+ 
+ #ifdef SIGTTIN
+ 
+-    squid_signal(SIGTTIN, shut_down, SA_NODEFER | SA_RESETHAND | SA_RESTART);
++    squid_signal(SIGTTIN, shut_down, SA_RESTART);
+ 
+ #endif
+ 
+@@ -1439,8 +1498,10 @@ SquidMain(int argc, char **argv)
+     RunRegisteredHere(RegisteredRunner::useConfig);
+     enter_suid();
+ 
+-    if (!opt_no_daemon && Config.workers > 0)
++    if (InDaemonMode() && IamMasterProcess()) {
+         watch_child(argv);
++        // NOTREACHED
++    }
+ 
+     if (opt_create_swap_dirs) {
+         /* chroot if configured to run inside chroot */
+@@ -1606,15 +1667,8 @@ mainStartScript(const char *prog)
+         _exit(-1);
+     } else {
+         do {
+-#if _SQUID_NEXT_
+-            union wait status;
+-            rpid = wait4(cpid, &status, 0, NULL);
+-#else
+-
+-            int status;
+-            rpid = waitpid(cpid, &status, 0);
+-#endif
+-
++            PidStatus status;
++            rpid = WaitForOnePid(cpid, status, 0);
+         } while (rpid != cpid);
+     }
+ }
+@@ -1647,18 +1701,32 @@ checkRunningPid(void)
+ }
+ 
+ static void
+-watch_child(char *argv[])
++masterCheckAndBroadcastSignals()
+ {
+-#if !_SQUID_WINDOWS_
+-    char *prog;
+-#if _SQUID_NEXT_
++    // if (do_reconfigure)
++    //     TODO: hot-reconfiguration of the number of kids and PID file location
+ 
+-    union wait status;
+-#else
++    if (do_shutdown)
++        shutting_down = 1;
+ 
+-    int status;
+-#endif
++    BroadcastSignalIfAny(DebugSignal);
++    BroadcastSignalIfAny(RotateSignal);
++    BroadcastSignalIfAny(ReconfigureSignal);
++    BroadcastSignalIfAny(ShutdownSignal);
++}
+ 
++static inline bool
++masterSignaled()
++{
++    return (DebugSignal > 0 || RotateSignal > 0 || ReconfigureSignal > 0 || ShutdownSignal > 0);
++}
++
++static void
++watch_child(char *argv[])
++{
++#if !_SQUID_WINDOWS_
++    char *prog;
++    PidStatus status;
+     pid_t pid;
+ #ifdef TIOCNOTTY
+ 
+@@ -1667,9 +1735,6 @@ watch_child(char *argv[])
+ 
+     int nullfd;
+ 
+-    if (!IamMasterProcess())
+-        return;
+-
+     openlog(APP_SHORTNAME, LOG_PID | LOG_NDELAY | LOG_CONS, LOG_LOCAL4);
+ 
+     if ((pid = fork()) < 0)
+@@ -1709,8 +1774,23 @@ watch_child(char *argv[])
+         dup2(nullfd, 2);
+     }
+ 
+-    // handle shutdown notifications from kids
+-    squid_signal(SIGUSR1, sig_shutdown, SA_RESTART);
++    writePidFile();
++
++#if defined(_SQUID_LINUX_THREADS_)
++    squid_signal(SIGQUIT, rotate_logs, 0);
++    squid_signal(SIGTRAP, sigusr2_handle, 0);
++#else
++    squid_signal(SIGUSR1, rotate_logs, 0);
++    squid_signal(SIGUSR2, sigusr2_handle, 0);
++#endif
++
++    squid_signal(SIGHUP, reconfigure, 0);
++
++    squid_signal(SIGTERM, master_shutdown, 0);
++    squid_signal(SIGINT, master_shutdown, 0);
++#ifdef SIGTTIN
++    squid_signal(SIGTTIN, master_shutdown, 0);
++#endif
+ 
+     if (Config.workers > 128) {
+         syslog(LOG_ALERT, "Suspiciously high workers value: %d",
+@@ -1723,14 +1803,18 @@ watch_child(char *argv[])
+ 
+     // keep [re]starting kids until it is time to quit
+     for (;;) {
+-        mainStartScript(argv[0]);
+-
++        bool mainStartScriptCalled = false;
+         // start each kid that needs to be [re]started; once
+-        for (int i = TheKids.count() - 1; i >= 0; --i) {
++        for (int i = TheKids.count() - 1; i >= 0 && !shutting_down; --i) {
+             Kid& kid = TheKids.get(i);
+             if (!kid.shouldRestart())
+                 continue;
+ 
++            if (!mainStartScriptCalled) {
++                mainStartScript(argv[0]);
++                mainStartScriptCalled = true;
++            }
++
+             if ((pid = fork()) == 0) {
+                 /* child */
+                 openlog(APP_SHORTNAME, LOG_PID | LOG_NDELAY | LOG_CONS, LOG_LOCAL4);
+@@ -1748,50 +1832,45 @@ watch_child(char *argv[])
+         /* parent */
+         openlog(APP_SHORTNAME, LOG_PID | LOG_NDELAY | LOG_CONS, LOG_LOCAL4);
+ 
+-        squid_signal(SIGINT, SIG_IGN, SA_RESTART);
+-
+-#if _SQUID_NEXT_
+-
+-        pid = wait3(&status, 0, NULL);
+-
+-#else
+-
+-        pid = waitpid(-1, &status, 0);
+-
+-#endif
+-        // Loop to collect all stopped kids before we go to sleep below.
+-        do {
+-            Kid* kid = TheKids.find(pid);
+-            if (kid) {
+-                kid->stop(status);
+-                if (kid->calledExit()) {
+-                    syslog(LOG_NOTICE,
+-                           "Squid Parent: %s process %d exited with status %d",
+-                           kid->name().termedBuf(),
+-                           kid->getPid(), kid->exitStatus());
+-                } else if (kid->signaled()) {
+-                    syslog(LOG_NOTICE,
+-                           "Squid Parent: %s process %d exited due to signal %d with status %d",
+-                           kid->name().termedBuf(),
+-                           kid->getPid(), kid->termSignal(), kid->exitStatus());
+-                } else {
+-                    syslog(LOG_NOTICE, "Squid Parent: %s process %d exited",
+-                           kid->name().termedBuf(), kid->getPid());
+-                }
+-                if (kid->hopeless()) {
+-                    syslog(LOG_NOTICE, "Squid Parent: %s process %d will not"
+-                           " be restarted due to repeated, frequent failures",
+-                           kid->name().termedBuf(), kid->getPid());
+-                }
++        // If Squid received a signal while checking for dying kids (below) or
++        // starting new kids (above), then do a fast check for a new dying kid
++        // (WaitForAnyPid with the WNOHANG option) and continue to forward
++        // signals to kids. Otherwise, wait for a kid to die or for a signal
++        // to abort the blocking WaitForAnyPid() call.
++        // With the WNOHANG option, we could check whether WaitForAnyPid() was
++        // aborted by a dying kid or a signal, but it is not required: The
++        // next do/while loop will check again for any dying kids.
++        int waitFlag = 0;
++        if (masterSignaled())
++            waitFlag = WNOHANG;
++        pid = WaitForAnyPid(status, waitFlag);
++
++        // check for a stopped kid
++        Kid* kid = pid > 0 ? TheKids.find(pid) : NULL;
++        if (kid) {
++            kid->stop(status);
++            if (kid->calledExit()) {
++                syslog(LOG_NOTICE,
++                       "Squid Parent: %s process %d exited with status %d",
++                       kid->name().termedBuf(),
++                       kid->getPid(), kid->exitStatus());
++            } else if (kid->signaled()) {
++                syslog(LOG_NOTICE,
++                       "Squid Parent: %s process %d exited due to signal %d with status %d",
++                       kid->name().termedBuf(),
++                       kid->getPid(), kid->termSignal(), kid->exitStatus());
+             } else {
+-                syslog(LOG_NOTICE, "Squid Parent: unknown child process %d exited", pid);
++                syslog(LOG_NOTICE, "Squid Parent: %s process %d exited",
++                       kid->name().termedBuf(), kid->getPid());
+             }
+-#if _SQUID_NEXT_
+-        } while ((pid = wait3(&status, WNOHANG, NULL)) > 0);
+-#else
++            if (kid->hopeless()) {
++                syslog(LOG_NOTICE, "Squid Parent: %s process %d will not"
++                       " be restarted due to repeated, frequent failures",
++                       kid->name().termedBuf(), kid->getPid());
++            }
++        } else if (pid > 0) {
++            syslog(LOG_NOTICE, "Squid Parent: unknown child process %d exited", pid);
+         }
+-        while ((pid = waitpid(-1, &status, WNOHANG)) > 0);
+-#endif
+ 
+         if (!TheKids.someRunning() && !TheKids.shouldRestartSome()) {
+             leave_suid();
+@@ -1800,6 +1879,7 @@ watch_child(char *argv[])
+             RunRegisteredHere(RegisteredRunner::finishShutdown);
+             enter_suid();
+ 
++            removePidFile();
+             if (TheKids.someSignaled(SIGINT) || TheKids.someSignaled(SIGTERM)) {
+                 syslog(LOG_ALERT, "Exiting due to unexpected forced shutdown");
+                 exit(1);
+@@ -1813,8 +1893,7 @@ watch_child(char *argv[])
+             exit(0);
+         }
+ 
+-        squid_signal(SIGINT, SIG_DFL, SA_RESTART);
+-        sleep(3);
++        masterCheckAndBroadcastSignals();
+     }
+ 
+     /* NOTREACHED */
+@@ -1920,12 +1999,8 @@ SquidShutdown()
+ 
+     memClean();
+ 
+-    if (IamPrimaryProcess()) {
+-        if (Config.pidFilename && strcmp(Config.pidFilename, "none") != 0) {
+-            enter_suid();
+-            safeunlink(Config.pidFilename, 0);
+-            leave_suid();
+-        }
++    if (!InDaemonMode()) {
++        removePidFile();
+     }
+ 
+     debugs(1, DBG_IMPORTANT, "Squid Cache (Version " << version_string << "): Exiting normally.");
+@@ -313,16 +313,19 @@ ssl_verify_cb(int ok, X509_STORE_CTX * ctx)
+             // pass them to certficate validator for more processing
+             else if (Ssl::TheConfig.ssl_crt_validator) {
+                 ok = 1;
+-                // Check if we have stored certificates chain. Store if not.
+-                if (!SSL_get_ex_data(ssl, ssl_ex_index_ssl_cert_chain)) {
+-                    STACK_OF(X509) *certStack = X509_STORE_CTX_get1_chain(ctx);
+-                    if (certStack && !SSL_set_ex_data(ssl, ssl_ex_index_ssl_cert_chain, certStack))
+-                        sk_X509_pop_free(certStack, X509_free);
+-                }
+             }
+         }
+     }
+ 
++    if (Ssl::TheConfig.ssl_crt_validator) {
++        // Check if we have stored certificates chain. Store if not.
++        if (!SSL_get_ex_data(ssl, ssl_ex_index_ssl_cert_chain)) {
++            STACK_OF(X509) *certStack = X509_STORE_CTX_get1_chain(ctx);
++            if (certStack && !SSL_set_ex_data(ssl, ssl_ex_index_ssl_cert_chain, certStack))
++                sk_X509_pop_free(certStack, X509_free);
++        }
++    }
++
+     if (!ok && !SSL_get_ex_data(ssl, ssl_ex_index_ssl_error_detail) ) {
+ 
+         // Find the broken certificate. It may be intermediate.
+@@ -460,7 +463,7 @@ ssl_options[] = {
+ #endif
+ #if SSL_OP_NO_TICKET
+     {
+-        "SSL_OP_NO_TICKET", SSL_OP_NO_TICKET
++        "NO_TICKET", SSL_OP_NO_TICKET
+     },
+ #endif
+     {
+@@ -29,7 +29,6 @@ void BroadcastSignalIfAny(int& sig) STUB
+ void sigusr2_handle(int sig) STUB
+ void debug_trap(const char *message) STUB
+ void sig_child(int sig) STUB
+-void sig_shutdown(int sig) STUB
+ const char * getMyHostname(void) STUB_RETVAL(NULL)
+ const char * uniqueHostname(void) STUB_RETVAL(NULL)
+ void leave_suid(void) STUB
+@@ -63,6 +62,7 @@ int NumberOfKids() STUB_RETVAL(0)
+ //not yet needed in the Stub, causes dependency on String
+ //String ProcessRoles() STUB_RETVAL(String())
+ void writePidFile(void) STUB
++void removePidFile(void) STUB
+ pid_t readPidFile(void) STUB_RETVAL(0)
+ void setMaxFD(void) STUB
+ void setSystemLimits(void) STUB
+@@ -76,4 +76,5 @@ void setUmask(mode_t mask) STUB
+ void strwordquote(MemBuf * mb, const char *str) STUB
+ void keepCapabilities(void) STUB
+ void restoreCapabilities(bool keep) STUB
++pid_t WaitForOnePid(pid_t pid, PidStatus &status, int flags) STUB_RETVAL(0)
+ 
+@@ -360,8 +360,12 @@ void
+ BroadcastSignalIfAny(int& sig)
+ {
+     if (sig > 0) {
+-        if (IamCoordinatorProcess())
+-            Ipc::Coordinator::Instance()->broadcastSignal(sig);
++        if (IamMasterProcess()) {
++            for (int i = TheKids.count() - 1; i >= 0; --i) {
++                Kid& kid = TheKids.get(i);
++                kill(kid.getPid(), sig);
++            }
++        }
+         sig = -1;
+     }
+ }
+@@ -398,48 +402,6 @@ debug_trap(const char *message)
+     _db_print("WARNING: %s\n", message);
+ }
+ 
+-void
+-sig_child(int sig)
+-{
+-#if !_SQUID_WINDOWS_
+-#if _SQUID_NEXT_
+-    union wait status;
+-#else
+-
+-    int status;
+-#endif
+-
+-    pid_t pid;
+-
+-    do {
+-#if _SQUID_NEXT_
+-        pid = wait3(&status, WNOHANG, NULL);
+-#else
+-
+-        pid = waitpid(-1, &status, WNOHANG);
+-#endif
+-        /* no debugs() here; bad things happen if the signal is delivered during _db_print() */
+-#if HAVE_SIGACTION
+-
+-    } while (pid > 0);
+-
+-#else
+-
+-    }
+-
+-    while (pid > 0 || (pid < 0 && errno == EINTR));
+-    signal(sig, sig_child);
+-
+-#endif
+-#endif
+-}
+-
+-void
+-sig_shutdown(int)
+-{
+-    shutting_down = 1;
+-}
+-
+ const char *
+ getMyHostname(void)
+ {
+@@ -745,9 +707,6 @@ writePidFile(void)
+     mode_t old_umask;
+     char buf[32];
+ 
+-    if (!IamPrimaryProcess())
+-        return;
+-
+     if ((f = Config.pidFilename) == NULL)
+         return;
+ 
+@@ -758,7 +717,7 @@ writePidFile(void)
+ 
+     old_umask = umask(022);
+ 
+-    fd = file_open(f, O_WRONLY | O_CREAT | O_TRUNC | O_TEXT);
++    fd = open(f, O_WRONLY | O_CREAT | O_TRUNC | O_TEXT, 0644);
+ 
+     umask(old_umask);
+ 
+@@ -771,8 +730,19 @@ writePidFile(void)
+     }
+ 
+     snprintf(buf, 32, "%d\n", (int) getpid());
+-    FD_WRITE_METHOD(fd, buf, strlen(buf));
+-    file_close(fd);
++    const size_t ws = write(fd, buf, strlen(buf));
++    assert(ws == strlen(buf));
++    close(fd);
++}
++
++void
++removePidFile()
++{
++    if (Config.pidFilename && strcmp(Config.pidFilename, "none") != 0) {
++        enter_suid();
++        safeunlink(Config.pidFilename, 0);
++        leave_suid();
++    }
+ }
+ 
+ pid_t
+@@ -1227,7 +1197,10 @@ restoreCapabilities(bool keep)
+         cap_value_t cap_list[10];
+         cap_list[ncaps] = CAP_NET_BIND_SERVICE;
+         ++ncaps;
+-        if (Ip::Interceptor.TransparentActive() || Ip::Qos::TheConfig.isHitNfmarkActive() || Ip::Qos::TheConfig.isAclNfmarkActive()) {
++        if (Ip::Interceptor.TransparentActive() ||
++                Ip::Qos::TheConfig.isHitNfmarkActive() ||
++                Ip::Qos::TheConfig.isAclNfmarkActive() ||
++                Ip::Qos::TheConfig.isAclTosActive()) {
+             cap_list[ncaps] = CAP_NET_ADMIN;
+             ++ncaps;
+         }
+@@ -1246,3 +1219,15 @@ restoreCapabilities(bool keep)
+ #endif /* HAVE_SYS_CAPABILITY_H */
+ }
+ 
++pid_t
++WaitForOnePid(pid_t pid, PidStatus &status, int flags)
++{
++#if _SQUID_NEXT_
++    if (pid < 0)
++        return wait3(&status, flags, NULL);
++    return wait4(cpid, &status, flags, NULL);
++#else
++    return waitpid(pid, &status, flags);
++#endif
++}
++
+@@ -44,6 +44,7 @@ void leave_suid(void);
+ void enter_suid(void);
+ void no_suid(void);
+ void writePidFile(void);
++void removePidFile();
+ void setMaxFD(void);
+ void setSystemLimits(void);
+ void squid_signal(int sig, SIGHDLR *, int flags);
+@@ -85,5 +86,30 @@ void releaseServerSockets(void);
+ void PrintRusage(void);
+ void dumpMallocStats(void);
+ 
++#if _SQUID_NEXT_
++typedef union wait PidStatus;
++#else
++typedef int PidStatus;
++#endif
++
++/**
++ * Compatibility wrapper function for waitpid
++ * \pid the pid of child proccess to wait for.
++ * \param status the exit status returned by waitpid
++ * \param flags WNOHANG or 0
++ */
++pid_t WaitForOnePid(pid_t pid, PidStatus &status, int flags);
++
++/**
++ * Wait for state changes in any of the kid processes.
++ * Equivalent to waitpid(-1, ...) system call
++ * \param status the exit status returned by waitpid
++ * \param flags WNOHANG or 0
++ */
++inline pid_t WaitForAnyPid(PidStatus &status, int flags)
++{
++    return WaitForOnePid(-1, status, flags);
++}
++
+ #endif /* SQUID_TOOLS_H_ */
+ 

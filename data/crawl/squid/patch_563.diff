@@ -1,0 +1,1204 @@
+@@ -829,14 +829,21 @@ void squid_getprotobynumber(void) {
+   SQUID_STATE_ROLLBACK(winsock)
+ ])
+ 
+-
+ dnl check that setresuid is properly implemented.
+ dnl sets squid_cv_resuid_works to "yes" or "no"
+ AC_DEFUN([SQUID_CHECK_SETRESUID_WORKS],[
+   AC_CACHE_CHECK(if setresuid is actually implemented, squid_cv_resuid_works,
+     AC_RUN_IFELSE([
+       AC_LANG_SOURCE([[
++#if HAVE_STDLIB_H
+ #include <stdlib.h>
++#endif
++#if HAVE_STDIO_H
++#include <stdio.h>
++#endif
++#if HAVE_UNISTD_H
++#include <unistd.h>
++#endif
+   int main(int argc, char **argv) {
+     if(setresuid(-1,-1,-1)) {
+       perror("setresuid:");
+@@ -31,12 +31,14 @@ Although this release is deemed good enough for use in many setups, please note
+ 
+ <itemize>
+ 	<item>The lack of some features available in Squid-2.x series. See the regression sections below for full details.
++	<item>eCAP library version 0.2.0 and later are not supported. See eCAP section below for details.
++	<item>CVE-2009-0801 : NAT interception vulnerability to malicious clients. This is fixed in 3.2 series.
++		Some attempts have been made to port for 3.1, but the unreliability of NAT handling in 3.1 makes this unsafe.
+ </itemize>
+ 
+ <p>Currently known issues which only depends on available developer time and may still be resolved in a future 3.1 release are:
+ 
+ <itemize>
+-	<item>CVE-2009-0801 : NAT interception vulnerability to malicious clients. This is fixed in 3.2 series.
+ 	<item>Windows support is still largely missing.
+ 	<item>AIX support for building with the IBM compiler is broken.
+ 	<item>OpenSSL 1.0.0 support is incomplete.
+@@ -319,6 +321,9 @@ reduce the number of warnings by blocking some embedded content.
+ 
+ <p>Currently known and available eCAP modules are listed in the wiki feature page on eCAP.
+ 
++<p><em>Known Issue:</em> libecap version 0.0.3 (exactly) is required to build this series
++  of Squid. Other versions of libecap contain significant interface differences.
++
+ 
+ <sect1>ICAP Bypass and Retry enhancements
+ 
+@@ -662,6 +662,18 @@ This section gives a thorough account of those changes in three categories:
+ 	<p>New option <em>max-stale=</em> to provide a maximum staleness factor. Squid won't
+ 	   serve objects more stale than this even if it failed to validate the object.
+ 
++	<tag>reply_header_access</tag>
++	<p>Added support for custom header header names.</p>
++
++	<tag>request_header_access</tag>
++	<p>Added support for custom header header names.</p>
++
++	<tag>reply_header_replace</tag>
++	<p>Added support for custom header header names.</p>
++
++	<tag>request_header_replace</tag>
++	<p>Added support for custom header header names.</p>
++
+ 	<tag>tcp_outgoing_address</tag>
+ 	<p>This parameter is now compatible with persistent server connections.
+ 	   The IPv6 magic 'to_ipv6' hacks needed in 3.1 are now no longer necessary.
+@@ -51,6 +51,10 @@
+ 		'HttpStateData (\S+) created',
+ 		'cbdataFree: Freeing (\S+)',
+ 	],
++	FD => [
++		'fd_open.*\sFD (\d+)',
++		'fd_close\s+FD (\d+)',
++	],
+ );
+ 
+ if (!$Pairs{$Thing}) {
+@@ -34,10 +34,14 @@
+ 
+ #include "squid-old.h"
+ #include "acl/FilledChecklist.h"
++#include "acl/Gadgets.h"
+ #include "compat/strtoll.h"
+ #include "HttpHdrContRange.h"
+ #include "HttpHeader.h"
++#include "HttpHeaderTools.h"
++#include "HttpRequest.h"
+ #include "MemBuf.h"
++#include "Store.h"
+ 
+ static void httpHeaderPutStrvf(HttpHeader * hdr, http_hdr_type id, const char *fmt, va_list vargs);
+ 
+@@ -414,18 +418,24 @@ httpHdrMangle(HttpHeaderEntry * e, HttpRequest * request, int req_or_rep)
+     int retval;
+ 
+     /* check with anonymizer tables */
+-    header_mangler *hm;
++    HeaderManglers *hms = NULL;
+     assert(e);
+ 
+     if (ROR_REQUEST == req_or_rep) {
+-        hm = &Config.request_header_access[e->id];
++        hms = Config.request_header_access;
+     } else if (ROR_REPLY == req_or_rep) {
+-        hm = &Config.reply_header_access[e->id];
++        hms = Config.reply_header_access;
+     } else {
+         /* error. But let's call it "request". */
+-        hm = &Config.request_header_access[e->id];
++        hms = Config.request_header_access;
+     }
+ 
++    /* manglers are not configured for this message kind */
++    if (!hms)
++        return 1;
++
++    const header_mangler *hm = hms->find(*e);
++
+     /* mangler or checklist went away. default allow */
+     if (!hm || !hm->access_list) {
+         return 1;
+@@ -467,17 +477,142 @@ httpHdrMangleList(HttpHeader * l, HttpRequest * request, int req_or_rep)
+         l->refreshMask();
+ }
+ 
+-/**
+- * return 1 if manglers are configured.  Used to set a flag
+- * for optimization during request forwarding.
+- */
+-int
+-httpReqHdrManglersConfigured()
++static
++void header_mangler_clean(header_mangler &m)
++{
++    aclDestroyAccessList(&m.access_list);
++    safe_free(m.replacement);
++}
++
++static
++void header_mangler_dump_access(StoreEntry * entry, const char *option,
++                                const header_mangler &m, const char *name)
++{
++    if (m.access_list != NULL) {
++        storeAppendPrintf(entry, "%s ", option);
++        dump_acl_access(entry, name, m.access_list);
++    }
++}
++
++static
++void header_mangler_dump_replacement(StoreEntry * entry, const char *option,
++                                     const header_mangler &m, const char *name)
++{
++    if (m.replacement)
++        storeAppendPrintf(entry, "%s %s %s\n", option, name, m.replacement);
++}
++
++HeaderManglers::HeaderManglers()
++{
++    memset(known, 0, sizeof(known));
++    memset(&all, 0, sizeof(all));
++}
++
++HeaderManglers::~HeaderManglers()
++{
++    for (int i = 0; i < HDR_ENUM_END; i++)
++        header_mangler_clean(known[i]);
++
++    typedef ManglersByName::iterator MBNI;
++    for (MBNI i = custom.begin(); i != custom.end(); ++i)
++        header_mangler_clean(i->second);
++
++    header_mangler_clean(all);
++}
++
++void
++HeaderManglers::dumpAccess(StoreEntry * entry, const char *name) const
+ {
+     for (int i = 0; i < HDR_ENUM_END; i++) {
+-        if (NULL != Config.request_header_access[i].access_list)
+-            return 1;
++        header_mangler_dump_access(entry, name, known[i],
++                                   httpHeaderNameById(i));
+     }
+ 
+-    return 0;
++    typedef ManglersByName::const_iterator MBNCI;
++    for (MBNCI i = custom.begin(); i != custom.end(); ++i)
++        header_mangler_dump_access(entry, name, i->second, i->first.c_str());
++
++    header_mangler_dump_access(entry, name, all, "All");
+ }
++
++void
++HeaderManglers::dumpReplacement(StoreEntry * entry, const char *name) const
++{
++    for (int i = 0; i < HDR_ENUM_END; i++) {
++        header_mangler_dump_replacement(entry, name, known[i],
++                                        httpHeaderNameById(i));
++    }
++
++    typedef ManglersByName::const_iterator MBNCI;
++    for (MBNCI i = custom.begin(); i != custom.end(); ++i) {
++        header_mangler_dump_replacement(entry, name, i->second,
++                                        i->first.c_str());
++    }
++
++    header_mangler_dump_replacement(entry, name, all, "All");
++}
++
++header_mangler *
++HeaderManglers::track(const char *name)
++{
++    int id = httpHeaderIdByNameDef(name, strlen(name));
++
++    if (id == HDR_BAD_HDR) { // special keyword or a custom header
++        if (strcmp(name, "All") == 0)
++            id = HDR_ENUM_END;
++        else if (strcmp(name, "Other") == 0)
++            id = HDR_OTHER;
++    }
++
++    header_mangler *m = NULL;
++    if (id == HDR_ENUM_END) {
++        m = &all;
++    } else if (id == HDR_BAD_HDR) {
++        m = &custom[name];
++    } else {
++        m = &known[id]; // including HDR_OTHER
++    }
++
++    assert(m);
++    return m;
++}
++
++void
++HeaderManglers::setReplacement(const char *name, const char *value)
++{
++    // for backword compatibility, we allow replacements to be configured
++    // for headers w/o access rules, but such replacements are ignored
++    header_mangler *m = track(name);
++
++    safe_free(m->replacement); // overwrite old value if any
++    m->replacement = xstrdup(value);
++}
++
++const header_mangler *
++HeaderManglers::find(const HttpHeaderEntry &e) const
++{
++    // a known header with a configured ACL list
++    if (e.id != HDR_OTHER && 0 <= e.id && e.id < HDR_ENUM_END &&
++            known[e.id].access_list)
++        return &known[e.id];
++
++    // a custom header
++    if (e.id == HDR_OTHER) {
++        // does it have an ACL list configured?
++        // Optimize: use a name type that we do not need to convert to here
++        const ManglersByName::const_iterator i = custom.find(e.name.termedBuf());
++        if (i != custom.end())
++            return &i->second;
++    }
++
++    // Next-to-last resort: "Other" rules match any custom header
++    if (e.id == HDR_OTHER && known[HDR_OTHER].access_list)
++        return &known[HDR_OTHER];
++
++    // Last resort: "All" rules match any header
++    if (all.access_list)
++        return &all;
++
++    return NULL;
++}
++
+@@ -0,0 +1,59 @@
++#ifndef SQUID_HTTPHEADERTOOLS_H
++#define SQUID_HTTPHEADERTOOLS_H
++
++#if HAVE_MAP
++#include <map>
++#endif
++#if HAVE_STRING
++#include <string>
++#endif
++
++class acl_access;
++struct _header_mangler {
++    acl_access *access_list;
++    char *replacement;
++};
++typedef struct _header_mangler header_mangler;
++
++class StoreEntry;
++
++/// A collection of header_mangler objects for a given message kind.
++class HeaderManglers
++{
++public:
++    HeaderManglers();
++    ~HeaderManglers();
++
++    /// returns a header mangler for field e or nil if none was specified
++    const header_mangler *find(const HttpHeaderEntry &e) const;
++
++    /// returns a mangler for the named header (known or custom)
++    header_mangler *track(const char *name);
++
++    /// updates mangler for the named header with a replacement value
++    void setReplacement(const char *name, const char *replacementValue);
++
++    /// report the *_header_access part of the configuration
++    void dumpAccess(StoreEntry *entry, const char *optionName) const;
++    /// report the *_header_replace part of the configuration
++    void dumpReplacement(StoreEntry *entry, const char *optionName) const;
++
++private:
++    /// a name:mangler map; optimize: use unordered map or some such
++    typedef std::map<std::string, header_mangler> ManglersByName;
++
++    /// one mangler for each known header
++    header_mangler known[HDR_ENUM_END];
++
++    /// one mangler for each custom header
++    ManglersByName custom;
++
++    /// configured if some mangling ACL applies to all header names
++    header_mangler all;
++
++private:
++    /* not implemented */
++    HeaderManglers(const HeaderManglers &);
++    HeaderManglers &operator =(const HeaderManglers &);
++};
++#endif
+@@ -363,6 +363,7 @@ squid_SOURCES = \
+ 	HttpHeader.h \
+ 	HttpHeaderMask.h \
+ 	HttpHeaderRange.h \
++	HttpHeaderTools.h \
+ 	HttpHeaderTools.cc \
+ 	HttpBody.h \
+ 	HttpBody.cc \
+@@ -1091,9 +1092,11 @@ tests_testHttpReply_SOURCES=\
+ 	SquidString.h \
+ 	SquidTime.h \
+ 	String.cc \
++	tests/stub_access_log.cc \
+ 	tests/stub_cache_cf.cc \
+ 	tests/stub_cache_manager.cc \
+ 	tests/stub_debug.cc \
++	tests/stub_errorpage.cc \
+ 	tests/stub_HelperChildConfig.cc \
+ 	StatCounters.h \
+ 	StatCounters.cc \
+@@ -1102,25 +1105,32 @@ tests_testHttpReply_SOURCES=\
+ 	tests/stub_store.cc \
+ 	tests/stub_store_stats.cc \
+ 	tests/stub_tools.cc \
++	tests/stub_HttpRequest.cc \
+ 	tests/testHttpReply.cc \
+ 	tests/testHttpReply.h \
+ 	tests/testMain.cc \
+ 	time.cc \
++	url.cc \
++	URLScheme.cc \
+ 	wordlist.cc
+ nodist_tests_testHttpReply_SOURCES=\
+ 	$(TESTSOURCES)
+ tests_testHttpReply_LDFLAGS = $(LIBADD_DL)
+ tests_testHttpReply_LDADD=\
++	acl/libacls.la \
+ 	acl/libapi.la \
+ 	acl/libstate.la \
+ 	$(AUTH_LIBS) \
++	anyp/libanyp.la \
+ 	ip/libip.la \
+ 	base/libbase.la \
++	$(SSL_LIBS) \
+ 	$(top_builddir)/lib/libmisccontainers.la \
+ 	$(top_builddir)/lib/libmiscencoding.la \
+ 	$(top_builddir)/lib/libmiscutil.la \
+ 	$(SQUID_CPPUNIT_LIBS) \
+ 	$(SQUID_CPPUNIT_LA) \
++	$(SSLLIB) \
+ 	$(COMPAT_LIB) \
+ 	$(XTRA_LIBS)
+ tests_testHttpReply_DEPENDENCIES= $(SQUID_CPPUNIT_LA)
+@@ -1182,6 +1192,7 @@ tests_testACLMaxUserIP_SOURCES= \
+ 	tests/stub_debug.cc \
+ 	tests/stub_DelayId.cc \
+ 	tests/stub_DiskIOModule.cc \
++	tests/stub_errorpage.cc \
+ 	tests/stub_fd.cc \
+ 	tests/stub_HttpRequest.cc \
+ 	tests/stub_MemObject.cc \
+@@ -2499,6 +2510,7 @@ tests_testStore_LDADD= \
+ 	mgr/libmgr.la \
+ 	ipc/libipc.la \
+ 	anyp/libanyp.la \
++	$(SSL_LIBS) \
+ 	$(top_builddir)/lib/libmisccontainers.la \
+ 	$(top_builddir)/lib/libmiscencoding.la \
+ 	$(top_builddir)/lib/libmiscutil.la \
+@@ -251,14 +251,40 @@ MemStore::copyFromShm(StoreEntry &e, const MemStoreMap::Extras &extras)
+     return true;
+ }
+ 
+-void
+-MemStore::considerKeeping(StoreEntry &e)
++bool
++MemStore::keepInLocalMemory(const StoreEntry &e) const
+ {
+     if (!e.memoryCachable()) {
+         debugs(20, 7, HERE << "Not memory cachable: " << e);
+-        return; // cannot keep due to entry state or properties
++        return false; // will not cache due to entry state or properties
++    }
++
++    assert(e.mem_obj);
++    const int64_t loadedSize = e.mem_obj->endOffset();
++    const int64_t expectedSize = e.mem_obj->expectedReplySize(); // may be < 0
++    const int64_t ramSize = max(loadedSize, expectedSize);
++
++    if (ramSize > static_cast<int64_t>(Config.Store.maxInMemObjSize)) {
++        debugs(20, 5, HERE << "Too big max(" <<
++               loadedSize << ", " << expectedSize << "): " << e);
++        return false; // will not cache due to cachable entry size limits
++    }
++
++    if (!willFit(ramSize)) {
++        debugs(20, 5, HERE << "Wont fit max(" <<
++               loadedSize << ", " << expectedSize << "): " << e);
++        return false; // will not cache due to memory cache slot limit
+     }
+ 
++    return true;
++}
++
++void
++MemStore::considerKeeping(StoreEntry &e)
++{
++    if (!keepInLocalMemory(e))
++        return;
++
+     // since we copy everything at once, we can only keep complete entries
+     if (e.store_status != STORE_OK) {
+         debugs(20, 7, HERE << "Incomplete: " << e);
+@@ -270,25 +296,25 @@ MemStore::considerKeeping(StoreEntry &e)
+     const int64_t loadedSize = e.mem_obj->endOffset();
+     const int64_t expectedSize = e.mem_obj->expectedReplySize();
+ 
++    // objects of unknown size are not allowed into memory cache, for now
++    if (expectedSize < 0) {
++        debugs(20, 5, HERE << "Unknown expected size: " << e);
++        return;
++    }
++
+     // since we copy everything at once, we can only keep fully loaded entries
+     if (loadedSize != expectedSize) {
+         debugs(20, 7, HERE << "partially loaded: " << loadedSize << " != " <<
+                expectedSize);
+         return;
+     }
+ 
+-    if (!willFit(expectedSize)) {
+-        debugs(20, 5, HERE << "No mem-cache space for " << e);
+-        return; // failed to free enough space
+-    }
+-
+     keep(e); // may still fail
+ }
+ 
+ bool
+-MemStore::willFit(int64_t need)
++MemStore::willFit(int64_t need) const
+ {
+-    // TODO: obey configured maximum entry size (with page-based rounding)
+     return need <= static_cast<int64_t>(Ipc::Mem::PageSize());
+ }
+ 
+@@ -27,6 +27,9 @@ class MemStore: public Store, public Ipc::StoreMapCleaner
+     /// cache the entry or forget about it until the next considerKeeping call
+     void considerKeeping(StoreEntry &e);
+ 
++    /// whether e should be kept in local RAM for possible future caching
++    bool keepInLocalMemory(const StoreEntry &e) const;
++
+     /* Store API */
+     virtual int callback();
+     virtual StoreEntry * get(const cache_key *);
+@@ -47,7 +50,7 @@ class MemStore: public Store, public Ipc::StoreMapCleaner
+     static int64_t EntryLimit();
+ 
+ protected:
+-    bool willFit(int64_t needed);
++    bool willFit(int64_t needed) const;
+     void keep(StoreEntry &e);
+ 
+     bool copyToShm(StoreEntry &e, MemStoreMap::Extras &extras);
+@@ -351,6 +351,11 @@ class Store : public RefCountable
+     /// called when the entry is no longer needed by any transaction
+     virtual void handleIdleEntry(StoreEntry &e) {}
+ 
++    // XXX: This method belongs to Store::Root/StoreController, but it is here
++    // because test cases use non-StoreController derivatives as Root
++    /// called to get rid of no longer needed entry data in RAM, if any
++    virtual void maybeTrimMemory(StoreEntry &e, const bool preserveSwappable) {}
++
+ private:
+     static RefCount<Store> CurrentRoot;
+ };
+@@ -60,6 +60,7 @@ class StoreController : public Store
+ 
+     /* Store parent API */
+     virtual void handleIdleEntry(StoreEntry &e);
++    virtual void maybeTrimMemory(StoreEntry &e, const bool preserveSwappable);
+ 
+     virtual void init();
+ 
+@@ -91,6 +92,7 @@ class StoreController : public Store
+ 
+ private:
+     void createOneStore(Store &aStore);
++    bool keepForLocalMemoryCache(const StoreEntry &e) const;
+ 
+     StorePointer swapDir; ///< summary view of all disk caches
+     MemStore *memStore; ///< memory cache
+@@ -47,9 +47,10 @@ AsyncCall::make()
+ bool
+ AsyncCall::cancel(const char *reason)
+ {
+-    if (isCanceled)
+-        debugs(debugSection, debugLevel, HERE << "will not call " << name <<
+-               " [" << id << ']' << " also because " << reason);
++    debugs(debugSection, debugLevel, HERE << "will not call " << name <<
++           " [" << id << "] " << (isCanceled ? "also " : "") <<
++           "because " << reason);
++
+     isCanceled = reason;
+     return false;
+ }
+@@ -169,12 +169,13 @@ static void free_all(void);
+ void requirePathnameExists(const char *name, const char *path);
+ static OBJH dump_config;
+ #if USE_HTTP_VIOLATIONS
+-static void dump_http_header_access(StoreEntry * entry, const char *name, header_mangler header[]);
+-static void parse_http_header_access(header_mangler header[]);
+-static void free_http_header_access(header_mangler header[]);
+-static void dump_http_header_replace(StoreEntry * entry, const char *name, header_mangler header[]);
+-static void parse_http_header_replace(header_mangler * header);
+-static void free_http_header_replace(header_mangler * header);
++static void free_HeaderManglers(HeaderManglers **pm);
++static void dump_http_header_access(StoreEntry * entry, const char *name, const HeaderManglers *manglers);
++static void parse_http_header_access(HeaderManglers **manglers);
++#define free_http_header_access free_HeaderManglers
++static void dump_http_header_replace(StoreEntry * entry, const char *name, const HeaderManglers *manglers);
++static void parse_http_header_replace(HeaderManglers **manglers);
++#define free_http_header_replace free_HeaderManglers
+ #endif
+ static void parse_denyinfo(acl_deny_info_list ** var);
+ static void dump_denyinfo(StoreEntry * entry, const char *name, acl_deny_info_list * var);
+@@ -225,7 +226,7 @@ update_maxobjsize(void)
+     int i;
+     int64_t ms = -1;
+ 
+-    for (i = 0; i < Config.cacheSwap.n_configured; ++i) {
++    for (i = 0; i < Config.cacheSwap.n_configured; i++) {
+         assert (Config.cacheSwap.swapDirs[i].getRaw());
+ 
+         if (dynamic_cast<SwapDir *>(Config.cacheSwap.swapDirs[i].getRaw())->
+@@ -273,7 +274,7 @@ parseManyConfigFiles(char* files, int depth)
+                    path, xstrerror());
+         }
+     }
+-    for (i = 0; i < (int)globbuf.gl_pathc; ++i) {
++    for (i = 0; i < (int)globbuf.gl_pathc; i++) {
+         error_count += parseOneConfigFile(globbuf.gl_pathv[i], depth);
+     }
+     globfree(&globbuf);
+@@ -431,7 +432,7 @@ parseOneConfigFile(const char *file_name, unsigned int depth)
+ 
+     Vector<bool> if_states;
+     while (fgets(config_input_line, BUFSIZ, fp)) {
+-        ++config_lineno;
++        config_lineno++;
+ 
+         if ((token = strchr(config_input_line, '\n')))
+             *token = '\0';
+@@ -455,7 +456,7 @@ parseOneConfigFile(const char *file_name, unsigned int depth)
+                 continue;	/* Not a valid #line directive, may be a comment */
+ 
+             while (*file && xisspace((unsigned char) *file))
+-                ++file;
++                file++;
+ 
+             if (*file) {
+                 if (*file != '"')
+@@ -516,7 +517,7 @@ parseOneConfigFile(const char *file_name, unsigned int depth)
+                 err_count += parseManyConfigFiles(tmp_line + 8, depth + 1);
+             } else if (!parse_line(tmp_line)) {
+                 debugs(3, 0, HERE << cfg_filename << ":" << config_lineno << " unrecognized: '" << tmp_line << "'");
+-                ++err_count;
++                err_count++;
+             }
+         }
+ 
+@@ -810,7 +811,7 @@ configDoConfigure(void)
+     // TODO: replace with a dedicated "purge" ACL option?
+     Config2.onoff.enable_purge = (ACLMethodData::ThePurgeCount > 0);
+ 
+-    Config2.onoff.mangle_request_headers = httpReqHdrManglersConfigured();
++    Config2.onoff.mangle_request_headers = (Config.request_header_access != NULL);
+ 
+     if (geteuid() == 0) {
+         if (NULL != Config.effectiveUser) {
+@@ -1176,7 +1177,7 @@ static void parseBytesOptionValue(size_t * bptr, const char *units, char const *
+     char const * number_end = value;
+ 
+     while ((*number_end >= '0' && *number_end <= '9')) {
+-        ++number_end;
++        number_end++;
+     }
+ 
+     String number;
+@@ -1675,23 +1676,15 @@ parse_client_delay_pool_access(ClientDelayConfig * cfg)
+ 
+ #if USE_HTTP_VIOLATIONS
+ static void
+-dump_http_header_access(StoreEntry * entry, const char *name, header_mangler header[])
++dump_http_header_access(StoreEntry * entry, const char *name, const HeaderManglers *manglers)
+ {
+-    int i;
+-
+-    for (i = 0; i < HDR_ENUM_END; ++i) {
+-        if (header[i].access_list != NULL) {
+-            storeAppendPrintf(entry, "%s ", name);
+-            dump_acl_access(entry, httpHeaderNameById(i),
+-                            header[i].access_list);
+-        }
+-    }
++    if (manglers)
++        manglers->dumpAccess(entry, name);
+ }
+ 
+ static void
+-parse_http_header_access(header_mangler header[])
++parse_http_header_access(HeaderManglers **pm)
+ {
+-    int id, i;
+     char *t = NULL;
+ 
+     if ((t = strtok(NULL, w_space)) == NULL) {
+@@ -1700,64 +1693,34 @@ parse_http_header_access(header_mangler header[])
+         return;
+     }
+ 
+-    /* Now lookup index of header. */
+-    id = httpHeaderIdByNameDef(t, strlen(t));
+-
+-    if (strcmp(t, "All") == 0)
+-        id = HDR_ENUM_END;
+-    else if (strcmp(t, "Other") == 0)
+-        id = HDR_OTHER;
+-    else if (id == -1) {
+-        debugs(3, 0, "" << cfg_filename << " line " << config_lineno << ": " << config_input_line);
+-        debugs(3, 0, "parse_http_header_access: unknown header name '" << t << "'");
+-        return;
+-    }
+-
+-    if (id != HDR_ENUM_END) {
+-        parse_acl_access(&header[id].access_list);
+-    } else {
+-        char *next_string = t + strlen(t) - 1;
+-        *next_string = 'A';
+-        *(next_string + 1) = ' ';
+-
+-        for (i = 0; i < HDR_ENUM_END; ++i) {
+-            char *new_string = xstrdup(next_string);
+-            strtok(new_string, w_space);
+-            parse_acl_access(&header[i].access_list);
+-            safe_free(new_string);
+-        }
+-    }
++    if (!*pm)
++        *pm = new HeaderManglers;
++    HeaderManglers *manglers = *pm;
++    header_mangler *mangler = manglers->track(t);
++    assert(mangler);
++    parse_acl_access(&mangler->access_list);
+ }
+ 
+ static void
+-free_http_header_access(header_mangler header[])
++free_HeaderManglers(HeaderManglers **pm)
+ {
+-    int i;
+-
+-    for (i = 0; i < HDR_ENUM_END; ++i) {
+-        free_acl_access(&header[i].access_list);
++    // we delete the entire http_header_* mangler configuration at once
++    if (const HeaderManglers *manglers = *pm) {
++        delete manglers;
++        *pm = NULL;
+     }
+ }
+ 
+ static void
+-dump_http_header_replace(StoreEntry * entry, const char *name, header_mangler
+-                         header[])
++dump_http_header_replace(StoreEntry * entry, const char *name, const HeaderManglers *manglers)
+ {
+-    int i;
+-
+-    for (i = 0; i < HDR_ENUM_END; ++i) {
+-        if (NULL == header[i].replacement)
+-            continue;
+-
+-        storeAppendPrintf(entry, "%s %s %s\n", name, httpHeaderNameById(i),
+-                          header[i].replacement);
+-    }
++    if (manglers)
++        manglers->dumpReplacement(entry, name);
+ }
+ 
+ static void
+-parse_http_header_replace(header_mangler header[])
++parse_http_header_replace(HeaderManglers **pm)
+ {
+-    int id, i;
+     char *t = NULL;
+ 
+     if ((t = strtok(NULL, w_space)) == NULL) {
+@@ -1766,44 +1729,12 @@ parse_http_header_replace(header_mangler header[])
+         return;
+     }
+ 
+-    /* Now lookup index of header. */
+-    id = httpHeaderIdByNameDef(t, strlen(t));
+-
+-    if (strcmp(t, "All") == 0)
+-        id = HDR_ENUM_END;
+-    else if (strcmp(t, "Other") == 0)
+-        id = HDR_OTHER;
+-    else if (id == -1) {
+-        debugs(3, 0, "" << cfg_filename << " line " << config_lineno << ": " << config_input_line);
+-        debugs(3, 0, "parse_http_header_replace: unknown header name " << t << ".");
+-
+-        return;
+-    }
+-
+-    if (id != HDR_ENUM_END) {
+-        if (header[id].replacement != NULL)
+-            safe_free(header[id].replacement);
+-
+-        header[id].replacement = xstrdup(t + strlen(t) + 1);
+-    } else {
+-        for (i = 0; i < HDR_ENUM_END; ++i) {
+-            if (header[i].replacement != NULL)
+-                safe_free(header[i].replacement);
+-
+-            header[i].replacement = xstrdup(t + strlen(t) + 1);
+-        }
+-    }
+-}
+-
+-static void
+-free_http_header_replace(header_mangler header[])
+-{
+-    int i;
++    const char *value = t + strlen(t) + 1;
+ 
+-    for (i = 0; i < HDR_ENUM_END; ++i) {
+-        if (header[i].replacement != NULL)
+-            safe_free(header[i].replacement);
+-    }
++    if (!*pm)
++        *pm = new HeaderManglers;
++    HeaderManglers *manglers = *pm;
++    manglers->setReplacement(t, value);
+ }
+ 
+ #endif
+@@ -1815,7 +1746,7 @@ dump_cachedir(StoreEntry * entry, const char *name, SquidConfig::_cacheSwap swap
+     int i;
+     assert (entry);
+ 
+-    for (i = 0; i < swap.n_configured; ++i) {
++    for (i = 0; i < swap.n_configured; i++) {
+         s = dynamic_cast<SwapDir *>(swap.swapDirs[i].getRaw());
+         if (!s) continue;
+         storeAppendPrintf(entry, "%s %s %s", name, s->type(), s->path);
+@@ -1924,7 +1855,7 @@ parse_cachedir(SquidConfig::_cacheSwap * swap)
+ 
+     /* reconfigure existing dir */
+ 
+-    for (i = 0; i < swap->n_configured; ++i) {
++    for (i = 0; i < swap->n_configured; i++) {
+         assert (swap->swapDirs[i].getRaw());
+ 
+         if ((strcasecmp(path_str, dynamic_cast<SwapDir *>(swap->swapDirs[i].getRaw())->path)) == 0) {
+@@ -2555,7 +2486,7 @@ parse_hostdomain(void)
+ 
+         if (*domain == '!') {	/* check for !.edu */
+             l->do_ping = 0;
+-            ++domain;
++            domain++;
+         }
+ 
+         l->domain = xstrdup(domain);
+@@ -2997,7 +2928,7 @@ parse_eol(char *volatile *var)
+     }
+ 
+     while (*token && xisspace(*token))
+-        ++token;
++        token++;
+ 
+     if (!*token) {
+         self_destruct();
+@@ -3695,12 +3626,12 @@ parse_port_option(AnyP::PortCfg * s, char *token)
+         s->tcp_keepalive.idle = atoi(t);
+         t = strchr(t, ',');
+         if (t) {
+-            ++t;
++            t++;
+             s->tcp_keepalive.interval = atoi(t);
+             t = strchr(t, ',');
+         }
+         if (t) {
+-            ++t;
++            t++;
+             s->tcp_keepalive.timeout = atoi(t);
+             t = strchr(t, ',');
+         }
+@@ -4392,7 +4392,7 @@ DOC_END
+ 
+ NAME: request_header_access
+ IFDEF: USE_HTTP_VIOLATIONS
+-TYPE: http_header_access[]
++TYPE: http_header_access
+ LOC: Config.request_header_access
+ DEFAULT: none
+ DOC_START
+@@ -4404,16 +4404,30 @@ DOC_START
+ 
+ 	This option replaces the old 'anonymize_headers' and the
+ 	older 'http_anonymizer' option with something that is much
+-	more configurable. This new method creates a list of ACLs
+-	for each header, allowing you very fine-tuned header
+-	mangling.
+-
+-	This option only applies to request headers, i.e., from the
+-	client to the server.
+-
+-	You can only specify known headers for the header name.
+-	Other headers are reclassified as 'Other'. You can also
+-	refer to all the headers with 'All'.
++	more configurable. A list of ACLs for each header name allows
++	removal of specific header fields under specific conditions.
++
++	This option only applies to outgoing HTTP request headers (i.e.,
++	headers sent by Squid to the next HTTP hop such as a cache peer
++	or an origin server). The option has no effect during cache hit
++	detection. The equivalent adaptation vectoring point in ICAP
++	terminology is post-cache REQMOD.
++
++	The option is applied to individual outgoing request header
++	fields. For each request header field F, Squid uses the first
++	qualifying sets of request_header_access rules:
++
++	    1. Rules with header_name equal to F's name.
++	    2. Rules with header_name 'Other', provided F's name is not
++	       on the hard-coded list of commonly used HTTP header names.
++	    3. Rules with header_name 'All'.
++
++	Within that qualifying rule set, rule ACLs are checked as usual.
++	If ACLs of an "allow" rule match, the header field is allowed to
++	go through as is. If ACLs of a "deny" rule match, the header is
++	removed and request_header_replace is then checked to identify
++	if the removed header has a replacement. If no rules within the
++	set have matching ACLs, the header field is left as is.
+ 
+ 	For example, to achieve the same behavior as the old
+ 	'http_anonymizer standard' option, you should use:
+@@ -4464,7 +4478,7 @@ DOC_END
+ 
+ NAME: reply_header_access
+ IFDEF: USE_HTTP_VIOLATIONS
+-TYPE: http_header_access[]
++TYPE: http_header_access
+ LOC: Config.reply_header_access
+ DEFAULT: none
+ DOC_START
+@@ -4478,17 +4492,8 @@ DOC_START
+ 	server to the client.
+ 
+ 	This is the same as request_header_access, but in the other
+-	direction.
+-
+-	This option replaces the old 'anonymize_headers' and the
+-	older 'http_anonymizer' option with something that is much
+-	more configurable. This new method creates a list of ACLs
+-	for each header, allowing you very fine-tuned header
+-	mangling.
+-
+-	You can only specify known headers for the header name.
+-	Other headers are reclassified as 'Other'. You can also
+-	refer to all the headers with 'All'.
++	direction. Please see request_header_access for detailed
++	documentation.
+ 
+ 	For example, to achieve the same behavior as the old
+ 	'http_anonymizer standard' option, you should use:
+@@ -4539,7 +4544,7 @@ DOC_END
+ 
+ NAME: request_header_replace header_replace
+ IFDEF: USE_HTTP_VIOLATIONS
+-TYPE: http_header_replace[]
++TYPE: http_header_replace
+ LOC: Config.request_header_access
+ DEFAULT: none
+ DOC_START
+@@ -4558,7 +4563,7 @@ DOC_END
+ 
+ NAME: reply_header_replace
+ IFDEF: USE_HTTP_VIOLATIONS
+-TYPE: http_header_replace[]
++TYPE: http_header_replace
+ LOC: Config.reply_header_access
+ DEFAULT: none
+ DOC_START
+@@ -1090,7 +1090,11 @@ _comm_close(int fd, char const *file, int line)
+         return;
+ 
+     /* The following fails because ipc.c is doing calls to pipe() to create sockets! */
+-    assert(isOpen(fd));
++    if (!isOpen(fd)) {
++        debugs(50, DBG_IMPORTANT, HERE << "BUG 3556: FD " << fd << " is not an open socket.");
++        // XXX: do we need to run close(fd) or fd_close(fd) here?
++        return;
++    }
+ 
+     assert(F->type != FD_FILE);
+ 
+@@ -131,6 +131,7 @@ Comm::ConnOpener::doneConnecting(comm_err_t status, int xerrno)
+     }
+ 
+     if (temporaryFd_ >= 0) {
++        debugs(5, 4, HERE << conn_ << " closing temp FD " << temporaryFd_);
+         // it never reached fully open, so cleanup the FD handlers
+         // Note that comm_close() sequence does not happen for partially open FD
+         Comm::SetSelect(temporaryFd_, COMM_SELECT_WRITE, NULL, NULL, 0);
+@@ -141,6 +142,7 @@ Comm::ConnOpener::doneConnecting(comm_err_t status, int xerrno)
+         }
+         fd_table[temporaryFd_].timeoutHandler = NULL;
+         fd_table[temporaryFd_].timeout = 0;
++        close(temporaryFd_);
+         fd_close(temporaryFd_);
+         temporaryFd_ = -1;
+     }
+@@ -84,6 +84,11 @@ FwdState::abort(void* d)
+ 
+     if (Comm::IsConnOpen(fwd->serverConnection())) {
+         comm_remove_close_handler(fwd->serverConnection()->fd, fwdServerClosedWrapper, fwd);
++        debugs(17, 3, HERE << "store entry aborted; closing " <<
++               fwd->serverConnection());
++        fwd->serverConnection()->close();
++    } else {
++        debugs(17, 7, HERE << "store entry aborted; no connection to close");
+     }
+     fwd->serverDestinations.clean();
+     fwd->self = NULL;
+@@ -1067,7 +1067,7 @@ HttpStateData::readReply(const CommIoCbParams &io)
+     }
+ 
+     if (EBIT_TEST(entry->flags, ENTRY_ABORTED)) {
+-        // TODO: should we call abortTransaction() here?
++        abortTransaction("store entry aborted while reading reply");
+         return;
+     }
+ 
+@@ -1346,12 +1346,9 @@ HttpStateData::processReplyBody()
+     }
+ 
+     if (EBIT_TEST(entry->flags, ENTRY_ABORTED)) {
+-        /*
+-         * The above writeReplyBody() call could ABORT this entry,
+-         * in that case, the server FD should already be closed.
+-         * there's nothing for us to do.
+-         */
+-        (void) 0;
++        // The above writeReplyBody() call may have aborted the store entry.
++        abortTransaction("store entry aborted while storing reply");
++        return;
+     } else
+         switch (persistentConnStatus()) {
+         case INCOMPLETE_MSG: {
+@@ -100,6 +100,13 @@ ipcCreate(int type, const char *prog, const char *const args[], const char *name
+     if (hIpc)
+         *hIpc = NULL;
+ 
++// NP: no wrapping around d and c usage since we *want* code expansion
++#define IPC_CHECK_FAIL(f,d,c) \
++    if ((f) < 0) { \
++        debugs(54, DBG_CRITICAL, "ERROR: Failed to create helper " d " FD: " << c); \
++        return ipcCloseAllFD(prfd, pwfd, crfd, cwfd); \
++    } else void(0)
++
+     if (type == IPC_TCP_SOCKET) {
+         crfd = cwfd = comm_open(SOCK_STREAM,
+                                 0,
+@@ -111,6 +118,8 @@ ipcCreate(int type, const char *prog, const char *const args[], const char *name
+                                 local_addr,
+                                 0,			/* blocking */
+                                 name);
++        IPC_CHECK_FAIL(crfd, "child read", "TCP " << local_addr);
++        IPC_CHECK_FAIL(prfd, "parent read", "TCP " << local_addr);
+     } else if (type == IPC_UDP_SOCKET) {
+         crfd = cwfd = comm_open(SOCK_DGRAM,
+                                 0,
+@@ -122,6 +131,8 @@ ipcCreate(int type, const char *prog, const char *const args[], const char *name
+                                 local_addr,
+                                 0,
+                                 name);
++        IPC_CHECK_FAIL(crfd, "child read", "UDP" << local_addr);
++        IPC_CHECK_FAIL(prfd, "parent read", "UDP" << local_addr);
+     } else if (type == IPC_FIFO) {
+         int p2c[2];
+         int c2p[2];
+@@ -140,6 +151,9 @@ ipcCreate(int type, const char *prog, const char *const args[], const char *name
+         fd_open(crfd = c2p[0], FD_PIPE, "IPC FIFO Child Read");
+         fd_open(pwfd = c2p[1], FD_PIPE, "IPC FIFO Parent Write");
+ 
++        IPC_CHECK_FAIL(crfd, "child read", "FIFO pipe");
++        IPC_CHECK_FAIL(prfd, "parent read", "FIFO pipe");
++
+ #if HAVE_SOCKETPAIR && defined(AF_UNIX)
+ 
+     } else if (type == IPC_UNIX_STREAM) {
+@@ -157,6 +171,9 @@ ipcCreate(int type, const char *prog, const char *const args[], const char *name
+         setsockopt(fds[1], SOL_SOCKET, SO_RCVBUF, (void *) &buflen, sizeof(buflen));
+         fd_open(prfd = pwfd = fds[0], FD_PIPE, "IPC UNIX STREAM Parent");
+         fd_open(crfd = cwfd = fds[1], FD_PIPE, "IPC UNIX STREAM Parent");
++        IPC_CHECK_FAIL(crfd, "child read", "UDS socket");
++        IPC_CHECK_FAIL(prfd, "parent read", "UDS socket");
++
+     } else if (type == IPC_UNIX_DGRAM) {
+         int fds[2];
+ 
+@@ -167,6 +184,9 @@ ipcCreate(int type, const char *prog, const char *const args[], const char *name
+ 
+         fd_open(prfd = pwfd = fds[0], FD_PIPE, "IPC UNIX DGRAM Parent");
+         fd_open(crfd = cwfd = fds[1], FD_PIPE, "IPC UNIX DGRAM Parent");
++
++        IPC_CHECK_FAIL(crfd, "child read", "UDS datagram");
++        IPC_CHECK_FAIL(prfd, "parent read", "UDS datagram");
+ #endif
+ 
+     } else {
+@@ -178,16 +198,6 @@ ipcCreate(int type, const char *prog, const char *const args[], const char *name
+     debugs(54, 3, "ipcCreate: crfd FD " << crfd);
+     debugs(54, 3, "ipcCreate: cwfd FD " << cwfd);
+ 
+-    if (crfd < 0) {
+-        debugs(54, 0, "ipcCreate: Failed to create child FD.");
+-        return ipcCloseAllFD(prfd, pwfd, crfd, cwfd);
+-    }
+-
+-    if (pwfd < 0) {
+-        debugs(54, 0, "ipcCreate: Failed to create server FD.");
+-        return ipcCloseAllFD(prfd, pwfd, crfd, cwfd);
+-    }
+-
+     if (type == IPC_TCP_SOCKET || type == IPC_UDP_SOCKET) {
+         PaS.InitAddrInfo(AI);
+ 
+@@ -234,7 +234,6 @@ SQUIDCEXTERN void httpHeaderCleanModule(void);
+ /* store report about current header usage and other stats */
+ void httpHeaderStoreReport(StoreEntry * e);
+ SQUIDCEXTERN void httpHdrMangleList(HttpHeader *, HttpRequest *, int req_or_rep);
+-SQUIDCEXTERN int httpReqHdrManglersConfigured();
+ 
+ #if SQUID_SNMP
+ SQUIDCEXTERN PF snmpHandleUdp;
+@@ -1446,14 +1446,6 @@ StoreEntry::memoryCachable() const
+     if (!Config.onoff.memory_cache_first && swap_status == SWAPOUT_DONE && refcount == 1)
+         return 0;
+ 
+-    if (Config.memShared && IamWorkerProcess()) {
+-        const int64_t expectedSize = mem_obj->expectedReplySize();
+-        // objects of unknown size are not allowed into memory cache, for now
+-        if (expectedSize < 0 ||
+-                expectedSize > static_cast<int64_t>(Config.Store.maxInMemObjSize))
+-            return 0;
+-    }
+-
+     return 1;
+ }
+ 
+@@ -781,6 +781,40 @@ StoreController::get(String const key, STOREGETCLIENT aCallback, void *aCallback
+     fatal("not implemented");
+ }
+ 
++// move this into [non-shared] memory cache class when we have one
++/// whether e should be kept in local RAM for possible future caching
++bool
++StoreController::keepForLocalMemoryCache(const StoreEntry &e) const
++{
++    if (!e.memoryCachable())
++        return false;
++
++    // does the current and expected size obey memory caching limits?
++    assert(e.mem_obj);
++    const int64_t loadedSize = e.mem_obj->endOffset();
++    const int64_t expectedSize = e.mem_obj->expectedReplySize(); // may be < 0
++    const int64_t ramSize = max(loadedSize, expectedSize);
++    const int64_t ramLimit = min(
++                                 static_cast<int64_t>(Config.memMaxSize),
++                                 static_cast<int64_t>(Config.Store.maxInMemObjSize));
++    return ramSize <= ramLimit;
++}
++
++void
++StoreController::maybeTrimMemory(StoreEntry &e, const bool preserveSwappable)
++{
++    bool keepInLocalMemory = false;
++    if (memStore)
++        keepInLocalMemory = memStore->keepInLocalMemory(e);
++    else
++        keepInLocalMemory = keepForLocalMemoryCache(e);
++
++    debugs(20, 7, HERE << "keepInLocalMemory: " << keepInLocalMemory);
++
++    if (!keepInLocalMemory)
++        e.trimMemory(preserveSwappable);
++}
++
+ void
+ StoreController::handleIdleEntry(StoreEntry &e)
+ {
+@@ -795,7 +829,7 @@ StoreController::handleIdleEntry(StoreEntry &e)
+         memStore->considerKeeping(e);
+         // leave keepInLocalMemory false; memStore maintains its own cache
+     } else {
+-        keepInLocalMemory = e.memoryCachable() && // entry is in good shape and
++        keepInLocalMemory = keepForLocalMemoryCache(e) && // in good shape and
+                             // the local memory cache is not overflowing
+                             (mem_node::InUseCount() <= store_pages_max);
+     }
+@@ -198,7 +198,7 @@ StoreEntry::swapOut()
+ 
+     const bool weAreOrMayBeSwappingOut = swappingOut() || mayStartSwapOut();
+ 
+-    trimMemory(weAreOrMayBeSwappingOut);
++    Store::Root().maybeTrimMemory(*this, weAreOrMayBeSwappingOut);
+ 
+     if (!weAreOrMayBeSwappingOut)
+         return; // nothing else to do
+@@ -36,6 +36,7 @@
+ 
+ /* needed for the global config */
+ #include "HttpHeader.h"
++#include "HttpHeaderTools.h"
+ 
+ /* for ICP_END */
+ #include "icp_opcode.h"
+@@ -58,14 +59,6 @@ struct acl_deny_info_list {
+     acl_deny_info_list *next;
+ };
+ 
+-
+-class acl_access;
+-
+-struct _header_mangler {
+-    acl_access *access_list;
+-    char *replacement;
+-};
+-
+ class ACLChecklist;
+ 
+ #if SQUID_SNMP
+@@ -577,10 +570,10 @@ struct SquidConfig {
+     } mcast_miss;
+ #endif
+ 
+-    /* one access list per header type we know of */
+-    header_mangler request_header_access[HDR_ENUM_END];
+-    /* one access list per header type we know of */
+-    header_mangler reply_header_access[HDR_ENUM_END];
++    /// request_header_access and request_header_replace
++    HeaderManglers *request_header_access;
++    /// reply_header_access and reply_header_replace
++    HeaderManglers *reply_header_access;
+     char *coredump_dir;
+     char *chroot_dir;
+ #if USE_CACHE_DIGESTS
+@@ -13,6 +13,7 @@
+ 
+ MemStore::MemStore() STUB
+ MemStore::~MemStore() STUB
++bool MemStore::keepInLocalMemory(const StoreEntry &) const STUB_RETVAL(false)
+ void MemStore::considerKeeping(StoreEntry &) STUB
+ void MemStore::reference(StoreEntry &) STUB
+ void MemStore::maintain() STUB

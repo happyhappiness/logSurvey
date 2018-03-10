@@ -1,0 +1,185 @@
+@@ -476,6 +476,7 @@ class SquidConfig
+         char *ssl_engine;
+         int session_ttl;
+         size_t sessionCacheSize;
++        char *certSignHash;
+     } SSL;
+ #endif
+ 
+@@ -2505,6 +2505,24 @@ DOC_START
+         Sets the cache size to use for ssl session
+ DOC_END
+ 
++NAME: sslproxy_cert_sign_hash
++IFDEF: USE_OPENSSL
++DEFAULT: none
++LOC: Config.SSL.certSignHash
++TYPE: string
++DOC_START
++	Sets the hashing algorithm to use when signing generated certificates.
++	Valid algorithm names depend on the OpenSSL library used. The following
++	names are usually available: sha1, sha256, sha512, and md5. Please see
++	your OpenSSL library manual for the available hashes. By default, Squids
++	that support this option use sha256 hashes.
++
++	Squid does not forcefully purge cached certificates that were generated
++	with an algorithm other than the currently configured one. They remain
++	in the cache, subject to the regular cache eviction policy, and become
++	useful if the algorithm changes again.
++DOC_END
++
+ NAME: ssl_bump
+ IFDEF: USE_OPENSSL
+ TYPE: sslproxy_ssl_bump
+@@ -4055,6 +4055,8 @@ void ConnStateData::buildSslCertGenerationParams(Ssl::CertificateProperties &cer
+             certProperties.signWithPkey.resetAndLock(port->signPkey.get());
+     }
+     signAlgorithm = certProperties.signAlgorithm;
++
++    certProperties.signHash = Ssl::DefaultSignHash;
+ }
+ 
+ void
+@@ -206,12 +206,21 @@ bool Ssl::CrtdMessage::parseRequest(Ssl::CertificateProperties &certProperties,
+     i = map.find(Ssl::CrtdMessage::param_Sign);
+     if (i != map.end()) {
+         if ((certProperties.signAlgorithm = Ssl::certSignAlgorithmId(i->second.c_str())) == Ssl::algSignEnd) {
+-            error = "Wrong signing algoritm: " + i->second;
++            error = "Wrong signing algoritm: ";
++            error += i->second;
+             return false;
+         }
+     } else
+         certProperties.signAlgorithm = Ssl::algSignTrusted;
+ 
++    i = map.find(Ssl::CrtdMessage::param_SignHash);
++    const char *signHashName = i != map.end() ? i->second.c_str() : SQUID_SSL_SIGN_HASH_IF_NONE;
++    if (!(certProperties.signHash = EVP_get_digestbyname(signHashName))) {
++        error = "Wrong signing hash: ";
++        error += signHashName;
++        return false;
++    }
++
+     if (!Ssl::readCertAndPrivateKeyFromMemory(certProperties.signWithX509, certProperties.signWithPkey, certs_part.c_str())) {
+         error = "Broken signing certificate!";
+         return false;
+@@ -239,6 +248,8 @@ void Ssl::CrtdMessage::composeRequest(Ssl::CertificateProperties const &certProp
+         body +=  "\n" + Ssl::CrtdMessage::param_SetValidBefore + "=on";
+     if (certProperties.signAlgorithm != Ssl::algSignEnd)
+         body +=  "\n" +  Ssl::CrtdMessage::param_Sign + "=" +  certSignAlgorithm(certProperties.signAlgorithm);
++    if (certProperties.signHash)
++        body +=  "\n" + Ssl::CrtdMessage::param_SignHash + "=" + EVP_MD_name(certProperties.signHash);
+ 
+     std::string certsPart;
+     if (!Ssl::writeCertAndPrivateKeyToMemory(certProperties.signWithX509, certProperties.signWithPkey, certsPart))
+@@ -256,3 +267,4 @@ const std::string Ssl::CrtdMessage::param_SetValidAfter(Ssl::CertAdaptAlgorithmS
+ const std::string Ssl::CrtdMessage::param_SetValidBefore(Ssl::CertAdaptAlgorithmStr[algSetValidBefore]);
+ const std::string Ssl::CrtdMessage::param_SetCommonName(Ssl::CertAdaptAlgorithmStr[algSetCommonName]);
+ const std::string Ssl::CrtdMessage::param_Sign("Sign");
++const std::string Ssl::CrtdMessage::param_SignHash("SignHash");
+@@ -84,6 +84,8 @@ class CrtdMessage
+     static const std::string param_SetCommonName;
+     /// Parameter name for passing signing algorithm
+     static const std::string param_Sign;
++    /// The signing hash to use
++    static const std::string param_SignHash;
+ protected:
+     enum ParseState {
+         BEFORE_CODE,
+@@ -221,7 +221,8 @@ Ssl::CertificateProperties::CertificateProperties():
+         setValidAfter(false),
+         setValidBefore(false),
+         setCommonName(false),
+-        signAlgorithm(Ssl::algSignEnd)
++        signAlgorithm(Ssl::algSignEnd),
++        signHash(NULL)
+ {}
+ 
+ std::string & Ssl::CertificateProperties::dbKey() const
+@@ -255,6 +256,11 @@ std::string & Ssl::CertificateProperties::dbKey() const
+         certKey.append(certSignAlgorithm(signAlgorithm));
+     }
+ 
++    if (signHash != NULL) {
++        certKey.append("+SignHash=", 10);
++        certKey.append(EVP_MD_name(signHash));
++    }
++
+     return certKey;
+ }
+ 
+@@ -434,11 +440,13 @@ static bool generateFakeSslCertificate(Ssl::X509_Pointer & certToStore, Ssl::EVP
+     if (!ret)
+         return false;
+ 
++    const  EVP_MD *hash = properties.signHash ? properties.signHash : EVP_get_digestbyname(SQUID_SSL_SIGN_HASH_IF_NONE);
++    assert(hash);
+     /*Now sign the request */
+     if (properties.signAlgorithm != Ssl::algSignSelf && properties.signWithPkey.get())
+-        ret = X509_sign(cert.get(), properties.signWithPkey.get(), EVP_sha1());
++        ret = X509_sign(cert.get(), properties.signWithPkey.get(), hash);
+     else //else sign with self key (self signed request)
+-        ret = X509_sign(cert.get(), pkey.get(), EVP_sha1());
++        ret = X509_sign(cert.get(), pkey.get(), hash);
+ 
+     if (!ret)
+         return false;
+@@ -34,6 +34,10 @@ typedef const SSL_METHOD * ContextMethod;
+ typedef SSL_METHOD * ContextMethod;
+ #endif
+ 
++#if !defined(SQUID_SSL_SIGN_HASH_IF_NONE)
++#define SQUID_SSL_SIGN_HASH_IF_NONE "sha256"
++#endif
++
+ /**
+    \ingroup SslCrtdSslAPI
+   * Add SSL locking (a.k.a. reference counting) to TidyPointer
+@@ -234,6 +238,7 @@ class CertificateProperties
+     bool setCommonName; ///< Replace the CN field of the mimicing subject with the given
+     std::string commonName; ///< A CN to use for the generated certificate
+     CertSignAlgorithm signAlgorithm; ///< The signing algorithm to use
++    const EVP_MD *signHash; ///< The signing hash to use
+     /// Returns certificate database primary key. New fake certificates
+     /// purge old fake certificates with the same key.
+     std::string & dbKey() const;
+@@ -295,6 +295,9 @@ int main(int argc, char *argv[])
+         {
+             Ssl::CertificateDb::check(db_path, max_db_size);
+         }
++        // Initialize SSL subsystem
++        SSL_load_error_strings();
++        SSLeay_add_ssl_algorithms();
+         // proccess request.
+         for (;;) {
+             char request[HELPER_INPUT_BUFFER];
+@@ -36,6 +36,8 @@ static void setSessionCallbacks(SSL_CTX *ctx);
+ Ipc::MemMap *SslSessionCache = NULL;
+ const char *SslSessionCacheName = "ssl_session_cache";
+ 
++const EVP_MD *Ssl::DefaultSignHash = NULL;
++
+ const char *Ssl::BumpModeStr[] = {
+     "none",
+     "client-first",
+@@ -718,6 +720,11 @@ ssl_initialize(void)
+         fatalf("Your OpenSSL has no SSL engine support\n");
+ #endif
+ 
++    const char *defName = Config.SSL.certSignHash ? Config.SSL.certSignHash : SQUID_SSL_SIGN_HASH_IF_NONE;
++    Ssl::DefaultSignHash = EVP_get_digestbyname(defName);
++    if (!Ssl::DefaultSignHash)
++        fatalf("Sign hash '%s' is not supported\n", defName);
++
+     ssl_ex_index_server = SSL_get_ex_new_index(0, (void *) "server", NULL, NULL, NULL);
+     ssl_ctx_ex_index_dont_verify_domain = SSL_CTX_get_ex_new_index(0, (void *) "dont_verify_domain", NULL, NULL, NULL);
+     ssl_ex_index_cert_error_check = SSL_get_ex_new_index(0, (void *) "cert_error_check", NULL, &ssl_dupAclChecklist, &ssl_freeAclChecklist);
+@@ -132,6 +132,8 @@ GETX509ATTRIBUTE GetX509CAAttribute;
+ /// \ingroup ServerProtocolSSLAPI
+ GETX509ATTRIBUTE GetX509Fingerprint;
+ 
++extern const EVP_MD *DefaultSignHash;
++
+ /**
+   \ingroup ServerProtocolSSLAPI
+  * Supported ssl-bump modes

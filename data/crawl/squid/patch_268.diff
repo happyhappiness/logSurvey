@@ -1,0 +1,396 @@
+@@ -69,7 +69,6 @@ HttpRequest::init()
+     method = Http::METHOD_NONE;
+     url.clear();
+     urlpath = NULL;
+-    login[0] = '\0';
+     host[0] = '\0';
+     host_is_numeric = -1;
+ #if USE_AUTH
+@@ -184,7 +183,7 @@ HttpRequest::clone() const
+     copy->pstate = pstate; // TODO: should we assert a specific state here?
+     copy->body_pipe = body_pipe;
+ 
+-    strncpy(copy->login, login, sizeof(login)); // MAX_LOGIN_SZ
++    copy->url.userInfo(url.userInfo());
+     strncpy(copy->host, host, sizeof(host)); // SQUIDHOSTNAMELEN
+     copy->host_addr = host_addr;
+ 
+@@ -116,9 +116,7 @@ class HttpRequest: public HttpMsg
+     HttpRequestMethod method;
+ 
+     // TODO expand to include all URI parts
+-    URL url; ///< the request URI (scheme only)
+-
+-    char login[MAX_LOGIN_SZ];
++    URL url; ///< the request URI (scheme and userinfo only)
+ 
+ private:
+     char host[SQUIDHOSTNAMELEN];
+@@ -11,6 +11,7 @@
+ 
+ #include "anyp/UriScheme.h"
+ #include "MemPool.h"
++#include "SBuf.h"
+ 
+ /**
+  * The URL class represents a Uniform Resource Location
+@@ -32,6 +33,9 @@ class URL
+     /// convert the URL scheme to that given
+     void setScheme(const AnyP::ProtocolType &p) {scheme_=p;}
+ 
++    void userInfo(const SBuf &s) {userInfo_=s;}
++    const SBuf &userInfo() const {return userInfo_;}
++
+ private:
+     /**
+      \par
+@@ -54,6 +58,8 @@ class URL
+      * and immutable, only settable at construction time,
+      */
+     AnyP::UriScheme scheme_;
++
++    SBuf userInfo_; // aka 'URL-login'
+ };
+ 
+ class HttpRequest;
+@@ -16,13 +16,19 @@
+ #include "rfc1738.h"
+ 
+ int
+-ACLUrlLoginStrategy::match (ACLData<char const *> * &data, ACLFilledChecklist *checklist, ACLFlags &)
++ACLUrlLoginStrategy::match(ACLData<char const *> * &data, ACLFilledChecklist *checklist, ACLFlags &)
+ {
+-    char *esc_buf = xstrdup(checklist->request->login);
+-    rfc1738_unescape(esc_buf);
+-    int result = data->match(esc_buf);
+-    safe_free(esc_buf);
+-    return result;
++    if (checklist->request->url.userInfo().isEmpty()) {
++        debugs(28, 5, "URL has no user-info details. cannot match");
++        return 0; // nothing can match
++    }
++
++    static char str[MAX_URL]; // should be big enough for a single URI segment
++
++    const SBuf::size_type len = checklist->request->url.userInfo().copy(str, sizeof(str)-1);
++    str[len] = '\0';
++    rfc1738_unescape(str);
++    return data->match(str);
+ }
+ 
+ ACLUrlLoginStrategy *
+@@ -2682,9 +2682,6 @@ clientProcessRequest(ConnStateData *conn, HttpParser *hp, ClientSocketContext *c
+                    ':' << request->port << " (not this proxy)");
+     }
+ 
+-    if (http->flags.internal)
+-        request->login[0] = '\0';
+-
+     request->flags.internal = http->flags.internal;
+     setLogUri (http, urlCanonicalClean(request.getRaw()));
+     request->client_addr = conn->clientConnection->remote; // XXX: remove reuest->client_addr member.
+@@ -1129,7 +1129,7 @@ clientInterpretRequestHeaders(ClientHttpRequest * http)
+ 
+     clientCheckPinning(http);
+ 
+-    if (request->login[0] != '\0')
++    if (!request->url.userInfo().isEmpty())
+         request->flags.auth = true;
+ 
+     if (req_hdr->has(HDR_VIA)) {
+@@ -126,7 +126,6 @@ class Gateway : public Ftp::Client
+     // these should all be private
+     virtual void start();
+     virtual Http::StatusCode failedHttpStatus(err_type &error);
+-    void loginParser(const char *, int escaped);
+     int restartable();
+     void appendSuccessHeader();
+     void hackShortcut(StateMethod *nextState);
+@@ -171,6 +170,8 @@ class Gateway : public Ftp::Client
+     virtual bool mayReadVirginReplyBody() const;
+     // BodyConsumer for HTTP: consume request body.
+     virtual void handleRequestBodyProducerAborted();
++
++    void loginParser(const SBuf &login, bool escaped);
+ };
+ 
+ } // namespace Ftp
+@@ -188,10 +189,6 @@ typedef struct {
+     char *link;
+ } ftpListParts;
+ 
+-#define FTP_LOGIN_ESCAPED	1
+-
+-#define FTP_LOGIN_NOT_ESCAPED	0
+-
+ #define CTRL_BUFLEN 1024
+ static char cbuf[CTRL_BUFLEN];
+ 
+@@ -393,58 +390,54 @@ Ftp::Gateway::~Gateway()
+ /**
+  * Parse a possible login username:password pair.
+  * Produces filled member variables user, password, password_url if anything found.
++ *
++ * \param login    a decoded Basic authentication credential token or URI user-info token
++ * \param escaped  whether to URL-decode the token after extracting user and password
+  */
+ void
+-Ftp::Gateway::loginParser(const char *login, int escaped)
++Ftp::Gateway::loginParser(const SBuf &login, bool escaped)
+ {
+-    const char *u = NULL; // end of the username sub-string
+-    int len;              // length of the current sub-string to handle.
++    debugs(9, 4, "login=" << login << ", escaped=" << escaped);
++    debugs(9, 9, "IN : login=" << login << ", escaped=" << escaped << ", user=" << user << ", password=" << password);
+ 
+-    int total_len = strlen(login);
+-
+-    debugs(9, 4, HERE << ": login='" << login << "', escaped=" << escaped);
+-    debugs(9, 9, HERE << ": IN : login='" << login << "', escaped=" << escaped << ", user=" << user << ", password=" << password);
+-
+-    if ((u = strchr(login, ':'))) {
++    if (login.isEmpty())
++        return;
+ 
+-        /* if there was a username part */
+-        if (u > login) {
+-            len = u - login;
+-            ++u; // jump off the delimiter.
+-            if (len > MAX_URL)
+-                len = MAX_URL-1;
+-            xstrncpy(user, login, len +1);
+-            debugs(9, 9, HERE << ": found user='" << user << "'(" << len <<"), escaped=" << escaped);
+-            if (escaped)
+-                rfc1738_unescape(user);
+-            debugs(9, 9, HERE << ": found user='" << user << "'(" << len <<") unescaped.");
+-        }
++    const SBuf::size_type colonPos = login.find(':');
+ 
+-        /* if there was a password part */
+-        len = login + total_len - u;
+-        if ( len > 0) {
+-            if (len > MAX_URL)
+-                len = MAX_URL -1;
+-            xstrncpy(password, u, len +1);
+-            debugs(9, 9, HERE << ": found password='" << password << "'(" << len <<"), escaped=" << escaped);
+-            if (escaped) {
+-                rfc1738_unescape(password);
+-                password_url = 1;
+-            }
+-            debugs(9, 9, HERE << ": found password='" << password << "'(" << len <<") unescaped.");
+-        }
+-    } else if (login[0]) {
+-        /* no password, just username */
+-        if (total_len > MAX_URL)
+-            total_len = MAX_URL -1;
+-        xstrncpy(user, login, total_len +1);
+-        debugs(9, 9, HERE << ": found user='" << user << "'(" << total_len <<"), escaped=" << escaped);
++    /* If there was a username part with at least one character use it.
++     * Ignore 0-length username portion, retain what we have already.
++     */
++    if (colonPos == SBuf::npos || colonPos > 0) {
++        const SBuf userName = login.substr(0, colonPos);
++        SBuf::size_type upto = userName.copy(user, sizeof(user)-1);
++        user[upto]='\0';
++        debugs(9, 9, "found user=" << userName << ' ' <<
++               (upto != userName.length() ? ", truncated-to=" : ", length=") << upto <<
++               ", escaped=" << escaped);
+         if (escaped)
+             rfc1738_unescape(user);
+-        debugs(9, 9, HERE << ": found user='" << user << "'(" << total_len <<") unescaped.");
++        debugs(9, 9, "found user=" << user << " (" << strlen(user) << ") unescaped.");
++    }
++
++    /* If there was a password part.
++     * For 0-length password clobber what we have already, this means explicitly none
++     */
++    if (colonPos != SBuf::npos) {
++        const SBuf pass = login.substr(colonPos+1, SBuf::npos);
++        SBuf::size_type upto = pass.copy(password, sizeof(password)-1);
++        password[upto]='\0';
++        debugs(9, 9, "found password=" << pass << " " <<
++               (upto != pass.length() ? ", truncated-to=" : ", length=") << upto <<
++               ", escaped=" << escaped);
++        if (escaped) {
++            rfc1738_unescape(password);
++            password_url = 1;
++        }
++        debugs(9, 9, "found password=" << password << " (" << strlen(password) << ") unescaped.");
+     }
+ 
+-    debugs(9, 9, HERE << ": OUT: login='" << login << "', escaped=" << escaped << ", user=" << user << ", password=" << password);
++    debugs(9, 9, "OUT: login=" << login << ", escaped=" << escaped << ", user=" << user << ", password=" << password);
+ }
+ 
+ void
+@@ -1052,16 +1045,16 @@ Ftp::Gateway::checkAuth(const HttpHeader * req_hdr)
+ 
+ #if HAVE_AUTH_MODULE_BASIC
+     /* Check HTTP Authorization: headers (better than defaults, but less than URL) */
+-    const char *auth;
+-    if ( (auth = req_hdr->getAuth(HDR_AUTHORIZATION, "Basic")) ) {
++    const SBuf auth(req_hdr->getAuth(HDR_AUTHORIZATION, "Basic"));
++    if (!auth.isEmpty()) {
+         flags.authenticated = 1;
+-        loginParser(auth, FTP_LOGIN_NOT_ESCAPED);
++        loginParser(auth, false);
+     }
+     /* we fail with authorization-required error later IFF the FTP server requests it */
+ #endif
+ 
+     /* Test URL login syntax. Overrides any headers received. */
+-    loginParser(request->login, FTP_LOGIN_ESCAPED);
++    loginParser(request->url.userInfo(), true);
+ 
+     /* name is missing. thats fatal. */
+     if (!user[0])
+@@ -1790,9 +1790,10 @@ HttpStateData::httpBuildRequestHeader(HttpRequest * request,
+ 
+     /* append Authorization if known in URL, not in header and going direct */
+     if (!hdr_out->has(HDR_AUTHORIZATION)) {
+-        if (!request->flags.proxying && request->login[0] != '\0') {
+-            httpHeaderPutStrf(hdr_out, HDR_AUTHORIZATION, "Basic %s",
+-                              old_base64_encode(request->login));
++        if (!request->flags.proxying && !request->url.userInfo().isEmpty()) {
++            static char result[MAX_URL*2]; // should be big enough for a single URI segment
++            if (base64_encode_str(result, sizeof(result)-1, request->url.userInfo().rawContent(), request->url.userInfo().length()) < static_cast<int>(sizeof(result)-1))
++                httpHeaderPutStrf(hdr_out, HDR_AUTHORIZATION, "Basic %s", result);
+         }
+     }
+ 
+@@ -1307,8 +1307,9 @@ netdbExchangeStart(void *data)
+                     netdbExchangeHandleReply, ex);
+     ex->r->flags.loopDetected = true;	/* cheat! -- force direct */
+ 
++    // XXX: send as Proxy-Authenticate instead
+     if (p->login)
+-        xstrncpy(ex->r->login, p->login, MAX_LOGIN_SZ);
++        ex->r->url.userInfo(SBuf(p->login));
+ 
+     urlCanonical(ex->r);
+ 
+@@ -20,7 +20,7 @@ static HttpRequest *urlParseFinish(const HttpRequestMethod& method,
+                                    const AnyP::ProtocolType protocol,
+                                    const char *const urlpath,
+                                    const char *const host,
+-                                   const char *const login,
++                                   const SBuf &login,
+                                    const int port,
+                                    HttpRequest *request);
+ static HttpRequest *urnParse(const HttpRequestMethod& method, char *urn, HttpRequest *request);
+@@ -218,7 +218,7 @@ urlParse(const HttpRequestMethod& method, char *url, HttpRequest *request)
+                strcmp(url, "*") == 0) {
+         protocol = AnyP::PROTO_HTTP;
+         port = urlDefaultPort(protocol);
+-        return urlParseFinish(method, protocol, url, host, login, port, request);
++        return urlParseFinish(method, protocol, url, host, SBuf(), port, request);
+     } else if (!strncmp(url, "urn:", 4)) {
+         return urnParse(method, url, request);
+     } else {
+@@ -423,7 +423,7 @@ urlParse(const HttpRequestMethod& method, char *url, HttpRequest *request)
+         }
+     }
+ 
+-    return urlParseFinish(method, protocol, urlpath, host, login, port, request);
++    return urlParseFinish(method, protocol, urlpath, host, SBuf(login), port, request);
+ }
+ 
+ /**
+@@ -436,7 +436,7 @@ urlParseFinish(const HttpRequestMethod& method,
+                const AnyP::ProtocolType protocol,
+                const char *const urlpath,
+                const char *const host,
+-               const char *const login,
++               const SBuf &login,
+                const int port,
+                HttpRequest *request)
+ {
+@@ -448,7 +448,7 @@ urlParseFinish(const HttpRequestMethod& method,
+     }
+ 
+     request->SetHost(host);
+-    xstrncpy(request->login, login, MAX_LOGIN_SZ);
++    request->url.userInfo(login);
+     request->port = (unsigned short) port;
+     return request;
+ }
+@@ -491,10 +491,10 @@ urlCanonical(HttpRequest * request)
+             if (request->port != urlDefaultPort(request->url.getScheme()))
+                 snprintf(portbuf, 32, ":%d", request->port);
+ 
+-            snprintf(urlbuf, MAX_URL, "%s://%s%s%s%s" SQUIDSTRINGPH,
++            snprintf(urlbuf, MAX_URL, "%s://" SQUIDSBUFPH "%s%s%s" SQUIDSTRINGPH,
+                      request->url.getScheme().c_str(),
+-                     request->login,
+-                     *request->login ? "@" : null_string,
++                     SQUIDSBUFPRINT(request->url.userInfo()),
++                     !request->url.userInfo().isEmpty() ? "@" : "",
+                      request->GetHost(),
+                      portbuf,
+                      SQUIDSTRINGPRINT(request->urlpath));
+@@ -514,7 +514,6 @@ urlCanonicalClean(const HttpRequest * request)
+ {
+     LOCAL_ARRAY(char, buf, MAX_URL);
+     LOCAL_ARRAY(char, portbuf, 32);
+-    LOCAL_ARRAY(char, loginbuf, MAX_LOGIN_SZ + 1);
+     char *t;
+ 
+     if (request->url.getScheme() == AnyP::PROTO_URN) {
+@@ -533,20 +532,10 @@ urlCanonicalClean(const HttpRequest * request)
+             if (request->port != urlDefaultPort(request->url.getScheme()))
+                 snprintf(portbuf, 32, ":%d", request->port);
+ 
+-            loginbuf[0] = '\0';
+-
+-            if ((int) strlen(request->login) > 0) {
+-                strcpy(loginbuf, request->login);
+-
+-                if ((t = strchr(loginbuf, ':')))
+-                    *t = '\0';
+-
+-                strcat(loginbuf, "@");
+-            }
+-
+-            snprintf(buf, MAX_URL, "%s://%s%s%s" SQUIDSTRINGPH,
++            snprintf(buf, MAX_URL, "%s://" SQUIDSBUFPH "%s%s%s" SQUIDSTRINGPH,
+                      request->url.getScheme().c_str(),
+-                     loginbuf,
++                     SQUIDSBUFPRINT(request->url.userInfo()),
++                     (request->url.userInfo().isEmpty() ? "" : "@"),
+                      request->GetHost(),
+                      portbuf,
+                      SQUIDSTRINGPRINT(request->urlpath));
+@@ -556,7 +545,7 @@ urlCanonicalClean(const HttpRequest * request)
+                 if ((t = strchr(buf, '?')))
+                     *(++t) = '\0';
+         }
+-        }
++        } // switch
+     }
+ 
+     if (stringHasCntl(buf))
+@@ -644,18 +633,18 @@ urlMakeAbsolute(const HttpRequest * req, const char *relUrl)
+     size_t urllen;
+ 
+     if (req->port != urlDefaultPort(req->url.getScheme())) {
+-        urllen = snprintf(urlbuf, MAX_URL, "%s://%s%s%s:%d",
++        urllen = snprintf(urlbuf, MAX_URL, "%s://" SQUIDSBUFPH "%s%s:%d",
+                           req->url.getScheme().c_str(),
+-                          req->login,
+-                          *req->login ? "@" : null_string,
++                          SQUIDSBUFPRINT(req->url.userInfo()),
++                          !req->url.userInfo().isEmpty() ? "@" : "",
+                           req->GetHost(),
+                           req->port
+                          );
+     } else {
+-        urllen = snprintf(urlbuf, MAX_URL, "%s://%s%s%s",
++        urllen = snprintf(urlbuf, MAX_URL, "%s://" SQUIDSBUFPH "%s%s",
+                           req->url.getScheme().c_str(),
+-                          req->login,
+-                          *req->login ? "@" : null_string,
++                          SQUIDSBUFPRINT(req->url.userInfo()),
++                          !req->url.userInfo().isEmpty() ? "@" : "",
+                           req->GetHost()
+                          );
+     }

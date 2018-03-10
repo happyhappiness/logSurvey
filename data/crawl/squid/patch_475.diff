@@ -1,0 +1,881 @@
+@@ -80,10 +80,12 @@
+ 
+ ACL::Prototype ACLBrowser::RegistryProtoype(&ACLBrowser::RegistryEntry_, "browser");
+ ACLStrategised<char const *> ACLBrowser::RegistryEntry_(new ACLRegexData, ACLRequestHeaderStrategy<HDR_USER_AGENT>::Instance(), "browser");
++ACLFlag  DestinationDomainFlags[] = {ACL_F_NO_LOOKUP, ACL_F_END};
+ ACL::Prototype ACLDestinationDomain::LiteralRegistryProtoype(&ACLDestinationDomain::LiteralRegistryEntry_, "dstdomain");
+-ACLStrategised<char const *> ACLDestinationDomain::LiteralRegistryEntry_(new ACLDomainData, ACLDestinationDomainStrategy::Instance(), "dstdomain");
++ACLStrategised<char const *> ACLDestinationDomain::LiteralRegistryEntry_(new ACLDomainData, ACLDestinationDomainStrategy::Instance(), "dstdomain", DestinationDomainFlags);
+ ACL::Prototype ACLDestinationDomain::RegexRegistryProtoype(&ACLDestinationDomain::RegexRegistryEntry_, "dstdom_regex");
+-ACLStrategised<char const *> ACLDestinationDomain::RegexRegistryEntry_(new ACLRegexData,ACLDestinationDomainStrategy::Instance() ,"dstdom_regex");
++ACLFlag  DestinationDomainRegexFlags[] = {ACL_F_NO_LOOKUP, ACL_F_REGEX_CASE, ACL_F_END};
++ACLStrategised<char const *> ACLDestinationDomain::RegexRegistryEntry_(new ACLRegexData,ACLDestinationDomainStrategy::Instance() ,"dstdom_regex", DestinationDomainRegexFlags);
+ ACL::Prototype ACLDestinationIP::RegistryProtoype(&ACLDestinationIP::RegistryEntry_, "dst");
+ ACLDestinationIP ACLDestinationIP::RegistryEntry_;
+ #if USE_AUTH
+@@ -38,6 +38,9 @@
+ #include "fatal.h"
+ #include "globals.h"
+ 
++char *ConfigParser::lastToken = NULL;
++std::queue<std::string> ConfigParser::undo;
++
+ void
+ ConfigParser::destruct()
+ {
+@@ -46,15 +49,38 @@ ConfigParser::destruct()
+            cfg_filename, config_lineno, config_input_line);
+ }
+ 
++void
++ConfigParser::strtokFileUndo()
++{
++    assert(lastToken);
++    undo.push(lastToken);
++}
++
++void
++ConfigParser::strtokFilePutBack(const char *tok)
++{
++    assert(tok);
++    undo.push(tok);
++}
++
+ char *
+ ConfigParser::strtokFile(void)
+ {
+     static int fromFile = 0;
+     static FILE *wordFile = NULL;
++    LOCAL_ARRAY(char, undoToken, CONFIG_LINE_LIMIT);
+ 
+     char *t, *fn;
+     LOCAL_ARRAY(char, buf, CONFIG_LINE_LIMIT);
+ 
++    if (!undo.empty()) {
++        strncpy(undoToken, undo.front().c_str(), sizeof(undoToken));
++        undoToken[sizeof(undoToken) - 1] = '\0';
++        undo.pop();
++        return undoToken;
++    }
++
++    lastToken = NULL;
+     do {
+ 
+         if (!fromFile) {
+@@ -82,7 +108,7 @@ ConfigParser::strtokFile(void)
+ 
+                 fromFile = 1;
+             } else {
+-                return t;
++                return lastToken = t;
+             }
+         }
+ 
+@@ -113,7 +139,7 @@ ConfigParser::strtokFile(void)
+         /* skip blank lines */
+     } while ( *t == '#' || !*t );
+ 
+-    return t;
++    return lastToken = t;
+ }
+ 
+ void
+@@ -35,6 +35,10 @@
+ #define SQUID_CONFIGPARSER_H
+ 
+ #include "SquidString.h"
++#include <queue>
++#if HAVE_STRING
++#include <string>
++#endif
+ 
+ class wordlist;
+ /**
+@@ -76,6 +80,11 @@ class ConfigParser
+     static const char *QuoteString(String &var);
+     static void ParseWordList(wordlist **list);
+     static char * strtokFile();
++    static void strtokFileUndo();
++    static void strtokFilePutBack(const char *);
++private:
++    static char *lastToken;
++    static std::queue<std::string> undo;
+ };
+ 
+ int parseConfigFile(const char *file_name);
+@@ -33,14 +33,70 @@
+ #include "acl/Acl.h"
+ #include "acl/Checklist.h"
+ #include "anyp/PortCfg.h"
++#include "cache_cf.h"
+ #include "ConfigParser.h"
+ #include "Debug.h"
+ #include "dlink.h"
+ #include "globals.h"
+ #include "SquidConfig.h"
+ 
++const ACLFlag ACLFlags::NoFlags[1] = {ACL_F_END};
++
+ const char *AclMatchedName = NULL;
+ 
++bool ACLFlags::supported(const ACLFlag f) const 
++{
++    if (f == ACL_F_REGEX_CASE)
++        return true;
++    return (supported_.find(f) != std::string::npos); 
++}
++
++void 
++ACLFlags::parseFlags(char * &nextToken)
++{
++    while((nextToken = ConfigParser::strtokFile()) != NULL && nextToken[0] == '-') {
++
++        //if token is the "--" break flag
++        if (strcmp(nextToken, "--") == 0) 
++            break;
++
++        for (const char *flg = nextToken+1; *flg!='\0'; flg++ ) {
++            if (supported(*flg)) {
++                makeSet(*flg);
++            }
++            else {
++                debugs(28, 0, HERE << "Flag '" << *flg << "' not supported");
++                self_destruct();
++            }
++        }
++    }
++
++    /*Regex code needs to parse -i file*/
++    if ( isSet(ACL_F_REGEX_CASE))
++        ConfigParser::strtokFilePutBack("-i");
++
++    if (nextToken != NULL && strcmp(nextToken, "--") != 0 )
++        ConfigParser::strtokFileUndo();
++}
++
++const char *
++ACLFlags::flagsStr() const
++{
++    static char buf[64];
++    if (flags_ == 0)
++        return "";
++
++    char *s = buf;
++    *s++ = '-';
++    for (ACLFlag f = 'A'; f <= 'z'; f++) {
++        // ACL_F_REGEX_CASE (-i) flag handled by ACLRegexData class, ignore
++        if (isSet(f) && f != ACL_F_REGEX_CASE)
++            *s++ = f;
++    }
++    *s = '\0';
++    return buf;
++}
++
+ void *
+ ACL::operator new (size_t byteCount)
+ {
+@@ -180,6 +236,9 @@ ACL::ParseAclLine(ConfigParser &parser, ACL ** head)
+      */
+     AclMatchedName = A->name;	/* ugly */
+ 
++    char *aTok;
++    A->flags.parseFlags(aTok);
++
+     /*split the function here */
+     A->parse();
+ 
+@@ -425,8 +484,11 @@ ACL::Prototype::Factory (char const *typeToClone)
+     debugs(28, 4, "ACL::Prototype::Factory: cloning an object for type '" << typeToClone << "'");
+ 
+     for (iterator i = Registry->begin(); i != Registry->end(); ++i)
+-        if (!strcmp (typeToClone, (*i)->typeString))
+-            return (*i)->prototype->clone();
++        if (!strcmp (typeToClone, (*i)->typeString)) {
++            ACL *A = (*i)->prototype->clone();
++            A->flags = (*i)->prototype->flags;
++            return A;
++        }
+ 
+     debugs(28, 4, "ACL::Prototype::Factory: cloning failed, no type '" << typeToClone << "' available");
+ 
+@@ -42,11 +42,54 @@
+ #if HAVE_OSTREAM
+ #include <ostream>
+ #endif
++#if HAVE_STRING
++#include <string>
++#endif
+ 
+ class ConfigParser;
+ class ACLChecklist;
+ class ACLList;
+ 
++typedef char ACLFlag;
++// ACLData Flags
++#define ACL_F_REGEX_CASE 'i'
++#define ACL_F_NO_LOOKUP 'n'
++#define ACL_F_END '\0'
++
++/**
++ * \ingroup ACLAPI
++ * Used to hold a list of one-letter flags which can be passed as parameters
++ * to acls  (eg '-i', '-n' etc)
++ */
++class ACLFlags
++{
++public:
++    explicit ACLFlags(const ACLFlag flags[]) : supported_(flags), flags_(0) {}
++    ACLFlags() : flags_(0) {}
++    bool supported(const ACLFlag f) const; ///< True if the given flag supported
++    void makeSet(const ACLFlag f) { flags_ |= flagToInt(f); } ///< Set the given flag
++    /// Return true if the given flag is set
++    bool isSet(const ACLFlag f) const { return flags_ & flagToInt(f);}
++    /// Parse a flags given in the form -[A..Z|a..z]
++    void parseFlags(char * &nextToken);
++    const char *flagsStr() const; ///< Convert the flags to a string representation
++
++private:
++    /// Convert a flag to a 64bit unsigned integer.
++    /// The characters from 'A' to 'z' represented by the values from 65 to 122.
++    /// They are 57 different characters which can be fit to the bits of an 64bit 
++    /// integer.
++    uint64_t flagToInt(const ACLFlag f) const {
++        assert('A' <= f && f <= 'z');
++        return ((uint64_t)1 << (f - 'A'));
++    }
++
++    std::string supported_; ///< The supported character flags
++    uint64_t flags_; ///< The flags which is set
++public:
++    static const ACLFlag NoFlags[1]; ///< An empty flags list
++};
++
+ /// \ingroup ACLAPI
+ class ACL
+ {
+@@ -61,6 +104,7 @@ class ACL
+     static ACL* FindByName(const char *name);
+ 
+     ACL();
++    explicit ACL(const ACLFlag flgs[]) : cfgline(NULL), flags(flgs){}
+     virtual ~ACL();
+     virtual ACL *clone()const = 0;
+     virtual void parse() = 0;
+@@ -82,6 +126,7 @@ class ACL
+     char name[ACL_NAME_SZ];
+     char *cfgline;
+     ACL *next;
++    ACLFlags flags; ///< The list of given ACL flags
+ 
+ public:
+ 
+@@ -609,7 +609,7 @@ ACL::Prototype ACLASN::DestinationRegistryProtoype(&ACLASN::DestinationRegistryE
+ ACLStrategised<Ip::Address> ACLASN::DestinationRegistryEntry_(new ACLASN, ACLDestinationASNStrategy::Instance(), "dst_as");
+ 
+ int
+-ACLSourceASNStrategy::match (ACLData<Ip::Address> * &data, ACLFilledChecklist *checklist)
++ACLSourceASNStrategy::match (ACLData<Ip::Address> * &data, ACLFilledChecklist *checklist, ACLFlags &)
+ {
+     return data->match(checklist->src_addr);
+ }
+@@ -623,7 +623,7 @@ ACLSourceASNStrategy::Instance()
+ ACLSourceASNStrategy ACLSourceASNStrategy::Instance_;
+ 
+ int
+-ACLDestinationASNStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist)
++ACLDestinationASNStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &)
+ {
+     const ipcache_addrs *ia = ipcache_gethostbyname(checklist->request->GetHost(), IP_LOOKUP_IF_MISS);
+ 
+@@ -48,7 +48,7 @@
+ #include "globals.h"
+ 
+ int
+-ACLCertificateStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist)
++ACLCertificateStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &)
+ {
+     const int fd = checklist->fd();
+     const bool goodDescriptor = 0 <= fd && fd <= Biggest_FD;
+@@ -44,7 +44,7 @@ class ACLCertificateStrategy : public ACLStrategy<X509 *>
+ {
+ 
+ public:
+-    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *);
++    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *, ACLFlags &);
+     static ACLCertificateStrategy *Instance();
+     /* Not implemented to prevent copies of the instance. */
+     /* Not private to prevent brain dead g+++ warnings about
+@@ -41,7 +41,7 @@ class ACLDestinationASNStrategy : public ACLStrategy<Ip::Address>
+ {
+ 
+ public:
+-    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *);
++    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *, ACLFlags &);
+     virtual bool requiresRequest() const {return true;}
+ 
+     static ACLDestinationASNStrategy *Instance();
+@@ -71,14 +71,19 @@ DestinationDomainLookup::LookupDone(const char *fqdn, const DnsLookupDetails &de
+ }
+ 
+ int
+-ACLDestinationDomainStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist)
++ACLDestinationDomainStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &flags)
+ {
+     assert(checklist != NULL && checklist->request != NULL);
+ 
+     if (data->match(checklist->request->GetHost())) {
+         return 1;
+     }
+ 
++    if (flags.isSet(ACL_F_NO_LOOKUP)) {
++        debugs(28, 3, "aclMatchAcl:  No-lookup DNS ACL '" << AclMatchedName << "' for '" << checklist->request->GetHost() << "'");
++        return 0;
++    }
++
+     /* numeric IPA? no, trust the above result. */
+     if (checklist->request->GetHostIsNumeric() == 0) {
+         return 0;
+@@ -43,7 +43,7 @@ class ACLDestinationDomainStrategy : public ACLStrategy<char const *>
+ {
+ 
+ public:
+-    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *);
++    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *, ACLFlags &);
+     static ACLDestinationDomainStrategy *Instance();
+     virtual bool requiresRequest() const {return true;}
+ 
+@@ -39,6 +39,8 @@
+ #include "HttpRequest.h"
+ #include "SquidConfig.h"
+ 
++ACLFlag ACLDestinationIP::SupportedFlags[] = {ACL_F_NO_LOOKUP, ACL_F_END};
++
+ char const *
+ ACLDestinationIP::typeString() const
+ {
+@@ -59,6 +61,17 @@ ACLDestinationIP::match(ACLChecklist *cl)
+         return ACLIP::match(checklist->conn()->clientConnection->local);
+     }
+ 
++    if (flags.isSet(ACL_F_NO_LOOKUP)) {
++        if (!checklist->request->GetHostIsNumeric()) {
++            debugs(28, 3, "aclMatchAcl:  No-lookup DNS ACL '" << AclMatchedName << "' for '" << checklist->request->GetHost() << "'");
++            return 0;
++        }
++
++        if(ACLIP::match(checklist->request->host_addr))
++            return 1;
++        return 0;
++    }
++
+     const ipcache_addrs *ia = ipcache_gethostbyname(checklist->request->GetHost(), IP_LOOKUP_IF_MISS);
+ 
+     if (ia) {
+@@ -55,12 +55,14 @@ class ACLDestinationIP : public ACLIP
+ public:
+     MEMPROXY_CLASS(ACLDestinationIP);
+ 
++    ACLDestinationIP(): ACLIP(ACLDestinationIP::SupportedFlags) {}
+     virtual char const *typeString() const;
+     virtual int match(ACLChecklist *checklist);
+     virtual bool requiresRequest() const {return true;}
+ 
+     virtual ACL *clone()const;
+ 
++    static ACLFlag SupportedFlags[];
+ private:
+     static Prototype RegistryProtoype;
+     static ACLDestinationIP RegistryEntry_;
+@@ -9,7 +9,7 @@
+ template class ACLStrategised<hier_code>;
+ 
+ int
+-ACLHierCodeStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist)
++ACLHierCodeStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &)
+ {
+     return data->match (checklist->request->hier.code);
+ }
+@@ -10,7 +10,7 @@ class ACLHierCodeStrategy : public ACLStrategy<hier_code>
+ {
+ 
+ public:
+-    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *);
++    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *, ACLFlags &);
+     virtual bool requiresRequest() const {return true;}
+ 
+     static ACLHierCodeStrategy *Instance();
+@@ -38,7 +38,7 @@
+ #include "HttpReply.h"
+ 
+ int
+-ACLHTTPRepHeaderStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist)
++ACLHTTPRepHeaderStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &)
+ {
+     return data->match (&checklist->reply->header);
+ }
+@@ -42,7 +42,7 @@ class ACLHTTPRepHeaderStrategy : public ACLStrategy<HttpHeader*>
+ {
+ 
+ public:
+-    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *);
++    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *, ACLFlags &);
+     virtual bool requiresReply() const { return true; }
+ 
+     static ACLHTTPRepHeaderStrategy *Instance();
+@@ -38,7 +38,7 @@
+ #include "HttpRequest.h"
+ 
+ int
+-ACLHTTPReqHeaderStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist)
++ACLHTTPReqHeaderStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &)
+ {
+     return data->match (&checklist->request->header);
+ }
+@@ -42,7 +42,7 @@ class ACLHTTPReqHeaderStrategy : public ACLStrategy<HttpHeader*>
+ {
+ 
+ public:
+-    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *);
++    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *, ACLFlags &);
+     virtual bool requiresRequest() const { return true; }
+ 
+     static ACLHTTPReqHeaderStrategy *Instance();
+@@ -509,7 +509,12 @@ ACLIP::parse()
+ {
+     char *t = NULL;
+ 
+-    while ((t = strtokFile())) {
++    flags.parseFlags(t);
++
++    if (!t)
++        return;
++
++    do {
+         acl_ip_data *q = acl_ip_data::FactoryParse(t);
+ 
+         while (q != NULL) {
+@@ -519,7 +524,7 @@ ACLIP::parse()
+             data = data->insert(q, acl_ip_data::NetworkCompare);
+             q = next_node;
+         }
+-    }
++    } while ((t = strtokFile()));
+ }
+ 
+ ACLIP::~ACLIP()
+@@ -33,6 +33,7 @@
+ #define SQUID_ACLIP_H
+ 
+ #include "acl/Acl.h"
++#include "acl/Data.h"
+ #include "splay.h"
+ #include "ip/Address.h"
+ 
+@@ -74,6 +75,7 @@ class ACLIP : public ACL
+     void operator delete(void *);
+ 
+     ACLIP() : data(NULL) {}
++    explicit ACLIP(const ACLFlag flgs[]) : ACL(flgs), data(NULL) {}
+ 
+     ~ACLIP();
+ 
+@@ -37,7 +37,7 @@
+ #include "acl/Checklist.h"
+ 
+ int
+-ACLLocalPortStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist)
++ACLLocalPortStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &)
+ {
+     return data->match (checklist->my_addr.GetPort());
+ }
+@@ -41,7 +41,7 @@ class ACLLocalPortStrategy : public ACLStrategy<int>
+ {
+ 
+ public:
+-    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *);
++    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *, ACLFlags &);
+     static ACLLocalPortStrategy *Instance();
+     /**
+      * Not implemented to prevent copies of the instance.
+@@ -42,7 +42,7 @@
+ template class ACLStrategised<HttpRequestMethod>;
+ 
+ int
+-ACLMethodStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist)
++ACLMethodStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &)
+ {
+     return data->match (checklist->request->method);
+ }
+@@ -42,7 +42,7 @@ class ACLMethodStrategy : public ACLStrategy<HttpRequestMethod>
+ {
+ 
+ public:
+-    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *);
++    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *, ACLFlags &);
+     virtual bool requiresRequest() const {return true;}
+ 
+     static ACLMethodStrategy *Instance();
+@@ -42,7 +42,7 @@
+ #include "client_side.h"
+ 
+ int
+-ACLMyPortNameStrategy::match(ACLData<MatchType> * &data, ACLFilledChecklist *checklist)
++ACLMyPortNameStrategy::match(ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &)
+ {
+     if (checklist->conn() != NULL)
+         return data->match(checklist->conn()->port->name);
+@@ -40,7 +40,7 @@ class ACLMyPortNameStrategy : public ACLStrategy<const char *>
+ {
+ 
+ public:
+-    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *);
++    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *, ACLFlags &);
+     static ACLMyPortNameStrategy *Instance();
+     /* Not implemented to prevent copies of the instance. */
+     /* Not private to prevent brain dead g+++ warnings about
+@@ -6,7 +6,7 @@
+ #include "CachePeer.h"
+ 
+ int
+-ACLPeerNameStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist)
++ACLPeerNameStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &)
+ {
+     if (checklist->dst_peer != NULL && checklist->dst_peer->name != NULL)
+         return data->match(checklist->dst_peer->name);
+@@ -8,7 +8,7 @@ class ACLPeerNameStrategy : public ACLStrategy<const char *>
+ {
+ 
+ public:
+-    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *);
++    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *, ACLFlags &);
+     static ACLPeerNameStrategy *Instance();
+     /* Not implemented to prevent copies of the instance. */
+     /* Not private to prevent brain dead g+++ warnings about
+@@ -42,7 +42,7 @@
+ template class ACLStrategised<AnyP::ProtocolType>;
+ 
+ int
+-ACLProtocolStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist)
++ACLProtocolStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &)
+ {
+     return data->match (checklist->request->protocol);
+ }
+@@ -42,7 +42,7 @@ class ACLProtocolStrategy : public ACLStrategy<AnyP::ProtocolType>
+ {
+ 
+ public:
+-    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *);
++    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *, ACLFlags &);
+     virtual bool requiresRequest() const {return true;}
+ 
+     static ACLProtocolStrategy *Instance();
+@@ -45,7 +45,7 @@ class ACLReplyHeaderStrategy : public ACLStrategy<char const *>
+ {
+ 
+ public:
+-    virtual int match (ACLData<char const *> * &, ACLFilledChecklist *);
++    virtual int match (ACLData<char const *> * &, ACLFilledChecklist *, ACLFlags &);
+     virtual bool requiresReply() const {return true;}
+ 
+     static ACLReplyHeaderStrategy *Instance();
+@@ -63,7 +63,7 @@ class ACLReplyHeaderStrategy : public ACLStrategy<char const *>
+ 
+ template <http_hdr_type header>
+ int
+-ACLReplyHeaderStrategy<header>::match (ACLData<char const *> * &data, ACLFilledChecklist *checklist)
++ACLReplyHeaderStrategy<header>::match (ACLData<char const *> * &data, ACLFilledChecklist *checklist, ACLFlags &)
+ {
+     char const *theHeader = checklist->reply->header.getStr(header);
+ 
+@@ -51,7 +51,7 @@ class ACLReplyMIMEType
+ 
+ template <>
+ inline int
+-ACLReplyHeaderStrategy<HDR_CONTENT_TYPE>::match(ACLData<char const *> * &data, ACLFilledChecklist *checklist)
++ACLReplyHeaderStrategy<HDR_CONTENT_TYPE>::match(ACLData<char const *> * &data, ACLFilledChecklist *checklist, ACLFlags &)
+ {
+     char const *theHeader = checklist->reply->header.getStr(HDR_CONTENT_TYPE);
+ 
+@@ -45,7 +45,7 @@ class ACLRequestHeaderStrategy : public ACLStrategy<char const *>
+ {
+ 
+ public:
+-    virtual int match (ACLData<char const *> * &, ACLFilledChecklist *);
++    virtual int match (ACLData<char const *> * &, ACLFilledChecklist *, ACLFlags &);
+     virtual bool requiresRequest() const {return true;}
+ 
+     static ACLRequestHeaderStrategy *Instance();
+@@ -63,7 +63,7 @@ class ACLRequestHeaderStrategy : public ACLStrategy<char const *>
+ 
+ template <http_hdr_type header>
+ int
+-ACLRequestHeaderStrategy<header>::match (ACLData<char const *> * &data, ACLFilledChecklist *checklist)
++ACLRequestHeaderStrategy<header>::match (ACLData<char const *> * &data, ACLFilledChecklist *checklist, ACLFlags &)
+ {
+     char const *theHeader = checklist->request->header.getStr(header);
+ 
+@@ -51,7 +51,7 @@ class ACLRequestMIMEType
+ 
+ template <>
+ inline int
+-ACLRequestHeaderStrategy<HDR_CONTENT_TYPE>::match (ACLData<char const *> * &data, ACLFilledChecklist *checklist)
++ACLRequestHeaderStrategy<HDR_CONTENT_TYPE>::match (ACLData<char const *> * &data, ACLFilledChecklist *checklist, ACLFlags &)
+ {
+     char const *theHeader = checklist->request->header.getStr(HDR_CONTENT_TYPE);
+ 
+@@ -13,7 +13,7 @@
+ #include "ssl/ServerBump.h"
+ 
+ int
+-ACLServerCertificateStrategy::match(ACLData<MatchType> * &data, ACLFilledChecklist *checklist)
++ACLServerCertificateStrategy::match(ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &)
+ {
+     X509 *cert = NULL;
+     if (checklist->serverCert.get())
+@@ -14,7 +14,7 @@
+ class ACLServerCertificateStrategy : public ACLStrategy<X509 *>
+ {
+ public:
+-    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *);
++    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *, ACLFlags &);
+     static ACLServerCertificateStrategy *Instance();
+     /* Not implemented to prevent copies of the instance. */
+     /* Not private to prevent brain dead g+++ warnings about
+@@ -44,7 +44,7 @@ class ACLSourceASNStrategy : public ACLStrategy<Ip::Address>
+ {
+ 
+ public:
+-    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *);
++    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *, ACLFlags &);
+     static ACLSourceASNStrategy *Instance();
+     /* Not implemented to prevent copies of the instance. */
+     /* Not private to prevent brain dead g+++ warnings about
+@@ -69,7 +69,7 @@ SourceDomainLookup::LookupDone(const char *fqdn, const DnsLookupDetails &details
+ }
+ 
+ int
+-ACLSourceDomainStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist)
++ACLSourceDomainStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &)
+ {
+     const char *fqdn = NULL;
+     fqdn = fqdncache_gethostbyaddr(checklist->src_addr, FQDN_LOOKUP_IF_MISS);
+@@ -42,7 +42,7 @@ class ACLSourceDomainStrategy : public ACLStrategy<char const *>
+ {
+ 
+ public:
+-    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *);
++    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *, ACLFlags &);
+     static ACLSourceDomainStrategy *Instance();
+     /* Not implemented to prevent copies of the instance. */
+     /* Not private to prevent brain dead g+++ warnings about
+@@ -4,7 +4,7 @@
+ #include "acl/Checklist.h"
+ 
+ int
+-ACLSslErrorStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist)
++ACLSslErrorStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &)
+ {
+     return data->match (checklist->sslErrors);
+ }
+@@ -8,7 +8,7 @@ class ACLSslErrorStrategy : public ACLStrategy<const Ssl::Errors *>
+ {
+ 
+ public:
+-    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *);
++    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *, ACLFlags &);
+     static ACLSslErrorStrategy *Instance();
+     /* Not implemented to prevent copies of the instance. */
+     /* Not private to prevent brain dead g+++ warnings about
+@@ -49,7 +49,7 @@ class ACLStrategised : public ACL
+     void operator delete(void *);
+ 
+     ~ACLStrategised();
+-    ACLStrategised(ACLData<MatchType> *, ACLStrategy<MatchType> *, char const *);
++    ACLStrategised(ACLData<MatchType> *, ACLStrategy<MatchType> *, char const *, const ACLFlag flags[] = ACLFlags::NoFlags);
+     ACLStrategised (ACLStrategised const &);
+     ACLStrategised &operator= (ACLStrategised const &);
+ 
+@@ -107,7 +107,7 @@ ACLStrategised<MatchType>::~ACLStrategised()
+ }
+ 
+ template <class MatchType>
+-ACLStrategised<MatchType>::ACLStrategised(ACLData<MatchType> *newData, ACLStrategy<MatchType> *theStrategy, char const *theType) : data (newData), type_(theType), matcher(theStrategy) {}
++ACLStrategised<MatchType>::ACLStrategised(ACLData<MatchType> *newData, ACLStrategy<MatchType> *theStrategy, char const *theType, const ACLFlag flgs[]) : ACL(flgs), data (newData), type_(theType), matcher(theStrategy) {}
+ 
+ template <class MatchType>
+ ACLStrategised<MatchType>::ACLStrategised (ACLStrategised const &old) : data (old.data->clone()), type_(old.type_), matcher (old.matcher)
+@@ -150,7 +150,7 @@ ACLStrategised<MatchType>::match(ACLChecklist *cl)
+ {
+     ACLFilledChecklist *checklist = dynamic_cast<ACLFilledChecklist*>(cl);
+     assert(checklist);
+-    return matcher->match(data, checklist);
++    return matcher->match(data, checklist, flags);
+ }
+ 
+ template <class MatchType>
+@@ -34,6 +34,7 @@
+ #ifndef SQUID_ACLSTRATEGY_H
+ #define SQUID_ACLSTRATEGY_H
+ 
++#include "acl/Acl.h"
+ #include "acl/Data.h"
+ 
+ class ACLFilledChecklist;
+@@ -45,7 +46,7 @@ class ACLStrategy
+ 
+ public:
+     typedef M MatchType;
+-    virtual int match (ACLData<M> * &, ACLFilledChecklist *) = 0;
++    virtual int match (ACLData<M> * &, ACLFilledChecklist *, ACLFlags &) = 0;
+     virtual bool requiresRequest() const {return false;}
+ 
+     virtual bool requiresReply() const {return false;}
+@@ -41,7 +41,7 @@
+ #include "HttpRequest.h"
+ 
+ int
+-ACLTagStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist)
++ACLTagStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &)
+ {
+     if (checklist->request != NULL)
+         return data->match (checklist->request->tag.termedBuf());
+@@ -41,7 +41,7 @@ class ACLTagStrategy : public ACLStrategy<const char *>
+ {
+ 
+ public:
+-    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *);
++    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *, ACLFlags &);
+     static ACLTagStrategy *Instance();
+     /* Not implemented to prevent copies of the instance. */
+     /* Not private to prevent brain dead g+++ warnings about
+@@ -38,7 +38,7 @@
+ #include "SquidTime.h"
+ 
+ int
+-ACLTimeStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist)
++ACLTimeStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &)
+ {
+     return data->match (squid_curtime);
+ }
+@@ -43,7 +43,7 @@ class ACLTimeStrategy : public ACLStrategy<time_t>
+ {
+ 
+ public:
+-    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *);
++    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *, ACLFlags &);
+     static ACLTimeStrategy *Instance();
+     /* Not implemented to prevent copies of the instance. */
+     /* Not private to prevent brain dead g+++ warnings about
+@@ -40,7 +40,7 @@
+ #include "URL.h"
+ 
+ int
+-ACLUrlStrategy::match (ACLData<char const *> * &data, ACLFilledChecklist *checklist)
++ACLUrlStrategy::match (ACLData<char const *> * &data, ACLFilledChecklist *checklist, ACLFlags &)
+ {
+     char *esc_buf = xstrdup(urlCanonical(checklist->request));
+     rfc1738_unescape(esc_buf);
+@@ -41,7 +41,7 @@ class ACLUrlStrategy : public ACLStrategy<char const *>
+ {
+ 
+ public:
+-    virtual int match (ACLData<char const *> * &, ACLFilledChecklist *);
++    virtual int match (ACLData<char const *> * &, ACLFilledChecklist *, ACLFlags &);
+     virtual bool requiresRequest() const {return true;}
+ 
+     static ACLUrlStrategy *Instance();
+@@ -38,7 +38,7 @@
+ #include "rfc1738.h"
+ 
+ int
+-ACLUrlLoginStrategy::match (ACLData<char const *> * &data, ACLFilledChecklist *checklist)
++ACLUrlLoginStrategy::match (ACLData<char const *> * &data, ACLFilledChecklist *checklist, ACLFlags &)
+ {
+     char *esc_buf = xstrdup(checklist->request->login);
+     rfc1738_unescape(esc_buf);
+@@ -45,7 +45,7 @@ class ACLUrlLoginStrategy : public ACLStrategy<char const *>
+ {
+ 
+ public:
+-    virtual int match (ACLData<char const *> * &, ACLFilledChecklist *);
++    virtual int match (ACLData<char const *> * &, ACLFilledChecklist *, ACLFlags &);
+     virtual bool requiresRequest() const {return true;}
+ 
+     static ACLUrlLoginStrategy *Instance();
+@@ -40,7 +40,7 @@
+ #include "rfc1738.h"
+ 
+ int
+-ACLUrlPathStrategy::match (ACLData<char const *> * &data, ACLFilledChecklist *checklist)
++ACLUrlPathStrategy::match (ACLData<char const *> * &data, ACLFilledChecklist *checklist, ACLFlags &)
+ {
+     char *esc_buf = xstrdup(checklist->request->urlpath.termedBuf());
+     rfc1738_unescape(esc_buf);
+@@ -42,7 +42,7 @@ class ACLUrlPathStrategy : public ACLStrategy<char const *>
+ {
+ 
+ public:
+-    virtual int match (ACLData<char const *> * &, ACLFilledChecklist *);
++    virtual int match (ACLData<char const *> * &, ACLFilledChecklist *, ACLFlags &);
+     virtual bool requiresRequest() const {return true;}
+ 
+     static ACLUrlPathStrategy *Instance();
+@@ -38,7 +38,7 @@
+ #include "HttpRequest.h"
+ 
+ int
+-ACLUrlPortStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist)
++ACLUrlPortStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &)
+ {
+     return data->match (checklist->request->port);
+ }
+@@ -40,7 +40,7 @@ class ACLUrlPortStrategy : public ACLStrategy<int>
+ {
+ 
+ public:
+-    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *);
++    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *, ACLFlags &);
+     virtual bool requiresRequest() const {return true;}
+ 
+     static ACLUrlPortStrategy *Instance();
+@@ -1276,10 +1276,11 @@ dump_acl(StoreEntry * entry, const char *name, ACL * ae)
+ 
+     while (ae != NULL) {
+         debugs(3, 3, "dump_acl: " << name << " " << ae->name);
+-        storeAppendPrintf(entry, "%s %s %s ",
++        storeAppendPrintf(entry, "%s %s %s %s ",
+                           name,
+                           ae->name,
+-                          ae->typeString());
++                          ae->typeString(),
++                          ae->flags.flagsStr());
+         v = w = ae->dump();
+ 
+         while (v != NULL) {
+@@ -705,7 +705,7 @@ ACLExternal::parse()
+ 
+     data = cbdataAlloc(external_acl_data);
+ 
+-    token = strtok(NULL, w_space);
++    token = strtokFile();
+ 
+     if (!token)
+         self_destruct();
+@@ -1160,7 +1160,7 @@ class ACLSNMPCommunityStrategy : public ACLStrategy<char const *>
+ {
+ 
+ public:
+-    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *);
++    virtual int match (ACLData<MatchType> * &, ACLFilledChecklist *, ACLFlags &);
+     static ACLSNMPCommunityStrategy *Instance();
+     /* Not implemented to prevent copies of the instance. */
+     /* Not private to prevent brain dead g++ warnings about
+@@ -1186,7 +1186,7 @@ ACL::Prototype ACLSNMPCommunity::RegistryProtoype(&ACLSNMPCommunity::RegistryEnt
+ ACLStrategised<char const *> ACLSNMPCommunity::RegistryEntry_(new ACLStringData, ACLSNMPCommunityStrategy::Instance(), "snmp_community");
+ 
+ int
+-ACLSNMPCommunityStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist)
++ACLSNMPCommunityStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &)
+ {
+     return data->match (checklist->snmp_community);
+ }

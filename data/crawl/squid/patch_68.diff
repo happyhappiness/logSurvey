@@ -1,58 +1,601 @@
-----++++src/security/PeerOptions.cc
-@@ -233,7 +233,7 @@ Security::PeerOptions::createClientContext(bool setOptions)
- 
- #if USE_OPENSSL
-     // XXX: temporary performance regression. c_str() data copies and prevents this being a const method
--    t = sslCreateClientContext(certFile.c_str(), privateKeyFile.c_str(), sslCipher.c_str(),
-+    t = sslCreateClientContext(*this, certFile.c_str(), privateKeyFile.c_str(), sslCipher.c_str(),
-                                (setOptions ? parsedOptions : 0), parsedFlags);
- 
- #elif USE_GNUTLS &amp;&amp; WHEN_READY_FOR_GNUTLS
-----++++src/ssl/support.cc
-@@ -631,21 +631,11 @@ ssl_next_proto_cb(SSL *s, unsigned char **out, unsigned char *outlen, const unsi
- #endif
- 
- Security::ContextPtr
--sslCreateClientContext(const char *certfile, const char *keyfile, const char *cipher, long options, long fl)
-+sslCreateClientContext(Security::PeerOptions &amp;peer, const char *certfile, const char *keyfile, const char *cipher, long options, long fl)
+@@ -52,36 +52,51 @@ class Debug
  {
--    Ssl::Initialize();
+ 
+ public:
++    /// meta-information for debugs() or a similar debugging call
++    class Context
++    {
++    public:
++        Context(const int aSectionLevel, const int aLevel);
++
++        int level; ///< minimum debugging level required by the debugs() call
++        int sectionLevel; ///< maximum debugging level allowed during the call
++
++    private:
++        friend class Debug;
++        void rewind(const int aSection, const int aLevel);
++        void formatStream();
++        Context *upper; ///< previous or parent record in nested debugging calls
++        std::ostringstream buf; ///< debugs() output sink
++    };
++
++    /// whether debugging the given section and the given level produces output
++    static bool Enabled(const int section, const int level)
++    {
++        return level <= Debug::Levels[section];
++    }
++
+     static char *debugOptions;
+     static char *cache_log;
+     static int rotateNumber;
+     static int Levels[MAX_DEBUG_SECTIONS];
+-    static int level; ///< minimum debugging level required by debugs() call
+-    static int sectionLevel; ///< maximum debugging level allowed now
+     static int override_X;
+     static int log_stderr;
+     static bool log_syslog;
+ 
+-    static std::ostream &getDebugOut();
+-    static void finishDebug();
+     static void parseOptions(char const *);
+ 
+-private:
+-    // Hack: replaces global ::xassert() to debug debugging assertions
+-    static void xassert(const char *msg, const char *file, int line);
++    /// minimum level required by the current debugs() call
++    static int Level() { return Current ? Current->level : 1; }
++    /// maximum level currently allowed
++    static int SectionLevel() { return Current ? Current->sectionLevel : 1; }
+ 
+-    /// Wrapper class to prevent SquidNew.h overrides getting confused
+-    /// with the libc++6 std::ostringstream definitions
+-    class OutStream : public std::ostringstream
+-    {
+-        MEMPROXY_CLASS(OutStream);
+-    public:
+-        void *operator new[] (size_t size) throw(std::bad_alloc) = delete; //{return xmalloc(size);}
+-        void operator delete[] (void *address) throw() = delete; // {xfree(address);}
+-    };
++    /// opens debugging context and returns output buffer
++    static std::ostringstream &Start(const int section, const int level);
++    /// logs output buffer created in Start() and closes debugging context
++    static void Finish();
+ 
+-    static OutStream *CurrentDebug;
+-    static int TheDepth; // level of nested debugging calls
++private:
++    static Context *Current; ///< deepest active context; nil outside debugs()
+ };
+ 
+ extern FILE *debug_log;
+@@ -97,15 +112,15 @@ const char * SkipBuildPrefix(const char* path);
+  */
+ #define debugs(SECTION, LEVEL, CONTENT) \
+    do { \
+-        if ((Debug::level = (LEVEL)) <= Debug::Levels[SECTION]) { \
+-            Debug::sectionLevel = Debug::Levels[SECTION]; \
+-            std::ostream &_dbo=Debug::getDebugOut(); \
+-            if (Debug::level > DBG_IMPORTANT) { \
+-                _dbo << (SECTION) << ',' << (LEVEL) << "| " \
++        const int _dbg_level = (LEVEL); \
++        if (Debug::Enabled((SECTION), _dbg_level)) { \
++            std::ostream &_dbo = Debug::Start((SECTION), _dbg_level); \
++            if (_dbg_level > DBG_IMPORTANT) { \
++                _dbo << (SECTION) << ',' << _dbg_level << "| " \
+                      << SkipBuildPrefix(__FILE__)<<"("<<__LINE__<<") "<<__FUNCTION__<<": "; \
+             } \
+             _dbo << CONTENT; \
+-            Debug::finishDebug(); \
++            Debug::Finish(); \
+         } \
+    } while (/*CONSTCOND*/ 0)
+ 
+@@ -141,10 +156,6 @@ inline std::ostream& operator <<(std::ostream &os, const uint8_t d)
+     return (os << (int)d);
+ }
+ 
+-/* Legacy debug style. Still used in some places. needs to die... */
+-#define do_debug(SECTION, LEVEL)   ((Debug::level = (LEVEL)) <= Debug::Levels[SECTION])
+-#define old_debug(SECTION, LEVEL)  if do_debug((SECTION), (LEVEL)) _db_print
 -
--#if (OPENSSL_VERSION_NUMBER &gt;= 0x10100000L)
--    Security::ContextPtr sslContext(SSL_CTX_new(TLS_client_method()));
--#else
--    Security::ContextPtr sslContext(SSL_CTX_new(SSLv23_client_method()));
--#endif
--
--    if (sslContext == NULL) {
--        const int ssl_error = ERR_get_error();
--        fatalf(&quot;Failed to allocate SSL context: %s\n&quot;,
--               ERR_error_string(ssl_error, NULL));
+ /* Legacy debug function definitions */
+ void _db_init(const char *logfile, const char *options);
+ void _db_print(const char *,...) PRINTF_FORMAT_ARG1;
+@@ -147,18 +147,16 @@ Adaptation::Ecap::Host::openDebug(libecap::LogVerbosity lv)
+ {
+     const int squidLevel = SquidLogLevel(lv);
+     const int squidSection = 93; // XXX: this should be a global constant
+-    // XXX: Debug.h should provide this to us
+-    if ((Debug::level = squidLevel) <= Debug::Levels[squidSection])
+-        return &Debug::getDebugOut();
+-    else
+-        return NULL;
++    return Debug::Enabled(squidSection, squidLevel) ?
++           &Debug::Start(squidSection, squidLevel) :
++           nullptr;
+ }
+ 
+ void
+ Adaptation::Ecap::Host::closeDebug(std::ostream *debug)
+ {
+     if (debug)
+-        Debug::finishDebug();
++        Debug::Finish();
+ }
+ 
+ Adaptation::Ecap::Host::MessagePtr
+@@ -33,7 +33,7 @@ class Lock
+     /// All locks must be cleared before it may be destroyed.
+     void lock() const {
+ #if defined(LOCKCOUNT_DEBUG)
+-        old_debug(0,1)("Incrementing this %p from count %u\n",this,count_);
++        debugs(0,1, "Incrementing this " << static_cast<void*>(this) << " from count " << count_);
+ #endif
+         assert(count_ < UINT32_MAX);
+         ++count_;
+@@ -43,7 +43,7 @@ class Lock
+     /// All locks must be cleared before it may be destroyed.
+     uint32_t unlock() const {
+ #if defined(LOCKCOUNT_DEBUG)
+-        old_debug(0,1)("Decrementing this %p from count %u\n",this,count_);
++        debugs(0,1, "Decrementing this " << static_cast<void*>(this) << " from count " << count_);
+ #endif
+         assert(count_ > 0);
+         return --count_;
+@@ -2661,7 +2661,7 @@ clientNegotiateSSL(int fd, void *data)
+         debugs(83, 2, "clientNegotiateSSL: Session " << SSL_get_session(ssl) <<
+                " reused on FD " << fd << " (" << fd_table[fd].ipaddr << ":" << (int)fd_table[fd].remote_port << ")");
+     } else {
+-        if (do_debug(83, 4)) {
++        if (Debug::Enabled(83, 4)) {
+             /* Write out the SSL session details.. actually the call below, but
+              * OpenSSL headers do strange typecasts confusing GCC.. */
+             /* PEM_write_SSL_SESSION(debug_log, SSL_get_session(ssl)); */
+@@ -24,8 +24,6 @@ int Debug::override_X = 0;
+ int Debug::log_stderr = -1;
+ bool Debug::log_syslog = false;
+ int Debug::Levels[MAX_DEBUG_SECTIONS];
+-int Debug::level;
+-int Debug::sectionLevel;
+ char *Debug::cache_log = NULL;
+ int Debug::rotateNumber = -1;
+ FILE *debug_log = NULL;
+@@ -136,7 +134,7 @@ _db_print_file(const char *format, va_list args)
+ static void
+ _db_print_stderr(const char *format, va_list args)
+ {
+-    if (Debug::log_stderr < Debug::level)
++    if (Debug::log_stderr < Debug::Level())
+         return;
+ 
+     if (debug_log == stderr)
+@@ -151,7 +149,7 @@ _db_print_syslog(const char *format, va_list args)
+ {
+     /* level 0,1 go to syslog */
+ 
+-    if (Debug::level > 1)
++    if (Debug::Level() > 1)
+         return;
+ 
+     if (!Debug::log_syslog)
+@@ -164,7 +162,7 @@ _db_print_syslog(const char *format, va_list args)
+ 
+     tmpbuf[BUFSIZ - 1] = '\0';
+ 
+-    syslog(Debug::level == 0 ? LOG_WARNING : LOG_NOTICE, "%s", tmpbuf);
++    syslog(Debug::Level() == 0 ? LOG_WARNING : LOG_NOTICE, "%s", tmpbuf);
+ }
+ #endif /* HAVE_SYSLOG */
+ 
+@@ -526,7 +524,7 @@ debugLogTime(void)
+     static char buf[128];
+     static time_t last_t = 0;
+ 
+-    if (Debug::level > 1) {
++    if (Debug::Level() > 1) {
+         char buf2[128];
+         tm = localtime(&t);
+         strftime(buf2, 127, "%Y/%m/%d %H:%M:%S", tm);
+@@ -728,55 +726,75 @@ ctx_get_descr(Ctx ctx)
+     return Ctx_Descrs[ctx] ? Ctx_Descrs[ctx] : "<null>";
+ }
+ 
+-int Debug::TheDepth = 0;
++Debug::Context *Debug::Current = nullptr;
+ 
+-Debug::OutStream *Debug::CurrentDebug(NULL);
++Debug::Context::Context(const int aSection, const int aLevel):
++    level(aLevel),
++    sectionLevel(Levels[aSection]),
++    upper(Current)
++{
++    formatStream();
++}
+ 
+-std::ostream &
+-Debug::getDebugOut()
++/// Optimization: avoids new Context creation for every debugs().
++void
++Debug::Context::rewind(const int aSection, const int aLevel)
+ {
+-    assert(TheDepth >= 0);
+-    ++TheDepth;
+-    if (TheDepth > 1) {
+-        assert(CurrentDebug);
+-        *CurrentDebug << std::endl << "reentrant debuging " << TheDepth << "-{";
+-    } else {
+-        assert(!CurrentDebug);
+-        CurrentDebug = new Debug::OutStream;
+-        // set default formatting flags
+-        CurrentDebug->setf(std::ios::fixed);
+-        CurrentDebug->precision(2);
 -    }
-+    Security::ContextPtr sslContext(peer.createBlankContext());
-+    if (!sslContext)
-+        return nullptr;
+-    return *CurrentDebug;
++    level = aLevel;
++    sectionLevel = Levels[aSection];
++    assert(upper == Current);
++
++    buf.str(std::string());
++    buf.clear();
++    // debugs() users are supposed to preserve format, but
++    // some do not, so we have to waste cycles resetting it for all.
++    formatStream();
+ }
  
-     SSL_CTX_set_options(sslContext, options);
++/// configures default formatting for the debugging stream
+ void
+-Debug::finishDebug()
++Debug::Context::formatStream()
++{
++    const static std::ostringstream cleanStream;
++    buf.flags(cleanStream.flags() | std::ios::fixed);
++    buf.width(cleanStream.width());
++    buf.precision(2);
++    buf.fill(' ');
++    // If this is not enough, use copyfmt(cleanStream) which is ~10% slower.
++}
++
++std::ostringstream &
++Debug::Start(const int section, const int level)
+ {
+-    assert(TheDepth >= 0);
+-    assert(CurrentDebug);
+-    if (TheDepth > 1) {
+-        *CurrentDebug << "}-" << TheDepth << std::endl;
++    Context *future = nullptr;
++
++    // prepare future context
++    if (Current) {
++        // all reentrant debugs() calls get here; create a dedicated context
++        future = new Context(section, level);
+     } else {
+-        assert(TheDepth == 1);
+-        _db_print("%s\n", CurrentDebug->str().c_str());
+-        delete CurrentDebug;
+-        CurrentDebug = NULL;
++        // Optimization: Nearly all debugs() calls get here; avoid allocations
++        static Context *topContext = new Context(1, 1);
++        topContext->rewind(section, level);
++        future = topContext;
+     }
+-    --TheDepth;
++
++    Current = future;
++
++    return future->buf;
+ }
  
-----++++src/ssl/support.h
-@@ -96,7 +96,7 @@ typedef CbDataList&lt;Ssl::CertError&gt; CertErrors;
- Security::ContextPtr sslCreateServerContext(AnyP::PortCfg &amp;port);
+-// Hack: replaces global ::xassert() to debug debugging assertions
+-// Relies on assert macro calling xassert() without a specific scope.
+ void
+-Debug::xassert(const char *msg, const char *file, int line)
++Debug::Finish()
+ {
+-
+-    if (CurrentDebug) {
+-        *CurrentDebug << "assertion failed: " << file << ":" << line <<
+-                      ": \"" << msg << "\"";
+-    }
+-    abort();
++    // TODO: Optimize to remove at least one extra copy.
++    _db_print("%s\n", Current->buf.str().c_str());
++
++    Context *past = Current;
++    Current = past->upper;
++    if (Current)
++        delete past;
++    // else it was a static topContext from Debug::Start()
+ }
  
- /// \ingroup ServerProtocolSSLAPI
--Security::ContextPtr sslCreateClientContext(const char *certfile, const char *keyfile, const char *cipher, long options, long flags);
-+Security::ContextPtr sslCreateClientContext(Security::PeerOptions &amp;, const char *certfile, const char *keyfile, const char *cipher, long options, long flags);
+ size_t
+@@ -826,8 +844,8 @@ Raw::print(std::ostream &os) const
  
- /// \ingroup ServerProtocolSSLAPI
- int ssl_read_method(int, char *, int);
-----++++src/tests/stub_libsslsquid.cc
-@@ -57,7 +57,7 @@ bool CertError::operator == (const CertError &amp;ce) const STUB_RETVAL(false)
- bool CertError::operator != (const CertError &amp;ce) const STUB_RETVAL(false)
- } // namespace Ssl
- Security::ContextPtr sslCreateServerContext(AnyP::PortCfg &amp;port) STUB_RETVAL(NULL)
--Security::ContextPtr sslCreateClientContext(const char *certfile, const char *keyfile, const char *cipher, long options, const char *flags) STUB_RETVAL(NULL)
-+Security::ContextPtr sslCreateClientContext(Security::PeerOptions &amp;, const char *, const char *, const char *, long, const char *) STUB_RETVAL(nullptr)
- int ssl_read_method(int, char *, int) STUB_RETVAL(0)
- int ssl_write_method(int, const char *, int) STUB_RETVAL(0)
- void ssl_shutdown_method(SSL *ssl) STUB
-----++++GitHub
+     // finalize debugging level if no level was set explicitly via minLevel()
+     const int finalLevel = (level >= 0) ? level :
+-                           (size_ > 40 ? DBG_DATA : Debug::sectionLevel);
+-    if (finalLevel <= Debug::sectionLevel) {
++                           (size_ > 40 ? DBG_DATA : Debug::SectionLevel());
++    if (finalLevel <= Debug::SectionLevel()) {
+         os << (label_ ? '=' : ' ');
+         if (data_) {
+             if (useHex_)
+@@ -116,8 +116,6 @@ static int addmember(stackmember * stack, int *stackdepth,
+ static int membercompare(stackmember a, stackmember b);
+ static char const *trim(char const *s);
+ static stackmember getsymbol(const char *s, char const **endptr);
+-static void printliteral(stackmember s);
+-static void printmember(stackmember s);
+ 
+ /* -2 = failed to compate
+  * -1 = a less than b
+@@ -846,105 +844,106 @@ getsymbol(const char *s, char const **endptr)
+     return rv;
+ }
+ 
+-void
+-printliteral(stackmember s)
++static void
++printLiteral(std::ostream &os, const stackmember &s)
+ {
+     switch (s.valuestored) {
+ 
+     case ESI_LITERAL_INVALID:
+-        old_debug(86, 1)( " Invalid " );
++        os << " Invalid ";
+         break;
+ 
+     case ESI_LITERAL_FLOAT:
+-        old_debug(86,1)("%f", s.value.floating);
++        os << s.value.floating;
+         break;
+ 
+     case ESI_LITERAL_STRING:
+-        old_debug(86,1)("'%s'", s.value.string);
++        os << '\'' << s.value.string << '\'';
+         break;
+ 
+     case ESI_LITERAL_INT:
+-        old_debug(86,1)("%d", s.value.integral);
++        os << s.value.integral;
+         break;
+ 
+     case ESI_LITERAL_BOOL:
+-        old_debug(86,1)("%s",s.value.integral ? "true" : "false");
++        os << (s.value.integral ? "true" : "false");
+     }
+ }
+ 
+-void
+-printmember(stackmember s)
++static std::ostream &
++operator <<(std::ostream &os, const stackmember &s)
+ {
+     switch (s.valuetype) {
+ 
+     case ESI_EXPR_INVALID:
+-        old_debug(86,1)(" Invalid ");
++        os << " Invalid ";
+         break;
+ 
+     case ESI_EXPR_LITERAL:
+-        printliteral(s);
++        printLiteral(os, s);
+         break;
+ 
+     case ESI_EXPR_EXPR:
+-        old_debug(86,1)("%s", s.value.integral ? "true" : "false");
++        os << (s.value.integral ? "true" : "false");
+         break;
+ 
+     case ESI_EXPR_OR:
+-        old_debug(86,1)("|");
++        os << "|";
+         break;
+ 
+     case ESI_EXPR_AND:
+-        old_debug(86,1)("&");
++        os << "&";
+         break;
+ 
+     case ESI_EXPR_NOT:
+-        old_debug(86,1)("!");
++        os << "!";
+         break;
+ 
+     case ESI_EXPR_START:
+-        old_debug(86,1)("(");
++        os << "(";
+         break;
+ 
+     case ESI_EXPR_END:
+-        old_debug(86,1)(")");
++        os << ")";
+         break;
+ 
+     case ESI_EXPR_EQ:
+-        old_debug(86,1)("==");
++        os << "==";
+         break;
+ 
+     case ESI_EXPR_NOTEQ:
+-        old_debug(86,1)("!=");
++        os << "!=";
+         break;
+ 
+     case ESI_EXPR_LESS:
+-        old_debug(86,1)("<");
++        os << "<";
+         break;
+ 
+     case ESI_EXPR_LESSEQ:
+-        old_debug(86,1)("<=");
++        os << "<=";
+         break;
+ 
+     case ESI_EXPR_MORE:
+-        old_debug(86,1)(">");
++        os << ">";
+         break;
+ 
+     case ESI_EXPR_MOREEQ:
+-        old_debug(86,1)(">=");
++        os << ">=";
+         break;
+     }
++
++    return os;
+ }
+ 
+ void
+ dumpstack(stackmember * stack, int depth)
+ {
+-    int i;
+-
+-    for (i = 0; i < depth; ++i)
+-        printmember(stack[i]);
+-
+-    if (depth)
+-        old_debug(86,1)("\n");
++    if (depth) {
++        std::ostringstream buf;
++        for (int i = 0; i < depth; ++i)
++            buf << stack[i];
++        debugs(86,1, buf.str());
++    }
+ }
+ 
+ int
+@@ -75,7 +75,7 @@ Security::NegotiationHistory::retrieveNegotiatedInfo(Security::SessionPtr ssl)
+         version_ = toProtocolVersion(ssl->version);
+     }
+ 
+-    if (do_debug(83, 5)) {
++    if (Debug::Enabled(83, 5)) {
+         BIO *b = SSL_get_rbio(ssl);
+         Ssl::Bio *bio = static_cast<Ssl::Bio *>(b->ptr);
+         debugs(83, 5, "SSL connection info on FD " << bio->fd() <<
+@@ -1305,7 +1305,7 @@ Ftp::Server::handleRequest(HttpRequest *request)
+     Must(header.has(Http::HdrType::FTP_ARGUMENTS));
+     String &params = header.findEntry(Http::HdrType::FTP_ARGUMENTS)->value;
+ 
+-    if (do_debug(9, 2)) {
++    if (Debug::Enabled(9, 2)) {
+         MemBuf mb;
+         mb.init();
+         request->pack(&mb);
+@@ -135,7 +135,7 @@ ssl_temp_rsa_cb(SSL * ssl, int anInt, int keylen)
+     }
+ 
+     if (newkey) {
+-        if (do_debug(83, 5))
++        if (Debug::Enabled(83, 5))
+             PEM_write_RSAPrivateKey(debug_log, rsa, NULL, NULL, 0, NULL, NULL);
+ 
+         debugs(83, DBG_IMPORTANT, "Generated ephemeral RSA key of length " << keylen);
+@@ -17,14 +17,11 @@
+ #include "Debug.h"
+ 
+ FILE *debug_log = NULL;
+-int Debug::TheDepth = 0;
+ 
+ char *Debug::debugOptions;
+ char *Debug::cache_log= NULL;
+ int Debug::rotateNumber = 0;
+ int Debug::Levels[MAX_DEBUG_SECTIONS];
+-int Debug::level;
+-int Debug::sectionLevel;
+ int Debug::override_X = 0;
+ int Debug::log_stderr = 1;
+ bool Debug::log_syslog = false;
+@@ -80,49 +77,48 @@ _db_print(const char *format,...)
+ static void
+ _db_print_stderr(const char *format, va_list args)
+ {
+-    if (1 < Debug::level)
++    if (1 < Debug::Level())
+         return;
+ 
+     vfprintf(stderr, format, args);
+ }
+ 
+-Debug::OutStream *Debug::CurrentDebug(NULL);
++void
++Debug::parseOptions(char const *)
++{}
+ 
+-std::ostream &
+-Debug::getDebugOut()
++const char*
++SkipBuildPrefix(const char* path)
+ {
+-    if (!CurrentDebug) {
+-        CurrentDebug = new Debug::OutStream;
+-        CurrentDebug->setf(std::ios::fixed);
+-        CurrentDebug->precision(2);
+-    }
+-    return *CurrentDebug;
++    return path;
+ }
+ 
+-void
+-Debug::parseOptions(char const *)
+-{}
++Debug::Context *Debug::Current = nullptr;
+ 
+-void
+-Debug::finishDebug()
++Debug::Context::Context(const int aSection, const int aLevel):
++    level(aLevel),
++    sectionLevel(Levels[aSection]),
++    upper(Current)
+ {
+-    std::cerr << "debugs: " << CurrentDebug->str() << std::endl;
+-    delete CurrentDebug;
+-    CurrentDebug = NULL;
++    buf.setf(std::ios::fixed);
++    buf.precision(2);
+ }
+ 
+-void
+-Debug::xassert(const char *msg, const char *file, int line)
++std::ostringstream &
++Debug::Start(const int section, const int level)
+ {
+-    getDebugOut() << "assertion failed: " << file << ":" << line <<
+-                  ": \"" << msg << "\"";
+-    abort();
++    Current = new Context(section, level);
++    return Current->buf;
+ }
+ 
+-const char*
+-SkipBuildPrefix(const char* path)
++void
++Debug::Finish()
+ {
+-    return path;
++    if (Current) {
++        _db_print("%s\n", Current->buf.str().c_str());
++        delete Current;
++        Current = nullptr;
++    }
+ }
+ 
+ std::ostream &
+@@ -136,10 +132,13 @@ Raw::print(std::ostream &os) const
+ 
+     // finalize debugging level if no level was set explicitly via minLevel()
+     const int finalLevel = (level >= 0) ? level :
+-                           (size_ > 40 ? DBG_DATA : Debug::sectionLevel);
+-    if (finalLevel <= Debug::sectionLevel) {
++                           (size_ > 40 ? DBG_DATA : Debug::SectionLevel());
++    if (finalLevel <= Debug::SectionLevel()) {
+         os << (label_ ? '=' : ' ');
+-        os.write(data_, size_);
++        if (data_)
++            os.write(data_, size_);
++        else
++            os << "[null]";
+     }
+ 
+     return os;

@@ -1,0 +1,1876 @@
+@@ -1,7 +1,7 @@
+ #
+ #  Makefile for the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.68 1997/04/28 04:22:55 wessels Exp $
++#  $Id: Makefile.in,v 1.69 1997/04/30 03:11:57 wessels Exp $
+ #
+ #  Uncomment and customize the following to suit your needs:
+ #
+@@ -86,6 +86,7 @@ OBJS	 	= \
+ 		dns.o \
+ 		errorpage.o \
+ 		event.o \
++		fd.o \
+ 		fdstat.o \
+ 		filemap.o \
+ 		fqdncache.o \
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: cache_cf.cc,v 1.181 1997/04/28 04:22:57 wessels Exp $
++ * $Id: cache_cf.cc,v 1.182 1997/04/30 03:11:58 wessels Exp $
+  *
+  * DEBUG: section 3     Configuration File Parsing
+  * AUTHOR: Harvest Derived
+@@ -124,11 +124,12 @@ struct SquidConfig Config;
+ #define DefaultNegativeTtl	(5 * 60)	/* 5 min */
+ #define DefaultNegativeDnsTtl	(2 * 60)	/* 2 min */
+ #define DefaultPositiveDnsTtl	(360 * 60)	/* 6 hours */
+-#define DefaultReadTimeout	(15 * 60)	/* 15 min */
+-#define DefaultLifetimeDefault	(200 * 60)	/* 3+ hours */
+-#define DefaultLifetimeShutdown	30	/* 30 seconds */
+-#define DefaultConnectTimeout	(2 * 60)	/* 2 min */
+-#define DefaultCleanRate	-1	/* disabled */
++#define DefaultReadTimeout      (15 * 60)       /* 15 min */
++#define DefaultConnectTimeout   120     /* 2 min */
++#define DefaultDeferTimeout     3600    /* 1 hour */
++#define DefaultClientLifetime   86400   /* 1 day */
++#define DefaultShutdownLifetime 30      /* 30 seconds */
++#define DefaultCleanRate        -1      /* disabled */
+ #define DefaultDnsChildren	5	/* 5 processes */
+ #define DefaultOptionsResDefnames 0	/* default off */
+ #define DefaultOptionsAnonymizer  0	/* default off */
+@@ -1025,24 +1026,24 @@ parseConfigFile(const char *file_name)
+ 	    parseMinutesLine(&Config.negativeDnsTtl);
+ 	else if (!strcmp(token, "positive_dns_ttl"))
+ 	    parseMinutesLine(&Config.positiveDnsTtl);
+-	else if (!strcmp(token, "read_timeout"))
+-	    parseMinutesLine(&Config.readTimeout);
++        else if (!strcmp(token, "read_timeout"))
++            parseMinutesLine(&Config.Timeout.read);
++        else if (!strcmp(token, "connect_timeout"))
++            parseIntegerValue(&Config.Timeout.connect);
++        else if (!strcmp(token, "defer_timeout"))
++            parseIntegerValue(&Config.Timeout.defer);
++        else if (!strcmp(token, "client_lifetime"))
++            parseIntegerValue(&Config.Timeout.lifetime);
++        else if (!strcmp(token, "shutdown_lifetime"))
++            parseIntegerValue(&Config.shutdownLifetime);
+ 	else if (!strcmp(token, "clean_rate"))
+ 	    parseMinutesLine(&Config.cleanRate);
+-	else if (!strcmp(token, "client_lifetime"))
+-	    parseMinutesLine(&Config.lifetimeDefault);
+ 	else if (!strcmp(token, "reference_age"))
+ 	    parseTimeLine(&Config.referenceAge, "minutes");
+ 
+-	else if (!strcmp(token, "shutdown_lifetime"))
+-	    parseIntegerValue(&Config.lifetimeShutdown);
+-
+ 	else if (!strcmp(token, "request_size"))
+ 	    parseKilobytes(&Config.maxRequestSize);
+ 
+-	else if (!strcmp(token, "connect_timeout"))
+-	    parseIntegerValue(&Config.connectTimeout);
+-
+ 	else if (!strcmp(token, "cache_ftp_program"))
+ 	    parsePathname(&Config.Program.ftpget, 1);
+ 	else if (!strcmp(token, "ftpget_program"))
+@@ -1224,13 +1225,6 @@ parseConfigFile(const char *file_name)
+     }
+ 
+     /* Sanity checks */
+-    if (Config.lifetimeDefault < Config.readTimeout) {
+-	printf("WARNING: client_lifetime (%d seconds) is less than read_timeout (%d seconds).\n",
+-	    Config.lifetimeDefault, Config.readTimeout);
+-	printf("         This may cause serious problems with your cache!!!\n");
+-	printf("         Change your configuration file.\n");
+-	fflush(stdout);		/* print message */
+-    }
+     if (Config.Swap.maxSize < (Config.Mem.maxSize >> 10)) {
+ 	printf("WARNING: cache_swap (%d kbytes) is less than cache_mem (%d bytes).\n", Config.Swap.maxSize, Config.Mem.maxSize);
+ 	printf("         This will cause serious problems with your cache!!!\n");
+@@ -1340,11 +1334,12 @@ configSetFactoryDefaults(void)
+     Config.negativeTtl = DefaultNegativeTtl;
+     Config.negativeDnsTtl = DefaultNegativeDnsTtl;
+     Config.positiveDnsTtl = DefaultPositiveDnsTtl;
+-    Config.readTimeout = DefaultReadTimeout;
+-    Config.lifetimeDefault = DefaultLifetimeDefault;
+-    Config.lifetimeShutdown = DefaultLifetimeShutdown;
++    Config.Timeout.read = DefaultReadTimeout;
++    Config.Timeout.connect = DefaultConnectTimeout;
++    Config.Timeout.defer = DefaultDeferTimeout;
++    Config.Timeout.lifetime = DefaultClientLifetime;
++    Config.shutdownLifetime = DefaultShutdownLifetime;
+     Config.maxRequestSize = DefaultMaxRequestSize;
+-    Config.connectTimeout = DefaultConnectTimeout;
+     Config.cleanRate = DefaultCleanRate;
+     Config.dnsChildren = DefaultDnsChildren;
+     Config.redirectChildren = DefaultRedirectChildren;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: comm.cc,v 1.144 1997/04/29 23:34:46 wessels Exp $
++ * $Id: comm.cc,v 1.145 1997/04/30 03:12:00 wessels Exp $
+  *
+  * DEBUG: section 5     Socket Functions
+  * AUTHOR: Harvest Derived
+@@ -141,7 +141,6 @@ static int comm_cleanup_fd_entry _PARAMS((int));
+ static int examine_select _PARAMS((fd_set *, fd_set *));
+ #endif
+ static void checkTimeouts _PARAMS((void));
+-static void checkLifetimes _PARAMS((void));
+ static void Reserve_More_FDs _PARAMS((void));
+ static void commSetReuseAddr _PARAMS((int));
+ static void commSetNoLinger _PARAMS((int));
+@@ -267,14 +266,8 @@ comm_open(int sock_type,
+ 	return (COMM_ERROR);
+     }
+     /* update fdstat */
+-    fdstat_open(new_socket, FD_SOCKET);
+-
++    fd_open(new_socket, FD_SOCKET, note);
+     fde = &fd_table[new_socket];
+-    memset(fde, '\0', sizeof(FD_ENTRY));
+-    if (note)
+-	fd_note(new_socket, note);
+-    fde->open = 1;
+-    fde->lifetime = -1;
+     if (!BIT_TEST(flags, COMM_NOCLOEXEC))
+ 	commSetCloseOnExec(new_socket);
+     if (port > (u_short) 0) {
+@@ -381,23 +374,31 @@ commConnectHandle(int fd, void *data)
+ 	break;
+     }
+ }
+-
+ int
+-comm_set_fd_lifetime(int fd, int lifetime)
++commSetTimeout(int fd, int timeout, PF *handler, void *data)
+ {
+-    FD_ENTRY *f;
+-    debug(5, 3, "comm_set_fd_lifetime: FD %d lft %d\n", fd, lifetime);
++    FD_ENTRY *fde;
++    debug(5, 3, "commSetTimeout: FD %d timeout %d\n", fd, timeout);
+     if (fd < 0 || fd > Squid_MaxFD)
+-	return 0;
+-    f = &fd_table[fd];
+-    if (lifetime < 0)
+-	return f->lifetime = -1;
++        fatal_dump("commSetTimeout: bad FD");
++    fde = &fd_table[fd];
++    if (timeout < 0) {
++        fde->timeout_handler = NULL;
++        fde->timeout_data = NULL;
++        return fde->timeout = 0;
++    }
+     if (shutdown_pending || reread_pending) {
+-	/* don't increase the lifetime if something pending */
+-	if (f->lifetime > -1 && (f->lifetime - squid_curtime) < lifetime)
+-	    return f->lifetime;
++        /* don't increase the timeout if something pending */
++        if (fde->timeout > 0 && (int) (fde->timeout - squid_curtime) < timeout)
++            return fde->timeout;
++    }
++    if (handler || data) {
++        fde->timeout_handler = handler;
++        fde->timeout_data = data;
++    } else if (fde->timeout_handler == NULL) {
++        debug_trap("commSetTimeout: setting timeout, but no handler");
+     }
+-    return f->lifetime = (int) squid_curtime + lifetime;
++    return fde->timeout = squid_curtime + (time_t) timeout;
+ }
+ 
+ int
+@@ -407,8 +408,6 @@ comm_connect_addr(int sock, const struct sockaddr_in *address)
+     FD_ENTRY *fde = &fd_table[sock];
+     int len;
+     int x;
+-    int lft;
+-
+     /* sanity check */
+     if (ntohs(address->sin_port) == 0) {
+ 	debug(5, 10, "comm_connect_addr: %s:%d: URL uses port 0?\n",
+@@ -447,15 +446,11 @@ comm_connect_addr(int sock, const struct sockaddr_in *address)
+     }
+     xstrncpy(fde->ipaddr, inet_ntoa(address->sin_addr), 16);
+     fde->remote_port = ntohs(address->sin_port);
+-    /* set the lifetime for this client */
+     if (status == COMM_OK) {
+-	lft = comm_set_fd_lifetime(sock, Config.lifetimeDefault);
+-	debug(5, 10, "comm_connect_addr: FD %d connected to %s:%d, lifetime %d.\n",
+-	    sock, fde->ipaddr, fde->remote_port, lft);
++	debug(5, 10, "comm_connect_addr: FD %d connected to %s:%d\n",
++	    sock, fde->ipaddr, fde->remote_port);
+     } else if (status == COMM_INPROGRESS) {
+-	lft = comm_set_fd_lifetime(sock, Config.connectTimeout);
+-	debug(5, 10, "comm_connect_addr: FD %d connection pending, lifetime %d\n",
+-	    sock, lft);
++	debug(5, 10, "comm_connect_addr: FD %d connection pending\n", sock);
+     }
+     /* Add new socket to list of open sockets. */
+     return status;
+@@ -501,9 +496,8 @@ comm_accept(int fd, struct sockaddr_in *peer, struct sockaddr_in *me)
+ 	*me = M;
+     commSetCloseOnExec(sock);
+     /* fdstat update */
+-    fdstat_open(sock, FD_SOCKET);
++    fd_open(sock, FD_SOCKET, "HTTP Request");
+     fde = &fd_table[sock];
+-    fde->open = 1;
+     strcpy(fde->ipaddr, inet_ntoa(P.sin_addr));
+     fde->remote_port = htons(P.sin_port);
+     fde->local_port = htons(M.sin_port);
+@@ -540,13 +534,11 @@ comm_close(int fd)
+ 	fatal_dump("comm_close: not a SOCKET");
+     fde->open = 0;
+     RWStateCallbackAndFree(fd, COMM_ERROR);
+-    fdstat_close(fd);		/* update fdstat */
+     commCallCloseHandlers(fd);
+-    memset(fde, '\0', sizeof(FD_ENTRY));
++    fd_close(fd);		/* update fdstat */
+ #if USE_ASYNC_IO
+     aioClose(fd);
+ #else
+-    fde->lifetime = -1;
+     close(fd);
+ #endif
+ }
+@@ -556,9 +548,8 @@ comm_close(int fd)
+ static int
+ comm_cleanup_fd_entry(int fd)
+ {
+-    FD_ENTRY *fde = &fd_table[fd];
+     RWStateCallbackAndFree(fd, COMM_ERROR);
+-    memset(fde, 0, sizeof(FD_ENTRY));
++    fd_close(fd);
+     return 0;
+ }
+ 
+@@ -776,7 +767,7 @@ comm_select(time_t sec)
+ 	     * -1 for SIGINT */
+ 	    /* reread_pending always == 1 when SIGHUP received */
+ 	    if (shutdown_pending > 0 || reread_pending > 0)
+-		setSocketShutdownLifetimes(Config.lifetimeShutdown);
++		setSocketShutdownLifetimes(Config.shutdownLifetime);
+ 	    else
+ 		setSocketShutdownLifetimes(0);
+ 	}
+@@ -810,7 +801,7 @@ comm_select(time_t sec)
+ 		debug(5, 2, "comm_select: Still waiting on %d FDs\n", nfds);
+ 	    if (pending_time == 0)
+ 		pending_time = squid_curtime;
+-	    if ((squid_curtime - pending_time) > (Config.lifetimeShutdown + 5)) {
++	    if ((squid_curtime - pending_time) > (Config.shutdownLifetime + 5)) {
+ 		pending_time = 0;
+ 		for (i = 1; i < maxfd; i++) {
+ 		    if ((fd = pfds[i].fd) < 0)
+@@ -854,12 +845,10 @@ comm_select(time_t sec)
+ 	getCurrentTime();
+ 	debug(5, num ? 5 : 8, "comm_select: %d sockets ready at %d\n",
+ 	    num, (int) squid_curtime);
+-	/* Check lifetime and timeout handlers ONCE each second.
+-	 * Replaces brain-dead check every time through the loop! */
++	/* Check timeout handlers ONCE each second. */
+ 	if (squid_curtime > last_timeout) {
+ 	    last_timeout = squid_curtime;
+ 	    checkTimeouts();
+-	    checkLifetimes();
+ 	}
+ 	if (num == 0)
+ 	    continue;
+@@ -893,35 +882,30 @@ comm_select(time_t sec)
+ 	    if (revents & POLLNVAL) {
+ 		struct close_handler *ch;
+ 		struct close_handler *next;
+-		FD_ENTRY *f = &fd_table[fd];
++		FD_ENTRY *fde = &fd_table[fd];
+ 		debug(5, 0, "WARNING: FD %d has handlers, but it's invalid.\n", fd);
+ 		debug(5, 0, "FD %d is a %s\n", fd, fdstatTypeStr[fd_table[fd].type]);
+ 		debug(5, 0, "--> %s\n", fd_note(fd, NULL));
+-		debug(5, 0, "lifetm:%p tmout:%p read:%p write:%p\n",
+-		    f->lifetime_handler,
+-		    f->timeout_handler,
+-		    f->read_handler,
+-		    f->write_handler);
+-		for (ch = f->close_handler; ch; ch = ch->next)
++		debug(5, 0, "tmout:%p read:%p write:%p\n",
++		    fde->timeout_handler,
++		    fde->read_handler,
++		    fde->write_handler);
++		for (ch = fde->close_handler; ch; ch = ch->next)
+ 		    debug(5, 0, " close handler: %p\n", ch->handler);
+-		if (f->close_handler) {
+-		    for (ch = f->close_handler; ch; ch = next) {
++		if (fde->close_handler) {
++		    for (ch = fde->close_handler; ch; ch = next) {
+ 			next = ch->next;
+ 			ch->handler(fd, ch->data);
+ 			safe_free(ch);
+ 		    }
+-		} else if (f->lifetime_handler) {
+-		    debug(5, 0, "examine_select: Calling Lifetime Handler\n");
+-		    f->lifetime_handler(fd, f->lifetime_data);
+-		} else if (f->timeout_handler) {
++		} else if (fde->timeout_handler) {
+ 		    debug(5, 0, "examine_select: Calling Timeout Handler\n");
+-		    f->timeout_handler(fd, f->timeout_data);
++		    fde->timeout_handler(fd, fde->timeout_data);
+ 		}
+-		f->close_handler = NULL;
+-		f->lifetime_handler = NULL;
+-		f->timeout_handler = NULL;
+-		f->read_handler = NULL;
+-		f->write_handler = NULL;
++		fde->close_handler = NULL;
++		fde->timeout_handler = NULL;
++		fde->read_handler = NULL;
++		fde->write_handler = NULL;
+ 	    }
+ 	}
+ 	return COMM_OK;
+@@ -970,7 +954,7 @@ comm_select(time_t sec)
+ 	     * -1 for SIGINT */
+ 	    /* reread_pending always == 1 when SIGHUP received */
+ 	    if (shutdown_pending > 0 || reread_pending > 0)
+-		setSocketShutdownLifetimes(Config.lifetimeShutdown);
++		setSocketShutdownLifetimes(Config.shutdownLifetime);
+ 	    else
+ 		setSocketShutdownLifetimes(0);
+ 	}
+@@ -1025,7 +1009,6 @@ comm_select(time_t sec)
+ 	if (squid_curtime > last_timeout) {
+ 	    last_timeout = squid_curtime;
+ 	    checkTimeouts();
+-	    checkLifetimes();
+ 	}
+ 	if (num == 0)
+ 	    continue;
+@@ -1078,56 +1061,20 @@ comm_select(time_t sec)
+ void
+ commSetSelect(int fd, unsigned int type, PF * handler, void *client_data, time_t timeout)
+ {
+-    if (fd < 0) {
+-	debug_trap("commSetSelect: FD < 0");
+-	return;
+-    }
+-    if (type & COMM_SELECT_TIMEOUT) {
+-	fd_table[fd].timeout_time = (getCurrentTime() + timeout);
+-	fd_table[fd].timeout_delta = timeout;
+-	fd_table[fd].timeout_handler = handler;
+-	fd_table[fd].timeout_data = client_data;
+-	if ((timeout <= 0) && handler) {
+-	    debug(5, 2, "commSetSelect: Zero timeout doesn't make sense\n");
+-	}
+-    }
+-    if (type & COMM_SELECT_READ) {
+-	fd_table[fd].read_handler = handler;
+-	fd_table[fd].read_data = client_data;
+-    }
+-    if (type & COMM_SELECT_WRITE) {
+-	fd_table[fd].write_handler = handler;
+-	fd_table[fd].write_data = client_data;
+-    }
+-    if (type & COMM_SELECT_LIFETIME) {
+-	fd_table[fd].lifetime_handler = handler;
+-	fd_table[fd].lifetime_data = client_data;
+-    }
+-}
+-
+-int
+-comm_get_select_handler(int fd,
+-    unsigned int type,
+-    void (**handler_ptr) _PARAMS((int, void *)),
+-    void **client_data_ptr)
+-{
+-    if (type & COMM_SELECT_TIMEOUT) {
+-	*handler_ptr = fd_table[fd].timeout_handler;
+-	*client_data_ptr = fd_table[fd].timeout_data;
+-    }
++    FD_ENTRY *fde;
++    if (fd < 0)
++        fatal_dump("commSetSelect: bad FD");
++    fde = &fd_table[fd];
+     if (type & COMM_SELECT_READ) {
+-	*handler_ptr = fd_table[fd].read_handler;
+-	*client_data_ptr = fd_table[fd].read_data;
++        fde->read_handler = handler;
++        fde->read_data = client_data;
+     }
+     if (type & COMM_SELECT_WRITE) {
+-	*handler_ptr = fd_table[fd].write_handler;
+-	*client_data_ptr = fd_table[fd].write_data;
+-    }
+-    if (type & COMM_SELECT_LIFETIME) {
+-	*handler_ptr = fd_table[fd].lifetime_handler;
+-	*client_data_ptr = fd_table[fd].lifetime_data;
++        fde->write_handler = handler;
++        fde->write_data = client_data;
+     }
+-    return 0;			/* XXX What is meaningful? */
++    if (timeout)
++        fde->timeout = squid_curtime + timeout;
+ }
+ 
+ void
+@@ -1285,27 +1232,16 @@ commSetTcpNoDelay(int fd)
+ }
+ #endif
+ 
+-/*
+- *  the fd_lifetime is used as a hardlimit to timeout dead sockets.
+- *  The basic problem is that many WWW clients are abusive and
+- *  it results in squid having lots of CLOSE_WAIT states.  Until
+- *  we can find a better solution, we give all asciiPort or
+- *  squid initiated clients a maximum lifetime.
+- */
+ int
+ comm_init(void)
+ {
+-    int i;
+-
+     fd_table = xcalloc(Squid_MaxFD, sizeof(FD_ENTRY));
+     meta_data.misc += Squid_MaxFD * sizeof(FD_ENTRY);
+     /* Keep a few file descriptors free so that we don't run out of FD's
+      * after accepting a client but before it opens a socket or a file.
+      * Since Squid_MaxFD can be as high as several thousand, don't waste them */
+     RESERVED_FD = min(100, Squid_MaxFD / 4);
+     /* hardwired lifetimes */
+-    for (i = 0; i < Squid_MaxFD; i++)
+-	comm_set_fd_lifetime(i, -1);	/* denotes invalid */
+     meta_data.misc += Squid_MaxFD * sizeof(int);
+     zero_tv.tv_sec = 0;
+     zero_tv.tv_usec = 0;
+@@ -1334,7 +1270,7 @@ examine_select(fd_set * readfds, fd_set * writefds)
+     struct timeval tv;
+     struct close_handler *ch = NULL;
+     struct close_handler *next = NULL;
+-    FD_ENTRY *f = NULL;
++    FD_ENTRY *fde = NULL;
+ 
+     debug(5, 0, "examine_select: Examining open file descriptors...\n");
+     for (fd = 0; fd < Squid_MaxFD; fd++) {
+@@ -1352,115 +1288,73 @@ examine_select(fd_set * readfds, fd_set * writefds)
+ 	    debug(5, 5, "FD %d is valid.\n", fd);
+ 	    continue;
+ 	}
+-	f = &fd_table[fd];
++	fde = &fd_table[fd];
+ 	debug(5, 0, "FD %d: %s\n", fd, xstrerror());
+ 	debug(5, 0, "WARNING: FD %d has handlers, but it's invalid.\n", fd);
+ 	debug(5, 0, "FD %d is a %s called '%s'\n",
+ 	    fd,
+ 	    fdstatTypeStr[fd_table[fd].type],
+-	    fd_note(fd, NULL));
+-	debug(5, 0, "lifetm:%p tmout:%p read:%p write:%p\n",
+-	    f->lifetime_handler,
+-	    f->timeout_handler,
+-	    f->read_handler,
+-	    f->write_handler);
+-	for (ch = f->close_handler; ch; ch = ch->next)
++	    fde->desc);
++	debug(5, 0, "tmout:%p read:%p write:%p\n",
++	    fde->timeout_handler,
++	    fde->read_handler,
++	    fde->write_handler);
++	for (ch = fde->close_handler; ch; ch = ch->next)
+ 	    debug(5, 0, " close handler: %p\n", ch->handler);
+-	if (f->close_handler) {
+-	    for (ch = f->close_handler; ch; ch = next) {
++	if (fde->close_handler) {
++	    for (ch = fde->close_handler; ch; ch = next) {
+ 		next = ch->next;
+ 		ch->handler(fd, ch->data);
+ 		safe_free(ch);
+ 	    }
+-	} else if (f->lifetime_handler) {
+-	    debug(5, 0, "examine_select: Calling Lifetime Handler\n");
+-	    f->lifetime_handler(fd, f->lifetime_data);
+-	} else if (f->timeout_handler) {
++	} else if (fde->timeout_handler) {
+ 	    debug(5, 0, "examine_select: Calling Timeout Handler\n");
+-	    f->timeout_handler(fd, f->timeout_data);
++	    fde->timeout_handler(fd, fde->timeout_data);
+ 	}
+-	f->close_handler = NULL;
+-	f->lifetime_handler = NULL;
+-	f->timeout_handler = NULL;
+-	f->read_handler = NULL;
+-	f->write_handler = NULL;
++	fde->close_handler = NULL;
++	fde->timeout_handler = NULL;
++	fde->read_handler = NULL;
++	fde->write_handler = NULL;
+ 	FD_CLR(fd, readfds);
+ 	FD_CLR(fd, writefds);
+     }
+     return 0;
+ }
+ #endif
+ 
+-char *
+-fd_note(int fd, const char *s)
+-{
+-    if (s == NULL)
+-	return (fd_table[fd].ascii_note);
+-    xstrncpy(fd_table[fd].ascii_note, s, FD_ASCII_NOTE_SZ);
+-    return (NULL);
+-}
+-
+ static void
+ checkTimeouts(void)
+-{
+-    int fd;
+-    PF *hdl = NULL;
+-    FD_ENTRY *f = NULL;
+-    void *data;
+-    /* scan for timeout */
+-    for (fd = 0; fd <= Biggest_FD; fd++) {
+-	f = &fd_table[fd];
+-	if (!f->open)
+-	    continue;
+-	if ((hdl = f->timeout_handler) == NULL)
+-	    continue;
+-	if (f->timeout_time > squid_curtime)
+-	    continue;
+-	debug(5, 5, "checkTimeouts: FD %d timeout at %d\n", fd, squid_curtime);
+-	data = f->timeout_data;
+-	f->timeout_handler = NULL;
+-	f->timeout_data = NULL;
+-	hdl(fd, data);
+-    }
+-}
+-
+-static void
+-checkLifetimes(void)
+ {
+     int fd;
+     FD_ENTRY *fde = NULL;
+-
+-    PF *hdl = NULL;
+-
++    PF *callback;
+     for (fd = 0; fd <= Biggest_FD; fd++) {
++	debug(5, 5, "checkTimeouts: Checking FD %d\n", fd);
+ 	fde = &fd_table[fd];
+-	if (!fde->open)
++	if (fde->open != FD_OPEN)
+ 	    continue;
+-	if (fde->lifetime < 0)
++	if (fde->timeout == 0)
+ 	    continue;
+-	if (fde->lifetime > squid_curtime)
++	if (fde->timeout > squid_curtime)
+ 	    continue;
+-	debug(5, 5, "checkLifetimes: FD %d Expired\n", fd);
+-	if ((hdl = fde->lifetime_handler) != NULL) {
+-	    debug(5, 5, "checkLifetimes: FD %d: Calling lifetime handler\n", fd);
+-	    hdl(fd, fde->lifetime_data);
+-	    fde->lifetime_handler = NULL;
+-	} else if ((hdl = fde->read_handler) != NULL) {
+-	    debug(5, 5, "checkLifetimes: FD %d: Calling read handler\n", fd);
+-	    hdl(fd, fd_table[fd].read_data);
+-	    fd_table[fd].read_handler = NULL;
+-	} else if ((hdl = fd_table[fd].write_handler)) {
+-	    debug(5, 5, "checkLifetimes: FD %d: Calling write handler\n", fd);
+-	    hdl(fd, fde->write_data);
++	debug(5, 5, "checkTimeouts: FD %d Expired\n", fd);
++	if (fde->timeout_handler) {
++	    debug(5, 5, "checkTimeouts: FD %d: Call timeout handler\n", fd);
++	    callback = fde->timeout_handler;
++	    fde->timeout_handler = NULL;
++	    callback(fd, fde->timeout_data);
++	} else if (fde->read_handler) {
++	    debug(5, 5, "checkTimeouts: FD %d: Call read handler\n", fd);
++	    callback = fde->read_handler;
++	    fde->read_handler = NULL;
++	    callback(fd, fde->read_data);
++	} else if (fde->write_handler) {
++	    debug(5, 5, "checkTimeouts: FD %d: Call write handler\n", fd);
++	    callback = fde->write_handler;
+ 	    fde->write_handler = NULL;
++	    callback(fd, fde->write_data);
+ 	} else {
+-	    debug(5, 5, "checkLifetimes: FD %d: No handlers, calling comm_close()\n", fd);
+-	    comm_close(fd);
+-	    comm_cleanup_fd_entry(fd);
+-	}
+-	if (fde->open) {
+-	    /* still opened */
+-	    debug(5, 5, "checkLifetimes: FD %d: Forcing comm_close()\n", fd);
++	    debug(5, 5, "checkTimeouts: FD %d: Forcing comm_close()\n", fd);
+ 	    comm_close(fd);
+ 	    comm_cleanup_fd_entry(fd);
+ 	}
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: disk.cc,v 1.61 1997/04/29 23:34:47 wessels Exp $
++ * $Id: disk.cc,v 1.62 1997/04/30 03:12:02 wessels Exp $
+  *
+  * DEBUG: section 6     Disk I/O Routines
+  * AUTHOR: Harvest Derived
+@@ -203,9 +203,8 @@ file_open_complete(void *data, int fd, int errcode)
+ 	return;
+     }
+     commSetCloseOnExec(fd);
++    fd_open(fd, FD_FILE, ctrlp->path);
+     fde = &fd_table[fd];
+-    memset(fde, '\0', sizeof(FD_ENTRY));
+-    fdstat_open(fd, FD_FILE);
+     xstrncpy(fde->disk.filename, ctrlp->path, SQUID_MAXPATHLEN);
+     if (ctrlp->callback)
+ 	(ctrlp->callback) (ctrlp->callback_data, fd);
+@@ -247,10 +246,7 @@ void
+ file_open_fd(int fd, const char *name, unsigned int type)
+ {
+     FD_ENTRY *fde = &fd_table[fd];
+-    if (fde->open)
+-	fatal_dump("file_open_fd: already open");
+-    memset(fde, '\0', sizeof(FD_ENTRY));
+-    fdstat_open(fd, type);
++    fd_open(fd, type, name);
+     commSetCloseOnExec(fd);
+     xstrncpy(fde->disk.filename, name, SQUID_MAXPATHLEN);
+ }
+@@ -276,10 +272,7 @@ file_close(int fd)
+ 	BIT_SET(fde->flags, FD_CLOSE_REQUEST);
+ 	return;
+     }
+-    /* update fdstat */
+-    fdstat_close(fd);
+-    memset(fde, '\0', sizeof(FD_ENTRY));
+-    comm_set_fd_lifetime(fd, -1);	/* invalidate the lifetime */
++    fd_close(fd);
+ #if USE_ASYNC_IO
+     aioClose(fd);
+ #else
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: dns.cc,v 1.31 1997/04/28 04:23:04 wessels Exp $
++ * $Id: dns.cc,v 1.32 1997/04/30 03:12:03 wessels Exp $
+  *
+  * DEBUG: section 34    Dnsserver interface
+  * AUTHOR: Harvest Derived
+@@ -184,7 +184,7 @@ dnsOpenServer(const char *command)
+ 	    comm_close(sfd);
+ 	    return -1;
+ 	}
+-	comm_set_fd_lifetime(sfd, -1);
++	commSetTimeout(sfd, -1, NULL, NULL);
+ 	return sfd;
+     }
+     /* child */
+@@ -246,7 +246,7 @@ dnsOpenServers(void)
+     char *prg = Config.Program.dnsserver;
+     int k;
+     int dnssocket;
+-    LOCAL_ARRAY(char, fd_note_buf, FD_ASCII_NOTE_SZ);
++    LOCAL_ARRAY(char, fd_note_buf, FD_DESC_SZ);
+ 
+     dnsFreeMemory();
+     dns_child_table = xcalloc(N, sizeof(dnsserver_t *));
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: ftp.cc,v 1.101 1997/04/29 22:12:56 wessels Exp $
++ * $Id: ftp.cc,v 1.102 1997/04/30 03:12:05 wessels Exp $
+  *
+  * DEBUG: section 9     File Transfer Protocol (FTP)
+  * AUTHOR: Harvest Derived
+@@ -139,7 +139,7 @@ static void ftpStateFree _PARAMS((int, void *));
+ static void ftpReadReply _PARAMS((int, void *));
+ static void ftpStartComplete _PARAMS((void *, int));
+ static void ftpConnectDone _PARAMS((int fd, int status, void *data));
+-static void ftpLifetimeExpire _PARAMS((int, void *));
++static PF ftpTimeout;
+ static void ftpProcessReplyHeader _PARAMS((FtpStateData *, const char *, int));
+ static void ftpSendComplete _PARAMS((int, char *, int, int, void *));
+ static void ftpSendRequest _PARAMS((int, void *));
+@@ -181,18 +181,16 @@ ftp_login_parser(const char *login, FtpStateData * ftpState)
+     xstrncpy(ftpState->password, Config.ftpUser, MAX_URL);
+ }
+ 
+-/* This will be called when socket lifetime is expired. */
+ static void
+-ftpLifetimeExpire(int fd, void *data)
++ftpTimeout(int fd, void *data)
+ {
+     FtpStateData *ftpState = data;
+     StoreEntry *entry = ftpState->entry;
+     debug(9, 4, "ftpLifeTimeExpire: FD %d: '%s'\n", fd, entry->url);
+-    squid_error_entry(entry, ERR_LIFETIME_EXP, NULL);
++    squid_error_entry(entry, ERR_READ_TIMEOUT, NULL);
+     comm_close(fd);
+ }
+ 
+-
+ /* This is too much duplicated code from httpProcessReplyHeader.  Only
+  * difference is FtpStateData vs HttpData. */
+ static void
+@@ -304,7 +302,7 @@ ftpReadReply(int fd, void *data)
+ 	    ftpReadReply,
+ 	    data, 0);
+ 	if (!BIT_TEST(entry->flag, READ_DEFERRED)) {
+-	    /* NOTE there is no read timeout handler to disable */
++	    commSetTimeout(fd, Config.Timeout.defer, NULL, NULL);
+ 	    BIT_SET(entry->flag, READ_DEFERRED);
+ 	}
+ 	/* dont try reading again for a while */
+@@ -317,6 +315,7 @@ ftpReadReply(int fd, void *data)
+     len = read(fd, buf, SQUID_TCP_SO_RCVBUF);
+     debug(9, 5, "ftpReadReply: FD %d, Read %d bytes\n", fd, len);
+     if (len > 0) {
++	commSetTimeout(fd, Config.Timeout.read, NULL, NULL);
+ 	IOStats.Ftp.reads++;
+ 	for (clen = len - 1, bin = 0; clen; bin++)
+ 	    clen >>= 1;
+@@ -355,7 +354,6 @@ ftpReadReply(int fd, void *data)
+ 	} else if (!(entry->flag & DELETE_BEHIND)) {
+ 	    storeTimestampsSet(entry);
+ 	}
+-	/* update fdstat and fdtable */
+ 	storeComplete(entry);
+ 	comm_close(fd);
+     } else if (entry->flag & CLIENT_ABORT_REQUEST) {
+@@ -385,11 +383,6 @@ ftpReadReply(int fd, void *data)
+ 	    COMM_SELECT_READ,
+ 	    ftpReadReply,
+ 	    data, 0);
+-	commSetSelect(fd,
+-	    COMM_SELECT_TIMEOUT,
+-	    ftpLifetimeExpire,
+-	    data,
+-	    Config.readTimeout);
+     }
+ }
+ 
+@@ -416,10 +409,6 @@ ftpSendComplete(int fd, char *buf, int size, int errflag, void *data)
+ 	COMM_SELECT_READ,
+ 	ftpReadReply,
+ 	ftpState, 0);
+-    commSetSelect(ftpState->ftp_fd,
+-	COMM_SELECT_TIMEOUT,
+-	ftpLifetimeExpire,
+-	ftpState, Config.readTimeout);
+ }
+ 
+ static const char *
+@@ -477,7 +466,7 @@ ftpSendRequest(int fd, void *data)
+ 	    got_negttl = 1;
+     }
+     if (!got_timeout) {
+-	sprintf(tbuf, "-t %d ", Config.readTimeout);
++	sprintf(tbuf, "-t %d ", Config.Timeout.read);
+ 	strcat(buf, tbuf);
+     }
+     if (!got_negttl) {
+@@ -596,80 +585,77 @@ ftpStartComplete(void *data, int status)
+     request_t *request = ctrlp->request;
+     StoreEntry *entry = ctrlp->entry;
+     char *url = entry->url;
+-    FtpStateData *ftpData = xcalloc(1, sizeof(FtpStateData));
++    FtpStateData *ftpState = xcalloc(1, sizeof(FtpStateData));
+     char *req_hdr;
+     char *response;
+-    ftpData->entry = entry;
++    ftpState->entry = entry;
+     xfree(ctrlp);
+     req_hdr = entry->mem_obj->mime_hdr;
+-    ftpData->request = requestLink(request);
+-    if (!ftpCheckAuth(ftpData, req_hdr)) {
++    ftpState->request = requestLink(request);
++    if (!ftpCheckAuth(ftpState, req_hdr)) {
+ 	/* This request is not fully authenticated */
+ 	if (request->port == 21) {
+-	    sprintf(realm, "ftp %s", ftpData->user);
++	    sprintf(realm, "ftp %s", ftpState->user);
+ 	} else {
+ 	    sprintf(realm, "ftp %s port %d",
+-		ftpData->user, request->port);
++		ftpState->user, request->port);
+ 	}
+ 	response = authorization_needed_msg(request, realm);
+ 	storeAppend(entry, response, strlen(response));
+ 	httpParseReplyHeaders(response, entry->mem_obj->reply);
+ 	storeComplete(entry);
+-	ftpStateFree(-1, ftpData);
++	ftpStateFree(-1, ftpState);
+ 	return;
+     }
+     debug(9, 5, "FtpStart: host=%s, path=%s, user=%s, passwd=%s\n",
+-	ftpData->request->host, ftpData->request->urlpath,
+-	ftpData->user, ftpData->password);
+-    ftpData->ftp_fd = comm_open(SOCK_STREAM,
++	ftpState->request->host, ftpState->request->urlpath,
++	ftpState->user, ftpState->password);
++    ftpState->ftp_fd = comm_open(SOCK_STREAM,
+ 	0,
+ 	local_addr,
+ 	0,
+ 	COMM_NONBLOCKING,
+ 	url);
+-    if (ftpData->ftp_fd == COMM_ERROR) {
++    if (ftpState->ftp_fd == COMM_ERROR) {
+ 	squid_error_entry(entry, ERR_CONNECT_FAIL, xstrerror());
+-	ftpStateFree(-1, ftpData);
++	ftpStateFree(-1, ftpState);
+ 	return;
+     }
+     /* Pipe/socket created ok */
+     /* register close handler */
+-    comm_add_close_handler(ftpData->ftp_fd,
++    comm_add_close_handler(ftpState->ftp_fd,
+ 	ftpStateFree,
+-	ftpData);
+-    /* Now connect ... */
+-    commConnectStart(ftpData->ftp_fd,
++	ftpState);
++    commSetTimeout(ftpState->ftp_fd,
++        Config.Timeout.connect,
++        ftpTimeout,
++        ftpState);
++    commConnectStart(ftpState->ftp_fd,
+ 	localhost,
+ 	ftpget_port,
+ 	ftpConnectDone,
+-	ftpData);
++	ftpState);
+ }
+ 
+ static void
+ ftpConnectDone(int fd, int status, void *data)
+ {
+-    FtpStateData *ftpData = data;
++    FtpStateData *ftpState = data;
+     if (status == COMM_ERROR) {
+-	squid_error_entry(ftpData->entry, ERR_CONNECT_FAIL, xstrerror());
++	squid_error_entry(ftpState->entry, ERR_CONNECT_FAIL, xstrerror());
+ 	comm_close(fd);
+ 	return;
+     }
+     commSetNonBlocking(fd);
+-    (void) fd_note(fd, ftpData->entry->url);
++    (void) fd_note(fd, ftpState->entry->url);
+     /* Install connection complete handler. */
+-    fd_note(fd, ftpData->entry->url);
++    fd_note(fd, ftpState->entry->url);
+     commSetSelect(fd,
+ 	COMM_SELECT_WRITE,
+ 	ftpSendRequest,
+ 	data, 0);
+-    comm_set_fd_lifetime(fd,
+-	Config.lifetimeDefault);
+-    commSetSelect(fd,
+-	COMM_SELECT_LIFETIME,
+-	ftpLifetimeExpire,
+-	ftpData, 0);
+     if (opt_no_ipcache)
+-	ipcacheInvalidate(ftpData->request->host);
++	ipcacheInvalidate(ftpState->request->host);
+ }
+ 
+ static void
+@@ -700,11 +686,11 @@ ftpServerClose(void)
+ 	COMM_SELECT_READ,
+ 	NULL,
+ 	NULL, 0);
+-    fdstat_close(ftpget_server_read);
++    fd_close(ftpget_server_read);
+     close(ftpget_server_read);
+-    fdstat_close(ftpget_server_write);
+-    close(ftpget_server_write);
+     ftpget_server_read = -1;
++    fd_close(ftpget_server_write);
++    close(ftpget_server_write);
+     ftpget_server_write = -1;
+ }
+ 
+@@ -764,10 +750,8 @@ ftpInitialize(void)
+ 	comm_close(cfd);
+ 	close(squid_to_ftpget[0]);
+ 	close(ftpget_to_squid[1]);
+-	fdstat_open(squid_to_ftpget[1], FD_PIPE);
+-	fdstat_open(ftpget_to_squid[0], FD_PIPE);
+-	fd_note(squid_to_ftpget[1], "ftpget -S");
+-	fd_note(ftpget_to_squid[0], "ftpget -S");
++	fd_open(squid_to_ftpget[1], FD_PIPE, "squid->ftpget");
++	fd_open(ftpget_to_squid[0], FD_PIPE, "ftpget->squid");
+ 	commSetCloseOnExec(squid_to_ftpget[1]);
+ 	commSetCloseOnExec(ftpget_to_squid[0]);
+ 	/* if ftpget -S goes away, this handler should get called */
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: gopher.cc,v 1.75 1997/04/29 22:12:56 wessels Exp $
++ * $Id: gopher.cc,v 1.76 1997/04/30 03:12:06 wessels Exp $
+  *
+  * DEBUG: section 10    Gopher
+  * AUTHOR: Harvest Derived
+@@ -168,8 +168,7 @@ static int gopher_url_parser(const char *url,
+     char *request);
+ static void gopherEndHTML _PARAMS((GopherStateData *));
+ static void gopherToHTML _PARAMS((GopherStateData *, char *inbuf, int len));
+-static PF gopherReadReplyTimeout;
+-static PF gopherLifetimeExpire;
++static PF gopherTimeout;
+ static PF gopherReadReply;
+ static void gopherSendComplete(int fd,
+     char *buf,
+@@ -678,33 +677,15 @@ gopherToHTML(GopherStateData * gopherState, char *inbuf, int len)
+ }
+ 
+ static void
+-gopherReadReplyTimeout(int fd, void *data)
+-{
+-    GopherStateData *gopherState = data;
+-    StoreEntry *entry = NULL;
+-    entry = gopherState->entry;
+-    debug(10, 4, "GopherReadReplyTimeout: Timeout on %d\n url: %s\n",
+-	fd, entry->url);
+-    squid_error_entry(entry, ERR_READ_TIMEOUT, NULL);
+-    comm_close(fd);
+-}
+-
+-/* This will be called when socket lifetime is expired. */
+-static void
+-gopherLifetimeExpire(int fd, void *data)
++gopherTimeout(int fd, void *data)
+ {
+     GopherStateData *gopherState = data;
+     StoreEntry *entry = gopherState->entry;
+-    debug(10, 4, "gopherLifeTimeExpire: FD %d: '%s'\n", fd, entry->url);
+-    squid_error_entry(entry, ERR_LIFETIME_EXP, NULL);
+-    commSetSelect(fd,
+-	COMM_SELECT_READ | COMM_SELECT_WRITE,
+-	NULL,
+-	NULL, 0);
++    debug(10, 4, "gopherTimeout: FD %d: '%s'\n", fd, entry->url);
++    squid_error_entry(entry, ERR_READ_TIMEOUT, NULL);
+     comm_close(fd);
+ }
+ 
+-
+ /* This will be called when data is ready to be read from fd.  Read until
+  * error or connection closed. */
+ static void
+@@ -745,13 +726,8 @@ gopherReadReply(int fd, void *data)
+ 	    gopherReadReply,
+ 	    data, 0);
+ 	/* don't install read timeout until we are below the GAP */
+-	commSetSelect(fd,
+-	    COMM_SELECT_TIMEOUT,
+-	    NULL,
+-	    NULL,
+-	    0);
+ 	if (!BIT_TEST(entry->flag, READ_DEFERRED)) {
+-	    comm_set_fd_lifetime(fd, 3600);	/* limit during deferring */
++            commSetTimeout(fd, Config.Timeout.defer, NULL, NULL);
+ 	    BIT_SET(entry->flag, READ_DEFERRED);
+ 	}
+ 	/* dont try reading again for a while */
+@@ -766,6 +742,7 @@ gopherReadReply(int fd, void *data)
+     len = read(fd, buf, TEMP_BUF_SIZE - 1);
+     debug(10, 5, "gopherReadReply: FD %d read len=%d\n", fd, len);
+     if (len > 0) {
++        commSetTimeout(fd, Config.Timeout.read, NULL, NULL);
+ 	IOStats.Gopher.reads++;
+ 	for (clen = len - 1, bin = 0; clen; bin++)
+ 	    clen >>= 1;
+@@ -780,11 +757,6 @@ gopherReadReply(int fd, void *data)
+ 		COMM_SELECT_READ,
+ 		gopherReadReply,
+ 		data, 0);
+-	    commSetSelect(fd,
+-		COMM_SELECT_TIMEOUT,
+-		gopherReadReplyTimeout,
+-		data,
+-		Config.readTimeout);
+ 	} else {
+ 	    BIT_RESET(entry->flag, ENTRY_CACHABLE);
+ 	    storeReleaseRequest(entry);
+@@ -828,11 +800,6 @@ gopherReadReply(int fd, void *data)
+ 	    COMM_SELECT_READ,
+ 	    gopherReadReply,
+ 	    data, 0);
+-	commSetSelect(fd,
+-	    COMM_SELECT_TIMEOUT,
+-	    gopherReadReplyTimeout,
+-	    data,
+-	    Config.readTimeout);
+     }
+     put_free_4k_page(buf);
+     return;
+@@ -897,13 +864,6 @@ gopherSendComplete(int fd, char *buf, int size, int errflag, void *data)
+ 	COMM_SELECT_READ,
+ 	gopherReadReply,
+ 	gopherState, 0);
+-    commSetSelect(fd,
+-	COMM_SELECT_TIMEOUT,
+-	gopherReadReplyTimeout,
+-	gopherState,
+-	Config.readTimeout);
+-    comm_set_fd_lifetime(fd, 86400);	/* extend lifetime */
+-
+     if (buf)
+ 	put_free_4k_page(buf);	/* Allocated by gopherSendRequest. */
+ }
+@@ -1007,6 +967,7 @@ gopherStartComplete(void *datap, int status)
+ 	comm_close(sock);
+ 	return;
+     }
++    commSetTimeout(sock, Config.Timeout.connect, gopherTimeout, gopherState);
+     commConnectStart(sock,
+ 	gopherState->host,
+ 	gopherState->port,
+@@ -1026,10 +987,6 @@ gopherConnectDone(int fd, int status, void *data)
+     /* Install connection complete handler. */
+     if (opt_no_ipcache)
+ 	ipcacheInvalidate(gopherState->host);
+-    commSetSelect(fd,
+-	COMM_SELECT_LIFETIME,
+-	gopherLifetimeExpire,
+-	gopherState, 0);
+     commSetSelect(fd,
+ 	COMM_SELECT_WRITE,
+ 	gopherSendRequest,
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: http.cc,v 1.155 1997/04/28 05:32:43 wessels Exp $
++ * $Id: http.cc,v 1.156 1997/04/30 03:12:07 wessels Exp $
+  *
+  * DEBUG: section 11    Hypertext Transfer Protocol (HTTP)
+  * AUTHOR: Harvest Derived
+@@ -214,8 +214,7 @@ static struct {
+ } ReplyHeaderStats;
+ 
+ static void httpStateFree _PARAMS((int fd, void *));
+-static void httpReadReplyTimeout _PARAMS((int fd, void *));
+-static void httpLifetimeExpire _PARAMS((int fd, void *));
++static PF httpTimeout;
+ static void httpMakePublic _PARAMS((StoreEntry *));
+ static void httpMakePrivate _PARAMS((StoreEntry *));
+ static void httpCacheNegatively _PARAMS((StoreEntry *));
+@@ -257,28 +256,13 @@ httpCachable(method_t method)
+     return 1;
+ }
+ 
+-/* This will be called when timeout on read. */
+ static void
+-httpReadReplyTimeout(int fd, void *data)
+-{
+-    HttpStateData *httpState = data;
+-    StoreEntry *entry = NULL;
+-    entry = httpState->entry;
+-    debug(11, 4, "httpReadReplyTimeout: FD %d: '%s'\n", fd, entry->url);
+-    squid_error_entry(entry, ERR_READ_TIMEOUT, NULL);
+-    commSetSelect(fd, COMM_SELECT_READ, NULL, NULL, 0);
+-    comm_close(fd);
+-}
+-
+-/* This will be called when socket lifetime is expired. */
+-static void
+-httpLifetimeExpire(int fd, void *data)
++httpTimeout(int fd, void *data)
+ {
+     HttpStateData *httpState = data;
+     StoreEntry *entry = httpState->entry;
+-    debug(11, 4, "httpLifeTimeExpire: FD %d: '%s'\n", fd, entry->url);
+-    squid_error_entry(entry, ERR_LIFETIME_EXP, NULL);
+-    commSetSelect(fd, COMM_SELECT_READ | COMM_SELECT_WRITE, NULL, NULL, 0);
++    debug(11, 4, "httpTimeout: FD %d: '%s'\n", fd, entry->url);
++    squid_error_entry(entry, ERR_READ_TIMEOUT, NULL);
+     comm_close(fd);
+ }
+ 
+@@ -591,13 +575,8 @@ httpReadReply(int fd, void *data)
+ 	    httpReadReply,
+ 	    httpState, 0);
+ 	/* disable read timeout until we are below the GAP */
+-	commSetSelect(fd,
+-	    COMM_SELECT_TIMEOUT,
+-	    NULL,
+-	    NULL,
+-	    0);
+ 	if (!BIT_TEST(entry->flag, READ_DEFERRED)) {
+-	    comm_set_fd_lifetime(fd, 3600);	/* limit during deferring */
++	    commSetTimeout(fd, Config.Timeout.defer, NULL, NULL);
+ 	    BIT_SET(entry->flag, READ_DEFERRED);
+ 	}
+ 	/* dont try reading again for a while */
+@@ -610,7 +589,7 @@ httpReadReply(int fd, void *data)
+     len = read(fd, buf, SQUID_TCP_SO_RCVBUF);
+     debug(11, 5, "httpReadReply: FD %d: len %d.\n", fd, len);
+     if (len > 0) {
+-	comm_set_fd_lifetime(fd, 86400);	/* extend after good read */
++        commSetTimeout(fd, Config.Timeout.read, NULL, NULL);
+ 	IOStats.Http.reads++;
+ 	for (clen = len - 1, bin = 0; clen; bin++)
+ 	    clen >>= 1;
+@@ -622,8 +601,6 @@ httpReadReply(int fd, void *data)
+ 	    /* XXX This may loop forever */
+ 	    commSetSelect(fd, COMM_SELECT_READ,
+ 		httpReadReply, httpState, 0);
+-	    commSetSelect(fd, COMM_SELECT_TIMEOUT,
+-		httpReadReplyTimeout, httpState, Config.readTimeout);
+ 	} else {
+ 	    BIT_RESET(entry->flag, ENTRY_CACHABLE);
+ 	    storeReleaseRequest(entry);
+@@ -655,11 +632,6 @@ httpReadReply(int fd, void *data)
+ 	if (httpState->reply_hdr_state < 2)
+ 	    httpProcessReplyHeader(httpState, buf, len);
+ 	storeAppend(entry, buf, len);
+-	commSetSelect(fd,
+-	    COMM_SELECT_TIMEOUT,
+-	    httpReadReplyTimeout,
+-	    httpState,
+-	    Config.readTimeout);
+ 	commSetSelect(fd,
+ 	    COMM_SELECT_READ,
+ 	    httpReadReply,
+@@ -689,12 +661,6 @@ httpSendComplete(int fd, char *buf, int size, int errflag, void *data)
+ 	    COMM_SELECT_READ,
+ 	    httpReadReply,
+ 	    httpState, 0);
+-	commSetSelect(fd,
+-	    COMM_SELECT_TIMEOUT,
+-	    httpReadReplyTimeout,
+-	    httpState,
+-	    Config.readTimeout);
+-	comm_set_fd_lifetime(fd, 86400);	/* extend lifetime */
+     }
+ }
+ 
+@@ -932,6 +898,7 @@ proxyhttpStartComplete(void *data, int status)
+     char *url = entry->url;
+     HttpStateData *httpState = NULL;
+     request_t *request = NULL;
++    int fd = ctrlp->sock;
+     xfree(ctrlp);
+     httpState = xcalloc(1, sizeof(HttpStateData));
+     httpState->entry = entry;
+@@ -946,6 +913,7 @@ proxyhttpStartComplete(void *data, int status)
+     comm_add_close_handler(httpState->fd,
+ 	httpStateFree,
+ 	httpState);
++    commSetTimeout(fd, Config.Timeout.read, httpTimeout, httpState);
+     request->method = orig_request->method;
+     xstrncpy(request->host, e->host, SQUIDHOSTNAMELEN);
+     request->port = e->http_port;
+@@ -973,6 +941,7 @@ httpConnect(int fd, const ipcache_addrs * ia, void *data)
+ 	return;
+     }
+     /* Open connection. */
++    commSetTimeout(fd, Config.Timeout.connect, httpTimeout, httpState);
+     commConnectStart(fd,
+ 	request->host,
+ 	request->port,
+@@ -996,8 +965,6 @@ httpConnectDone(int fd, int status, void *data)
+ 	if (opt_no_ipcache)
+ 	    ipcacheInvalidate(request->host);
+ 	fd_note(fd, entry->url);
+-	commSetSelect(fd, COMM_SELECT_LIFETIME,
+-	    httpLifetimeExpire, httpState, 0);
+ 	commSetSelect(fd, COMM_SELECT_WRITE,
+ 	    httpSendRequest, httpState, 0);
+     }
+@@ -1065,6 +1032,7 @@ httpStartComplete(void *data, int status)
+     comm_add_close_handler(httpState->fd,
+ 	httpStateFree,
+ 	httpState);
++    commSetTimeout(sock, Config.Timeout.read, httpTimeout, httpState);
+     httpState->ip_lookup_pending = 1;
+     ipcache_nbgethostbyname(request->host,
+ 	httpState->fd,
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: icmp.cc,v 1.34 1997/04/28 05:32:44 wessels Exp $
++ * $Id: icmp.cc,v 1.35 1997/04/30 03:12:08 wessels Exp $
+  *
+  * DEBUG: section 37    ICMP Routines
+  * AUTHOR: Duane Wessels
+@@ -306,7 +306,7 @@ icmpOpen(void)
+ 	COMM_SELECT_READ,
+ 	icmpRecv,
+ 	-1, 0);
+-    comm_set_fd_lifetime(icmp_sock, -1);
++    commSetTimeout(icmp_sock, -1, NULL, NULL);
+     debug(29, 0, "Pinger socket opened on FD %d\n", icmp_sock);
+ #endif
+ }
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: main.cc,v 1.142 1997/04/29 22:13:02 wessels Exp $
++ * $Id: main.cc,v 1.143 1997/04/30 03:12:10 wessels Exp $
+  *
+  * DEBUG: section 1     Startup and Main Loop
+  * AUTHOR: Harvest Derived
+@@ -301,7 +301,7 @@ reconfigure(int sig)
+ {
+     debug(1, 1, "reconfigure: SIGHUP received\n");
+     debug(1, 1, "Waiting %d seconds for active connections to finish\n",
+-	Config.lifetimeShutdown);
++	Config.shutdownLifetime);
+     reread_pending = 1;
+ #if !HAVE_SIGACTION
+     signal(sig, reconfigure);
+@@ -315,7 +315,7 @@ shut_down(int sig)
+     debug(1, 1, "Preparing for shutdown after %d connections\n",
+ 	ntcpconn + nudpconn);
+     debug(1, 1, "Waiting %d seconds for active connections to finish\n",
+-	shutdown_pending > 0 ? Config.lifetimeShutdown : 0);
++	shutdown_pending > 0 ? Config.shutdownLifetime : 0);
+ #ifdef KILL_PARENT_OPT
+     debug(1, 1, "Killing RunCache, pid %d\n", getppid());
+     kill(getppid(), sig);
+@@ -545,8 +545,7 @@ mainInitialize(void)
+ 	Config.Port.icp = (u_short) icpPortNumOverride;
+ 
+     _db_init(Config.Log.log, Config.debugOptions);
+-    fdstat_open(fileno(debug_log), FD_LOG);
+-    fd_note(fileno(debug_log), Config.Log.log);
++    fd_open(fileno(debug_log), FD_LOG, Config.Log.log);
+ 
+     debug(1, 0, "Starting Squid Cache version %s for %s...\n",
+ 	version_string,
+@@ -676,12 +675,9 @@ main(int argc, char **argv)
+ 
+     /* we have to init fdstat here. */
+     fdstat_init();
+-    fdstat_open(0, FD_LOG);
+-    fdstat_open(1, FD_LOG);
+-    fdstat_open(2, FD_LOG);
+-    fd_note(0, "STDIN");
+-    fd_note(1, "STDOUT");
+-    fd_note(2, "STDERR");
++    fd_open(0, FD_LOG, "stdin");
++    fd_open(1, FD_LOG, "stdout");
++    fd_open(2, FD_LOG, "stderr");
+ 
+     /* preinit for debug module */
+     debug_log = stderr;
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: redirect.cc,v 1.37 1997/04/29 22:13:06 wessels Exp $
++ * $Id: redirect.cc,v 1.38 1997/04/30 03:12:12 wessels Exp $
+  *
+  * DEBUG: section 29    Redirector
+  * AUTHOR: Duane Wessels
+@@ -133,7 +133,7 @@ redirectCreateRedirector(const char *command)
+ 	    comm_close(sfd);
+ 	    return -1;
+ 	}
+-	comm_set_fd_lifetime(sfd, -1);
++        commSetTimeout(sfd, -1, NULL, NULL);
+ 	debug(29, 4, "redirect_create_redirector: FD %d connected to %s #%d.\n",
+ 	    sfd, command, ++n_redirector);
+ 	slp.tv_sec = 0;
+@@ -374,7 +374,7 @@ redirectOpenServers(void)
+     char *prg = Config.Program.redirect;
+     int k;
+     int redirectsocket;
+-    LOCAL_ARRAY(char, fd_note_buf, FD_ASCII_NOTE_SZ);
++    LOCAL_ARRAY(char, fd_note_buf, FD_DESC_SZ);
+     static int first_time = 0;
+ 
+     redirectFreeMemory();
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: ssl.cc,v 1.45 1997/04/28 05:32:49 wessels Exp $
++ * $Id: ssl.cc,v 1.46 1997/04/30 03:12:12 wessels Exp $
+  *
+  * DEBUG: section 26    Secure Sockets Layer Proxy
+  * AUTHOR: Duane Wessels
+@@ -51,8 +51,7 @@ typedef struct {
+ 
+ static const char *const conn_established = "HTTP/1.0 200 Connection established\r\n\r\n";
+ 
+-static void sslLifetimeExpire _PARAMS((int fd, void *));
+-static void sslReadTimeout _PARAMS((int fd, void *));
++static PF sslTimeout;
+ static void sslReadServer _PARAMS((int fd, void *));
+ static void sslReadClient _PARAMS((int fd, void *));
+ static void sslWriteServer _PARAMS((int fd, void *));
+@@ -124,16 +123,6 @@ sslStateFree(int fd, void *data)
+     safe_free(sslState);
+ }
+ 
+-/* This will be called when the server lifetime is expired. */
+-static void
+-sslLifetimeExpire(int fd, void *data)
+-{
+-    SslStateData *sslState = data;
+-    debug(26, 4, "sslLifeTimeExpire: FD %d: URL '%s'>\n",
+-	fd, sslState->url);
+-    sslClose(sslState);
+-}
+-
+ /* Read from server side and queue it for writing to the client */
+ static void
+ sslReadServer(int fd, void *data)
+@@ -152,11 +141,6 @@ sslReadServer(int fd, void *data)
+ 		COMM_SELECT_READ,
+ 		sslReadServer,
+ 		sslState, 0);
+-	    commSetSelect(sslState->server.fd,
+-		COMM_SELECT_TIMEOUT,
+-		sslReadTimeout,
+-		sslState,
+-		sslState->timeout);
+ 	} else {
+ 	    sslClose(sslState);
+ 	}
+@@ -166,6 +150,8 @@ sslReadServer(int fd, void *data)
+     } else {
+ 	sslState->server.offset = 0;
+ 	sslState->server.len = len;
++        /* extend server read timeout */
++        commSetTimeout(sslState->server.fd, Config.Timeout.read, NULL, NULL);
+ 	commSetSelect(sslState->client.fd,
+ 	    COMM_SELECT_WRITE,
+ 	    sslWriteClient,
+@@ -237,11 +223,6 @@ sslWriteServer(int fd, void *data)
+ 	    COMM_SELECT_READ,
+ 	    sslReadClient,
+ 	    sslState, 0);
+-	commSetSelect(sslState->server.fd,
+-	    COMM_SELECT_TIMEOUT,
+-	    sslReadTimeout,
+-	    sslState,
+-	    sslState->timeout);
+     } else {
+ 	/* still have more to write */
+ 	commSetSelect(sslState->server.fd,
+@@ -296,10 +277,10 @@ sslWriteClient(int fd, void *data)
+ }
+ 
+ static void
+-sslReadTimeout(int fd, void *data)
++sslTimeout(int fd, void *data)
+ {
+     SslStateData *sslState = data;
+-    debug(26, 3, "sslReadTimeout: FD %d\n", fd);
++    debug(26, 3, "sslTimeout: FD %d\n", fd);
+     sslClose(sslState);
+ }
+ 
+@@ -311,7 +292,7 @@ sslConnected(int fd, void *data)
+     strcpy(sslState->server.buf, conn_established);
+     sslState->server.len = strlen(conn_established);
+     sslState->server.offset = 0;
+-    comm_set_fd_lifetime(fd, 86400);	/* extend lifetime */
++    commSetTimeout(sslState->server.fd, Config.Timeout.read, NULL, NULL);
+     commSetSelect(sslState->client.fd,
+ 	COMM_SELECT_WRITE,
+ 	sslWriteClient,
+@@ -361,19 +342,10 @@ sslConnect(int fd, const ipcache_addrs * ia, void *data)
+     debug(26, 5, "sslConnect: client=%d server=%d\n",
+ 	sslState->client.fd,
+ 	sslState->server.fd);
+-    /* Install lifetime handler */
+-    commSetSelect(sslState->server.fd,
+-	COMM_SELECT_LIFETIME,
+-	sslLifetimeExpire,
+-	sslState, 0);
+-    /* NOTE this changes the lifetime handler for the client side.
+-     * It used to be asciiConnLifetimeHandle, but it does funny things
+-     * like looking for read handlers and assuming it was still reading
+-     * the HTTP request.  sigh... */
+-    commSetSelect(sslState->client.fd,
+-	COMM_SELECT_LIFETIME,
+-	sslLifetimeExpire,
+-	sslState, 0);
++    commSetTimeout(sslState->server.fd,
++        Config.Timeout.read,
++        sslTimeout,
++        sslState);
+     commConnectStart(fd,
+ 	sslState->host,
+ 	sslState->port,
+@@ -447,7 +419,7 @@ sslStart(int fd, const char *url, request_t * request, char *mime_hdr, int *size
+     sslState->url = xstrdup(url);
+     sslState->request = requestLink(request);
+     sslState->mime_hdr = mime_hdr;
+-    sslState->timeout = Config.readTimeout;
++    sslState->timeout = Config.Timeout.read;
+     sslState->size_ptr = size_ptr;
+     sslState->client.fd = fd;
+     sslState->server.fd = sock;
+@@ -459,6 +431,10 @@ sslStart(int fd, const char *url, request_t * request, char *mime_hdr, int *size
+     comm_add_close_handler(sslState->client.fd,
+ 	sslClientClosed,
+ 	sslState);
++    commSetTimeout(sslState->client.fd,
++        Config.Timeout.lifetime,
++        sslTimeout,
++        sslState);
+     peerSelect(request,
+ 	NULL,
+ 	sslPeerSelectComplete,
+@@ -476,11 +452,11 @@ sslProxyConnected(int fd, void *data)
+     debug(26, 3, "sslProxyConnected: Sending 'CONNECT %s HTTP/1.0'\n", sslState->url);
+     sslState->client.len = strlen(sslState->client.buf);
+     sslState->client.offset = 0;
+-    comm_set_fd_lifetime(fd, 86400);	/* extend lifetime */
+     commSetSelect(sslState->server.fd,
+ 	COMM_SELECT_WRITE,
+ 	sslWriteServer,
+ 	sslState, 0);
++    commSetTimeout(fd, Config.Timeout.read, NULL, NULL);
+     commSetSelect(sslState->server.fd,
+ 	COMM_SELECT_READ,
+ 	sslReadServer,
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: stat.cc,v 1.136 1997/04/29 23:34:53 wessels Exp $
++ * $Id: stat.cc,v 1.137 1997/04/30 03:12:14 wessels Exp $
+  *
+  * DEBUG: section 18    Cache Manager Statistics
+  * AUTHOR: Harvest Derived
+@@ -631,8 +631,7 @@ static void
+ statFiledescriptors(StoreEntry * sentry)
+ {
+     int i;
+-    int lft;
+-    int to;
++    int to = 0;
+     FD_ENTRY *f;
+ 
+     storeAppendPrintf(sentry, open_bracket);
+@@ -647,42 +646,36 @@ statFiledescriptors(StoreEntry * sentry)
+     storeAppendPrintf(sentry, "{---- ------ ---- ---- --------------------- ------------------------------}\n");
+     for (i = 0; i < Squid_MaxFD; i++) {
+ 	f = &fd_table[i];
+-	if (!fdstat_isopen(i))
++	if (!f->open)
+ 	    continue;
+ 	storeAppendPrintf(sentry, "{%4d %-6s ",
+ 	    i,
+ 	    fdstatTypeStr[f->type]);
+ 	switch (f->type) {
+ 	case FD_SOCKET:
+-	    if ((lft = f->lifetime) < 0)
+-		lft = 0;
+-	    to = f->timeout_time;
+-	    if (lft > 0)
+-		lft = (lft - squid_curtime) / 60;
+-	    if (to > 0)
+-		to = (to - squid_curtime) / 60;
+-	    if (f->timeout_handler == NULL)
+-		to = 0;
+-	    storeAppendPrintf(sentry, "%4d %4d %-21s %s}\n",
+-		lft,
+-		to,
+-		host_port_fmt(f->ipaddr, f->remote_port),
+-		fd_note(i, NULL));
+-	    break;
++            if (f->timeout > 0)
++                to = (int) (f->timeout - squid_curtime) / 60;
++            if (f->timeout_handler == NULL)
++                to = 0;
++            storeAppendPrintf(sentry, "%4d %-21s %s}\n",
++                to,
++                host_port_fmt(f->ipaddr, f->remote_port),
++                f->desc);
++            break;
+ 	case FD_FILE:
+ 	    storeAppendPrintf(sentry, "%31s %s}\n",
+ 		null_string,
+ 		f->disk.filename);
+ 	    break;
+ 	case FD_PIPE:
+-	    storeAppendPrintf(sentry, "%31s %s}\n", null_string, fd_note(i, NULL));
++	    storeAppendPrintf(sentry, "%31s %s}\n", null_string, f->desc);
+ 	    break;
+ 	case FD_LOG:
+-	    storeAppendPrintf(sentry, "%31s %s}\n", null_string, fd_note(i, NULL));
++	    storeAppendPrintf(sentry, "%31s %s}\n", null_string, f->desc);
+ 	    break;
+ 	case FD_UNKNOWN:
+ 	default:
+-	    storeAppendPrintf(sentry, "%31s %s}\n", null_string, fd_note(i, NULL));
++	    storeAppendPrintf(sentry, "%31s %s}\n", null_string, f->desc);
+ 	    break;
+ 	}
+     }
+@@ -982,10 +975,9 @@ parameter_get(const cacheinfo * obj, StoreEntry * sentry)
+ 	Config.negativeTtl);
+     storeAppendPrintf(sentry,
+ 	"{ReadTimeout %d \"# Maximum idle connection (s)\"}\n",
+-	Config.readTimeout);
+-    storeAppendPrintf(sentry,
+-	"{ClientLifetime %d \"# Lifetime for incoming HTTP requests\"}\n",
+-	Config.lifetimeDefault);
++	Config.Timeout.read);
++    storeAppendPrintf(sentry, "{DeferTimeout %d\n", Config.Timeout.defer);
++    storeAppendPrintf(sentry, "{ClientLifetime %d\n", Config.Timeout.lifetime);
+     storeAppendPrintf(sentry,
+ 	"{CleanRate %d \"# Rate for periodic object expiring\"}\n",
+ 	Config.cleanRate);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: tools.cc,v 1.100 1997/04/29 23:34:54 wessels Exp $
++ * $Id: tools.cc,v 1.101 1997/04/30 03:12:15 wessels Exp $
+  *
+  * DEBUG: section 21    Misc Functions
+  * AUTHOR: Harvest Derived
+@@ -122,6 +122,8 @@ Thanks!\n"
+ 
+ static void fatal_common _PARAMS((const char *));
+ static void mail_warranty _PARAMS((void));
++static void shutdownTimeoutHandler _PARAMS((int fd, void *data));
++
+ #if USE_ASYNC_IO
+ static void safeunlinkComplete _PARAMS((void *data, int retcode, int errcode));
+ #endif
+@@ -315,20 +317,30 @@ sigusr2_handle(int sig)
+ #endif
+ }
+ 
++static void
++shutdownTimeoutHandler(int fd, void *data)
++{
++    debug(21, 1, "Forcing close of FD %d\n", fd);
++    comm_close(fd);
++}
++
+ void
+-setSocketShutdownLifetimes(int lft)
++setSocketShutdownLifetimes(int to)
+ {
+     FD_ENTRY *f = NULL;
+     int i;
+     for (i = Biggest_FD; i >= 0; i--) {
+-	f = &fd_table[i];
+-	if (!f->read_handler && !f->write_handler)
+-	    continue;
+-	if (fd_table[i].type != FD_SOCKET)
+-	    continue;
+-	if (f->lifetime > 0 && (f->lifetime - squid_curtime) <= lft)
+-	    continue;
+-	comm_set_fd_lifetime(i, lft);
++        f = &fd_table[i];
++        if (!f->read_handler && !f->write_handler)
++            continue;
++        if (f->type != FD_SOCKET)
++            continue;
++        if (f->timeout > 0 && (int) (f->timeout - squid_curtime) <= to)
++            continue;
++        commSetTimeout(i,
++            to,
++            f->timeout_handler ? f->timeout_handler : shutdownTimeoutHandler,
++            f->timeout_data);
+     }
+ }
+ 
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: tunnel.cc,v 1.45 1997/04/28 05:32:49 wessels Exp $
++ * $Id: tunnel.cc,v 1.46 1997/04/30 03:12:12 wessels Exp $
+  *
+  * DEBUG: section 26    Secure Sockets Layer Proxy
+  * AUTHOR: Duane Wessels
+@@ -51,8 +51,7 @@ typedef struct {
+ 
+ static const char *const conn_established = "HTTP/1.0 200 Connection established\r\n\r\n";
+ 
+-static void sslLifetimeExpire _PARAMS((int fd, void *));
+-static void sslReadTimeout _PARAMS((int fd, void *));
++static PF sslTimeout;
+ static void sslReadServer _PARAMS((int fd, void *));
+ static void sslReadClient _PARAMS((int fd, void *));
+ static void sslWriteServer _PARAMS((int fd, void *));
+@@ -124,16 +123,6 @@ sslStateFree(int fd, void *data)
+     safe_free(sslState);
+ }
+ 
+-/* This will be called when the server lifetime is expired. */
+-static void
+-sslLifetimeExpire(int fd, void *data)
+-{
+-    SslStateData *sslState = data;
+-    debug(26, 4, "sslLifeTimeExpire: FD %d: URL '%s'>\n",
+-	fd, sslState->url);
+-    sslClose(sslState);
+-}
+-
+ /* Read from server side and queue it for writing to the client */
+ static void
+ sslReadServer(int fd, void *data)
+@@ -152,11 +141,6 @@ sslReadServer(int fd, void *data)
+ 		COMM_SELECT_READ,
+ 		sslReadServer,
+ 		sslState, 0);
+-	    commSetSelect(sslState->server.fd,
+-		COMM_SELECT_TIMEOUT,
+-		sslReadTimeout,
+-		sslState,
+-		sslState->timeout);
+ 	} else {
+ 	    sslClose(sslState);
+ 	}
+@@ -166,6 +150,8 @@ sslReadServer(int fd, void *data)
+     } else {
+ 	sslState->server.offset = 0;
+ 	sslState->server.len = len;
++        /* extend server read timeout */
++        commSetTimeout(sslState->server.fd, Config.Timeout.read, NULL, NULL);
+ 	commSetSelect(sslState->client.fd,
+ 	    COMM_SELECT_WRITE,
+ 	    sslWriteClient,
+@@ -237,11 +223,6 @@ sslWriteServer(int fd, void *data)
+ 	    COMM_SELECT_READ,
+ 	    sslReadClient,
+ 	    sslState, 0);
+-	commSetSelect(sslState->server.fd,
+-	    COMM_SELECT_TIMEOUT,
+-	    sslReadTimeout,
+-	    sslState,
+-	    sslState->timeout);
+     } else {
+ 	/* still have more to write */
+ 	commSetSelect(sslState->server.fd,
+@@ -296,10 +277,10 @@ sslWriteClient(int fd, void *data)
+ }
+ 
+ static void
+-sslReadTimeout(int fd, void *data)
++sslTimeout(int fd, void *data)
+ {
+     SslStateData *sslState = data;
+-    debug(26, 3, "sslReadTimeout: FD %d\n", fd);
++    debug(26, 3, "sslTimeout: FD %d\n", fd);
+     sslClose(sslState);
+ }
+ 
+@@ -311,7 +292,7 @@ sslConnected(int fd, void *data)
+     strcpy(sslState->server.buf, conn_established);
+     sslState->server.len = strlen(conn_established);
+     sslState->server.offset = 0;
+-    comm_set_fd_lifetime(fd, 86400);	/* extend lifetime */
++    commSetTimeout(sslState->server.fd, Config.Timeout.read, NULL, NULL);
+     commSetSelect(sslState->client.fd,
+ 	COMM_SELECT_WRITE,
+ 	sslWriteClient,
+@@ -361,19 +342,10 @@ sslConnect(int fd, const ipcache_addrs * ia, void *data)
+     debug(26, 5, "sslConnect: client=%d server=%d\n",
+ 	sslState->client.fd,
+ 	sslState->server.fd);
+-    /* Install lifetime handler */
+-    commSetSelect(sslState->server.fd,
+-	COMM_SELECT_LIFETIME,
+-	sslLifetimeExpire,
+-	sslState, 0);
+-    /* NOTE this changes the lifetime handler for the client side.
+-     * It used to be asciiConnLifetimeHandle, but it does funny things
+-     * like looking for read handlers and assuming it was still reading
+-     * the HTTP request.  sigh... */
+-    commSetSelect(sslState->client.fd,
+-	COMM_SELECT_LIFETIME,
+-	sslLifetimeExpire,
+-	sslState, 0);
++    commSetTimeout(sslState->server.fd,
++        Config.Timeout.read,
++        sslTimeout,
++        sslState);
+     commConnectStart(fd,
+ 	sslState->host,
+ 	sslState->port,
+@@ -447,7 +419,7 @@ sslStart(int fd, const char *url, request_t * request, char *mime_hdr, int *size
+     sslState->url = xstrdup(url);
+     sslState->request = requestLink(request);
+     sslState->mime_hdr = mime_hdr;
+-    sslState->timeout = Config.readTimeout;
++    sslState->timeout = Config.Timeout.read;
+     sslState->size_ptr = size_ptr;
+     sslState->client.fd = fd;
+     sslState->server.fd = sock;
+@@ -459,6 +431,10 @@ sslStart(int fd, const char *url, request_t * request, char *mime_hdr, int *size
+     comm_add_close_handler(sslState->client.fd,
+ 	sslClientClosed,
+ 	sslState);
++    commSetTimeout(sslState->client.fd,
++        Config.Timeout.lifetime,
++        sslTimeout,
++        sslState);
+     peerSelect(request,
+ 	NULL,
+ 	sslPeerSelectComplete,
+@@ -476,11 +452,11 @@ sslProxyConnected(int fd, void *data)
+     debug(26, 3, "sslProxyConnected: Sending 'CONNECT %s HTTP/1.0'\n", sslState->url);
+     sslState->client.len = strlen(sslState->client.buf);
+     sslState->client.offset = 0;
+-    comm_set_fd_lifetime(fd, 86400);	/* extend lifetime */
+     commSetSelect(sslState->server.fd,
+ 	COMM_SELECT_WRITE,
+ 	sslWriteServer,
+ 	sslState, 0);
++    commSetTimeout(fd, Config.Timeout.read, NULL, NULL);
+     commSetSelect(sslState->server.fd,
+ 	COMM_SELECT_READ,
+ 	sslReadServer,
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: unlinkd.cc,v 1.2 1997/04/28 04:23:32 wessels Exp $
++ * $Id: unlinkd.cc,v 1.3 1997/04/30 03:12:16 wessels Exp $
+  *
+  * DEBUG: section 43    Unlink Daemon
+  * AUTHOR: Duane Wessels
+@@ -127,7 +127,7 @@ unlinkdCreate(void)
+ 	    close(wfd1);
+ 	    return -1;
+ 	}
+-	comm_set_fd_lifetime(wfd1, -1);
++	commSetTimeout(wfd1, -1, NULL, NULL);
+ 	slp.tv_sec = 0;
+ 	slp.tv_usec = 250000;
+ 	select(0, NULL, NULL, NULL, &slp);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: wais.cc,v 1.65 1997/04/29 22:13:12 wessels Exp $
++ * $Id: wais.cc,v 1.66 1997/04/30 03:12:17 wessels Exp $
+  *
+  * DEBUG: section 24    WAIS Relay
+  * AUTHOR: Harvest Derived
+@@ -121,8 +121,7 @@ typedef struct {
+ 
+ static PF waisStateFree;
+ static void waisStartComplete _PARAMS((void *, int));
+-static PF waisReadReplyTimeout;
+-static PF waisLifetimeExpire;
++static PF waisTimeout;
+ static PF waisReadReply;
+ static void waisSendComplete _PARAMS((int, char *, int, int, void *));
+ static PF waisSendRequest;
+@@ -141,27 +140,14 @@ waisStateFree(int fd, void *data)
+     xfree(waisState);
+ }
+ 
+-/* This will be called when timeout on read. */
+-static void
+-waisReadReplyTimeout(int fd, void *data)
+-{
+-    WaisStateData *waisState = data;
+-    StoreEntry *entry = waisState->entry;
+-    debug(24, 4, "waisReadReplyTimeout: Timeout on %d\n url: %s\n", fd, entry->url);
+-    squid_error_entry(entry, ERR_READ_TIMEOUT, NULL);
+-    commSetSelect(fd, COMM_SELECT_READ, NULL, NULL, 0);
+-    comm_close(fd);
+-}
+-
+ /* This will be called when socket lifetime is expired. */
+ static void
+-waisLifetimeExpire(int fd, void *data)
++waisTimeout(int fd, void *data)
+ {
+     WaisStateData *waisState = data;
+     StoreEntry *entry = waisState->entry;
+-    debug(24, 4, "waisLifeTimeExpire: FD %d: '%s'\n", fd, entry->url);
+-    squid_error_entry(entry, ERR_LIFETIME_EXP, NULL);
+-    commSetSelect(fd, COMM_SELECT_READ | COMM_SELECT_WRITE, NULL, NULL, 0);
++    debug(24, 4, "waisTimeout: FD %d: '%s'\n", fd, entry->url);
++    squid_error_entry(entry, ERR_READ_TIMEOUT, NULL);
+     comm_close(fd);
+ }
+ 
+@@ -206,13 +192,8 @@ waisReadReply(int fd, void *data)
+ 	    waisReadReply,
+ 	    waisState, 0);
+ 	/* don't install read handler while we're above the gap */
+-	commSetSelect(fd,
+-	    COMM_SELECT_TIMEOUT,
+-	    NULL,
+-	    NULL,
+-	    0);
+ 	if (!BIT_TEST(entry->flag, READ_DEFERRED)) {
+-	    comm_set_fd_lifetime(fd, 3600);	/* limit during deferring */
++	    commSetTimeout(fd, Config.Timeout.defer, NULL, NULL);
+ 	    BIT_SET(entry->flag, READ_DEFERRED);
+ 	}
+ 	/* dont try reading again for a while */
+@@ -224,6 +205,7 @@ waisReadReply(int fd, void *data)
+     len = read(fd, buf, 4096);
+     debug(24, 5, "waisReadReply: FD %d read len:%d\n", fd, len);
+     if (len > 0) {
++	commSetTimeout(fd, Config.Timeout.read, NULL, NULL);
+ 	IOStats.Wais.reads++;
+ 	for (clen = len - 1, bin = 0; clen; bin++)
+ 	    clen >>= 1;
+@@ -236,8 +218,6 @@ waisReadReply(int fd, void *data)
+ 	    /* XXX This may loop forever */
+ 	    commSetSelect(fd, COMM_SELECT_READ,
+ 		waisReadReply, waisState, 0);
+-	    commSetSelect(fd, COMM_SELECT_TIMEOUT,
+-		waisReadReplyTimeout, waisState, Config.readTimeout);
+ 	} else {
+ 	    BIT_RESET(entry->flag, ENTRY_CACHABLE);
+ 	    storeReleaseRequest(entry);
+@@ -260,11 +240,6 @@ waisReadReply(int fd, void *data)
+ 	    COMM_SELECT_READ,
+ 	    waisReadReply,
+ 	    waisState, 0);
+-	commSetSelect(fd,
+-	    COMM_SELECT_TIMEOUT,
+-	    waisReadReplyTimeout,
+-	    waisState,
+-	    Config.readTimeout);
+     }
+ }
+ 
+@@ -286,11 +261,6 @@ waisSendComplete(int fd, char *buf, int size, int errflag, void *data)
+ 	    COMM_SELECT_READ,
+ 	    waisReadReply,
+ 	    waisState, 0);
+-	commSetSelect(fd,
+-	    COMM_SELECT_TIMEOUT,
+-	    waisReadReplyTimeout,
+-	    waisState,
+-	    Config.readTimeout);
+     }
+ }
+ 
+@@ -361,6 +331,10 @@ waisStart(method_t method, char *mime_hdr, StoreEntry * entry)
+     waisState->fd = fd;
+     waisState->entry = entry;
+     xstrncpy(waisState->request, url, MAX_URL);
++    comm_add_close_handler(waisState->fd,
++	waisStateFree,
++	waisState);
++    commSetTimeout(fd, Config.Timeout.read, waisTimeout, waisState);
+     storeLockObject(entry, waisStartComplete, waisState);
+     return COMM_OK;
+ }
+@@ -370,10 +344,6 @@ static void
+ waisStartComplete(void *data, int status)
+ {
+     WaisStateData *waisState = data;
+-
+-    comm_add_close_handler(waisState->fd,
+-	waisStateFree,
+-	waisState);
+     waisState->ip_lookup_pending = 1;
+     ipcache_nbgethostbyname(waisState->relayhost,
+ 	waisState->fd,
+@@ -393,6 +363,7 @@ waisConnect(int fd, const ipcache_addrs * ia, void *data)
+ 	comm_close(waisState->fd);
+ 	return;
+     }
++    commSetTimeout(fd, Config.Timeout.connect, waisTimeout, waisState);
+     commConnectStart(fd,
+ 	waisState->relayhost,
+ 	waisState->relayport,
+@@ -412,10 +383,6 @@ waisConnectDone(int fd, int status, void *data)
+     /* Install connection complete handler. */
+     if (opt_no_ipcache)
+ 	ipcacheInvalidate(waisState->relayhost);
+-    commSetSelect(fd,
+-	COMM_SELECT_LIFETIME,
+-	waisLifetimeExpire,
+-	waisState, 0);
+     commSetSelect(fd,
+ 	COMM_SELECT_WRITE,
+ 	waisSendRequest,

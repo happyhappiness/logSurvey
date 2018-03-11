@@ -1,0 +1,1153 @@
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: client_side.cc,v 1.135 1997/10/28 20:42:50 wessels Exp $
++ * $Id: client_side.cc,v 1.136 1997/10/30 02:40:57 wessels Exp $
+  *
+  * DEBUG: section 33    Client-side Routines
+  * AUTHOR: Duane Wessels
+@@ -94,19 +94,21 @@ clientAccessCheckDone(int answer, void *data)
+     } else {
+ 	debug(33, 5) ("Access Denied: %s\n", http->url);
+ 	redirectUrl = aclGetDenyInfoUrl(&Config.denyInfoList, AclMatchedName);
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_ACCESS_DENIED;
+-	err->request = requestLink(http->request);
+-	err->src_addr = http->conn->peer.sin_addr;
+ 	if (redirectUrl) {
+-	    err->http_status = HTTP_MOVED_TEMPORARILY;
++	    err = errorCon(ERR_ACCESS_DENIED, HTTP_MOVED_TEMPORARILY);
++	    err->request = requestLink(http->request);
++	    err->src_addr = http->conn->peer.sin_addr;
+ 	    err->redirect_url = xstrdup(redirectUrl);
++	    errorSend(fd, err);
++
+ 	} else {
+ 	    /* NOTE: don't use HTTP_UNAUTHORIZED because then the
+ 	     * stupid browser wants us to authenticate */
+-	    err->http_status = HTTP_FORBIDDEN;
++	    err = errorCon(ERR_ACCESS_DENIED, HTTP_FORBIDDEN);
++	    err->request = requestLink(http->request);
++	    err->src_addr = http->conn->peer.sin_addr;
++	    errorSend(fd, err);
+ 	}
+-	errorSend(fd, err);
+     }
+ }
+ 
+@@ -355,11 +357,9 @@ clientPurgeRequest(clientHttpRequest * http)
+     ErrorState *err = NULL;
+     debug(33, 3) ("Config.onoff.enable_purge = %d\n", Config.onoff.enable_purge);
+     if (!Config.onoff.enable_purge) {
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_ACCESS_DENIED;
++	err = errorCon(ERR_ACCESS_DENIED, HTTP_FORBIDDEN);
+ 	err->request = requestLink(http->request);
+ 	err->src_addr = http->conn->peer.sin_addr;
+-	err->http_status = HTTP_FORBIDDEN;
+ 	errorSend(fd, err);
+ 	return;
+     }
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: errorpage.cc,v 1.94 1997/10/30 00:51:04 wessels Exp $
++ * $Id: errorpage.cc,v 1.95 1997/10/30 02:40:58 wessels Exp $
+  *
+  * DEBUG: section 4     Error Generation
+  * AUTHOR: Duane Wessels
+@@ -29,9 +29,16 @@
+  *  
+  */
+ 
++/*
++ * Abstract:	These routines are used to generate error messages to be
++ *		sent to clients.  The error type is used to select between
++ *		the various message formats. (formats are stored in the
++ *		Config.errorDirectory)
++ */
++
+ #include "squid.h"
+ 
+-const char *err_string[] =
++static const char *err_string[] =
+ {
+     "ERR_NONE",
+     "ERR_READ_TIMEOUT",
+@@ -57,10 +64,19 @@ const char *err_string[] =
+ static char *error_text[ERR_MAX];
+ 
+ static void errorStateFree(ErrorState * err);
+-static char *errorConvert(char token, ErrorState * err);
+-static char *errorBuildBuf(ErrorState * err, int *len);
++static const char *errorConvert(char token, ErrorState * err);
++static const char *errorBuildBuf(ErrorState * err, int *len);
+ static CWCB errorSendComplete;
+ 
++/*
++ * Function:  errorInitialize
++ *
++ * Abstract:  This function reads in the error messages formats, and stores
++ *            them in error_text[];
++ *
++ * Global effects:
++ *            error_text[] - is modified
++ */
+ void
+ errorInitialize(void)
+ {
+@@ -78,15 +94,102 @@ errorInitialize(void)
+ 	    fatal("Failed to open error text file");
+ 	}
+ 	if (fstat(fd, &sb) < 0)
+-	    fatal_dump("stat() failed on error text file");
++	    fatal("fstat() failed on error text file");
+ 	safe_free(error_text[i]);
+ 	error_text[i] = xcalloc(sb.st_size + 1, 1);
+ 	if (read(fd, error_text[i], sb.st_size) != sb.st_size)
+-	    fatal_dump("failed to fully read error text file");
++	    fatal("failed to fully read error text file");
+ 	file_close(fd);
+     }
+ }
+ 
++/*
++ * Function:  errorCon
++ *
++ * Abstract:  This function creates a ErrorState object.
++ */
++ErrorState *
++errorCon(err_type type, http_status status)
++{
++    ErrorState *err = xcalloc(1, sizeof(ErrorState));
++    err->type = type;
++    err->http_status = status;
++    return err;
++}
++
++/*
++ * Function:  errorAppendEntry
++ *
++ * Arguments: err - This object is destroyed after use in this function.
++ *
++ * Abstract:  This function generates a error page from the info contained
++ *            by 'err' and then attaches it to the specified 'entry'
++ *
++ * Note:      The above abstract is should be check for correctness!!!!
++ */
++void
++errorAppendEntry(StoreEntry * entry, ErrorState * err)
++{
++    const char *buf;
++    MemObject *mem = entry->mem_obj;
++    int len;
++    assert(entry->store_status == STORE_PENDING);
++    buf = errorBuildBuf(err, &len);
++    storeAppend(entry, buf, len);
++    if (mem)
++	mem->reply->code = err->http_status;
++    errorStateFree(err);
++    xfree(err);
++}
++
++/*
++ * Function:  errorSend
++ *
++ * Arguments: err - This object is destroyed after use in this function.
++ *
++ * Abstract:  This function generates a error page from the info contained
++ *            by 'err' and then sends it to the client.
++ *
++ * Note:      The callback function errorSendComplete() cleans up 'err'
++ *
++ * Note:      I don't think we need to add 'err' to the callback table
++ *            since the only path ends up a errorSendComplete().
++ */
++void
++errorSend(int fd, ErrorState * err)
++{
++    const char *buf;
++    int len;
++    debug(4, 3) ("errorSend: FD %d, err=%p\n", fd, err);
++    assert(fd >= 0);
++    buf = errorBuildBuf(err, &len);
++    cbdataAdd(err);
++    comm_write(fd, xstrdup(buf), len, errorSendComplete, err, xfree);
++}
++
++/*
++ * Function:  errorSendComplete
++ *
++ * Abstract:  This function 
++ *
++ * Note:      If there is a callback, the callback is responsible for
++ *            closeing the FD, otherwise we do it ourseves.
++ */
++static void
++errorSendComplete(int fd, char *buf, int size, int errflag, void *data)
++{
++    ErrorState *err = data;
++    debug(4, 3) ("errorSendComplete: FD %d, size=%d\n", fd, size);
++    if (errflag != COMM_ERR_CLOSING) {
++	if (err->callback)
++	    err->callback(fd, err->callback_data, size);
++	else
++	    comm_close(fd);
++    }
++    errorStateFree(err);
++    cbdataFree(err);
++}
++
+ static void
+ errorStateFree(ErrorState * err)
+ {
+@@ -102,114 +205,109 @@ errorStateFree(ErrorState * err)
+ }
+ 
+ #define CVT_BUF_SZ 512
+-static char *
++
++/*
++ * c - Squid error code
++ * d - seconds elapsed since request received
++ * e - errno                                    x
++ * E - strerror()                               x
++ * F - FTP reply line                           x
++ * f - FTP request line                         x
++ * h - cache hostname                           x
++ * i - client IP address                        x
++ * I - server IP address                        x
++ * L - HREF link for more info/contact          x
++ * M - Request Method                           x
++ * p - URL port #                               x
++ * P - Protocol                                 x
++ * t - local time                               x
++ * T - UTC                                      x
++ * w - cachemgr email address                   x
++ * z - dns server error message                 x
++ */
++
++static const char *
+ errorConvert(char token, ErrorState * err)
+ {
+-    char *p = NULL;
+     request_t *r = err->request;
+     static char buf[CVT_BUF_SZ];
++    const char *p = buf;
+     switch (token) {
+-    case 'U':
+-	p = r ? urlCanonicalClean(r) : err->url;
+-	break;
+-    case 'H':
+-	p = r ? r->host : "[unknown host]";
+-	break;
+-    case 'p':
+-	if (r) {
+-	    snprintf(buf, CVT_BUF_SZ, "%d", (int) r->port);
+-	    p = buf;
+-	} else {
+-	    p = "[unknown port]";
+-	}
+-	break;
+-    case 'P':
+-	p = r ? (char *) ProtocolStr[r->protocol] : "[unkown protocol]";
+-	break;
+-    case 'M':
+-	p = r ? (char *) RequestMethodStr[r->method] : "[unkown method]";
+-	break;
+-    case 'z':
+-	if (err->dnsserver_msg)
+-	    p = err->dnsserver_msg;
+-	else
+-	    p = "UNKNOWN\n";
+-	break;
+     case 'e':
+ 	snprintf(buf, CVT_BUF_SZ, "%d", err->xerrno);
+-	p = buf;
+ 	break;
+     case 'E':
+ 	snprintf(buf, CVT_BUF_SZ, "(%d) %s", err->xerrno, strerror(err->xerrno));
+-	p = buf;
+ 	break;
+-    case 'w':
+-	if (Config.adminEmail) {
+-	    snprintf(buf, CVT_BUF_SZ, "%s", Config.adminEmail);
+-	    p = buf;
+-	} else
+-	    p = "UNKNOWN";
++    case 'f':
++	/* FTP REQUEST LINE */
++	if (err->ftp.request)
++	    p = err->ftp.request;
++	else
++	    p = "<none>";
++	break;
++    case 'F':
++	/* FTP REPLY LINE */
++	if (err->ftp.request)
++	    p = err->ftp.reply;
++	else
++	    p = "<none>";
+ 	break;
+     case 'h':
+ 	snprintf(buf, CVT_BUF_SZ, "%s", getMyHostname());
+-	p = buf;
+-	break;
+-    case 't':
+-	xstrncpy(buf, mkhttpdlogtime(&squid_curtime), 128);
+-	p = buf;
+ 	break;
+-    case 'L':
+-	if (Config.errHtmlText) {
+-	    snprintf(buf, CVT_BUF_SZ, "%s", Config.errHtmlText);
+-	    p = buf;
+-	} else
+-	    p = "[not available]";
++    case 'H':
++	p = r ? r->host : "[unknown host]";
+ 	break;
+     case 'i':
+ 	snprintf(buf, CVT_BUF_SZ, "%s", inet_ntoa(err->src_addr));
+-	p = buf;
+ 	break;
+     case 'I':
+ 	if (err->host) {
+ 	    snprintf(buf, CVT_BUF_SZ, "%s", err->host);
+-	    p = buf;
+ 	} else
+-	    p = "unknown\n";
++	    p = "[unknown]";
++	break;
++    case 'L':
++	if (Config.errHtmlText) {
++	    snprintf(buf, CVT_BUF_SZ, "%s", Config.errHtmlText);
++	} else
++	    p = "[not available]";
++	break;
++    case 'M':
++	p = r ? RequestMethodStr[r->method] : "[unkown method]";
++	break;
++    case 'p':
++	if (r) {
++	    snprintf(buf, CVT_BUF_SZ, "%d", (int) r->port);
++	} else {
++	    p = "[unknown port]";
++	}
++	break;
++    case 'P':
++	p = r ? ProtocolStr[r->protocol] : "[unkown protocol]";
++	break;
++    case 't':
++	xstrncpy(buf, mkhttpdlogtime(&squid_curtime), 128);
+ 	break;
+     case 'T':
+ 	snprintf(buf, CVT_BUF_SZ, "%s", mkrfc1123(squid_curtime));
+-	p = buf;
+ 	break;
+-    case 'f':
+-	/* FTP REQUEST LINE */
+-	if (err->ftp.request)
+-	    p = err->ftp.request;
+-	else
+-	    p = "<none>";
++    case 'U':
++	p = r ? urlCanonicalClean(r) : err->url;
+ 	break;
+-    case 'F':
+-	/* FTP REPLY LINE */
+-	if (err->ftp.request)
+-	    p = err->ftp.reply;
++    case 'w':
++	if (Config.adminEmail) {
++	    snprintf(buf, CVT_BUF_SZ, "%s", Config.adminEmail);
++	} else
++	    p = "[unknown]";
++	break;
++    case 'z':
++	if (err->dnsserver_msg)
++	    p = err->dnsserver_msg;
+ 	else
+-	    p = "<none>";
++	    p = "[unknown]";
+ 	break;
+-/*
+- * e - errno                                    x
+- * E - strerror()                               x
+- * t - local time                               x
+- * T - UTC                                      x
+- * c - Squid error code
+- * I - server IP address                        x
+- * i - client IP address                        x
+- * L - HREF link for more info/contact          x
+- * w - cachemgr email address                   x
+- * h - cache hostname                           x
+- * d - seconds elapsed since request received
+- * p - URL port #                               x
+- * f - FTP request line                         x
+- * F - FTP reply line                           x
+- */
+     default:
+ 	p = "%UNKNOWN%";
+ 	break;
+@@ -220,7 +318,7 @@ errorConvert(char token, ErrorState * err)
+     return p;
+ }
+ 
+-static char *
++static const char *
+ errorBuildBuf(ErrorState * err, int *len)
+ {
+     LOCAL_ARRAY(char, buf, ERROR_BUF_SZ);
+@@ -231,7 +329,7 @@ errorBuildBuf(ErrorState * err, int *len)
+     char *m;
+     char *mx;
+     char *p;
+-    char *t;
++    const char *t;
+     assert(err != NULL);
+     assert(err->type > ERR_NONE && err->type < ERR_MAX);
+     mx = m = xstrdup(error_text[err->type]);
+@@ -271,48 +369,3 @@ errorBuildBuf(ErrorState * err, int *len)
+     xfree(mx);
+     return buf;
+ }
+-
+-void
+-errorSend(int fd, ErrorState * err)
+-{
+-    char *buf;
+-    int len;
+-    debug(4, 3) ("errorSend: FD %d, err=%p\n", fd, err);
+-    assert(fd >= 0);
+-    buf = errorBuildBuf(err, &len);
+-    cbdataAdd(err);
+-    cbdataLock(err);
+-    BIT_SET(err->flags, ERR_FLAG_CBDATA);
+-    comm_write(fd, xstrdup(buf), len, errorSendComplete, err, xfree);
+-}
+-
+-void
+-errorAppendEntry(StoreEntry * entry, ErrorState * err)
+-{
+-    char *buf;
+-    MemObject *mem = entry->mem_obj;
+-    int len;
+-    assert(entry->store_status == STORE_PENDING);
+-    buf = errorBuildBuf(err, &len);
+-    storeAppend(entry, buf, len);
+-    if (mem)
+-	mem->reply->code = err->http_status;
+-    errorStateFree(err);
+-}
+-
+-/* If there is a callback, the callback is responsible to close
+- * the FD, otherwise we do it ourseves. */
+-static void
+-errorSendComplete(int fd, char *buf, int size, int errflag, void *data)
+-{
+-    ErrorState *err = data;
+-    debug(4, 3) ("errorSendComplete: FD %d, size=%d\n", fd, size);
+-    if (errflag != COMM_ERR_CLOSING) {
+-	if (err->callback)
+-	    err->callback(fd, err->callback_data, size);
+-	else
+-	    comm_close(fd);
+-    }
+-    cbdataUnlock(err);
+-    errorStateFree(err);
+-}
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: fqdncache.cc,v 1.63 1997/10/29 15:18:20 wessels Exp $
++ * $Id: fqdncache.cc,v 1.64 1997/10/30 02:40:59 wessels Exp $
+  *
+  * DEBUG: section 35    FQDN Cache
+  * AUTHOR: Harvest Derived
+@@ -762,9 +762,7 @@ fqdncache_gethostbyaddr(struct in_addr addr, int flags)
+ {
+     char *name = inet_ntoa(addr);
+     fqdncache_entry *f = NULL;
+-    const struct hostent *hp = NULL;
+     struct in_addr ip;
+-    static char *static_name = NULL;
+ 
+     if (!name)
+ 	fatal_dump("fqdncache_gethostbyaddr: NULL name");
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: ftp.cc,v 1.157 1997/10/30 00:47:48 wessels Exp $
++ * $Id: ftp.cc,v 1.158 1997/10/30 02:40:59 wessels Exp $
+  *
+  * DEBUG: section 9     File Transfer Protocol (FTP)
+  * AUTHOR: Harvest Derived
+@@ -237,9 +237,7 @@ ftpTimeout(int fd, void *data)
+     debug(9, 4) ("ftpTimeout: FD %d: '%s'\n", fd, entry->url);
+     if (entry->store_status == STORE_PENDING) {
+ 	if (entry->mem_obj->inmem_hi == 0) {
+-	    err = xcalloc(1, sizeof(ErrorState));
+-	    err->type = ERR_READ_TIMEOUT;
+-	    err->http_status = HTTP_GATEWAY_TIMEOUT;
++	    err = errorCon(ERR_READ_TIMEOUT, HTTP_GATEWAY_TIMEOUT);
+ 	    err->request = requestLink(ftpState->request);
+ 	    errorAppendEntry(entry, err);
+ 	}
+@@ -650,23 +648,20 @@ ftpReadData(int fd, void *data)
+ 	    commSetSelect(fd, COMM_SELECT_READ, ftpReadData, data, Config.Timeout.read);
+ 	} else {
+ 	    if (entry->mem_obj->inmem_hi == 0) {
+-		err = xcalloc(1, sizeof(ErrorState));
+-		err->type = ERR_READ_ERROR;
++		err = errorCon(ERR_READ_ERROR, HTTP_INTERNAL_SERVER_ERROR);
+ 		err->xerrno = errno;
+-		err->http_status = HTTP_INTERNAL_SERVER_ERROR;
+ 		err->request = requestLink(ftpState->request);
+ 		errorAppendEntry(entry, err);
+ 	    }
+ 	    storeAbort(entry, 0);
+ 	    ftpDataTransferDone(ftpState);
+ 	}
+     } else if (len == 0 && entry->mem_obj->inmem_hi == 0) {
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_ZERO_SIZE_OBJECT;
++	err = errorCon(ERR_ZERO_SIZE_OBJECT, HTTP_SERVICE_UNAVAILABLE);
+ 	err->xerrno = errno;
+-	err->http_status = HTTP_SERVICE_UNAVAILABLE;
+ 	err->request = requestLink(ftpState->request);
+ 	errorAppendEntry(entry, err);
++
+ 	storeAbort(entry, 0);
+ 	ftpDataTransferDone(ftpState);
+     } else if (len == 0) {
+@@ -872,12 +867,12 @@ ftpStart(request_t * request, StoreEntry * entry)
+ 	url);
+     if (fd == COMM_ERROR) {
+ 	debug(9, 4) ("ftpStart: Failed to open a socket.\n");
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_SOCKET_FAILURE;
+-	err->http_status = HTTP_INTERNAL_SERVER_ERROR;
++
++	err = errorCon(ERR_SOCKET_FAILURE, HTTP_INTERNAL_SERVER_ERROR);
+ 	err->xerrno = errno;
+ 	err->request = requestLink(ftpState->request);
+ 	errorAppendEntry(entry, err);
++
+ 	storeAbort(entry, 0);
+ 	return;
+     }
+@@ -901,23 +896,23 @@ ftpConnectDone(int fd, int status, void *data)
+     debug(9, 3) ("ftpConnectDone, status = %d\n", status);
+     if (status == COMM_ERR_DNS) {
+ 	debug(9, 4) ("ftpConnectDone: Unknown host: %s\n", request->host);
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_DNS_FAIL;
+-	err->http_status = HTTP_SERVICE_UNAVAILABLE;
++
++	err = errorCon(ERR_DNS_FAIL, HTTP_SERVICE_UNAVAILABLE);
+ 	err->dnsserver_msg = xstrdup(dns_error_message);
+ 	err->request = requestLink(request);
+ 	errorAppendEntry(ftpState->entry, err);
++
+ 	storeAbort(ftpState->entry, 0);
+ 	comm_close(fd);
+     } else if (status != COMM_OK) {
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_CONNECT_FAIL;
+-	err->http_status = HTTP_SERVICE_UNAVAILABLE;
++
++	err = errorCon(ERR_CONNECT_FAIL, HTTP_SERVICE_UNAVAILABLE);
+ 	err->xerrno = errno;
+ 	err->host = xstrdup(request->host);
+ 	err->port = request->port;
+ 	err->request = requestLink(request);
+ 	errorAppendEntry(ftpState->entry, err);
++
+ 	storeAbort(ftpState->entry, 0);
+ 	comm_close(fd);
+     } else {
+@@ -967,9 +962,7 @@ ftpWriteCommandCallback(int fd, char *buf, int size, int errflag, void *data)
+     if (errflag) {
+ 	debug(50, 1) ("ftpWriteCommandCallback: FD %d: %s\n", fd, xstrerror());
+ 	if (entry->mem_obj->inmem_hi == 0) {
+-	    err = xcalloc(1, sizeof(ErrorState));
+-	    err->type = ERR_WRITE_ERROR;
+-	    err->http_status = HTTP_SERVICE_UNAVAILABLE;
++	    err = errorCon(ERR_WRITE_ERROR, HTTP_SERVICE_UNAVAILABLE);
+ 	    err->xerrno = errno;
+ 	    err->request = requestLink(ftpState->request);
+ 	    errorAppendEntry(entry, err);
+@@ -1044,9 +1037,7 @@ ftpReadControlReply(int fd, void *data)
+ 		Config.Timeout.read);
+ 	} else {
+ 	    if (entry->mem_obj->inmem_hi == 0) {
+-		err = xcalloc(1, sizeof(ErrorState));
+-		err->type = ERR_READ_ERROR;
+-		err->http_status = HTTP_INTERNAL_SERVER_ERROR;
++		err = errorCon(ERR_READ_ERROR, HTTP_INTERNAL_SERVER_ERROR);
+ 		err->xerrno = errno;
+ 		err->request = requestLink(ftpState->request);
+ 		errorAppendEntry(entry, err);
+@@ -1062,9 +1053,7 @@ ftpReadControlReply(int fd, void *data)
+ 	if (entry->store_status == STORE_PENDING) {
+ 	    storeReleaseRequest(entry);
+ 	    if (entry->mem_obj->inmem_hi == 0) {
+-		err = xcalloc(1, sizeof(ErrorState));
+-		err->type = ERR_READ_ERROR;
+-		err->http_status = HTTP_INTERNAL_SERVER_ERROR;
++		err = errorCon(ERR_READ_ERROR, HTTP_INTERNAL_SERVER_ERROR);
+ 		err->xerrno = errno;
+ 		err->request = requestLink(ftpState->request);
+ 		errorAppendEntry(entry, err);
+@@ -1361,14 +1350,13 @@ ftpPasvCallback(int fd, int status, void *data)
+     ErrorState *err;
+     debug(9, 3) ("ftpPasvCallback\n");
+     if (status != COMM_OK) {
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_CONNECT_FAIL;
+-	err->http_status = HTTP_SERVICE_UNAVAILABLE;
++	err = errorCon(ERR_CONNECT_FAIL, HTTP_SERVICE_UNAVAILABLE);
+ 	err->xerrno = errno;
+ 	err->host = xstrdup(ftpState->data.host);
+ 	err->port = ftpState->data.port;
+ 	err->request = requestLink(request);
+ 	errorAppendEntry(ftpState->entry, err);
++
+ 	storeAbort(ftpState->entry, 0);
+ 	comm_close(fd);
+ 	return;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: gopher.cc,v 1.108 1997/10/28 21:59:06 wessels Exp $
++ * $Id: gopher.cc,v 1.109 1997/10/30 02:41:01 wessels Exp $
+  *
+  * DEBUG: section 10    Gopher
+  * AUTHOR: Harvest Derived
+@@ -652,9 +652,7 @@ gopherTimeout(int fd, void *data)
+     ErrorState *err;
+     debug(10, 4) ("gopherTimeout: FD %d: '%s'\n", fd, entry->url);
+     if (entry->mem_obj->inmem_hi == 0) {
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_READ_TIMEOUT;
+-	err->http_status = HTTP_GATEWAY_TIMEOUT;
++	err = errorCon(ERR_READ_TIMEOUT, HTTP_GATEWAY_TIMEOUT);
+ 	err->url = xstrdup(gopherState->request);
+ 	errorAppendEntry(entry, err);
+     }
+@@ -707,21 +705,17 @@ gopherReadReply(int fd, void *data)
+ 	} else {
+ 	    /* was  assert */
+ 	    ErrorState *err;
+-	    err = xcalloc(1, sizeof(ErrorState));
+-	    err->type = ERR_READ_ERROR;
++	    err = errorCon(ERR_READ_ERROR, HTTP_INTERNAL_SERVER_ERROR);
+ 	    err->xerrno = errno;
+-	    err->http_status = HTTP_INTERNAL_SERVER_ERROR;
+ 	    err->url = xstrdup(entry->url);
+ 	    errorAppendEntry(entry, err);
+ 	    storeAbort(entry, 0);
+ 	    comm_close(fd);
+ 	}
+     } else if (len == 0 && entry->mem_obj->inmem_hi == 0) {
+ 	ErrorState *err;
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_ZERO_SIZE_OBJECT;
++	err = errorCon(ERR_ZERO_SIZE_OBJECT, HTTP_SERVICE_UNAVAILABLE);
+ 	err->xerrno = errno;
+-	err->http_status = HTTP_SERVICE_UNAVAILABLE;
+ 	err->url = xstrdup(gopherState->request);
+ 	errorAppendEntry(entry, err);
+ 	storeAbort(entry, 0);
+@@ -761,12 +755,10 @@ gopherSendComplete(int fd, char *buf, int size, int errflag, void *data)
+ 	fd, size, errflag);
+     if (errflag) {
+ 	ErrorState *err;
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_CONNECT_FAIL;
++	err = errorCon(ERR_CONNECT_FAIL, HTTP_SERVICE_UNAVAILABLE);
+ 	err->xerrno = errno;
+ 	err->host = xstrdup(gopherState->host);
+ 	err->port = gopherState->port;
+-	err->http_status = HTTP_SERVICE_UNAVAILABLE;
+ 	err->url = xstrdup(entry->url);
+ 	errorAppendEntry(entry, err);
+ 
+@@ -853,9 +845,7 @@ gopherStart(StoreEntry * entry)
+     if (gopher_url_parser(entry->url, gopherState->host, &gopherState->port,
+ 	    &gopherState->type_id, gopherState->request)) {
+ 	ErrorState *err;
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_INVALID_URL;
+-	err->http_status = HTTP_BAD_REQUEST;
++	err = errorCon(ERR_INVALID_URL, HTTP_BAD_REQUEST);
+ 	err->url = xstrdup(entry->url);
+ 	errorAppendEntry(entry, err);
+ 	storeAbort(entry, 0);
+@@ -871,10 +861,8 @@ gopherStart(StoreEntry * entry)
+ 	entry->url);
+     if (fd == COMM_ERROR) {
+ 	debug(10, 4) ("gopherStart: Failed because we're out of sockets.\n");
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_SOCKET_FAILURE;
++	err = errorCon(ERR_SOCKET_FAILURE, HTTP_INTERNAL_SERVER_ERROR);
+ 	err->xerrno = errno;
+-	err->http_status = HTTP_INTERNAL_SERVER_ERROR;
+ 	err->url = xstrdup(entry->url);
+ 	errorAppendEntry(entry, err);
+ 	storeAbort(entry, 0);
+@@ -920,19 +908,15 @@ gopherConnectDone(int fd, int status, void *data)
+     ErrorState *err;
+     if (status == COMM_ERR_DNS) {
+ 	debug(10, 4) ("gopherConnectDone: Unknown host: %s\n", gopherState->host);
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_DNS_FAIL;
++	err = errorCon(ERR_DNS_FAIL, HTTP_SERVICE_UNAVAILABLE);
+ 	err->dnsserver_msg = xstrdup(dns_error_message);
+-	err->http_status = HTTP_SERVICE_UNAVAILABLE;
+ 	err->url = xstrdup(entry->url);
+ 	errorAppendEntry(entry, err);
+ 	storeAbort(gopherState->entry, 0);
+ 	comm_close(fd);
+     } else if (status != COMM_OK) {
+ 	ErrorState *err;
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_CONNECT_FAIL;
+-	err->http_status = HTTP_SERVICE_UNAVAILABLE;
++	err = errorCon(ERR_CONNECT_FAIL, HTTP_SERVICE_UNAVAILABLE);
+ 	err->xerrno = errno;
+ 	err->host = xstrdup(gopherState->host);
+ 	err->port = gopherState->port;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: http.cc,v 1.206 1997/10/28 21:59:08 wessels Exp $
++ * $Id: http.cc,v 1.207 1997/10/30 02:41:02 wessels Exp $
+  *
+  * DEBUG: section 11    Hypertext Transfer Protocol (HTTP)
+  * AUTHOR: Harvest Derived
+@@ -252,9 +252,7 @@ httpTimeout(int fd, void *data)
+     debug(11, 4) ("httpTimeout: FD %d: '%s'\n", fd, entry->url);
+     assert(entry->store_status == STORE_PENDING);
+     if (entry->mem_obj->inmem_hi == 0) {
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_READ_TIMEOUT;
+-	err->http_status = HTTP_GATEWAY_TIMEOUT;
++	err = errorCon(ERR_READ_TIMEOUT, HTTP_GATEWAY_TIMEOUT);
+ 	err->request = requestLink(httpState->request);
+ 	errorAppendEntry(entry, err);
+     }
+@@ -619,10 +617,8 @@ httpReadReply(int fd, void *data)
+ 	    commSetSelect(fd, COMM_SELECT_READ, httpReadReply, httpState, 0);
+ 	} else {
+ 	    if (clen == 0) {
+-		err = xcalloc(1, sizeof(ErrorState));
+-		err->type = ERR_READ_ERROR;
++		err = errorCon(ERR_READ_ERROR, HTTP_INTERNAL_SERVER_ERROR);
+ 		err->xerrno = errno;
+-		err->http_status = HTTP_INTERNAL_SERVER_ERROR;
+ 		err->request = requestLink(httpState->request);
+ 		errorAppendEntry(entry, err);
+ 	    }
+@@ -636,12 +632,12 @@ httpReadReply(int fd, void *data)
+ 	    httpRestart(httpState);
+ 	} else {
+ 	    httpState->eof = 1;
+-	    err = xcalloc(1, sizeof(ErrorState));
+-	    err->type = ERR_ZERO_SIZE_OBJECT;
++
++	    err = errorCon(ERR_ZERO_SIZE_OBJECT, HTTP_SERVICE_UNAVAILABLE);
+ 	    err->xerrno = errno;
+-	    err->http_status = HTTP_SERVICE_UNAVAILABLE;
+ 	    err->request = requestLink(httpState->request);
+ 	    errorAppendEntry(entry, err);
++
+ 	    storeAbort(entry, 0);
+ 	    comm_close(fd);
+ 	}
+@@ -685,12 +681,11 @@ httpSendComplete(int fd, char *buf, int size, int errflag, void *data)
+     if (errflag == COMM_ERR_CLOSING)
+ 	return;
+     if (errflag) {
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_WRITE_ERROR;
+-	err->http_status = HTTP_INTERNAL_SERVER_ERROR;
++	err = errorCon(ERR_WRITE_ERROR, HTTP_INTERNAL_SERVER_ERROR);
+ 	err->xerrno = errno;
+ 	err->request = requestLink(httpState->request);
+ 	errorAppendEntry(entry, err);
++
+ 	storeAbort(entry, 0);
+ 	comm_close(fd);
+ 	return;
+@@ -935,13 +930,13 @@ httpSocketOpen(StoreEntry * entry, request_t * request)
+ 	entry->url);
+     if (fd < 0) {
+ 	debug(11, 4) ("httpSocketOpen: Failed because we're out of sockets.\n");
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_SOCKET_FAILURE;
+-	err->http_status = HTTP_INTERNAL_SERVER_ERROR;
++
++	err = errorCon(ERR_SOCKET_FAILURE, HTTP_INTERNAL_SERVER_ERROR);
+ 	err->xerrno = errno;
+ 	if (request)
+ 	    err->request = requestLink(request);
+ 	errorAppendEntry(entry, err);
++
+ 	storeAbort(entry, 0);
+     }
+     return fd;
+@@ -1055,23 +1050,23 @@ httpConnectDone(int fd, int status, void *data)
+     ErrorState *err;
+     if (status == COMM_ERR_DNS) {
+ 	debug(11, 4) ("httpConnectDone: Unknown host: %s\n", request->host);
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_DNS_FAIL;
+-	err->http_status = HTTP_SERVICE_UNAVAILABLE;
++
++	err = errorCon(ERR_DNS_FAIL, HTTP_SERVICE_UNAVAILABLE);
+ 	err->dnsserver_msg = xstrdup(dns_error_message);
+ 	err->request = requestLink(request);
+ 	errorAppendEntry(entry, err);
++
+ 	storeAbort(entry, 0);
+ 	comm_close(fd);
+     } else if (status != COMM_OK) {
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_CONNECT_FAIL;
+-	err->http_status = HTTP_SERVICE_UNAVAILABLE;
++
++	err = errorCon(ERR_CONNECT_FAIL, HTTP_SERVICE_UNAVAILABLE);
+ 	err->xerrno = errno;
+ 	err->host = xstrdup(request->host);
+ 	err->port = request->port;
+ 	err->request = requestLink(request);
+ 	errorAppendEntry(entry, err);
++
+ 	storeAbort(entry, 0);
+ 	if (httpState->neighbor)
+ 	    peerCheckConnectStart(httpState->neighbor);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: ipcache.cc,v 1.139 1997/10/28 20:42:53 wessels Exp $
++ * $Id: ipcache.cc,v 1.140 1997/10/30 02:41:04 wessels Exp $
+  *
+  * DEBUG: section 14    IP Cache
+  * AUTHOR: Harvest Derived
+@@ -815,7 +815,6 @@ ipcache_gethostbyname(const char *name, int flags)
+ {
+     ipcache_entry *i = NULL;
+     ipcache_addrs *addrs;
+-    const struct hostent *hp;
+ 
+     if (!name)
+ 	fatal_dump("ipcache_gethostbyname: NULL name");
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: pconn.cc,v 1.7 1997/10/26 02:35:36 wessels Exp $
++ * $Id: pconn.cc,v 1.8 1997/10/30 02:41:06 wessels Exp $
+  *
+  * DEBUG: section 48    Persistent Connections
+  * AUTHOR: Duane Wessels
+@@ -130,7 +130,7 @@ void
+ pconnPush(int fd, const char *host, u_short port)
+ {
+     struct _pconn *p;
+-    LOCAL_ARRAY(char, key, SQUIDHOSTNAMELEN + 10);
++    LOCAL_ARRAY(char, key, SQUIDHOSTNAMELEN + 10); /* MO why static array? */
+     assert(table != NULL);
+     strcpy(key, pconnKey(host, port));
+     p = (struct _pconn *) hash_lookup(table, key);
+@@ -155,7 +155,7 @@ pconnPop(const char *host, u_short port)
+     struct _pconn *p;
+     hash_link *hptr;
+     int fd = -1;
+-    LOCAL_ARRAY(char, key, SQUIDHOSTNAMELEN + 10);
++    LOCAL_ARRAY(char, key, SQUIDHOSTNAMELEN + 10); /* MO why static array? */
+     assert(table != NULL);
+     strcpy(key, pconnKey(host, port));
+     hptr = hash_lookup(table, key);
+@@ -542,6 +542,7 @@ extern peer_t parseNeighborType(const char *s);
+ extern void errorSend(int fd, ErrorState *);
+ extern void errorAppendEntry(StoreEntry *, ErrorState *);
+ extern void errorInitialize(void);
++extern ErrorState *errorCon(err_type, http_status);
+ 
+ extern OBJH stat_io_get;
+ extern OBJH stat_objects_get;
+@@ -560,3 +561,4 @@ extern void dump_peers(StoreEntry *, peer *);
+ extern void pconnPush(int, const char *host, u_short port);
+ extern int pconnPop(const char *host, u_short port);
+ extern void pconnInit(void);
++
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: ssl.cc,v 1.65 1997/10/25 17:22:58 wessels Exp $
++ * $Id: ssl.cc,v 1.66 1997/10/30 02:41:08 wessels Exp $
+  *
+  * DEBUG: section 26    Secure Sockets Layer Proxy
+  * AUTHOR: Duane Wessels
+@@ -321,32 +321,30 @@ sslConnectDone(int fd, int status, void *data)
+     ErrorState *err = NULL;
+     if (status == COMM_ERR_DNS) {
+ 	debug(26, 4) ("sslConnect: Unknown host: %s\n", sslState->host);
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_DNS_FAIL;
+-	err->http_status = HTTP_NOT_FOUND;
++
++	err = errorCon(ERR_DNS_FAIL, HTTP_NOT_FOUND);
+ 	err->request = requestLink(request);
+ 	err->dnsserver_msg = xstrdup(dns_error_message);
+ 	err->callback = sslErrorComplete;
+ 	err->callback_data = sslState;
+ 	errorSend(sslState->client.fd, err);
+-	return;
++
+     } else if (status != COMM_OK) {
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_CONNECT_FAIL;
+-	err->http_status = HTTP_SERVICE_UNAVAILABLE;
++	err = errorCon(ERR_CONNECT_FAIL, HTTP_SERVICE_UNAVAILABLE);
+ 	err->xerrno = errno;
+ 	err->host = xstrdup(sslState->host);
+ 	err->port = sslState->port;
+ 	err->request = requestLink(request);
+ 	err->callback = sslErrorComplete;
+ 	err->callback_data = sslState;
+ 	errorSend(sslState->client.fd, err);
+-	return;
++
++    } else {
++	if (sslState->proxying)
++	    sslProxyConnected(sslState->server.fd, sslState);
++        else
++	    sslConnected(sslState->server.fd, sslState);
+     }
+-    if (sslState->proxying)
+-	sslProxyConnected(sslState->server.fd, sslState);
+-    else
+-	sslConnected(sslState->server.fd, sslState);
+ }
+ 
+ void
+@@ -367,9 +365,8 @@ sslStart(int fd, const char *url, request_t * request, size_t * size_ptr)
+ 	url);
+     if (sock == COMM_ERROR) {
+ 	debug(26, 4) ("sslStart: Failed because we're out of sockets.\n");
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_SOCKET_FAILURE;
+-	err->http_status = HTTP_INTERNAL_SERVER_ERROR;
++
++	err = errorCon(ERR_SOCKET_FAILURE, HTTP_INTERNAL_SERVER_ERROR);
+ 	err->xerrno = errno;
+ 	err->request = requestLink(request);
+ 	errorSend(fd, err);
+@@ -457,9 +454,9 @@ static void
+ sslPeerSelectFail(peer * p, void *data)
+ {
+     SslStateData *sslState = data;
+-    ErrorState *err = xcalloc(1, sizeof(ErrorState));
+-    err->type = ERR_CANNOT_FORWARD;
+-    err->http_status = HTTP_SERVICE_UNAVAILABLE;
++    ErrorState *err;
++
++    err = errorCon(ERR_CANNOT_FORWARD, HTTP_SERVICE_UNAVAILABLE);
+     err->request = requestLink(sslState->request);
+     err->callback = sslErrorComplete;
+     err->callback_data = sslState;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: tunnel.cc,v 1.65 1997/10/25 17:22:58 wessels Exp $
++ * $Id: tunnel.cc,v 1.66 1997/10/30 02:41:08 wessels Exp $
+  *
+  * DEBUG: section 26    Secure Sockets Layer Proxy
+  * AUTHOR: Duane Wessels
+@@ -321,32 +321,30 @@ sslConnectDone(int fd, int status, void *data)
+     ErrorState *err = NULL;
+     if (status == COMM_ERR_DNS) {
+ 	debug(26, 4) ("sslConnect: Unknown host: %s\n", sslState->host);
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_DNS_FAIL;
+-	err->http_status = HTTP_NOT_FOUND;
++
++	err = errorCon(ERR_DNS_FAIL, HTTP_NOT_FOUND);
+ 	err->request = requestLink(request);
+ 	err->dnsserver_msg = xstrdup(dns_error_message);
+ 	err->callback = sslErrorComplete;
+ 	err->callback_data = sslState;
+ 	errorSend(sslState->client.fd, err);
+-	return;
++
+     } else if (status != COMM_OK) {
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_CONNECT_FAIL;
+-	err->http_status = HTTP_SERVICE_UNAVAILABLE;
++	err = errorCon(ERR_CONNECT_FAIL, HTTP_SERVICE_UNAVAILABLE);
+ 	err->xerrno = errno;
+ 	err->host = xstrdup(sslState->host);
+ 	err->port = sslState->port;
+ 	err->request = requestLink(request);
+ 	err->callback = sslErrorComplete;
+ 	err->callback_data = sslState;
+ 	errorSend(sslState->client.fd, err);
+-	return;
++
++    } else {
++	if (sslState->proxying)
++	    sslProxyConnected(sslState->server.fd, sslState);
++        else
++	    sslConnected(sslState->server.fd, sslState);
+     }
+-    if (sslState->proxying)
+-	sslProxyConnected(sslState->server.fd, sslState);
+-    else
+-	sslConnected(sslState->server.fd, sslState);
+ }
+ 
+ void
+@@ -367,9 +365,8 @@ sslStart(int fd, const char *url, request_t * request, size_t * size_ptr)
+ 	url);
+     if (sock == COMM_ERROR) {
+ 	debug(26, 4) ("sslStart: Failed because we're out of sockets.\n");
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_SOCKET_FAILURE;
+-	err->http_status = HTTP_INTERNAL_SERVER_ERROR;
++
++	err = errorCon(ERR_SOCKET_FAILURE, HTTP_INTERNAL_SERVER_ERROR);
+ 	err->xerrno = errno;
+ 	err->request = requestLink(request);
+ 	errorSend(fd, err);
+@@ -457,9 +454,9 @@ static void
+ sslPeerSelectFail(peer * p, void *data)
+ {
+     SslStateData *sslState = data;
+-    ErrorState *err = xcalloc(1, sizeof(ErrorState));
+-    err->type = ERR_CANNOT_FORWARD;
+-    err->http_status = HTTP_SERVICE_UNAVAILABLE;
++    ErrorState *err;
++
++    err = errorCon(ERR_CANNOT_FORWARD, HTTP_SERVICE_UNAVAILABLE);
+     err->request = requestLink(sslState->request);
+     err->callback = sslErrorComplete;
+     err->callback_data = sslState;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: wais.cc,v 1.92 1997/10/28 21:59:14 wessels Exp $
++ * $Id: wais.cc,v 1.93 1997/10/30 02:41:09 wessels Exp $
+  *
+  * DEBUG: section 24    WAIS Relay
+  * AUTHOR: Harvest Derived
+@@ -143,9 +143,7 @@ waisTimeout(int fd, void *data)
+     ErrorState *err;
+     StoreEntry *entry = waisState->entry;
+     debug(24, 4) ("waisTimeout: FD %d: '%s'\n", fd, entry->url);
+-    err = xcalloc(1, sizeof(ErrorState));
+-    err->type = ERR_READ_TIMEOUT;
+-    err->http_status = HTTP_GATEWAY_TIMEOUT;
++    err = errorCon(ERR_READ_TIMEOUT, HTTP_GATEWAY_TIMEOUT);
+     err->request = urlParse(METHOD_CONNECT, waisState->request);
+     errorAppendEntry(entry, err);
+     storeAbort(entry, 0);
+@@ -168,11 +166,11 @@ waisReadReply(int fd, void *data)
+     int bin;
+     if (protoAbortFetch(entry)) {
+ 	ErrorState *err;
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_CLIENT_ABORT;
+-	err->http_status = HTTP_INTERNAL_SERVER_ERROR;
++
++	err = errorCon(ERR_CLIENT_ABORT, HTTP_INTERNAL_SERVER_ERROR);
+ 	err->request = urlParse(METHOD_CONNECT, waisState->request);
+ 	errorAppendEntry(entry, err);
++
+ 	storeAbort(entry, 0);
+ 	comm_close(fd);
+ 	return;
+@@ -201,9 +199,8 @@ waisReadReply(int fd, void *data)
+ 	    ErrorState *err;
+ 	    BIT_CLR(entry->flag, ENTRY_CACHABLE);
+ 	    storeReleaseRequest(entry);
+-	    err = xcalloc(1, sizeof(ErrorState));
+-	    err->type = ERR_READ_ERROR;
+-	    err->http_status = HTTP_INTERNAL_SERVER_ERROR;
++	    err = errorCon(ERR_READ_ERROR, HTTP_INTERNAL_SERVER_ERROR);
++	    err->xerrno = errno;
+ 	    err->request = urlParse(METHOD_CONNECT, waisState->request);
+ 	    errorAppendEntry(entry, err);
+ 
+@@ -212,12 +209,11 @@ waisReadReply(int fd, void *data)
+ 	}
+     } else if (len == 0 && entry->mem_obj->inmem_hi == 0) {
+ 	ErrorState *err;
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_ZERO_SIZE_OBJECT;
++	err = errorCon(ERR_ZERO_SIZE_OBJECT, HTTP_SERVICE_UNAVAILABLE);
+ 	err->xerrno = errno;
+-	err->http_status = HTTP_SERVICE_UNAVAILABLE;
+ 	err->request = urlParse(METHOD_CONNECT, waisState->request);
+ 	errorAppendEntry(entry, err);
++
+ 	storeAbort(entry, 0);
+ 	comm_close(fd);
+     } else if (len == 0) {
+@@ -247,12 +243,10 @@ waisSendComplete(int fd, char *buf, int size, int errflag, void *data)
+ 	return;
+     if (errflag) {
+ 	ErrorState *err;
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_CONNECT_FAIL;
++	err = errorCon(ERR_CONNECT_FAIL, HTTP_SERVICE_UNAVAILABLE);
+ 	err->xerrno = errno;
+ 	err->host = xstrdup(waisState->relayhost);
+ 	err->port = waisState->relayport;
+-	err->http_status = HTTP_SERVICE_UNAVAILABLE;
+ 	err->request = urlParse(METHOD_CONNECT, waisState->request);
+ 	errorAppendEntry(entry, err);
+ 	storeAbort(entry, 0);
+@@ -312,9 +306,7 @@ waisStart(request_t * request, StoreEntry * entry)
+     if (!Config.Wais.relayHost) {
+ 	ErrorState *err;
+ 	debug(24, 0) ("waisStart: Failed because no relay host defined!\n");
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_NO_RELAY;
+-	err->http_status = HTTP_INTERNAL_SERVER_ERROR;
++	err = errorCon(ERR_NO_RELAY, HTTP_INTERNAL_SERVER_ERROR);
+ 	err->request = urlParse(METHOD_CONNECT, waisState->request);
+ 	errorAppendEntry(entry, err);
+ 
+@@ -330,9 +322,7 @@ waisStart(request_t * request, StoreEntry * entry)
+     if (fd == COMM_ERROR) {
+ 	ErrorState *err;
+ 	debug(24, 4) ("waisStart: Failed because we're out of sockets.\n");
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_SOCKET_FAILURE;
+-	err->http_status = HTTP_INTERNAL_SERVER_ERROR;
++	err = errorCon(ERR_SOCKET_FAILURE, HTTP_INTERNAL_SERVER_ERROR);
+ 	err->request = urlParse(METHOD_CONNECT, waisState->request);
+ 	errorAppendEntry(entry, err);
+ 	storeAbort(entry, 0);
+@@ -366,18 +356,14 @@ waisConnectDone(int fd, int status, void *data)
+     ErrorState *err;
+ 
+     if (status == COMM_ERR_DNS) {
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_DNS_FAIL;
+-	err->http_status = HTTP_SERVICE_UNAVAILABLE;
++	err = errorCon(ERR_DNS_FAIL, HTTP_SERVICE_UNAVAILABLE);
+ 	err->dnsserver_msg = xstrdup(dns_error_message);
+ 	err->request = urlParse(METHOD_CONNECT, request);
+ 	errorAppendEntry(waisState->entry, err);
+ 	storeAbort(waisState->entry, 0);
+ 	comm_close(fd);
+     } else if (status != COMM_OK) {
+-	err = xcalloc(1, sizeof(ErrorState));
+-	err->type = ERR_CONNECT_FAIL;
+-	err->http_status = HTTP_SERVICE_UNAVAILABLE;
++	err = errorCon(ERR_CONNECT_FAIL, HTTP_SERVICE_UNAVAILABLE);
+ 	err->xerrno = errno;
+ 	err->host = xstrdup(waisState->relayhost);
+ 	err->port = waisState->relayport;

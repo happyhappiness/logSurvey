@@ -1,153 +1,370 @@
-@@ -123,7 +123,8 @@ void
- FwdState::closeServerConnection(const char *reason)
- {
-     debugs(17, 3, "because " << reason << "; " << serverConn);
--    comm_remove_close_handler(serverConn->fd, fwdServerClosedWrapper, this);
-+    comm_remove_close_handler(serverConn->fd, closeHandler);
-+    closeHandler = NULL;
-     fwdPconnPool->noteUses(fd_table[serverConn->fd].pconn.uses);
-     serverConn->close();
- }
-@@ -456,7 +457,8 @@ FwdState::unregister(Comm::ConnectionPointer &conn)
-     debugs(17, 3, HERE << entry->url() );
-     assert(serverConnection() == conn);
-     assert(Comm::IsConnOpen(conn));
--    comm_remove_close_handler(conn->fd, fwdServerClosedWrapper, this);
-+    comm_remove_close_handler(conn->fd, closeHandler);
-+    closeHandler = NULL;
-     serverConn = NULL;
- }
+@@ -30,6 +30,7 @@
+ #include "acl/Asn.h"
+ #include "acl/Browser.h"
+ #include "acl/Checklist.h"
++#include "acl/ConnectionsEncrypted.h"
+ #include "acl/Data.h"
+ #include "acl/DestinationAsn.h"
+ #include "acl/DestinationDomain.h"
+@@ -231,3 +232,5 @@ ACLStrategised<const char *> ACLAdaptationService::RegistryEntry_(new ACLAdaptat
+ ACL::Prototype ACLSquidError::RegistryProtoype(&ACLSquidError::RegistryEntry_, "squid_error");
+ ACLStrategised<err_type> ACLSquidError::RegistryEntry_(new ACLSquidErrorData, ACLSquidErrorStrategy::Instance(), "squid_error");
  
-@@ -687,7 +689,7 @@ FwdState::connectDone(const Comm::ConnectionPointer &conn, Comm::Flag status, in
-     serverConn = conn;
-     debugs(17, 3, HERE << serverConnection() << ": '" << entry->url() << "'" );
++ACL::Prototype Acl::ConnectionsEncrypted::RegistryProtoype(&Acl::ConnectionsEncrypted::RegistryEntry_, "connections_encrypted");
++Acl::ConnectionsEncrypted Acl::ConnectionsEncrypted::RegistryEntry_("connections_encrypted");
+@@ -24,7 +24,8 @@ HttpMsg::HttpMsg(http_hdr_owner_type owner):
+     cache_control(NULL),
+     hdr_sz(0),
+     content_length(0),
+-    pstate(psReadyToParseStartLine)
++    pstate(psReadyToParseStartLine),
++    sources(0)
+ {}
  
--    comm_add_close_handler(serverConnection()->fd, fwdServerClosedWrapper, this);
-+    closeHandler = comm_add_close_handler(serverConnection()->fd, fwdServerClosedWrapper, this);
+ HttpMsg::~HttpMsg()
+@@ -23,6 +23,26 @@ class HttpMsg : public RefCountable
  
- #if USE_OPENSSL
-     if (!request->flags.pinned) {
-@@ -865,7 +867,8 @@ FwdState::connectStart()
-             request->flags.pinned = true;
-             if (pinned_connection->pinnedAuth())
-                 request->flags.auth = true;
--            comm_add_close_handler(serverConn->fd, fwdServerClosedWrapper, this);
+ public:
+     typedef RefCount<HttpMsg> Pointer;
++    /// Who may have created or modified this message?
++    enum Sources {
++        srcUnknown = 0,
 +
-+            closeHandler = comm_add_close_handler(serverConn->fd,  fwdServerClosedWrapper, this);
- 
-             syncWithServerConn(pinned_connection->pinning.host);
- 
-@@ -904,7 +907,7 @@ FwdState::connectStart()
-         debugs(17, 3, HERE << "reusing pconn " << serverConnection());
-         ++n_tries;
- 
--        comm_add_close_handler(serverConnection()->fd, fwdServerClosedWrapper, this);
-+        closeHandler = comm_add_close_handler(serverConnection()->fd,  fwdServerClosedWrapper, this);
- 
-         syncWithServerConn(request->url.host());
- 
-@@ -153,6 +153,8 @@ class FwdState : public RefCountable
- 
-     Comm::ConnectionPointer serverConn; ///< a successfully opened connection to a server.
- 
-+    AsyncCall::Pointer closeHandler; ///< The serverConn close handler
++        /* flags in 0xFFFF zone are for "secure" or "encrypted" sources */
++        srcHttps = 1 << 0, ///< https_port or bumped http_port tunnel; HTTPS server
++        srcFtps = 1 << 1, ///< ftps_port or SFTP server; currently unused
++        srcIcaps = 1 << 2, ///< Secure ICAP service
++        srcEcaps = 1 << 3, ///< eCAP service that is considered secure; currently unused
 +
-     /// possible pconn race states
-     typedef enum { raceImpossible, racePossible, raceHappened } PconnRace;
-     PconnRace pconnRace; ///< current pconn race state
-@@ -104,7 +104,9 @@ class Client:
-     virtual void sentRequestBody(const CommIoCbParams &io) = 0;
-     virtual void doneSendingRequestBody() = 0;
++        /* these flags "taint" the message: it may have been observed or mangled outside Squid */
++        srcHttp = 1 << (16 + 0), ///< http_port or HTTP server
++        srcFtp = 1 << (16 + 1), ///< ftp_port or FTP server
++        srcIcap = 1 << (16 + 2), ///< traditional ICAP service without encryption
++        srcEcap = 1 << (16 + 3), ///< eCAP service that uses insecure libraries/daemons
++        srcGopher = 1 << (16 + 14), ///< Gopher server
++        srcWhois = 1 << (16 + 15), ///< Whois server
++        srcUnsafe = 0xFFFF0000,  ///< Unsafe sources mask
++        srcSafe = 0x0000FFFF ///< Safe sources mask
++    };
  
--    virtual void closeServer() = 0;            /**< end communication with the server */
-+    /// Use this to end communication with the server. The call cancels our
-+    /// closure handler and tells FwdState to forget about the connection.
-+    virtual void closeServer() = 0;
-     virtual bool doneWithServer() const = 0;   /**< did we end communication? */
-     /// whether we may receive more virgin response body bytes
-     virtual bool mayReadVirginReplyBody() const = 0;
-@@ -972,7 +972,7 @@ comm_udp_sendto(int fd,
-     return Comm::COMM_ERROR;
+     HttpMsg(http_hdr_owner_type owner);
+     virtual ~HttpMsg();
+@@ -65,6 +85,8 @@ class HttpMsg : public RefCountable
+ 
+     BodyPipe::Pointer body_pipe; // optional pipeline to receive message body
+ 
++    uint32_t sources; ///< The message sources 
++
+     // returns true and sets hdr_sz on success
+     // returns false and sets *error to zero when needs more data
+     // returns false and sets *error to a positive Http::StatusCode on error
+@@ -588,6 +588,7 @@ bool HttpReply::inheritProperties(const HttpMsg *aMsg)
+     if (!aRep)
+         return false;
+     keep_alive = aRep->keep_alive;
++    sources = aRep->sources;
+     return true;
  }
  
--void
-+AsyncCall::Pointer
- comm_add_close_handler(int fd, CLCB * handler, void *data)
+@@ -250,6 +250,8 @@ HttpRequest::inheritProperties(const HttpMsg *aMsg)
+     clientConnectionManager = aReq->clientConnectionManager;
+ 
+     notes = aReq->notes;
++
++    sources = aReq->sources;
+     return true;
+ }
+ 
+@@ -153,6 +153,8 @@ SSL_ACLS = \
+         CertificateData.h  \
+         Certificate.cc \
+         Certificate.h  \
++	ConnectionsEncrypted.cc \
++	ConnectionsEncrypted.h \
+ 	ServerCertificate.cc \
+ 	ServerCertificate.h \
+ 	ServerName.cc \
+@@ -157,11 +157,24 @@ Adaptation::Config::dumpService(StoreEntry *entry, const char *name) const
+     typedef Services::iterator SCI;
+     for (SCI i = AllServices().begin(); i != AllServices().end(); ++i) {
+         const ServiceConfig &cfg = (*i)->cfg();
+-        storeAppendPrintf(entry, "%s " SQUIDSTRINGPH "_%s %s %d " SQUIDSTRINGPH "\n",
++        bool isEcap = cfg.protocol.caseCmp("ecap") == 0;
++        bool isIcap = !isEcap;
++        const char *optConnectionEncryption = "";
++        // Print connections_encrypted option if no default value is used
++        if (cfg.secure.encryptTransport && !cfg.connectionEncryption)
++            optConnectionEncryption = " connection-encryption=off";
++        else if (isEcap && !cfg.connectionEncryption)
++            optConnectionEncryption = " connection-encryption=off";
++        else if (isIcap && !cfg.secure.encryptTransport && cfg.connectionEncryption)
++            optConnectionEncryption = " connection-encryption=on";
++
++        storeAppendPrintf(entry, "%s " SQUIDSTRINGPH " %s_%s %d " SQUIDSTRINGPH "%s\n",
+                           name,
+                           SQUIDSTRINGPRINT(cfg.key),
+                           cfg.methodStr(), cfg.vectPointStr(), cfg.bypass,
+-                          SQUIDSTRINGPRINT(cfg.uri));
++                          SQUIDSTRINGPRINT(cfg.uri),
++                          
++                          optConnectionEncryption);
+     }
+ }
+ 
+@@ -127,6 +127,10 @@ Adaptation::ServiceConfig::parse()
+         else if (strcmp(name, "on-overload") == 0) {
+             grokked = grokOnOverload(onOverload, value);
+             onOverloadSet = true;
++        } else if (strcmp(name, "connection-encryption") == 0) {
++            bool encrypt;
++            grokked = grokBool(encrypt, name, value);
++            connectionEncryption.configure(encrypt);
+         } else if (strncmp(name, "ssl", 3) == 0 || strncmp(name, "tls-", 4) == 0) {
+ #if !USE_OPENSSL
+             debugs(3, DBG_PARSE_NOTE(DBG_IMPORTANT), "WARNING: adaptation option '" << name << "' requires --with-openssl. ICAP service option ignored.");
+@@ -13,6 +13,7 @@
+ #include "base/RefCount.h"
+ #include "security/PeerOptions.h"
+ #include "SquidString.h"
++#include "YesNoNone.h"
+ 
+ namespace Adaptation
  {
-     debugs(5, 5, "comm_add_close_handler: FD " << fd << ", handler=" <<
-@@ -981,6 +981,7 @@ comm_add_close_handler(int fd, CLCB * handler, void *data)
-     AsyncCall::Pointer call=commCbCall(5,4, "SomeCloseHandler",
-                                        CommCloseCbPtrFun(handler, data));
-     comm_add_close_handler(fd, call);
-+    return call;
- }
+@@ -50,6 +51,7 @@ class ServiceConfig: public RefCountable
  
- void
-@@ -79,7 +79,7 @@ int ignoreErrno(int);
- void commCloseAllSockets(void);
- void checkTimeouts(void);
+     // security settings for adaptation service
+     Security::PeerOptions secure;
++    YesNoNone connectionEncryption; ///< whether this service uses only secure connections
  
--void comm_add_close_handler(int fd, CLCB *, void *);
-+AsyncCall::Pointer comm_add_close_handler(int fd, CLCB *, void *);
- void comm_add_close_handler(int fd, AsyncCall::Pointer &);
- void comm_remove_close_handler(int fd, CLCB *, void *);
- void comm_remove_close_handler(int fd, AsyncCall::Pointer &);
-@@ -166,7 +166,8 @@ HttpStateData::httpTimeout(const CommTimeoutCbParams &)
-         fwd->fail(new ErrorState(ERR_READ_TIMEOUT, Http::scGatewayTimeout, fwd->request));
-     }
- 
--    serverConnection->close();
-+    closeServer();
-+    mustStop("HttpStateData::httpTimeout");
- }
- 
- /// Remove an existing public store entry if the incoming response (to be
-@@ -1234,8 +1235,8 @@ HttpStateData::readReply(const CommIoCbParams &io)
-         err->xerrno = rd.xerrno;
-         fwd->fail(err);
-         flags.do_next_read = false;
--        io.conn->close();
--
-+        closeServer();
-+        mustStop("HttpStateData::readReply");
-         return;
-     }
- 
-@@ -1335,7 +1336,8 @@ HttpStateData::continueAfterParsingHeader()
-     entry->reset();
-     fwd->fail(new ErrorState(error, Http::scBadGateway, fwd->request));
-     flags.do_next_read = false;
--    serverConnection->close();
-+    closeServer();
-+    mustStop("HttpStateData::continueAfterParsingHeader");
-     return false; // quit on error
- }
- 
-@@ -1599,7 +1601,8 @@ HttpStateData::wroteLast(const CommIoCbParams &io)
-         ErrorState *err = new ErrorState(ERR_WRITE_ERROR, Http::scBadGateway, fwd->request);
-         err->xerrno = io.xerrno;
-         fwd->fail(err);
--        serverConnection->close();
-+        closeServer();
-+        mustStop("HttpStateData::wroteLast");
-         return;
-     }
- 
-@@ -1627,7 +1630,6 @@ HttpStateData::sendComplete()
-     request->hier.peer_http_request_sent = current_time;
- }
- 
--// Close the HTTP server connection. Used by serverComplete().
- void
- HttpStateData::closeServer()
+ protected:
+     Method parseMethod(const char *buf) const;
+@@ -170,6 +170,8 @@ void
+ Adaptation::Ecap::ServiceRep::finalize()
  {
-@@ -2426,7 +2428,8 @@ HttpStateData::handleMoreRequestBodyAvailable()
-             debugs(11, DBG_IMPORTANT, "http handleMoreRequestBodyAvailable: Likely proxy abuse detected '" << request->client_addr << "' -> '" << entry->url() << "'" );
+     Adaptation::Service::finalize();
++    if (!cfg().connectionEncryption.configured())
++        writeableCfg().connectionEncryption.configure(true);
+     theService = FindAdapterService(cfg().uri);
+     if (theService) {
+         try {
+@@ -420,6 +420,7 @@ Adaptation::Ecap::XactionRep::useAdapted(const libecap::shared_ptr<libecap::Mess
+     Must(proxyingAb == opUndecided);
  
-             if (virginReply()->sline.status() == Http::scInvalidHeader) {
--                serverConnection->close();
-+                closeServer();
-+                mustStop("HttpStateData::handleMoreRequestBodyAvailable");
-                 return;
-             }
-         }
+     HttpMsg *msg = answer().header;
++    updateSources(msg);
+     if (!theAnswerRep->body()) { // final, bodyless answer
+         proxyingAb = opNever;
+         updateHistory(msg);
+@@ -733,3 +734,8 @@ Adaptation::Ecap::XactionRep::status() const
+     return buf.content();
+ }
+ 
++void
++Adaptation::Ecap::XactionRep::updateSources(HttpMsg *adapted)
++{
++    adapted->sources |= service().cfg().connectionEncryption ? HttpMsg::srcEcaps : HttpMsg::srcEcap;
++}
+@@ -94,6 +94,7 @@ class XactionRep : public Adaptation::Initiate, public libecap::host::Xaction,
+     void updateHistory(HttpMsg *adapted);
+     void terminateMaster();
+     void scheduleStop(const char *reason);
++    void updateSources(HttpMsg *adapted);
+ 
+     const libecap::Area clientIpValue() const;
+     const libecap::Area usernameValue() const;
+@@ -771,6 +771,16 @@ void Adaptation::Icap::ModXact::startSending()
+ 
+     if (state.sending == State::sendingVirgin)
+         echoMore();
++    else {
++        // If we are not using the virgin HTTP object update the 
++        // HttpMsg::sources flag.
++        // The state.sending may set to State::sendingVirgin in the case
++        // of 206 responses too, where we do not want to update HttpMsg::sources
++        // flag. However even for 206 responses the state.sending is 
++        // not set yet to sendingVirgin. This is done in later step 
++        // after the parseBody method called.
++        updateSources();
++    }
+ }
+ 
+ void Adaptation::Icap::ModXact::parseIcapHead()
+@@ -1949,6 +1959,12 @@ void Adaptation::Icap::ModXact::clearError()
+         request->clearError();
+ }
+ 
++void Adaptation::Icap::ModXact::updateSources()
++{
++    Must(adapted.header);
++    adapted.header->sources |= (service().cfg().connectionEncryption ? HttpMsg::srcIcaps : HttpMsg::srcIcap);
++}
++
+ /* Adaptation::Icap::ModXactLauncher */
+ 
+ Adaptation::Icap::ModXactLauncher::ModXactLauncher(HttpMsg *virginHeader, HttpRequest *virginCause, AccessLogEntry::Pointer &alp, Adaptation::ServicePointer aService):
+@@ -221,6 +221,7 @@ class ModXact: public Xaction, public BodyProducer, public BodyConsumer
+     void prepEchoing();
+     void prepPartialBodyEchoing(uint64_t pos);
+     void echoMore();
++    void updateSources(); ///< Update the HttpMsg sources
+ 
+     virtual bool doneAll() const;
+     virtual void swanSong();
+@@ -85,7 +85,11 @@ Adaptation::Icap::ServiceRep::finalize()
+     if (cfg().secure.encryptTransport) {
+         debugs(3, DBG_IMPORTANT, "Initializing service " << cfg().resource << " SSL context");
+         sslContext = writeableCfg().secure.createClientContext(true);
+-    }
++        if (!cfg().connectionEncryption.configured())
++            writeableCfg().connectionEncryption.configure(true);
++    } else if (!cfg().connectionEncryption.configured())
++        writeableCfg().connectionEncryption.configure(false);
++   
+ 
+     theSessionFailures.configure(TheConfig.oldest_service_failure > 0 ?
+                                  TheConfig.oldest_service_failure : -1);
+@@ -1218,6 +1218,30 @@ IF USE_OPENSSL
+ 
+ 	acl aclname ssl::server_name_regex [-i] \.foo\.com ...
+ 	  # regex matches server name obtained from various sources [fast]
++
++	acl aclname connections_encrypted
++	  # matches transactions with all HTTP messages received over TLS
++	  # transport connections. [fast]
++	  #
++	  # The master transaction deals with HTTP messages received from
++	  # various sources. All sources used by the master transaction in the
++	  # past are considered by the ACL. The following rules define whether
++	  # a given message source taints the entire master transaction,
++	  # resulting in ACL mismatches:
++	  #
++	  #  * The HTTP client transport connection is not TLS.
++	  #  * An adaptation service connection-encryption flag is off.
++	  #  * The peer or origin server transport connection is not TLS.
++	  #
++	  # Caching currently does not affect these rules. This cache ignorance
++	  # implies that only the current HTTP client transport and REQMOD
++	  # services status determine whether this ACL matches a from-cache
++	  # transaction. The source of the cached response does not have any
++	  # effect on future transaction that use the cached response without
++	  # revalidation. This may change.
++	  #
++	  # DNS, ICP, and HTCP exchanges during the master transaction do not
++	  # affect these rules.
+ ENDIF
+ 	acl aclname any-of acl1 acl2 ...
+ 	  # match any one of the acls [fast or slow]
+@@ -8445,6 +8469,17 @@ DOC_START
+ 		Use the given number as the Max-Connections limit, regardless
+ 		of the Max-Connections value given by the service, if any.
+ 
++	connection-encryption=on|off
++		Determines the ICAP service effect on the connections_encrypted
++		ACL.
++
++		The default is "on" for Secure ICAP services (i.e., those
++		with the icaps:// service URIs scheme) and "off" for plain ICAP
++		services.
++
++		Does not affect ICAP connections (e.g., does not turn Secure
++		ICAP on or off).
++
+ 	==== ICAPS / TLS OPTIONS ====
+ 
+ 	These options are used for Secure ICAP (icaps://....) services only.
+@@ -8621,6 +8656,15 @@ DOC_START
+ 
+ 		Routing is not allowed by default.
+ 
++	connection-encryption=on|off
++		Determines the eCAP service effect on the connections_encrypted
++		ACL. 
++
++		Defaults to "on", which does not taint the master transaction
++		w.r.t. that ACL.
++
++		Does not affect eCAP API calls.
++
+ 	Older ecap_service format without optional named parameters is
+ 	deprecated but supported for backward compatibility.
+ 
+@@ -2342,6 +2342,8 @@ clientProcessRequest(ConnStateData *conn, const Http1::RequestParserPointer &hp,
+     // TODO: decouple http->flags.accel from request->flags.sslBumped
+     request->flags.noDirect = (request->flags.accelerated && !request->flags.sslBumped) ?
+                               !conn->port->allow_direct : 0;
++    request->sources |= isFtp ? HttpMsg::srcFtp :
++        ((request->flags.sslBumped || conn->port->transport.protocol == AnyP::PROTO_HTTPS) ? HttpMsg::srcHttps : HttpMsg::srcHttp);
+ #if USE_AUTH
+     if (request->flags.sslBumped) {
+         if (conn->getAuth() != NULL)
+@@ -2589,6 +2589,7 @@ Ftp::Gateway::appendSuccessHeader()
+     if (mime_enc)
+         reply->header.putStr(Http::HdrType::CONTENT_ENCODING, mime_enc);
+ 
++    reply->sources |= HttpMsg::srcFtp;
+     setVirginReply(reply);
+     adaptOrFinalizeReply();
+ }
+@@ -346,6 +346,7 @@ Ftp::Relay::forwardReply()
+     EBIT_CLR(entry->flags, ENTRY_FWD_HDR_WAIT);
+ 
+     HttpReply *const reply = createHttpReply(Http::scNoContent);
++    reply->sources |= HttpMsg::srcFtp;
+ 
+     setVirginReply(reply);
+     adaptOrFinalizeReply();
+@@ -418,6 +419,8 @@ Ftp::Relay::startDataDownload()
+            " (" << data.conn->local << ")");
+ 
+     HttpReply *const reply = createHttpReply(Http::scOkay, -1);
++    reply->sources |= HttpMsg::srcFtp;
++
+     EBIT_CLR(entry->flags, ENTRY_FWD_HDR_WAIT);
+     setVirginReply(reply);
+     adaptOrFinalizeReply();
+@@ -122,6 +122,7 @@ class GopherStateData
+     char *buf;          /* pts to a 4k page */
+     Comm::ConnectionPointer serverConn;
+     FwdState::Pointer fwd;
++    HttpReply::Pointer reply_;
+     char replybuf[BUFSIZ];
+ };
+ 
+@@ -249,6 +250,7 @@ gopherMimeCreate(GopherStateData * gopherState)
+         reply->header.putStr(Http::HdrType::CONTENT_ENCODING, mime_enc);
+ 
+     entry->replaceHttpReply(reply);
++    gopherState->reply_ = reply;
+ }
+ 
+ /**
+@@ -772,8 +774,11 @@ gopherReadReply(const Comm::ConnectionPointer &conn, char *buf, size_t len, Comm
+         ++IOStats.Gopher.read_hist[bin];
+ 
+         HttpRequest *req = gopherState->fwd->request;
+-        if (req->hier.bodyBytesRead < 0)
++        if (req->hier.bodyBytesRead < 0) {
+             req->hier.bodyBytesRead = 0;
++            // first bytes read, update Reply flags:
++            gopherState->reply_->sources |= HttpMsg::srcGopher;
++        }
+ 
+         req->hier.bodyBytesRead += len;
+     }
+@@ -769,6 +769,8 @@ HttpStateData::processReplyHeader()
+     // done with Parser, now process using the HttpReply
+     hp = NULL;
+ 
++    newrep->sources |= request->url.getScheme() == AnyP::PROTO_HTTPS ? HttpMsg::srcHttps : HttpMsg::srcHttp;
++
+     newrep->removeStaleWarnings();
+ 
+     if (newrep->sline.protocol == AnyP::PROTO_HTTP && newrep->sline.status() >= 100 && newrep->sline.status() < 200) {
+@@ -105,6 +105,7 @@ WhoisState::setReplyToOK(StoreEntry *sentry)
+     HttpReply *reply = new HttpReply;
+     sentry->buffer();
+     reply->setHeaders(Http::scOkay, "Gatewaying", "text/plain", -1, -1, -2);
++    reply->sources |= HttpMsg::srcWhois;
+     sentry->replaceHttpReply(reply);
+ }
+ 

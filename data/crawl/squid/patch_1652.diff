@@ -1,0 +1,881 @@
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: acl.cc,v 1.154 1998/03/28 23:24:40 wessels Exp $
++ * $Id: acl.cc,v 1.155 1998/03/29 08:50:56 wessels Exp $
+  *
+  * DEBUG: section 28    Access Control
+  * AUTHOR: Duane Wessels
+@@ -44,6 +44,8 @@ static FILE *aclFile;
+ 
+ static void aclDestroyAclList(acl_list * list);
+ static void aclDestroyTimeList(acl_time_data * data);
++static void aclDestroyProxyAuth(acl_proxy_auth * p);
++static FREE aclFreeProxyAuthUser;
+ static int aclMatchAclList(const acl_list *, aclCheck_t *);
+ static int aclMatchInteger(intlist * data, int i);
+ static int aclMatchTime(acl_time_data * data, time_t when);
+@@ -1184,7 +1186,7 @@ aclMatchProxyAuth(acl_proxy_auth * p, aclCheck_t * checklist)
+     char *cleartext;
+     char *sent_auth;
+     char *passwd = NULL;
+-    hash_link *hashr = NULL;
++    acl_proxy_auth_user *u;
+     s = mime_get_header(checklist->request->headers, "Proxy-authorization:");
+     if (s == NULL)
+ 	return 0;
+@@ -1208,21 +1210,21 @@ aclMatchProxyAuth(acl_proxy_auth * p, aclCheck_t * checklist)
+     debug(28, 5) ("aclMatchProxyAuth: checking user %s\n", sent_user);
+     /* reread password file if necessary */
+     aclReadProxyAuth(p);
+-    hashr = hash_lookup(p->hash, sent_user);
+-    if (hashr == NULL) {
++    u = hash_lookup(p->hash, sent_user);
++    if (NULL == u) {
+ 	/* User doesn't exist; deny them */
+ 	debug(28, 4) ("aclMatchProxyAuth: user %s does not exist\n", sent_user);
+ 	return 0;
+     }
+     /* See if we've already validated them */
+     *passwd |= 0x80;
+-    if (strcmp(hashr->item, passwd) == 0) {
++    if (0 == strcmp(u->passwd, passwd)) {
+ 	debug(28, 5) ("aclMatchProxyAuth: user %s previously validated\n",
+ 	    sent_user);
+ 	return 1;
+     }
+     *passwd &= (~0x80);
+-    if (strcmp(hashr->item, (char *) crypt(passwd, hashr->item))) {
++    if (strcmp(u->passwd, crypt(passwd, u->passwd))) {
+ 	/* Passwords differ, deny access */
+ 	p->last_time = 0;	/* Trigger a check of the password file */
+ 	debug(28, 4) ("aclMatchProxyAuth: authentication failed: user %s: "
+@@ -1231,8 +1233,10 @@ aclMatchProxyAuth(acl_proxy_auth * p, aclCheck_t * checklist)
+     }
+     *passwd |= 0x80;
+     debug(28, 5) ("aclMatchProxyAuth: user %s validated OK\n", sent_user);
+-    hash_delete(p->hash, sent_user);
+-    hash_insert(p->hash, xstrdup(sent_user), (void *) xstrdup(passwd));
++    hash_remove_link(p->hash, (hash_link *) u);
++    safe_free(u->passwd);
++    u->passwd = xstrdup(passwd);
++    hash_join(p->hash, (hash_link *) u);
+     return 1;
+ }
+ 
+@@ -1704,14 +1708,19 @@ aclDestroyRegexList(relist * data)
+     }
+ }
+ 
++static void
++aclFreeProxyAuthUser(void *data)
++{
++    acl_proxy_auth_user *u = data;
++    xfree(u->user);
++    xfree(u->passwd);
++    memFree(MEM_ACL_PROXY_AUTH_USER, u);
++}
++
+ static void
+ aclDestroyProxyAuth(acl_proxy_auth * p)
+ {
+-    hash_link *hashr = NULL;
+-    /* destroy hash list contents */
+-    for (hashr = hash_first(p->hash); hashr; hashr = hash_next(p->hash))
+-	hash_delete(p->hash, hashr->key);
+-    /* destroy and free the hash table itself */
++    hashFreeItems(p->hash, aclFreeProxyAuthUser);
+     hashFreeMemory(p->hash);
+     p->hash = NULL;
+     safe_free(p->filename);
+@@ -1882,56 +1891,49 @@ aclReadProxyAuth(acl_proxy_auth * p)
+     static char *passwords = NULL;
+     char *user = NULL;
+     char *passwd = NULL;
+-    hash_link *hashr = NULL;
+     FILE *f = NULL;
+-    if ((squid_curtime - p->last_time) >= p->check_interval) {
+-	if (stat(p->filename, &buf) == 0) {
+-	    if (buf.st_mtime != p->change_time) {
+-		debug(28, 1) ("aclReadProxyAuth: reloading changed proxy authentication file %s\n", p->filename);
+-		p->change_time = buf.st_mtime;
+-		if (p->hash != 0) {
+-		    debug(28, 5) ("aclReadProxyAuth: invalidating old entries\n");
+-		    for (hashr = hash_first(p->hash); hashr; hashr = hash_next(p->hash)) {
+-			debug(28, 6) ("aclReadProxyAuth: deleting %s\n", hashr->key);
+-			hash_delete(p->hash, hashr->key);
+-		    }
+-		} else {
+-		    /* First time around, 7921 should be big enough */
+-		    p->hash = hash_create(urlcmp, 7921, hash_string);
+-		    if (p->hash == NULL) {
+-			debug(28, 0) ("aclReadProxyAuth: can't create "
+-			    "hash table, turning auth off.\n");
+-			return 0;
+-		    }
+-		}
+-		passwords = xmalloc((size_t) buf.st_size + 2);
+-		f = fopen(p->filename, "r");
+-		fread(passwords, (size_t) buf.st_size, 1, f);
+-		*(passwords + buf.st_size) = '\0';
+-		strcat(passwords, "\n");
+-		fclose(f);
+-		user = strtok(passwords, ":");
+-		passwd = strtok(NULL, "\n");
+-		debug(28, 5) ("aclReadProxyAuth: adding new passwords to hash table\n");
+-		while (user != NULL) {
+-		    if ((int) strlen(user) > 1 && passwd && (int) strlen(passwd) > 1) {
+-			debug(28, 6) ("aclReadProxyAuth: adding %s, %s to hash table\n", user, passwd);
+-			hash_insert(p->hash, xstrdup(user), (void *) xstrdup(passwd));
+-		    }
+-		    user = strtok(NULL, ":");
+-		    passwd = strtok(NULL, "\n");
+-		}
+-		xfree(passwords);
+-	    } else {
+-		debug(28, 5) ("aclReadProxyAuth: %s not changed (old=%d,new=%d)\n",
+-		    p->filename, (int) p->change_time, (int) buf.st_mtime);
+-	    }
+-	} else {
+-	    debug(28, 0) ("aclReadProxyAuth: can't access proxy_auth file %s, turning authentication off\n", p->filename);
+-	    return 0;
+-	}
++    if ((squid_curtime - p->last_time) < p->check_interval)
++	return 1;
++    if (0 != stat(p->filename, &buf)) {
++	debug(28, 0) ("aclReadProxyAuth: can't access proxy_auth file %s, turning authentication off\n", p->filename);
++	return 0;
++    }
++    if (buf.st_mtime == p->change_time) {
++	debug(28, 5) ("aclReadProxyAuth: %s not changed (old=%d,new=%d)\n",
++	    p->filename, (int) p->change_time, (int) buf.st_mtime);
+ 	p->last_time = squid_curtime;
++	return 1;
++    }
++    debug(28, 1) ("aclReadProxyAuth: reloading changed proxy authentication file %s\n", p->filename);
++    p->change_time = buf.st_mtime;
++    if (NULL != p->hash) {
++	hashFreeItems(p->hash, aclFreeProxyAuthUser);
++	hashFreeMemory(p->hash);
++    }
++    p->hash = hash_create(urlcmp, 7921, hash_string);
++    assert(NULL != p->hash);
++    passwords = xmalloc((size_t) buf.st_size + 2);
++    f = fopen(p->filename, "r");
++    fread(passwords, (size_t) buf.st_size, 1, f);
++    *(passwords + buf.st_size) = '\0';
++    strcat(passwords, "\n");
++    fclose(f);
++    user = strtok(passwords, ":");
++    passwd = strtok(NULL, "\n");
++    debug(28, 5) ("aclReadProxyAuth: adding new passwords to hash table\n");
++    while (user != NULL) {
++	if ((int) strlen(user) > 1 && passwd && (int) strlen(passwd) > 1) {
++	    acl_proxy_auth_user *u;
++	    u = memAllocate(MEM_ACL_PROXY_AUTH_USER);
++	    u->user = xstrdup(user);
++	    u->passwd = xstrdup(passwd);
++	    debug(28, 6) ("aclReadProxyAuth: adding %s, %s to hash table\n", user, passwd);
++	    hash_join(p->hash, (hash_link *) u);
++	}
++	user = strtok(NULL, ":");
++	passwd = strtok(NULL, "\n");
+     }
++    xfree(passwords);
+     return 1;
+ }
+ 
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: client_db.cc,v 1.29 1998/03/27 05:36:55 wessels Exp $
++ * $Id: client_db.cc,v 1.30 1998/03/29 08:50:57 wessels Exp $
+  *
+  * DEBUG: section 0     Client Database
+  * AUTHOR: Duane Wessels
+@@ -33,6 +33,7 @@
+ 
+ static hash_table *client_table = NULL;
+ static ClientInfo *clientdbAdd(struct in_addr addr);
++static FREE clientdbFreeItem;
+ 
+ static ClientInfo *
+ clientdbAdd(struct in_addr addr)
+@@ -164,32 +165,22 @@ clientdbDump(StoreEntry * sentry)
+     }
+ }
+ 
++static void
++clientdbFreeItem(void *data)
++{
++    memFree(MEM_CLIENT_INFO, data);
++}
++
+ void
+ clientdbFreeMemory(void)
+ {
+-    ClientInfo *c;
+-    ClientInfo **C;
+-    int i = 0;
+-    int j;
+-    int n = memInUse(MEM_CLIENT_INFO);
+-    C = xcalloc(n, sizeof(ClientInfo *));
+-    c = (ClientInfo *) hash_first(client_table);
+-    while (c && i < n) {
+-	*(C + i) = c;
+-	i++;
+-	c = (ClientInfo *) hash_next(client_table);
+-    }
+-    for (j = 0; j < i; j++) {
+-	c = *(C + j);
+-	memFree(MEM_CLIENT_INFO, c);
+-    }
+-    xfree(C);
++    hashFreeItems(client_table, clientdbFreeItem);
+     hashFreeMemory(client_table);
+     client_table = NULL;
+ }
+ 
+ #if SQUID_SNMP
+-int 
++int
+ meshCtblGetRowFn(oid * New, oid * Oid)
+ {
+     ClientInfo *c = NULL;
+@@ -263,7 +254,7 @@ snmp_meshCtblFn(variable_list * Var, snint * ErrP)
+ 	break;
+     case MESH_CTBL_HTHITS:
+ 	aggr = 0;
+-	for (l = 0; l<LOG_TYPE_MAX; l++) {
++	for (l = 0; l < LOG_TYPE_MAX; l++) {
+ 	    if (isTcpHit(l))
+ 		aggr += c->Http.result_hist[l];
+ 	}
+@@ -46,10 +46,10 @@ typedef enum {
+     ERR_CACHE_ACCESS_DENIED,
+     ERR_CACHE_MGR_ACCESS_DENIED,
+     ERR_SQUID_SIGNATURE,	/* not really an error */
+-    ERR_FTP_PUT_CREATED,	/* !error,a note that the file was created */    
++    ERR_FTP_PUT_CREATED,	/* !error,a note that the file was created */
+     ERR_FTP_PUT_MODIFIED,	/* modified, !created */
+     ERR_FTP_PUT_ERROR,
+-    ERR_ONLY_IF_CACHED_MISS,    /* failure to satisfy only-if-cached request */
++    ERR_ONLY_IF_CACHED_MISS,	/* failure to satisfy only-if-cached request */
+     ERR_MAX
+ } err_type;
+ 
+@@ -471,6 +471,7 @@ typedef enum {
+     MEM_ACL,
+     MEM_ACL_LIST,
+     MEM_ACL_ACCESS,
++    MEM_ACL_PROXY_AUTH_USER,
+     MEM_ACLCHECK_T,
+     MEM_AIO_RESULT_T,
+     MEM_WORDLIST,
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: fqdncache.cc,v 1.95 1998/03/28 23:31:21 wessels Exp $
++ * $Id: fqdncache.cc,v 1.96 1998/03/29 08:50:58 wessels Exp $
+  *
+  * DEBUG: section 35    FQDN Cache
+  * AUTHOR: Harvest Derived
+@@ -147,6 +147,7 @@ static void fqdncache_dnsDispatch(dnsserver_t *, fqdncache_entry *);
+ static void fqdncacheChangeKey(fqdncache_entry * i);
+ static void fqdncacheLockEntry(fqdncache_entry * f);
+ static void fqdncacheUnlockEntry(fqdncache_entry * f);
++static FREE fqdncacheFreeEntry;
+ 
+ static hash_table *fqdn_table = NULL;
+ static struct fqdncacheQueueData *fqdncacheQueueHead = NULL;
+@@ -552,7 +553,7 @@ fqdncache_nbgethostbyaddr(struct in_addr addr, FQDNH * handler, void *handlerDat
+ 	fqdncacheAddPending(f, handler, handlerData);
+ 	if (squid_curtime - f->expires > 600) {
+ 	    debug(14, 0) ("fqdncache_nbgethostbyname: '%s' PENDING for %d seconds, aborting\n", name,
+-	        (int) (squid_curtime + Config.negativeDnsTtl - f->expires));
++		(int) (squid_curtime + Config.negativeDnsTtl - f->expires));
+ 	    fqdncacheChangeKey(f);
+ 	    fqdncache_call_pending(f);
+ 	}
+@@ -802,31 +803,22 @@ fqdncacheUnlockEntry(fqdncache_entry * f)
+ 	fqdncache_release(f);
+ }
+ 
++static void
++fqdncacheFreeEntry(void *data)
++{
++    fqdncache_entry *f = data;
++    int k;
++    for (k = 0; k < (int) f->name_count; k++)
++	safe_free(f->names[k]);
++    safe_free(f->name);
++    safe_free(f->error_message);
++    memFree(MEM_FQDNCACHE_ENTRY, f);
++}
++
+ void
+ fqdncacheFreeMemory(void)
+ {
+-    fqdncache_entry *f;
+-    fqdncache_entry **list;
+-    int i = 0;
+-    int j = 0;
+-    int k = 0;
+-    int n = memInUse(MEM_FQDNCACHE_ENTRY);
+-    list = xcalloc(n, sizeof(fqdncache_entry *));
+-    f = (fqdncache_entry *) hash_first(fqdn_table);
+-    while (f != NULL && i < n) {
+-	*(list + i) = f;
+-	i++;
+-	f = (fqdncache_entry *) hash_next(fqdn_table);
+-    }
+-    for (j = 0; j < i; j++) {
+-	f = *(list + j);
+-	for (k = 0; k < (int) f->name_count; k++)
+-	    safe_free(f->names[k]);
+-	safe_free(f->name);
+-	safe_free(f->error_message);
+-	memFree(MEM_FQDNCACHE_ENTRY, f);
+-    }
+-    xfree(list);
++    hashFreeItems(fqdn_table, fqdncacheFreeEntry);
+     hashFreeMemory(fqdn_table);
+     fqdn_table = NULL;
+ }
+@@ -905,7 +897,7 @@ fqdn_getMax()
+ }
+ 
+ variable_list *
+-snmp_fqdncacheFn(variable_list * Var, snint *ErrP)
++snmp_fqdncacheFn(variable_list * Var, snint * ErrP)
+ {
+     variable_list *Answer;
+     static fqdncache_entry *fq = NULL;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: globals.h,v 1.43 1998/03/16 20:30:03 wessels Exp $
++ * $Id: globals.h,v 1.44 1998/03/29 08:50:59 wessels Exp $
+  */
+ 
+ extern FILE *debug_log;		/* NULL */
+@@ -47,7 +47,6 @@ extern int configured_once;	/* 0 */
+ extern int debugLevels[MAX_DEBUG_SECTIONS];
+ extern int do_mallinfo;		/* 0 */
+ extern int opt_reuseaddr;	/* 1 */
+-extern int hash_links_allocated;
+ extern int icmp_sock;		/* -1 */
+ extern int neighbors_do_private_keys;	/* 1 */
+ extern int opt_accel_uses_host;	/* 0 */
+@@ -97,7 +96,7 @@ extern double request_failure_ratio;	/* 0.0 */
+ extern int store_hash_buckets;	/* 0 */
+ extern hash_table *store_table;	/* NULL */
+ extern dlink_list store_list;
+-extern const String StringNull; /* { 0, 0, NULL } */
++extern const String StringNull;	/* { 0, 0, NULL } */
+ extern int hot_obj_count;	/* 0 */
+ 
+ #ifdef HAVE_SYSLOG
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: ipcache.cc,v 1.172 1998/03/28 23:24:48 wessels Exp $
++ * $Id: ipcache.cc,v 1.173 1998/03/29 08:51:00 wessels Exp $
+  *
+  * DEBUG: section 14    IP Cache
+  * AUTHOR: Harvest Derived
+@@ -146,6 +146,7 @@ static void ipcacheUnlockEntry(ipcache_entry *);
+ static void ipcacheLockEntry(ipcache_entry *);
+ static void ipcacheNudgeQueue(void);
+ static void ipcacheChangeKey(ipcache_entry * i);
++static FREE ipcacheFreeEntry;
+ 
+ static ipcache_addrs static_addrs;
+ static hash_table *ip_table = NULL;
+@@ -978,30 +979,21 @@ ipcacheMarkGoodAddr(const char *name, struct in_addr addr)
+     }
+ }
+ 
++static void
++ipcacheFreeEntry(void *data)
++{
++    ipcache_entry *i = data;
++    safe_free(i->addrs.in_addrs);
++    safe_free(i->addrs.bad_mask);
++    safe_free(i->name);
++    safe_free(i->error_message);
++    memFree(MEM_IPCACHE_ENTRY, i);
++}
++
+ void
+ ipcacheFreeMemory(void)
+ {
+-    ipcache_entry *i;
+-    ipcache_entry **list;
+-    int k = 0;
+-    int j;
+-    int n = memInUse(MEM_IPCACHE_ENTRY);
+-    list = xcalloc(n, sizeof(ipcache_entry *));
+-    i = (ipcache_entry *) hash_first(ip_table);
+-    while (i != NULL && k < n) {
+-	*(list + k) = i;
+-	k++;
+-	i = (ipcache_entry *) hash_next(ip_table);
+-    }
+-    for (j = 0; j < k; j++) {
+-	i = *(list + j);
+-	safe_free(i->addrs.in_addrs);
+-	safe_free(i->addrs.bad_mask);
+-	safe_free(i->name);
+-	safe_free(i->error_message);
+-	memFree(MEM_IPCACHE_ENTRY, i);
+-    }
+-    xfree(list);
++    hashFreeItems(ip_table, ipcacheFreeEntry);
+     hashFreeMemory(ip_table);
+     ip_table = NULL;
+ }
+@@ -1072,7 +1064,7 @@ ipcache_getMax()
+ }
+ 
+ variable_list *
+-snmp_ipcacheFn(variable_list * Var, snint *ErrP)
++snmp_ipcacheFn(variable_list * Var, snint * ErrP)
+ {
+     variable_list *Answer;
+     ipcache_entry *IPc = NULL;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: mem.cc,v 1.19 1998/03/20 18:06:45 rousskov Exp $
++ * $Id: mem.cc,v 1.20 1998/03/29 08:51:01 wessels Exp $
+  *
+  * DEBUG: section 13    High Level Memory Pool Management
+  * AUTHOR: Harvest Derived
+@@ -37,15 +37,24 @@ static MemPool *MemPools[MEM_MAX];
+ 
+ /* string pools */
+ #define mem_str_pool_count 3
+-static const struct { 
+-    const char *name; 
++static const struct {
++    const char *name;
+     size_t obj_size;
+-} StrPoolsAttrs[mem_str_pool_count] = { 
+-    { "Short Strings",   36, },   /* to fit rfc1123 and similar */
+-    { "Medium Strings", 128, },   /* to fit most urls */
+-    { "Long Strings",   512 }     /* other */
++} StrPoolsAttrs[mem_str_pool_count] = {
++
++    {
++	"Short Strings", 36,
++    },				/* to fit rfc1123 and similar */
++    {
++	"Medium Strings", 128,
++    },				/* to fit most urls */
++    {
++	"Long Strings", 512
++    }				/* other */
+ };
+-static struct { MemPool *pool; } StrPools[mem_str_pool_count];
++static struct {
++    MemPool *pool;
++} StrPools[mem_str_pool_count];
+ static MemMeter StrCountMeter;
+ static MemMeter StrVolumeMeter;
+ 
+@@ -71,25 +80,25 @@ memStringStats(StoreEntry * sentry)
+     int pooled_count = 0;
+     size_t pooled_volume = 0;
+     /* heading */
+-    storeAppendPrintf(sentry, 
++    storeAppendPrintf(sentry,
+ 	"String Pool\t Impact\t\t\n"
+ 	" \t (%%strings)\t (%%volume)\n");
+     /* table body */
+     for (i = 0; i < mem_str_pool_count; i++) {
+ 	const MemPool *pool = StrPools[i].pool;
+ 	const int plevel = pool->meter.inuse.level;
+-  	storeAppendPrintf(sentry, pfmt,
++	storeAppendPrintf(sentry, pfmt,
+ 	    pool->label,
+ 	    xpercentInt(plevel, StrCountMeter.level),
+-	    xpercentInt(plevel*pool->obj_size, StrVolumeMeter.level));
++	    xpercentInt(plevel * pool->obj_size, StrVolumeMeter.level));
+ 	pooled_count += plevel;
+-	pooled_volume += plevel*pool->obj_size;
++	pooled_volume += plevel * pool->obj_size;
+     }
+     /* malloc strings */
+     storeAppendPrintf(sentry, pfmt,
+ 	"Other Strings",
+-	xpercentInt(StrCountMeter.level-pooled_count, StrCountMeter.level),
+-	xpercentInt(StrVolumeMeter.level-pooled_volume, StrVolumeMeter.level));
++	xpercentInt(StrCountMeter.level - pooled_count, StrCountMeter.level),
++	xpercentInt(StrVolumeMeter.level - pooled_volume, StrVolumeMeter.level));
+ }
+ 
+ static void
+@@ -123,14 +132,14 @@ memFree(mem_type type, void *p)
+ 
+ /* allocate a variable size buffer using best-fit pool */
+ void *
+-memAllocBuf(size_t net_size, size_t *gross_size)
++memAllocBuf(size_t net_size, size_t * gross_size)
+ {
+     int i;
+     MemPool *pool = NULL;
+     assert(gross_size);
+     for (i = 0; i < mem_str_pool_count; i++) {
+ 	if (net_size <= StrPoolsAttrs[i].obj_size) {
+-	    pool =  StrPools[i].pool;
++	    pool = StrPools[i].pool;
+ 	    break;
+ 	}
+     }
+@@ -187,6 +196,8 @@ memInit(void)
+     memDataInit(MEM_ACL_LIST, "acl_list", sizeof(acl_list), 0);
+     memDataInit(MEM_ACL_NAME_LIST, "acl_name_list", sizeof(acl_name_list), 0);
+     memDataInit(MEM_ACL_TIME_DATA, "acl_time_data", sizeof(acl_time_data), 0);
++    memDataInit(MEM_ACL_PROXY_AUTH_USER, "acl_proxy_auth_user",
++	sizeof(acl_proxy_auth_user), 0);
+     memDataInit(MEM_AIO_RESULT_T, "aio_result_t", sizeof(aio_result_t), 0);
+     memDataInit(MEM_CACHEMGR_PASSWD, "cachemgr_passwd",
+ 	sizeof(cachemgr_passwd), 0);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: net_db.cc,v 1.80 1998/03/27 05:36:56 wessels Exp $
++ * $Id: net_db.cc,v 1.81 1998/03/29 08:51:01 wessels Exp $
+  *
+  * DEBUG: section 37    Network Measurement Database
+  * AUTHOR: Duane Wessels
+@@ -51,6 +51,8 @@ static IPH netdbSendPing;
+ static QS sortPeerByRtt;
+ static QS sortByRtt;
+ static QS netdbLRU;
++static FREE netdbFreeNameEntry;
++static FREE netdbFreeNetdbEntry;
+ 
+ /* We have to keep a local list of peer names.  The Peers structure
+  * gets freed during a reconfigure.  We want this database to
+@@ -527,46 +529,31 @@ netdbHandlePingReply(const struct sockaddr_in *from, int hops, int rtt)
+ #endif
+ }
+ 
++static void
++netdbFreeNetdbEntry(void *data)
++{
++    netdbEntry *n = data;
++    safe_free(n->peers);
++    memFree(MEM_NETDBENTRY, n);
++}
++
++static void
++netdbFreeNameEntry(void *data)
++{
++    net_db_name *x = data;
++    xfree(x->name);
++    memFree(MEM_NET_DB_NAME, x);
++}
++
+ void
+ netdbFreeMemory(void)
+ {
+ #if USE_ICMP
+-    netdbEntry *n;
+-    netdbEntry **L1;
+-    net_db_name **L2;
+-    net_db_name *x;
+-    int i = 0;
+-    int j;
+-    L1 = xcalloc(memInUse(MEM_NETDBENTRY), sizeof(netdbEntry *));
+-    n = (netdbEntry *) hash_first(addr_table);
+-    while (n && i < memInUse(MEM_NETDBENTRY)) {
+-	*(L1 + i) = n;
+-	i++;
+-	n = (netdbEntry *) hash_next(addr_table);
+-    }
+-    for (j = 0; j < i; j++) {
+-	n = *(L1 + j);
+-	safe_free(n->peers);
+-	memFree(MEM_NETDBENTRY, n);
+-    }
+-    xfree(L1);
+-    i = 0;
+-    L2 = xcalloc(memInUse(MEM_NET_DB_NAME), sizeof(net_db_name *));
+-    x = (net_db_name *) hash_first(host_table);
+-    while (x && i < memInUse(MEM_NET_DB_NAME)) {
+-	*(L2 + i) = x;
+-	i++;
+-	x = (net_db_name *) hash_next(host_table);
+-    }
+-    for (j = 0; j < i; j++) {
+-	x = *(L2 + j);
+-	xfree(x->name);
+-	memFree(MEM_NET_DB_NAME, x);
+-    }
+-    xfree(L2);
++    hashFreeItems(addr_table, netdbFreeNetdbEntry);
+     hashFreeMemory(addr_table);
+-    hashFreeMemory(host_table);
+     addr_table = NULL;
++    hashFreeItems(host_table, netdbFreeNameEntry);
++    hashFreeMemory(host_table);
+     host_table = NULL;
+     wordlistDestroy(&peer_names);
+     peer_names = NULL;
+@@ -701,7 +688,7 @@ netdbUpdatePeer(request_t * r, peer * e, int irtt, int ihops)
+ 
+ #if SQUID_SNMP
+ 
+-int 
++int
+ netdbGetRowFn(oid * New, oid * Oid)
+ {
+     netdbEntry *c = NULL;
+@@ -69,7 +69,7 @@ extern int cbdataValid(const void *p);
+ extern void cbdataDump(StoreEntry *);
+ 
+ extern void clientdbInit(void);
+-extern void clientdbUpdate(struct in_addr, log_type, protocol_t,size_t);
++extern void clientdbUpdate(struct in_addr, log_type, protocol_t, size_t);
+ extern int clientdbCutoffDenied(struct in_addr);
+ extern void clientdbDump(StoreEntry *);
+ extern void clientdbFreeMemory(void);
+@@ -200,21 +200,16 @@ extern int gopherCachable(const char *);
+ 
+ extern void whoisStart(request_t * req, StoreEntry *);
+ 
+-/* init */
+ extern hash_table *hash_create(HASHCMP *, int, HASHHASH *);
+-extern void hash_insert(hash_table *, const char *, void *);
+-extern int hash_delete(hash_table *, const char *);
+-extern int hash_delete_link(hash_table *, hash_link *);
+ extern void hash_join(hash_table *, hash_link *);
+ extern int hash_remove_link(hash_table *, hash_link *);
+ extern int hashPrime(int n);
+-
+-/* searching, accessing */
+-extern hash_link *hash_lookup(hash_table *, const void *);
+-extern hash_link *hash_first(hash_table *);
+-extern hash_link *hash_next(hash_table *);
++extern void *hash_lookup(hash_table *, const void *);
++extern void *hash_first(hash_table *);
++extern void *hash_next(hash_table *);
+ extern hash_link *hash_get_bucket(hash_table *, unsigned int);
+ extern void hashFreeMemory(hash_table *);
++extern void hashFreeItems(hash_table *, FREE *);
+ extern HASHHASH hash_string;
+ extern HASHHASH hash_url;
+ extern HASHHASH hash4;
+@@ -296,8 +291,8 @@ extern void httpHdrContRangePackInto(const HttpHdrContRange * crange, Packer * p
+ extern HttpHeaderFieldInfo *httpHeaderBuildFieldsInfo(const HttpHeaderFieldAttrs * attrs, int count);
+ extern void httpHeaderDestroyFieldsInfo(HttpHeaderFieldInfo * info, int count);
+ extern int httpHeaderIdByName(const char *name, int name_len, const HttpHeaderFieldInfo * attrs, int end);
+-extern void httpHeaderMaskInit(HttpHeaderMask *mask);
+-extern void httpHeaderCalcMask(HttpHeaderMask *mask, const int *enums, int count);
++extern void httpHeaderMaskInit(HttpHeaderMask * mask);
++extern void httpHeaderCalcMask(HttpHeaderMask * mask, const int *enums, int count);
+ extern int strListGetItem(const char *str, char del, const char **item, int *ilen, const char **pos);
+ extern const char *getStringPrefix(const char *str, const char *end);
+ extern int httpHeaderParseInt(const char *start, int *val);
+@@ -310,7 +305,7 @@ extern void httpHeaderCleanModule();
+ extern void httpHeaderInit(HttpHeader * hdr);
+ extern void httpHeaderClean(HttpHeader * hdr);
+ /* clone */
+-extern void httpHeaderUpdate(HttpHeader *old, const HttpHeader *fresh);
++extern void httpHeaderUpdate(HttpHeader * old, const HttpHeader * fresh);
+ /* parse/pack */
+ extern int httpHeaderParse(HttpHeader * hdr, const char *header_start, const char *header_end);
+ extern void httpHeaderPackInto(const HttpHeader * hdr, Packer * p);
+@@ -555,7 +550,7 @@ void statHistLogInit(StatHist * H, int capacity, double min, double max);
+ void statHistEnumInit(StatHist * H, int last_enum);
+ 
+ /* MemMeter */
+-extern void memMeterSyncHWater(MemMeter *m);
++extern void memMeterSyncHWater(MemMeter * m);
+ #define memMeterCheckHWater(m) { if ((m).hwater_level < (m).level) memMeterSyncHWater(&(m)); }
+ #define memMeterInc(m) { (m).level++; memMeterCheckHWater(m); }
+ #define memMeterDec(m) { (m).level--; }
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: store.cc,v 1.398 1998/03/28 23:24:51 wessels Exp $
++ * $Id: store.cc,v 1.399 1998/03/29 08:51:03 wessels Exp $
+  *
+  * DEBUG: section 20    Storeage Manager
+  * AUTHOR: Harvest Derived
+@@ -156,7 +156,7 @@ static void storeHashDelete(StoreEntry *);
+ static MemObject *new_MemObject(const char *, const char *);
+ static void destroy_MemObject(StoreEntry *);
+ static void destroy_MemObjectData(MemObject *);
+-static void destroy_StoreEntry(StoreEntry *);
++static FREE destroy_StoreEntry;
+ static void storePurgeMem(StoreEntry *);
+ static unsigned int getKeyCounter(method_t);
+ static int storeKeepInMemory(const StoreEntry *);
+@@ -220,8 +220,9 @@ destroy_MemObject(StoreEntry * e)
+ }
+ 
+ static void
+-destroy_StoreEntry(StoreEntry * e)
++destroy_StoreEntry(void *data)
+ {
++    StoreEntry *e = data;
+     debug(20, 3) ("destroy_StoreEntry: destroying %p\n", e);
+     assert(e != NULL);
+     if (e->mem_obj)
+@@ -927,20 +928,7 @@ storeNegativeCache(StoreEntry * e)
+ void
+ storeFreeMemory(void)
+ {
+-    StoreEntry *e;
+-    StoreEntry **list;
+-    int i = 0;
+-    int j;
+-    list = xcalloc(memInUse(MEM_STOREENTRY), sizeof(StoreEntry *));
+-    e = (StoreEntry *) hash_first(store_table);
+-    while (e && i < memInUse(MEM_STOREENTRY)) {
+-	*(list + i) = e;
+-	i++;
+-	e = (StoreEntry *) hash_next(store_table);
+-    }
+-    for (j = 0; j < i; j++)
+-	destroy_StoreEntry(*(list + j));
+-    xfree(list);
++    hashFreeItems(store_table, destroy_StoreEntry);
+     hashFreeMemory(store_table);
+     store_table = NULL;
+ }
+@@ -29,6 +29,13 @@ struct _acl_proxy_auth {
+     hash_table *hash;
+ };
+ 
++struct _acl_proxy_auth_user {
++    /* first two items must be same as hash_link */
++    char *user;
++    acl_proxy_auth_user *next;
++    char *passwd;
++};
++
+ struct _acl_deny_info_list {
+     int err_page_id;
+     char *err_page_name;
+@@ -120,7 +127,6 @@ struct _acl_access {
+     struct _acl_access *next;
+ };
+ 
+-
+ struct _aclCheck_t {
+     const struct _acl_access *access_list;
+     struct in_addr src_addr;
+@@ -444,13 +450,13 @@ struct _hash_link {
+ };
+ 
+ struct _hash_table {
+-    int valid;
+     hash_link **buckets;
+     HASHCMP *cmp;
+     HASHHASH *hash;
+     unsigned int size;
+     unsigned int current_slot;
+     hash_link *current_ptr;
++    int count;
+ };
+ 
+ /* http status line */
+@@ -537,8 +543,8 @@ struct _HttpHeaderEntry {
+ 
+ struct _HttpHeader {
+     /* protected, do not use these, use interface functions instead */
+-    Array entries;              /* parsed fields in raw format */
+-    HttpHeaderMask mask;        /* bit set <=> entry present */
++    Array entries;		/* parsed fields in raw format */
++    HttpHeaderMask mask;	/* bit set <=> entry present */
+ };
+ 
+ struct _HttpReply {
+@@ -550,7 +556,7 @@ struct _HttpReply {
+     time_t date;
+     time_t last_modified;
+     time_t expires;
+-    String content_type; 
++    String content_type;
+     HttpHdrCc *cache_control;
+     HttpHdrContRange *content_range;
+     short int pconn_keep_alive;
+@@ -711,7 +717,7 @@ struct _ip_pending {
+ };
+ 
+ struct _ipcache_entry {
+-    /* first two items must be equivalent to hash_link in hash.h */
++    /* first two items must be equivalent to hash_link */
+     char *name;
+     struct _ipcache_entry *next;
+     time_t lastref;
+@@ -731,7 +737,7 @@ struct _fqdn_pending {
+ };
+ 
+ struct _fqdncache_entry {
+-    /* first two items must be equivalent to hash_link in hash.h */
++    /* first two items must be equivalent to hash_link */
+     char *name;
+     struct _fqdncache_entry *next;
+     time_t lastref;
+@@ -815,7 +821,7 @@ struct _net_db_peer {
+ };
+ 
+ struct _netdbEntry {
+-    /* first two items must be equivalent to hash_link in hash.h */
++    /* first two items must be equivalent to hash_link */
+     char *key;
+     netdbEntry *next;
+     char network[16];
+@@ -965,7 +971,7 @@ struct _MemObject {
+ };
+ 
+ struct _StoreEntry {
+-    /* first two items must be same as hash_link in hash.h */
++    /* first two items must be same as hash_link */
+     const cache_key *key;
+     struct _StoreEntry *next;
+     MemObject *mem_obj;
+@@ -1007,7 +1013,7 @@ struct _request_t {
+     String urlpath;
+     int link_count;		/* free when zero */
+     int flags;
+-    HttpHdrCc *cache_control;   /* not used yet */
++    HttpHdrCc *cache_control;	/* not used yet */
+     time_t max_age;
+     float http_ver;
+     time_t ims;
+@@ -1175,16 +1181,16 @@ struct _MemPool {
+ };
+ 
+ struct _ClientInfo {
+-    /* first two items must be equivalent to hash_link in hash.h */
++    /* first two items must be equivalent to hash_link */
+     char *key;
+     ClientInfo *next;
+     struct in_addr addr;
+     struct {
+ 	int result_hist[LOG_TYPE_MAX];
+ 	int n_requests;
+-        kb_t kbytes_in;
+-        kb_t kbytes_out;
+-        kb_t hit_kbytes_out;
++	kb_t kbytes_in;
++	kb_t kbytes_out;
++	kb_t hit_kbytes_out;
+     } Http, Icp;
+     struct {
+ 	time_t time;
+@@ -25,6 +25,7 @@ typedef struct _acl_time_data acl_time_data;
+ typedef struct _acl_name_list acl_name_list;
+ typedef struct _acl_deny_info_list acl_deny_info_list;
+ typedef struct _acl_proxy_auth acl_proxy_auth;
++typedef struct _acl_proxy_auth_user acl_proxy_auth_user;
+ typedef struct _acl_arp_data acl_arp_data;
+ typedef struct _acl acl;
+ typedef struct _snmp_request_t snmp_request_t;

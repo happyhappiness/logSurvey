@@ -1,0 +1,1029 @@
+@@ -121,14 +121,14 @@ init_challenge(char *domain, char *domain_controller)
+ 	debug("Couldn't connect to SMB Server. Error:%s\n", errstr);
+ 	return 1;
+     }
+-    if (SMB_Negotiate(handle, SMB_Prots) < 0) {		/* An error */
++    if (SMB_Negotiate(handle, SMB_Prots) < 0) { /* An error */
+ 	debug("Error negotiating protocol with SMB Server\n");
+ 	SMB_Discon(handle, 0);
+ 	handle = NULL;
+ 	return 2;
+     }
+     if (handle->Security == 0) {	/* share-level security, unuseable */
+-	debug("SMB Server uses share-level security .. we need user sercurity.\n");
++	debug("SMB Server uses share-level security .. we need user security.\n");
+ 	SMB_Discon(handle, 0);
+ 	handle = NULL;
+ 	return 3;
+@@ -1,6 +1,6 @@
+ /*
+  * (C) 2000 Francesco Chemolli <kinkie@kame.usr.dsi.unimi.it>,
+- *        inspired by previous work by Andy Doran
++ *        inspired by previous work by Andrew Doran <ad@interlude.eu.org>
+  *
+  * Distributed freely under the terms of the GNU General Public License,
+  * version 2. See the file COPYING for licensing details
+@@ -37,6 +37,8 @@
+ /* #define DEBUG */
+ #endif
+ 
++#define DEAD_DC_RETRY_INTERVAL 30
++
+ /************* END CONFIGURATION ***************/
+ 
+ #include <sys/types.h>
+@@ -66,10 +68,9 @@ debug(char *format,...)
+ 
+ 
+ /* A couple of harmless helper macros */
+-#define SEND(X) debug("sending '%s' to squid\n",X); printf(X); printf("\n");
++#define SEND(X) debug("sending '%s' to squid\n",X); printf(X "\n");
+ #ifdef __GNUC__
+-#define SEND2(X,Y...) debug("sending '" X "' to squid\n",Y); printf(X,Y);\
+-         printf("\n");
++#define SEND2(X,Y...) debug("sending '" X "' to squid\n",Y); printf(X "\n",Y);
+ #else
+ /* no gcc, no debugging. varargs macros are a gcc extension */
+ #define SEND2 printf
+@@ -92,15 +93,11 @@ void dc_disconnect(void);
+ int connectedp(void);
+ int is_dc_ok(char *domain, char *domain_controller);
+ 
+-/* flags used for dc status */
+-#define DC_OK 0x0
+-#define DC_DEAD 0x1
+-
+ typedef struct _dc dc;
+ struct _dc {
+     char *domain;
+     char *controller;
+-    unsigned char status;
++    time_t dead; /* 0 if it's alive, otherwise time of death */
+     dc *next;
+ };
+ 
+@@ -22,6 +22,9 @@
+ #include "smbval/smblib-common.h"
+ #include "smbval/rfcnb-error.h"
+ 
++#include <signal.h>
++#include <unistd.h>
++
+ /* these are part of rfcnb-priv.h and smblib-priv.h */
+ extern int SMB_Get_Error_Msg(int msg, char *msgbuf, int len);
+ extern int SMB_Get_Last_Error();
+@@ -52,26 +55,23 @@ extern int RFCNB_Get_Last_Error();
+ char error_messages_buffer[BUFFER_SIZE];
+ #endif
+ 
+-char load_balance = 0, failover_enabled = 0, protocol_pedantic = 0, last_ditch_enabled = 0;
++char load_balance = 0, protocol_pedantic = 0;
++#ifdef NTLM_FAIL_OPEN
++char last_ditch_enabled = 0;
++#endif
+ 
+ dc *controllers = NULL;
+ int numcontrollers = 0;
+ dc *current_dc;
+ 
+ char smb_error_buffer[1000];
+ 
+-/* housekeeping cycle and periodic operations */
+-static unsigned char need_dc_resurrection = 0;
++/* signal handler to be invoked when the authentication operation
++	 times out */
++static char got_timeout=0;
+ static void
+-resurrect_dead_dc()
+-{
+-    int j;
+-    dc *c = controllers;
+-
+-    need_dc_resurrection = 0;
+-    for (j = 0; j < numcontrollers; j++)
+-	if (c->status != DC_OK && is_dc_ok(c->domain, c->controller))
+-	    c->status = DC_OK;
++timeout_during_auth(int signum) {
++	dc_disconnect();
+ }
+ 
+ /* makes a null-terminated string upper-case. Changes CONTENTS! */
+@@ -101,6 +101,7 @@ void
+ send_bh_or_ld(char *bhmessage, ntlm_authenticate * failedauth, int authlen)
+ {
+     char *creds = NULL;
++#ifdef NTLM_FAIL_OPEN
+     if (last_ditch_enabled) {
+ 	creds = fetch_credentials(failedauth, authlen);
+ 	if (creds) {
+@@ -110,14 +111,18 @@ send_bh_or_ld(char *bhmessage, ntlm_authenticate * failedauth, int authlen)
+ 	    SEND("NA last-ditch on, but no credentials");
+ 	}
+     } else {
++#endif
+ 	SEND2("BH %s", bhmessage);
++#ifdef NTLM_FAIL_OPEN
+     }
++#endif
+ }
+ 
+ /*
+  * options:
+  * -b try load-balancing the domain-controllers
+  * -f fail-over to another DC if DC connection fails.
++ *    DEPRECATED and VERBOSELY IGNORED. This is on by default now.
+  * -l last-ditch-mode
+  * domain\controller ...
+  */
+@@ -127,7 +132,7 @@ void
+ usage()
+ {
+     fprintf(stderr,
+-	"%s usage:\n%s [-b] [-f] domain\\controller [domain\\controller ...]\n-b, if specified, enables load-balancing among controllers\n-f, if specified, enables failover among controllers\n-l, if specified, changes behavior on domain controller failyures to\tlast-ditch\n\nYou MUST specify at least one Domain Controller.\nYou can use either \\ or / as separator between the domain name \n\tand the controller name\n",
++	"%s usage:\n%s [-b] [-f] domain\\controller [domain\\controller ...]\n-b, if specified, enables load-balancing among controllers\n-f, if specified, enables failover among controllers (DEPRECATED and always active)\n-l, if specified, changes behavior on domain controller failyures to\tlast-ditch\n\nYou MUST specify at least one Domain Controller.\nYou can use either \\ or / as separator between the domain name \n\tand the controller name\n",
+ 	my_program_name, my_program_name);
+ }
+ 
+@@ -143,11 +148,14 @@ process_options(int argc, char *argv[])
+ 	    load_balance = 1;
+ 	    break;
+ 	case 'f':
+-	    failover_enabled = 1;
++	    fprintf(stderr,
++		"WARNING. The -f flag is DEPRECATED and always active.\n");
+ 	    break;
++#ifdef NTLM_FAIL_OPEN
+ 	case 'l':
+ 	    last_ditch_enabled = 1;
+ 	    break;
++#endif
+ 	default:
+ 	    fprintf(stderr, "unknown option: -%c. Exiting\n", opt);
+ 	    usage();
+@@ -189,7 +197,7 @@ process_options(int argc, char *argv[])
+ 	numcontrollers++;
+ 	new_dc->domain = d;
+ 	new_dc->controller = c;
+-	new_dc->status = DC_OK;
++	new_dc->dead = 0;
+ 	if (controllers == NULL) {	/* first controller */
+ 	    controllers = new_dc;
+ 	    last_dc = new_dc;
+@@ -214,32 +222,35 @@ obtain_challenge()
+ {
+     int j = 0;
+     const char *ch = NULL;
+-    debug("obtain_challenge: getting new challenge\n");
+     for (j = 0; j < numcontrollers; j++) {
+-	if (current_dc->status == DC_OK) {
+-	    debug("getting challenge from %s\\%s (attempt no. %d)\n",
+-		current_dc->domain, current_dc->controller, j + 1);
+-	    ch = make_challenge(current_dc->domain, current_dc->controller);
+-	    debug("make_challenge retuned %p\n", ch);
+-	    if (ch) {
+-		debug("Got it\n");
+-		return ch;	/* All went OK, returning */
++	debug("obtain_challenge: selecting %s\\%s (attempt #%d)\n",
++	    current_dc->domain, current_dc->controller, j + 1);
++	if (current_dc->dead != 0) {
++	    if (time(NULL) - current_dc->dead >= DEAD_DC_RETRY_INTERVAL) {
++		/* mark helper as retry-worthy if it's so. */
++		debug("Reviving DC\n");
++		current_dc->dead = 0;
++	    } else {		/* skip it */
++		debug("Skipping it\n");
++		continue;
+ 	    }
+-	    /* Huston, we've got a problem. Take this DC out of the loop */
+-	    debug("Marking DC as DEAD\n");
+-	    current_dc->status = DC_DEAD;
+-	    need_dc_resurrection = 1;
+-	} else {
+-	    debug("controller %s\\%s not OK, skipping\n", current_dc->domain,
+-		current_dc->controller);
+ 	}
+-	if (failover_enabled == 0)	/* No failover. Just return */
+-	    return NULL;
++	/* else branch. Here we KNOW that the DC is fine */
++	debug("attempting challenge retrieval\n");
++	ch = make_challenge(current_dc->domain, current_dc->controller);
++	debug("make_challenge retuned %p\n", ch);
++	if (ch) {
++	    debug("Got it\n");
++	    return ch;		/* All went OK, returning */
++	}
++	/* Huston, we've got a problem. Take this DC out of the loop */
++	debug("Marking DC as DEAD\n");
++	current_dc->dead = time(NULL);
+ 	/* Try with the next */
+ 	debug("moving on to next controller\n");
+ 	current_dc = current_dc->next;
+     }
+-    /* DC (all DCs if failover is enabled) failed. */
++    /* all DCs failed. */
+     return NULL;
+ }
+ 
+@@ -256,7 +267,6 @@ manage_request()
+     if (fgets(buf, BUFFER_SIZE, stdin) == NULL) {
+ 	fprintf(stderr, "fgets() failed! dying..... errno=%d (%s)\n", errno,
+ 	    strerror(errno));
+-	abort();
+ 	exit(1);		/* BIIG buffer */
+     }
+     debug("managing request\n");
+@@ -298,8 +308,18 @@ manage_request()
+ 	    /* notreached */
+ 	case NTLM_AUTHENTICATE:
+ 	    /* check against the DC */
+-	    plen = strlen(buf) * 3 / 4;		/* we only need it here. Optimization */
++	    plen = strlen(buf) * 3 / 4; /* we only need it here. Optimization */
++	    signal(SIGALRM,timeout_during_auth);
++	    alarm(30);
+ 	    cred = ntlm_check_auth((ntlm_authenticate *) decoded, plen);
++	    alarm(0);
++	    signal(SIGALRM,SIG_DFL);
++	    if (got_timeout != 0) {
++		fprintf(stderr,"ntlm-auth[%d]: Timeout during authentication.\n", getpid());
++		SEND("BH Timeout during authentication");
++		got_timeout=0;
++		return;
++	    }
+ 	    if (cred == NULL) {
+ 		int smblib_err, smb_errorclass, smb_errorcode, nb_error;
+ 		/* there was an error. We have two errno's to look at.
+@@ -310,8 +330,7 @@ manage_request()
+ 		smb_errorclass = SMBlib_Error_Class(SMB_Get_Last_SMB_Err());
+ 		smb_errorcode = SMBlib_Error_Code(SMB_Get_Last_SMB_Err());
+ 		nb_error = RFCNB_Get_Last_Error();
+-		debug
+-		    ("No creds. SMBlib error %d, SMB error class %d, SMB error code %d, NB error %d\n",
++		debug("No creds. SMBlib error %d, SMB error class %d, SMB error code %d, NB error %d\n",
+ 		    smblib_err, smb_errorclass, smb_errorcode, nb_error);
+ 		/* Should I use smblib_err? Actually it seems I can do as well
+ 		 * without it.. */
+@@ -400,8 +419,6 @@ manage_request()
+ 	    ch = obtain_challenge();
+ 	}
+ 	SEND2("TT %s", ch);
+-	if (need_dc_resurrection)	/* looks like a good moment... */
+-	    resurrect_dead_dc();
+ 	return;
+     }
+     SEND("BH Helper detected protocol error");
+@@ -20,6 +20,7 @@
+  * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+  */
+ 
++#include "std-includes.h"
+ #include <string.h>
+ #include <ctype.h>
+ #include <dirent.h>
+@@ -4,8 +4,8 @@
+  *
+  * Example ntlm authentication program for Squid, based on the
+  * original proxy_auth code from client_side.c, written by
+- * Jon Thackray <jrmt@uk.gdscorp.com>. and the inital ntlm code
+- * Andy Doran.
++ * Jon Thackray <jrmt@uk.gdscorp.com>. Initial ntlm code by
++ * Andrew Doran <ad@interlude.eu.org>.
+  *
+  * This code gets the username and returns it. No validation is done.
+  * and by the way: it is a complete patch-up. Use the "real thing" NTLMSSP
+@@ -48,7 +48,7 @@
+ #endif
+ static char *authenticate_ntlm_domain = "LIFELESSWKS";
+ 
+-/* NTLM authentication by ad@netbsd.org - 07/1999 */
++/* NTLM authentication by ad@interlude.eu.org - 07/1999 */
+ /* XXX this is not done cleanly... */
+ 
+ /* makes a null-terminated string lower-case. Changes CONTENTS! */
+@@ -1,7 +1,7 @@
+ /*
+- * $Id: ntlm.h,v 1.3 2001/03/10 00:55:39 hno Exp $
++ * $Id: ntlm.h,v 1.4 2001/08/29 14:57:38 robertc Exp $
+  *
+- * AUTHOR: Andy Doran <ad@netbsd.org>
++ * AUTHOR: Andrew Doran <ad@interlude.eu.org>
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+  * ----------------------------------------------------------
+@@ -1,10 +1,10 @@
+ /*
+- * $Id: ntlmauth.h,v 1.4 2001/03/10 00:55:36 hno Exp $
++ * $Id: ntlmauth.h,v 1.5 2001/08/29 14:57:33 robertc Exp $
+  *
+  * * * * * * * * Legal stuff * * * * * * *
+  *
+  * (C) 2000 Francesco Chemolli <kinkie@kame.usr.dsi.unimi.it>,
+- *   inspired by previous work by Andy Doran.
++ *   inspired by previous work by Andrew Doran <ad@interlude.eu.org>.
+  *  This program is free software; you can redistribute it and/or modify
+  *  it under the terms of the GNU General Public License as published by
+  *  the Free Software Foundation; either version 2 of the License, or
+@@ -1,10 +1,10 @@
+ /*
+- * $Id: ntlmauth.c,v 1.2 2001/02/07 18:56:50 hno Exp $
++ * $Id: ntlmauth.c,v 1.3 2001/08/29 14:57:34 robertc Exp $
+  *
+  * * * * * * * * Legal stuff * * * * * * *
+  *
+  * (C) 2000 Francesco Chemolli <kinkie@kame.usr.dsi.unimi.it>,
+- *   inspired by previous work by Andy Doran.
++ *   inspired by previous work by Andrew Doran <ad@interlude.eu.org>.
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+  * the Free Software Foundation; either version 2 of the License, or
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: auth_ntlm.cc,v 1.10 2001/08/03 15:13:12 adrian Exp $
++ * $Id: auth_ntlm.cc,v 1.11 2001/08/29 14:57:36 robertc Exp $
+  *
+  * DEBUG: section 29    NTLM Authenticator
+  * AUTHOR: Robert Collins
+@@ -306,7 +306,8 @@ authenticateNTLMDirection(auth_user_request_t * auth_user_request)
+ /* null auth_user is checked for by authenticateDirection */
+     switch (ntlm_request->auth_state) {
+     case AUTHENTICATE_STATE_NONE:	/* no progress at all. */
+-	debug(28, 1) ("authenticateNTLMDirection: called before NTLM Authenticate!. Report a bug to squid-dev.\n");
++        if (auth_user_request->auth_user->flags.credentials_ok != 2)
++	  debug(29, 1) ("authenticateNTLMDirection: called before NTLM Authenticate!. Report a bug to squid-dev. au %x\n", auth_user_request);
+ 	return -2;
+     case AUTHENTICATE_STATE_NEGOTIATE:		/* send to helper */
+     case AUTHENTICATE_STATE_RESPONSE:	/*send to helper */
+@@ -375,6 +376,11 @@ authNTLMRequestFree(ntlm_request_t * ntlm_request)
+ 	xfree(ntlm_request->authchallenge);
+     if (ntlm_request->ntlmauthenticate)
+ 	xfree(ntlm_request->ntlmauthenticate);
++    if (ntlm_request->authserver != NULL && ntlm_request->authserver_deferred) {
++	debug(29, 9) ("authenticateNTLMRequestFree: releasing server '%d'\n", ntlm_request->authserver);
++	helperStatefulReleaseServer(ntlm_request->authserver);
++	ntlm_request->authserver = NULL;
++    }
+     memPoolFree(ntlm_request_pool, ntlm_request);
+ }
+ 
+@@ -450,167 +456,179 @@ authenticateNTLMHandleReply(void *data, void *lastserver, char *reply)
+     ntlm_request_t *ntlm_request;
+     debug(29, 9) ("authenticateNTLMHandleReply: Helper: '%d' {%s}\n", lastserver, reply ? reply : "<NULL>");
+     valid = cbdataValid(r->data);
+-    if (valid) {
+-	if (reply) {
+-	    /* seperate out the useful data */
+-	    if (strncasecmp(reply, "TT ", 3) == 0) {
+-		reply += 3;
+-		/* we have been given a Challenge */
+-		/* we should check we weren't given an empty challenge */
+-		/* copy the challenge to the state data */
+-		helperstate = helperStatefulServerGetData(lastserver);
+-		if (helperstate == NULL)
+-		    fatal("lost NTLM helper state! quitting\n");
+-		helperstate->challenge = xstrndup(reply, NTLM_CHALLENGE_SZ + 5);
+-		helperstate->challengeuses = 0;
+-		helperstate->renewed = squid_curtime;
+-		/* and we satisfy the request that happended on the refresh boundary */
+-		/* note this code is now in two places FIXME */
+-		assert(r->auth_user_request != NULL);
+-		assert(r->auth_user_request->auth_user->auth_type == AUTH_NTLM);
+-		auth_user_request = r->auth_user_request;
+-		ntlm_request = auth_user_request->scheme_data;
+-		assert(ntlm_request != NULL);
+-		result = S_HELPER_DEFER;
+-		/* reserve the server for future authentication */
+-		ntlm_request->authserver_deferred = 1;
+-		debug(29, 9) ("authenticateNTLMHandleReply: helper '%d'\n", lastserver);
+-		assert(ntlm_request->auth_state == AUTHENTICATE_STATE_NEGOTIATE);
+-		ntlm_request->authserver = lastserver;
+-		ntlm_request->authchallenge = xstrndup(reply, NTLM_CHALLENGE_SZ + 5);
+-	    } else if (strncasecmp(reply, "AF ", 3) == 0) {
+-		/* we're finished, release the helper */
+-		reply += 3;
+-		assert(r->auth_user_request != NULL);
+-		assert(r->auth_user_request->auth_user->auth_type == AUTH_NTLM);
+-		auth_user_request = r->auth_user_request;
+-		assert(auth_user_request->scheme_data != NULL);
+-		ntlm_request = auth_user_request->scheme_data;
+-		auth_user = auth_user_request->auth_user;
+-		ntlm_user = auth_user_request->auth_user->scheme_data;
+-		assert(ntlm_user != NULL);
+-		result = S_HELPER_RELEASE;
+-		/* we only expect OK when finishing the handshake */
+-		assert(ntlm_request->auth_state == AUTHENTICATE_STATE_RESPONSE);
+-		ntlm_user->username = xstrndup(reply, MAX_LOGIN_SZ);
+-		ntlm_request->authserver = NULL;
+-		auth_user->flags.credentials_ok = 1;	/* login ok */
++    if (!valid) {
++	debug(29, 1) ("AuthenticateNTLMHandleReply: invalid callback data. Releasing helper '%d'.\n", lastserver);
++	cbdataUnlock(r->data);
++	authenticateStateFree(r);
++	debug(29, 9) ("NTLM HandleReply, telling stateful helper : %d\n", S_HELPER_RELEASE);
++	return S_HELPER_RELEASE;
++    } 
++    
++    if (!reply) {
++	fatal("authenticateNTLMHandleReply: called with no result string\n");
++    } 
++
++    /* seperate out the useful data */
++    if (strncasecmp(reply, "TT ", 3) == 0) {
++	reply += 3;
++	/* we have been given a Challenge */
++	/* we should check we weren't given an empty challenge */
++	/* copy the challenge to the state data */
++	helperstate = helperStatefulServerGetData(lastserver);
++	if (helperstate == NULL)
++	    fatal("lost NTLM helper state! quitting\n");
++	helperstate->challenge = xstrndup(reply, NTLM_CHALLENGE_SZ + 5);
++	helperstate->challengeuses = 0;
++	helperstate->renewed = squid_curtime;
++	/* and we satisfy the request that happended on the refresh boundary */
++	/* note this code is now in two places FIXME */
++	assert(r->auth_user_request != NULL);
++	assert(r->auth_user_request->auth_user->auth_type == AUTH_NTLM);
++	auth_user_request = r->auth_user_request;
++	ntlm_request = auth_user_request->scheme_data;
++	assert(ntlm_request != NULL);
++	result = S_HELPER_DEFER;
++	/* reserve the server for future authentication */
++	ntlm_request->authserver_deferred = 1;
++	debug(29, 9) ("authenticateNTLMHandleReply: helper '%d'\n", lastserver);
++	assert(ntlm_request->auth_state == AUTHENTICATE_STATE_NEGOTIATE);
++	ntlm_request->authserver = lastserver;
++	ntlm_request->authchallenge = xstrndup(reply, NTLM_CHALLENGE_SZ + 5);
++    } else if (strncasecmp(reply, "AF ", 3) == 0) {
++	/* we're finished, release the helper */
++	reply += 3;
++	assert(r->auth_user_request != NULL);
++	assert(r->auth_user_request->auth_user->auth_type == AUTH_NTLM);
++	auth_user_request = r->auth_user_request;
++	assert(auth_user_request->scheme_data != NULL);
++	ntlm_request = auth_user_request->scheme_data;
++	auth_user = auth_user_request->auth_user;
++	ntlm_user = auth_user_request->auth_user->scheme_data;
++	assert(ntlm_user != NULL);
++	result = S_HELPER_RELEASE;
++	/* we only expect OK when finishing the handshake */
++	assert(ntlm_request->auth_state == AUTHENTICATE_STATE_RESPONSE);
++	ntlm_user->username = xstrndup(reply, MAX_LOGIN_SZ);
++	ntlm_request->authserver = NULL;
++	auth_user->flags.credentials_ok = 1;	/* login ok */
+ #ifdef NTLM_FAIL_OPEN
+-	    } else if (strncasecmp(reply, "LD ", 3) == 0) {
+-		/* This is a variant of BH, which rather than deny access
+-		 * allows the user through. The helper is starved and then refreshed
+-		 * via YR, all pending authentications are likely to fail also.
+-		 * It is meant for those helpers which occasionally fail for
+-		 * no reason at all (casus belli, NTLMSSP helper on NT domain,
+-		 * failing about 1 auth out of 1k.
+-		 * The code is a merge from the BH case with snippets of the AF
+-		 * case */
+-		/* AF code: mark user as authenticated */
+-		reply += 3;
+-		assert(r->auth_user_request != NULL);
+-		assert(r->auth_user_request->auth_user->auth_type == AUTH_NTLM);
+-		auth_user_request = r->auth_user_request;
+-		assert(auth_user_request->scheme_data != NULL);
+-		ntlm_request = auth_user_request->scheme_data;
+-		auth_user = auth_user_request->auth_user;
+-		ntlm_user = auth_user_request->auth_user->scheme_data;
+-		assert(ntlm_user != NULL);
+-		result = S_HELPER_RELEASE;
+-		/* we only expect OK when finishing the handshake */
+-		assert(ntlm_request->auth_state == AUTHENTICATE_STATE_RESPONSE);
+-		ntlm_user->username = xstrndup(reply, MAX_LOGIN_SZ);
+-		helperstate = helperStatefulServerGetData(ntlm_request->authserver);
+-		ntlm_request->authserver = NULL;
+-		auth_user->flags.credentials_ok = 1;	/* login ok */
+-		/* BH code: mark helper as broken */
+-		/* Not a valid helper response to a YR request. Assert so the helper
+-		 * programmer will fix their bugs! */
+-		assert(ntlm_request->auth_state != AUTHENTICATE_STATE_NEGOTIATE);
+-		/* mark it for starving */
+-		helperstate->starve = 1;
++    } else if (strncasecmp(reply, "LD ", 3) == 0) {
++	/* This is a variant of BH, which rather than deny access
++	 * allows the user through. The helper is starved and then refreshed
++	 * via YR, all pending authentications are likely to fail also.
++	 * It is meant for those helpers which occasionally fail for
++	 * no reason at all (casus belli, NTLMSSP helper on NT domain,
++	 * failing about 1 auth out of 1k.
++	 * The code is a merge from the BH case with snippets of the AF
++	 * case */
++	/* AF code: mark user as authenticated */
++	reply += 3;
++	assert(r->auth_user_request != NULL);
++	assert(r->auth_user_request->auth_user->auth_type == AUTH_NTLM);
++	auth_user_request = r->auth_user_request;
++	assert(auth_user_request->scheme_data != NULL);
++	ntlm_request = auth_user_request->scheme_data;
++	auth_user = auth_user_request->auth_user;
++	ntlm_user = auth_user_request->auth_user->scheme_data;
++	assert(ntlm_user != NULL);
++	result = S_HELPER_RELEASE;
++	/* we only expect OK when finishing the handshake */
++	assert(ntlm_request->auth_state == AUTHENTICATE_STATE_RESPONSE);
++	ntlm_user->username = xstrndup(reply, MAX_LOGIN_SZ);
++	helperstate = helperStatefulServerGetData(ntlm_request->authserver);
++	ntlm_request->authserver = NULL;
++	auth_user->flags.credentials_ok = 1;	/* login ok */
++	/* BH code: mark helper as broken */
++	/* Not a valid helper response to a YR request. Assert so the helper
++	 * programmer will fix their bugs! */
++	assert(ntlm_request->auth_state != AUTHENTICATE_STATE_NEGOTIATE);
++	/* mark it for starving */
++	helperstate->starve = 1;
+ #endif
+-	    } else if (strncasecmp(reply, "NA ", 3) == 0) {
+-		/* TODO: only work with auth_user here if it exists */
+-		assert(r->auth_user_request != NULL);
+-		assert(r->auth_user_request->auth_user->auth_type == AUTH_NTLM);
+-		auth_user_request = r->auth_user_request;
+-		auth_user = auth_user_request->auth_user;
+-		assert(auth_user != NULL);
+-		ntlm_user = auth_user->scheme_data;
+-		ntlm_request = auth_user_request->scheme_data;
+-		assert((ntlm_user != NULL) && (ntlm_request != NULL));
+-		/* todo: action of Negotiate state on error */
+-		result = S_HELPER_RELEASE;	/*some error has occured. no more requests */
+-		ntlm_request->authserver = NULL;
+-		auth_user->flags.credentials_ok = 2;	/* Login/Usercode failed */
+-		debug(29, 4) ("authenticateNTLMHandleReply: Error validating user via NTLM. Error returned '%s'\n", reply);
+-		ntlm_request->auth_state = AUTHENTICATE_STATE_NONE;
+-		if ((t = strchr(reply, ' ')))	/* strip after a space */
+-		    *t = '\0';
+-	    } else if (strncasecmp(reply, "BH ", 3) == 0) {
+-		/* TODO kick off a refresh process. This can occur after a YR or after
+-		 * a KK. If after a YR release the helper and resubmit the request via 
+-		 * Authenticate NTLM start. 
+-		 * If after a KK deny the user's request w/ 407 and mark the helper as 
+-		 * Needing YR. */
+-		assert(r->auth_user_request != NULL);
+-		assert(r->auth_user_request->auth_user->auth_type == AUTH_NTLM);
+-		auth_user_request = r->auth_user_request;
+-		auth_user = auth_user_request->auth_user;
+-		assert(auth_user != NULL);
+-		ntlm_user = auth_user->scheme_data;
+-		ntlm_request = auth_user_request->scheme_data;
+-		assert((ntlm_user != NULL) && (ntlm_request != NULL));
+-		result = S_HELPER_RELEASE;	/*some error has occured. no more requests for 
+-						 * this helper */
+-		helperstate = helperStatefulServerGetData(ntlm_request->authserver);
+-		ntlm_request->authserver = NULL;
+-		if (ntlm_request->auth_state == AUTHENTICATE_STATE_NEGOTIATE) {
+-		    /* The helper broke on YR. It automatically
+-		     * resets */
+-		    auth_user->flags.credentials_ok = 3;	/* cannot process */
+-		    debug(29, 1) ("authenticateNTLMHandleReply: Error obtaining challenge from helper: %d. Error returned '%s'\n", lastserver, reply);
+-		    /* mark it for starving */
+-		    helperstate->starve = 1;
+-		    /* resubmit the request. This helper is currently busy, so we will get
+-		     * a different one. */
+-		    authenticateNTLMStart(auth_user_request, r->handler, r->data);
+-		} else {
+-		    /* the helper broke on a KK */
+-		    /* first the standard KK stuff */
+-		    auth_user->flags.credentials_ok = 2;	/* Login/Usercode failed */
+-		    debug(29, 4) ("authenticateNTLMHandleReply: Error validating user via NTLM. Error returned '%s'\n", reply);
+-		    ntlm_request->auth_state = AUTHENTICATE_STATE_NONE;
+-		    if ((t = strchr(reply, ' ')))	/* strip after a space */
+-			*t = '\0';
+-		    /* now we mark the helper for resetting. */
+-		    helperstate->starve = 1;
+-		}
+-		ntlm_request->auth_state = AUTHENTICATE_STATE_NONE;
+-	    } else {
+-		/* TODO: only work with auth_user here if it exists */
+-		assert(r->auth_user_request != NULL);
+-		assert(r->auth_user_request->auth_user->auth_type == AUTH_NTLM);
+-		auth_user_request = r->auth_user_request;
+-		auth_user = auth_user_request->auth_user;
+-		assert(auth_user != NULL);
+-		ntlm_user = auth_user->scheme_data;
+-		ntlm_request = auth_user_request->scheme_data;
+-		assert((ntlm_user != NULL) && (ntlm_request != NULL));
+-		debug(29, 1) ("authenticateNTLMHandleReply: Unsupported helper response, '%s'\n", reply);
+-		/* restart the authentication process */
+-		ntlm_request->auth_state = AUTHENTICATE_STATE_NONE;
+-		auth_user->flags.credentials_ok = 3;	/* cannot process */
+-		ntlm_request->authserver = NULL;
+-	    }
++    } else if (strncasecmp(reply, "NA ", 3) == 0) {
++	/* TODO: only work with auth_user here if it exists */
++	assert(r->auth_user_request != NULL);
++	assert(r->auth_user_request->auth_user->auth_type == AUTH_NTLM);
++	auth_user_request = r->auth_user_request;
++	auth_user = auth_user_request->auth_user;
++	assert(auth_user != NULL);
++	ntlm_user = auth_user->scheme_data;
++	ntlm_request = auth_user_request->scheme_data;
++	assert((ntlm_user != NULL) && (ntlm_request != NULL));
++	/* todo: action of Negotiate state on error */
++	result = S_HELPER_RELEASE;	/*some error has occured. no more requests */
++	ntlm_request->authserver = NULL;
++	auth_user->flags.credentials_ok = 2;	/* Login/Usercode failed */
++	debug(29, 4) ("authenticateNTLMHandleReply: Error validating user via NTLM. Error returned '%s'\n", reply);
++	ntlm_request->auth_state = AUTHENTICATE_STATE_NONE;
++	if ((t = strchr(reply, ' ')))	/* strip after a space */
++	    *t = '\0';
++    } else if (strncasecmp(reply, "NA", 2) == 0) {
++	/* NTLM Helper protocol violation! */
++	fatal ("NTLM Helper returned invalid response \"NA\" - a error message MUST be attached\n");
++    } else if (strncasecmp(reply, "BH ", 3) == 0) {
++	/* TODO kick off a refresh process. This can occur after a YR or after
++	 * a KK. If after a YR release the helper and resubmit the request via 
++	 * Authenticate NTLM start. 
++	 * If after a KK deny the user's request w/ 407 and mark the helper as 
++	 * Needing YR. */
++	assert(r->auth_user_request != NULL);
++	assert(r->auth_user_request->auth_user->auth_type == AUTH_NTLM);
++	auth_user_request = r->auth_user_request;
++	auth_user = auth_user_request->auth_user;
++	assert(auth_user != NULL);
++	ntlm_user = auth_user->scheme_data;
++	ntlm_request = auth_user_request->scheme_data;
++	assert((ntlm_user != NULL) && (ntlm_request != NULL));
++	result = S_HELPER_RELEASE;	/*some error has occured. no more requests for 
++					 * this helper */
++	assert (ntlm_request->authserver ? ntlm_request->authserver == lastserver : 1);
++	helperstate = helperStatefulServerGetData(ntlm_request->authserver);
++	ntlm_request->authserver = NULL;
++	if (ntlm_request->auth_state == AUTHENTICATE_STATE_NEGOTIATE) {
++	    /* The helper broke on YR. It automatically
++	     * resets */
++	    auth_user->flags.credentials_ok = 3;	/* cannot process */
++	    debug(29, 1) ("authenticateNTLMHandleReply: Error obtaining challenge from helper: %d. Error returned '%s'\n", lastserver, reply);
++	    /* mark it for starving */
++	    helperstate->starve = 1;
++	    /* resubmit the request. This helper is currently busy, so we will get
++	     * a different one. */
++	    authenticateNTLMStart(auth_user_request, r->handler, r->data);
++	    /* don't call the callback */
++	    cbdataUnlock(r->data);
++	    authenticateStateFree(r);
++	    debug(29, 9) ("NTLM HandleReply, telling stateful helper : %d\n", result);
++	    return result;
+ 	} else {
+-	    fatal("authenticateNTLMHandleReply: called with no result string\n");
++	    /* the helper broke on a KK */
++	    /* first the standard KK stuff */
++	    auth_user->flags.credentials_ok = 2;	/* Login/Usercode failed */
++	    debug(29, 4) ("authenticateNTLMHandleReply: Error validating user via NTLM. Error returned '%s'\n", reply);
++	    if ((t = strchr(reply, ' ')))	/* strip after a space */
++		*t = '\0';
++	    /* now we mark the helper for resetting. */
++	    helperstate->starve = 1;
+ 	}
+-	r->handler(r->data, NULL);
++	ntlm_request->auth_state = AUTHENTICATE_STATE_NONE;
+     } else {
+-	debug(29, 1) ("AuthenticateNTLMHandleReply: invalid callback data. Releasing helper '%d'.\n", lastserver);
+-	result = S_HELPER_RELEASE;
++	/* TODO: only work with auth_user here if it exists */
++	assert(r->auth_user_request != NULL);
++	assert(r->auth_user_request->auth_user->auth_type == AUTH_NTLM);
++	auth_user_request = r->auth_user_request;
++	auth_user = auth_user_request->auth_user;
++	assert(auth_user != NULL);
++	ntlm_user = auth_user->scheme_data;
++	ntlm_request = auth_user_request->scheme_data;
++	assert((ntlm_user != NULL) && (ntlm_request != NULL));
++	debug(29, 1) ("authenticateNTLMHandleReply: *** Unsupported helper response ***, '%s'\n", reply);
++	/* restart the authentication process */
++	ntlm_request->auth_state = AUTHENTICATE_STATE_NONE;
++	auth_user->flags.credentials_ok = 3;	/* cannot process */
++	assert (ntlm_request->authserver ? ntlm_request->authserver == lastserver : 1);
++	ntlm_request->authserver = NULL;
+     }
++    r->handler(r->data, NULL);
+     cbdataUnlock(r->data);
+     authenticateStateFree(r);
+     debug(29, 9) ("NTLM HandleReply, telling stateful helper : %d\n", result);
+@@ -726,8 +744,7 @@ authenticateNTLMStart(auth_user_request_t * auth_user_request, RH * handler, voi
+ 	    helperStatefulReleaseServer(server);
+ 	    /* Get another deferrable server */
+ 	    server = helperStatefulDefer(ntlmauthenticators);
+-	    if (server != NULL)
+-		helperstate = helperStatefulServerGetData(server);
++	    helperstate = server ? helperStatefulServerGetData(server) : NULL;
+ 	}
+ 	if (server == NULL)
+ 	    debug(29, 9) ("unable to get a deferred ntlm helper... all helpers are refreshing challenges. Queuing as a placeholder request.\n");
+@@ -757,8 +774,8 @@ authenticateNTLMStart(auth_user_request_t * auth_user_request, RH * handler, voi
+ 	    helperstate->challengeuses++;
+ 	    /* assign the challenge */
+ 	    ntlm_request->authchallenge = xstrndup(helperstate->challenge, NTLM_CHALLENGE_SZ + 5);
+-	    /* we're not actually submitting a request, so we need to release the helper should
+-	     * the connection close unexpectedly
++	    /* we're not actually submitting a request, so we need to release the helper 
++	     * should the connection close unexpectedly
+ 	     */
+ 	    ntlm_request->authserver_deferred = 1;
+ 	    handler(data, NULL);
+@@ -840,10 +857,17 @@ authenticateNTLMOnCloseConnection(ConnStateData * conn)
+     if (conn->auth_user_request != NULL) {
+ 	assert(conn->auth_user_request->scheme_data != NULL);
+ 	ntlm_request = conn->auth_user_request->scheme_data;
++	assert (ntlm_request->conn == conn);
+ 	if (ntlm_request->authserver != NULL && ntlm_request->authserver_deferred)
+ 	    authenticateNTLMReleaseServer(conn->auth_user_request);
+ 	/* unlock the connection based lock */
+ 	debug(29, 9) ("authenticateNTLMOnCloseConnection: Unlocking auth_user from the connection.\n");
++	/* minor abstraction break here: FIXME */
++	/* Ensure that the auth user request will be getting closed */
++	/* IFF we start persisting the struct after the conn closes - say for logging
++	 * then this test may become invalid
++	 */
++	assert(conn->auth_user_request->references == 1);
+ 	authenticateAuthUserRequestUnlock(conn->auth_user_request);
+ 	conn->auth_user_request = NULL;
+     }
+@@ -971,6 +995,7 @@ authenticateNTLMAuthenticateUser(auth_user_request_t * auth_user_request, reques
+ 	ntlm_request->ntlmnegotiate = xstrndup(proxy_auth, NTLM_CHALLENGE_SZ + 5);
+ 	conn->auth_type = AUTH_NTLM;
+ 	conn->auth_user_request = auth_user_request;
++	ntlm_request->conn = conn;
+ 	/* and lock for the connection duration */
+ 	debug(29, 9) ("authenticateNTLMAuthenticateUser: Locking auth_user from the connection.\n");
+ 	authenticateAuthUserRequestLock(auth_user_request);
+@@ -1010,6 +1035,7 @@ authenticateNTLMAuthenticateUser(auth_user_request_t * auth_user_request, reques
+ 	} else {
+ 	    debug(29, 4) ("authenticateNTLMAuthenticateUser: ntlm proxy-auth cache hit\n");
+ 	    /* throw away the temporary entry */
++	    ntlm_request->authserver_deferred = 0;
+ 	    authenticateNTLMReleaseServer(auth_user_request);
+ 	    authenticateAuthUserMerge(auth_user, proxy_auth_hash->auth_user);
+ 	    auth_user = proxy_auth_hash->auth_user;
+@@ -1029,7 +1055,7 @@ authenticateNTLMAuthenticateUser(auth_user_request_t * auth_user_request, reques
+ 	return;
+ 	break;
+     case AUTHENTICATE_STATE_RESPONSE:
+-	/* auth-challenge pair cache miss. We've just got the response */
++	/* auth-challenge pair cache miss. We've just got the response from the helper */
+ 	/*add to cache and let them through */
+ 	ntlm_request->auth_state = AUTHENTICATE_STATE_DONE;
+ 	/* this connection is authenticated */
+@@ -34,6 +34,8 @@ struct _ntlm_request {
+     auth_state_t auth_state;
+     /* have we got the helper-server in a deferred state? */
+     int authserver_deferred;
++    /* what connection is this associated with */
++    ConnStateData * conn;
+ };
+ 
+ struct _ntlm_helper_state_t {
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: authenticate.cc,v 1.27 2001/08/09 11:00:10 adrian Exp $
++ * $Id: authenticate.cc,v 1.28 2001/08/29 14:57:34 robertc Exp $
+  *
+  * DEBUG: section 29    Authenticator
+  * AUTHOR: Duane Wessels
+@@ -111,6 +111,10 @@ authenticateOnCloseConnection(ConnStateData * conn)
+     assert(conn != NULL);
+     if (conn->auth_user_request != NULL) {
+ 	auth_user_request = conn->auth_user_request;
++	/* if the auth type gets reset, the connection shouldn't 
++	 * remain linked to it - the next type might not be conn based
++	 */
++	assert(auth_user_request->auth_user->auth_module);
+ 	if (authscheme_list[auth_user_request->auth_user->auth_module - 1].oncloseconnection) {
+ 	    authscheme_list[auth_user_request->auth_user->auth_module - 1].oncloseconnection(conn);
+ 	}
+@@ -359,7 +363,7 @@ authenticateAuthUserRequestIPCount(auth_user_request_t * auth_user_request)
+  * Proxy Auth (or Auth) header. It may be a cached Auth User or a new
+  * Unauthenticated structure. The structure is given an inital lock here.
+  */
+-auth_user_request_t *
++static auth_user_request_t *
+ authenticateGetAuthUser(const char *proxy_auth)
+ {
+     auth_user_request_t *auth_user_request = authenticateAuthUserRequestNew();
+@@ -444,7 +448,10 @@ authenticateAuthenticate(auth_user_request_t ** auth_user_request, http_hdr_type
+ 	conn->auth_type = AUTH_UNKNOWN;
+ 	debug(28, 4) ("authenticateAuthenticate: broken auth or no proxy_auth header. Requesting auth header.\n");
+ 	/* something wrong with the AUTH credentials. Force a new attempt */
+-	conn->auth_user_request = NULL;
++	if (conn->auth_user_request) {
++	    authenticateAuthUserRequestUnlock(conn->auth_user_request);
++	    conn->auth_user_request = NULL;
++	}
+ 	if (*auth_user_request) {
+ 	    /* unlock the ACL lock */
+ 	    authenticateAuthUserRequestUnlock(*auth_user_request);
+@@ -460,7 +467,7 @@ authenticateAuthenticate(auth_user_request_t ** auth_user_request, http_hdr_type
+     if (proxy_auth && conn->auth_user_request &&
+ 	authenticateUserAuthenticated(conn->auth_user_request) &&
+ 	strcmp(proxy_auth, authscheme_list[conn->auth_user_request->auth_user->auth_module - 1].authConnLastHeader(conn->auth_user_request))) {
+-	debug(28, 1) ("authenticateAuthenticate: DUPLICATE AUTH - authentication header on already authenticated connection!. Current user '%s' proxy_auth %s\n", authenticateUserRequestUsername(conn->auth_user_request), proxy_auth);
++	debug(28, 1) ("authenticateAuthenticate: DUPLICATE AUTH - authentication header on already authenticated connection!. AU %x, Current user '%s' proxy_auth %s\n", conn->auth_user_request, authenticateUserRequestUsername(conn->auth_user_request), proxy_auth);
+ 	/* remove this request struct - the link is already authed and it can't be to 
+ 	 * reauth.
+ 	 */
+@@ -494,9 +501,9 @@ authenticateAuthenticate(auth_user_request_t ** auth_user_request, http_hdr_type
+ 		    /* lock the user for the request structure link */
+ 		    authenticateAuthUserRequestLock(*auth_user_request);
+ 		    request->auth_user_request = *auth_user_request;
+-		    /* unlock the ACL reference. */
+-		    authenticateAuthUserRequestUnlock(*auth_user_request);
+ 		}
++		/* unlock the ACL reference granted by ...GetAuthUser. */
++		authenticateAuthUserRequestUnlock(*auth_user_request);
+ 		*auth_user_request = NULL;
+ 		return AUTH_ACL_CHALLENGE;
+ 	    }
+@@ -526,6 +533,7 @@ authenticateAuthenticate(auth_user_request_t ** auth_user_request, http_hdr_type
+ 	    conn, headertype);
+ 	switch (authenticateDirection(*auth_user_request)) {
+ 	case 1:
++	case -2:
+ 	    /* this ACL check is finished. Unlock. */
+ 	    authenticateAuthUserRequestUnlock(*auth_user_request);
+ 	    *auth_user_request = NULL;
+@@ -535,14 +543,9 @@ authenticateAuthenticate(auth_user_request_t ** auth_user_request, http_hdr_type
+ 	     * the *auth_user_request variables stores the auth_user_request
+ 	     * for the callback to here - Do not Unlock */
+ 	    return AUTH_ACL_HELPER;
+-	case -2:
+-	    /* this ACL check is finished. Unlock. */
+-	    authenticateAuthUserRequestUnlock(*auth_user_request);
+-	    *auth_user_request = NULL;
+-	    return AUTH_ACL_CHALLENGE;
+ 	}
+ 	/* on 0 the authentication is finished - fallthrough */
+-	/* See of user authentication failed for some reason */
++	/* See if user authentication failed for some reason */
+ 	if (!authenticateUserAuthenticated(*auth_user_request)) {
+ 	    if ((authenticateUserRequestUsername(*auth_user_request))) {
+ 		if (!request->auth_user_request) {
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: client_side.cc,v 1.544 2001/08/26 22:17:23 hno Exp $
++ * $Id: client_side.cc,v 1.545 2001/08/29 14:57:34 robertc Exp $
+  *
+  * DEBUG: section 33    Client-side Routines
+  * AUTHOR: Duane Wessels
+@@ -856,13 +856,16 @@ connStateFree(int fd, void *data)
+     clientHttpRequest *http;
+     debug(33, 3) ("connStateFree: FD %d\n", fd);
+     assert(connState != NULL);
+-    authenticateOnCloseConnection(connState);
+     clientdbEstablished(connState->peer.sin_addr, -1);	/* decrement */
+     while ((http = connState->chr) != NULL) {
+ 	assert(http->conn == connState);
+ 	assert(connState->chr != connState->chr->next);
+ 	httpRequestFree(http);
+     }
++    if (connState->auth_user_request)
++	authenticateAuthUserRequestUnlock(connState->auth_user_request);
++    connState->auth_user_request = NULL;
++    authenticateOnCloseConnection(connState);
+     if (connState->in.size == CLIENT_REQ_BUF_SZ)
+ 	memFree(connState->in.buf, MEM_CLIENT_REQ_BUF);
+     else
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: errorpage.cc,v 1.165 2001/05/21 04:50:57 hno Exp $
++ * $Id: errorpage.cc,v 1.166 2001/08/29 14:57:34 robertc Exp $
+  *
+  * DEBUG: section 4     Error Generation
+  * AUTHOR: Duane Wessels
+@@ -372,6 +372,7 @@ errorStateFree(ErrorState * err)
+     safe_free(err->ftp.reply);
+     if (err->auth_user_request)
+ 	authenticateAuthUserRequestUnlock(err->auth_user_request);
++    err->auth_user_request = NULL;
+     cbdataFree(err);
+ }
+ 
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: helper.cc,v 1.29 2001/08/03 15:13:04 adrian Exp $
++ * $Id: helper.cc,v 1.30 2001/08/29 14:57:35 robertc Exp $
+  *
+  * DEBUG: section 29    Helper process maintenance
+  * AUTHOR: Harvest Derived?
+@@ -180,6 +180,7 @@ helperStatefulOpenServers(statefulhelper * hlp)
+ 	}
+ 	hlp->n_running++;
+ 	srv = cbdataAlloc(helper_stateful_server);
++	srv->pid = x;
+ 	srv->flags.alive = 1;
+ 	srv->flags.reserved = S_HELPER_FREE;
+ 	srv->deferred_requests = 0;
+@@ -463,9 +464,10 @@ helperStatefulStats(StoreEntry * sentry, statefulhelper * hlp)
+     storeAppendPrintf(sentry, "avg service time: %d msec\n",
+ 	hlp->stats.avg_svc_time);
+     storeAppendPrintf(sentry, "\n");
+-    storeAppendPrintf(sentry, "%7s\t%7s\t%11s\t%s\t%7s\t%7s\t%7s\n",
++    storeAppendPrintf(sentry, "%7s\t%7s\t%7s\t%11s\t%s\t%7s\t%7s\t%7s\n",
+ 	"#",
+ 	"FD",
++	"PID",
+ 	"# Requests",
+ 	"# Deferred Requests",
+ 	"Flags",
+@@ -475,16 +477,18 @@ helperStatefulStats(StoreEntry * sentry, statefulhelper * hlp)
+     for (link = hlp->servers.head; link; link = link->next) {
+ 	srv = link->data;
+ 	tt = 0.001 * tvSubMsec(srv->dispatch_time, current_time);
+-	storeAppendPrintf(sentry, "%7d\t%7d\t%11d\t%11d\t%c%c%c%c%c\t%7.3f\t%7d\t%s\n",
++	storeAppendPrintf(sentry, "%7d\t%7d\t%7d\t%11d\t%11d\t%c%c%c%c%c%c\t%7.3f\t%7d\t%s\n",
+ 	    srv->index + 1,
+ 	    srv->rfd,
++	    srv->pid,
+ 	    srv->stats.uses,
+ 	    srv->deferred_requests,
+ 	    srv->flags.alive ? 'A' : ' ',
+ 	    srv->flags.busy ? 'B' : ' ',
+ 	    srv->flags.closing ? 'C' : ' ',
+ 	    srv->flags.reserved != S_HELPER_FREE ? 'R' : ' ',
+ 	    srv->flags.shutdown ? 'S' : ' ',
++	    srv->request ? (srv->request->placeholder ? 'P' : ' ') : ' ',
+ 	    tt < 0.0 ? 0.0 : tt,
+ 	    (int) srv->offset,
+ 	    srv->request ? log_quote(srv->request->buf) : "(none)");
+@@ -495,6 +499,7 @@ helperStatefulStats(StoreEntry * sentry, statefulhelper * hlp)
+     storeAppendPrintf(sentry, "   C = CLOSING\n");
+     storeAppendPrintf(sentry, "   R = RESERVED or DEFERRED\n");
+     storeAppendPrintf(sentry, "   S = SHUTDOWN\n");
++    storeAppendPrintf(sentry, "   P = PLACEHOLDER\n");
+ }
+ 
+ void
+@@ -820,7 +825,9 @@ helperStatefulHandleRead(int fd, void *data)
+ 	    intAverage(hlp->stats.avg_svc_time,
+ 	    tvSubMsec(srv->dispatch_time, current_time),
+ 	    hlp->stats.replies, REDIRECT_AV_FACTOR);
+-	if (srv->flags.shutdown) {
++	if (srv->flags.shutdown
++	    && srv->flags.reserved == S_HELPER_FREE
++	    && !srv->deferred_requests) {
+ 	    comm_close(srv->wfd);
+ 	    srv->wfd = -1;
+ 	} else {
+@@ -1032,7 +1039,9 @@ helperStatefulDispatch(helper_stateful_server * srv, helper_stateful_request * r
+ 	/* and push the queue. Note that the callback may have submitted a new 
+ 	 * request to the helper which is why we test for the request*/
+ 	if (srv->request == NULL) {
+-	    if (srv->flags.shutdown) {
++	    if (srv->flags.shutdown
++		&& srv->flags.reserved == S_HELPER_FREE
++		&& !srv->deferred_requests) {
+ 		comm_close(srv->wfd);
+ 		srv->wfd = -1;
+ 	    } else {
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: ipc.cc,v 1.22 2001/01/12 00:37:18 wessels Exp $
++ * $Id: ipc.cc,v 1.23 2001/08/29 14:57:35 robertc Exp $
+  *
+  * DEBUG: section 54    Interprocess Communication
+  * AUTHOR: Duane Wessels
+@@ -204,7 +204,7 @@ ipcCreate(int type, const char *prog, char *const args[], const char *name, int
+ 	    *wfd = pwfd;
+ 	fd_table[prfd].flags.ipc = 1;
+ 	fd_table[pwfd].flags.ipc = 1;
+-	return pwfd;
++	return pid;
+     }
+     /* child */
+     no_suid();			/* give up extra priviliges */
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: protos.h,v 1.410 2001/08/16 00:16:17 hno Exp $
++ * $Id: protos.h,v 1.411 2001/08/29 14:57:35 robertc Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -737,7 +737,6 @@ extern void authenticateInit(authConfig *);
+ extern void authenticateShutdown(void);
+ extern void authenticateFixHeader(HttpReply *, auth_user_request_t *, request_t *, int, int);
+ extern void authenticateAddTrailer(HttpReply *, auth_user_request_t *, request_t *, int);
+-extern auth_user_request_t *authenticateGetAuthUser(const char *proxy_auth);
+ extern auth_acl_t authenticateAuthenticate(auth_user_request_t **, http_hdr_type, request_t *, ConnStateData *, struct in_addr);
+ extern void authenticateAuthUserUnlock(auth_user_t * auth_user);
+ extern void authenticateAuthUserLock(auth_user_t * auth_user);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: structs.h,v 1.396 2001/08/03 15:13:04 adrian Exp $
++ * $Id: structs.h,v 1.397 2001/08/29 14:57:35 robertc Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -2031,6 +2031,7 @@ struct _helper_server {
+ 
+ struct _helper_stateful_server {
+     int index;
++    int pid;
+     int rfd;
+     int wfd;
+     char *buf;

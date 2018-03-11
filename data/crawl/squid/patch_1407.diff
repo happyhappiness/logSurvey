@@ -1,0 +1,199 @@
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: cache_cf.cc,v 1.357 2000/12/04 20:40:36 wessels Exp $
++ * $Id: cache_cf.cc,v 1.358 2000/12/05 06:24:00 wessels Exp $
+  *
+  * DEBUG: section 3     Configuration File Parsing
+  * AUTHOR: Harvest Derived
+@@ -1106,6 +1106,8 @@ parse_peer(peer ** head)
+ #endif
+ 	} else if (!strcasecmp(token, "allow-miss")) {
+ 	    p->options.allow_miss = 1;
++	} else if (!strcasecmp(token, "max-conn=")) {
++	    p->max_conn = atoi(token + 9);
+ 	} else {
+ 	    debug(3, 0) ("parse_peer: token='%s'\n", token);
+ 	    self_destruct();
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: forward.cc,v 1.75 2000/11/01 04:03:14 wessels Exp $
++ * $Id: forward.cc,v 1.76 2000/12/05 06:24:00 wessels Exp $
+  *
+  * DEBUG: section 17    Request Forwarding
+  * AUTHOR: Duane Wessels
+@@ -49,6 +49,7 @@ static void fwdStartFail(FwdState *);
+ static void fwdLogReplyStatus(int tries, http_status status);
+ static OBJH fwdStats;
+ static STABH fwdAbort;
++static peer *fwdStateServerPeer(FwdState *);
+ 
+ #define MAX_FWD_STATS_IDX 9
+ static int FwdReplyCodes[MAX_FWD_STATS_IDX + 1][HTTP_INVALID_HEADER + 1];
+@@ -58,6 +59,16 @@ static void fwdLog(FwdState * fwdState);
+ static Logfile *logfile = NULL;
+ #endif
+ 
++static peer *
++fwdStateServerPeer(FwdState * fwdState)
++{
++    if (NULL == fwdState)
++	return NULL;
++    if (NULL == fwdState->servers)
++	return NULL;
++    return fwdState->servers->peer;
++}
++
+ static void
+ fwdServerFree(FwdServer * fs)
+ {
+@@ -71,6 +82,7 @@ fwdStateFree(FwdState * fwdState)
+ {
+     StoreEntry *e = fwdState->entry;
+     int sfd;
++    peer *p;
+     debug(17, 3) ("fwdStateFree: %p\n", fwdState);
+     assert(e->mem_obj);
+ #if URL_CHECKSUM_DEBUG
+@@ -92,6 +104,7 @@ fwdStateFree(FwdState * fwdState)
+     }
+     if (storePendingNClients(e) > 0)
+ 	assert(!EBIT_TEST(e->flags, ENTRY_FWD_HDR_WAIT));
++    p = fwdStateServerPeer(fwdState);
+     fwdServersFree(&fwdState->servers);
+     requestUnlink(fwdState->request);
+     fwdState->request = NULL;
+@@ -106,6 +119,8 @@ fwdStateFree(FwdState * fwdState)
+ 	fwdState->server_fd = -1;
+ 	debug(17, 3) ("fwdStateFree: closing FD %d\n", sfd);
+ 	comm_close(sfd);
++	if (p)
++	    p->stats.conn_open--;
+     }
+     cbdataFree(fwdState);
+ }
+@@ -188,6 +203,8 @@ fwdConnectDone(int server_fd, int status, void *data)
+ 	err->dnsserver_msg = xstrdup(dns_error_message);
+ 	err->request = requestLink(request);
+ 	fwdFail(fwdState, err);
++	if (fs->peer)
++	    fs->peer->stats.conn_open--;
+ 	comm_close(server_fd);
+     } else if (status != COMM_OK) {
+ 	assert(fs);
+@@ -202,8 +219,10 @@ fwdConnectDone(int server_fd, int status, void *data)
+ 	}
+ 	err->request = requestLink(request);
+ 	fwdFail(fwdState, err);
+-	if (fs->peer)
++	if (fs->peer) {
+ 	    peerConnectFailed(fs->peer);
++	    fs->peer->stats.conn_open--;
++	}
+ 	comm_close(server_fd);
+     } else {
+ 	debug(17, 3) ("fwdConnectDone: FD %d: '%s'\n", server_fd, storeUrl(fwdState->entry));
+@@ -228,6 +247,7 @@ fwdConnectTimeout(int fd, void *data)
+     FwdState *fwdState = data;
+     StoreEntry *entry = fwdState->entry;
+     ErrorState *err;
++    peer *p = fwdStateServerPeer(fwdState);
+     debug(17, 2) ("fwdConnectTimeout: FD %d: '%s'\n", fd, storeUrl(entry));
+     assert(fd == fwdState->server_fd);
+     if (entry->mem_obj->inmem_hi == 0) {
+@@ -242,6 +262,8 @@ fwdConnectTimeout(int fd, void *data)
+ 	    if (fwdState->servers->peer)
+ 		peerConnectFailed(fwdState->servers->peer);
+     }
++    if (p)
++	p->stats.conn_open--;
+     comm_close(fd);
+ }
+ 
+@@ -302,6 +324,14 @@ fwdConnectStart(void *data)
+     }
+     fwdState->server_fd = fd;
+     fwdState->n_tries++;
++    /*
++     * stats.conn_open is used to account for the number of
++     * connections that we have open to the peer, so we can limit
++     * based on the max-conn option.  We need to increment here,
++     * even if the connection may fail.
++     */
++    if (fs->peer)
++	fs->peer->stats.conn_open++;
+     comm_add_close_handler(fd, fwdServerClosed, fwdState);
+     commSetTimeout(fd,
+ 	ctimeout,
+@@ -338,7 +368,7 @@ fwdStartFail(FwdState * fwdState)
+ static void
+ fwdDispatch(FwdState * fwdState)
+ {
+-    peer *p;
++    peer *p = NULL;
+     request_t *request = fwdState->request;
+     StoreEntry *entry = fwdState->entry;
+     ErrorState *err;
+@@ -400,6 +430,11 @@ fwdDispatch(FwdState * fwdState)
+ 	     * transient (network) error; its a bug.
+ 	     */
+ 	    fwdState->flags.dont_retry = 1;
++	    /*
++	     * this assertion exists because if we are connected to
++	     * a peer, then we need to decrement p->stats.conn_open.
++	     */
++	    assert(NULL == p);
+ 	    comm_close(fwdState->server_fd);
+ 	    break;
+ 	}
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: neighbors.cc,v 1.288 2000/11/07 22:04:38 wessels Exp $
++ * $Id: neighbors.cc,v 1.289 2000/12/05 06:24:00 wessels Exp $
+  *
+  * DEBUG: section 15    Neighbor Routines
+  * AUTHOR: Harvest Derived
+@@ -189,6 +189,9 @@ peerHTTPOkay(const peer * p, request_t * request)
+ 	return 0;
+     if (!neighborUp(p))
+ 	return 0;
++    if (p->max_conn)
++	if (p->stats.conn_open >= p->max_conn)
++	    return 0;
+     return 1;
+ }
+ 
+@@ -1242,6 +1245,7 @@ dump_peers(StoreEntry * sentry, peer * peers)
+ 	storeAppendPrintf(sentry, "Status     : %s\n",
+ 	    neighborUp(e) ? "Up" : "Down");
+ 	storeAppendPrintf(sentry, "AVG RTT    : %d msec\n", e->stats.rtt);
++	storeAppendPrintf(sentry, "OPEN CONNS : %d\n", e->stats.conn_open);
+ 	storeAppendPrintf(sentry, "LAST QUERY : %8d seconds ago\n",
+ 	    (int) (squid_curtime - e->stats.last_query));
+ 	storeAppendPrintf(sentry, "LAST REPLY : %8d seconds ago\n",
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: structs.h,v 1.361 2000/11/13 12:25:13 adrian Exp $
++ * $Id: structs.h,v 1.362 2000/12/05 06:24:00 wessels Exp $
+  *
+  *
+  * SQUID Internet Object Cache  http://squid.nlanr.net/Squid/
+@@ -1043,6 +1043,7 @@ struct _peer {
+ 	time_t last_connect_failure;
+ 	time_t last_connect_probe;
+ 	int logged_state;	/* so we can print dead/revived msgs */
++	int conn_open;		/* current opened connections */
+     } stats;
+     struct {
+ 	int version;
+@@ -1109,6 +1110,7 @@ struct _peer {
+ #endif
+     char *login;		/* Proxy authorization */
+     time_t connect_timeout;
++    int max_conn;
+ };
+ 
+ struct _net_db_name {

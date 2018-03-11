@@ -1,0 +1,2768 @@
+@@ -109,6 +109,7 @@ class Vector
+     iterator end();
+     const_iterator end () const;
+     E& operator [] (unsigned i);
++    const E& operator [] (unsigned i) const;
+ 
+     /* Do not change these, until the entry C struct is removed */
+     size_t capacity;
+@@ -346,6 +347,14 @@ Vector<E>::operator [] (unsigned i)
+     return items[i];
+ }
+ 
++template<class E>
++const E &
++Vector<E>::operator [] (unsigned i) const
++{
++    assert (size() > i);
++    return items[i];
++}
++
+ template<class C>
+ VectorIteratorBase<C>::VectorIteratorBase() : pos(0), theVector(NULL)
+ {}
+@@ -34,7 +34,7 @@ class ClientRequestContext : public RefCountable
+ #if USE_ADAPTATION
+ 
+     void adaptationAccessCheck();
+-    void adaptationAclCheckDone(Adaptation::ServicePointer service);
++    void adaptationAclCheckDone(Adaptation::ServiceGroupPointer g);
+ #endif
+ 
+     ClientHttpRequest *http;
+@@ -141,6 +141,9 @@ static const HttpHeaderFieldAttrs HeadersAttrs[] = {
+     {"Negotiate", HDR_NEGOTIATE, ftStr},
+ #if X_ACCELERATOR_VARY
+     {"X-Accelerator-Vary", HDR_X_ACCELERATOR_VARY, ftStr},
++#endif
++#if USE_ADAPTATION
++    {"X-Next-Services", HDR_X_NEXT_SERVICES, ftStr},
+ #endif
+     {"Surrogate-Capability", HDR_SURROGATE_CAPABILITY, ftStr},
+     {"Surrogate-Control", HDR_SURROGATE_CONTROL, ftPSc},
+@@ -186,6 +189,9 @@ static http_hdr_type ListHeadersArr[] = {
+     /* HDR_EXPECT, HDR_TE, HDR_TRAILER */
+ #if X_ACCELERATOR_VARY
+     HDR_X_ACCELERATOR_VARY,
++#endif
++#if USE_ADAPTATION
++    HDR_X_NEXT_SERVICES,
+ #endif
+     HDR_SURROGATE_CAPABILITY,
+     HDR_SURROGATE_CONTROL,
+@@ -221,6 +227,9 @@ static http_hdr_type ReplyHeadersArr[] = {
+     HDR_X_REQUEST_URI,
+ #if X_ACCELERATOR_VARY
+     HDR_X_ACCELERATOR_VARY,
++#endif
++#if USE_ADAPTATION
++    HDR_X_NEXT_SERVICES,
+ #endif
+     HDR_X_SQUID_ERROR,
+     HDR_SURROGATE_CONTROL
+@@ -122,6 +122,9 @@ typedef enum {
+     HDR_NEGOTIATE,
+ #if X_ACCELERATOR_VARY
+     HDR_X_ACCELERATOR_VARY,
++#endif
++#if USE_ADAPTATION
++    HDR_X_NEXT_SERVICES,
+ #endif
+     HDR_SURROGATE_CAPABILITY,
+     HDR_SURROGATE_CONTROL,
+@@ -382,17 +382,24 @@ HttpRequest::icapHistory() const
+ 
+ #if USE_ADAPTATION
+ Adaptation::History::Pointer 
+-HttpRequest::adaptHistory() const
++HttpRequest::adaptHistory(bool createIfNone) const
+ {
+-    if (!adaptHistory_) {
+-        if (Adaptation::History::Enabled) {
+-            adaptHistory_ = new Adaptation::History();
+-            debugs(93,4, HERE << "made " << adaptHistory_ << " for " << this);
+-        }
++    if (!adaptHistory_ && createIfNone) {
++        adaptHistory_ = new Adaptation::History();
++        debugs(93,4, HERE << "made " << adaptHistory_ << " for " << this);
+     }
+ 
+     return adaptHistory_;
+ }
++
++Adaptation::History::Pointer 
++HttpRequest::adaptLogHistory() const
++{
++    const bool loggingNeedsHistory = (LogfileStatus == LOG_ENABLE) &&
++        alLogformatHasAdaptToken; // TODO: make global to remove this method?
++    return HttpRequest::adaptHistory(loggingNeedsHistory);
++}
++
+ #endif
+ 
+ bool
+@@ -101,7 +101,9 @@ class HttpRequest: public HttpMsg
+ 
+ #if USE_ADAPTATION
+     /// Returns possibly nil history, creating it if adapt. logging is enabled
+-    Adaptation::History::Pointer adaptHistory() const;
++    Adaptation::History::Pointer adaptLogHistory() const;
++    /// Returns possibly nil history, creating it if requested
++    Adaptation::History::Pointer adaptHistory(bool createIfNone = false) const;
+ #endif
+ #if ICAP_CLIENT
+     /// Returns possibly nil history, creating it if icap logging is enabled
+@@ -43,7 +43,7 @@
+ 
+ #if USE_ADAPTATION
+ #include "adaptation/AccessCheck.h"
+-#include "adaptation/Service.h"
++#include "adaptation/Iterator.h"
+ #endif
+ 
+ // implemented in client_side_reply.cc until sides have a common parent
+@@ -508,24 +508,11 @@ ServerStateData::originalRequest()
+ }
+ 
+ #if USE_ADAPTATION
+-/*
+- * Initiate an ICAP transaction.  Return true on success.
+- * Caller will handle error condition by generating a Squid error message
+- * or take other action.
+- */
+-bool
+-ServerStateData::startAdaptation(Adaptation::ServicePointer service, HttpRequest *cause)
++/// Initiate an asynchronous adaptation transaction which will call us back.
++void
++ServerStateData::startAdaptation(const Adaptation::ServiceGroupPointer &group, HttpRequest *cause)
+ {
+     debugs(11, 5, "ServerStateData::startAdaptation() called");
+-    if (!service) {
+-        debugs(11, 3, "ServerStateData::startAdaptation fails: lack of service");
+-        return false;
+-    }
+-    if (service->broken()) {
+-        debugs(11, 3, "ServerStateData::startAdaptation fails: broken service");
+-        return false;
+-    }
+-
+     // check whether we should be sending a body as well
+     // start body pipe to feed ICAP transaction if needed
+     assert(!virginBodyDestination);
+@@ -541,9 +528,10 @@ ServerStateData::startAdaptation(Adaptation::ServicePointer service, HttpRequest
+             virginBodyDestination->setBodySize(size);
+     }
+ 
+-    adaptedHeadSource = initiateAdaptation(service->makeXactLauncher(
+-                                               this, vrep, cause));
+-    return adaptedHeadSource != NULL;
++    adaptedHeadSource = initiateAdaptation(
++        new Adaptation::Iterator(this, vrep, cause, group));
++    startedAdaptation = adaptedHeadSource != NULL;
++    Must(startedAdaptation);
+ }
+ 
+ // properly cleans up ICAP-related state
+@@ -758,7 +746,7 @@ ServerStateData::handleAdaptationAborted(bool bypassable)
+ }
+ 
+ void
+-ServerStateData::adaptationAclCheckDone(Adaptation::ServicePointer service)
++ServerStateData::adaptationAclCheckDone(Adaptation::ServiceGroupPointer group)
+ {
+     adaptationAccessCheckPending = false;
+ 
+@@ -773,34 +761,22 @@ ServerStateData::adaptationAclCheckDone(Adaptation::ServicePointer service)
+     }
+     // TODO: Should we check receivedBodyTooLarge on the server-side as well?
+ 
+-    startedAdaptation = startAdaptation(service, originalRequest());
+-
+-    if (!startedAdaptation && (!service || service->cfg().bypass)) {
+-        // handle ICAP start failure when no service was selected
+-        // or where the selected service was optional
++    if (!group) {
++        debugs(11,3, HERE << "no adapation needed");
+         setFinalReply(virginReply());
+         processReplyBody();
+         return;
+     }
+ 
+-    if (!startedAdaptation) {
+-        // handle start failure for an essential ICAP service
+-        ErrorState *err = errorCon(ERR_ICAP_FAILURE,
+-                                   HTTP_INTERNAL_SERVER_ERROR, originalRequest());
+-        err->xerrno = errno;
+-        errorAppendEntry(entry, err);
+-        abortTransaction("ICAP start failure");
+-        return;
+-    }
+-
++    startAdaptation(group, originalRequest());
+     processReplyBody();
+ }
+ 
+ void
+-ServerStateData::adaptationAclCheckDoneWrapper(Adaptation::ServicePointer service, void *data)
++ServerStateData::adaptationAclCheckDoneWrapper(Adaptation::ServiceGroupPointer group, void *data)
+ {
+     ServerStateData *state = (ServerStateData *)data;
+-    state->adaptationAclCheckDone(service);
++    state->adaptationAclCheckDone(group);
+ }
+ #endif
+ 
+@@ -86,8 +86,8 @@ class ServerStateData:
+     virtual  HttpRequest *originalRequest();
+ 
+ #if USE_ADAPTATION
+-    void adaptationAclCheckDone(Adaptation::ServicePointer service);
+-    static void adaptationAclCheckDoneWrapper(Adaptation::ServicePointer service, void *data);
++    void adaptationAclCheckDone(Adaptation::ServiceGroupPointer group);
++    static void adaptationAclCheckDoneWrapper(Adaptation::ServiceGroupPointer group, void *data);
+ 
+     // ICAPInitiator: start an ICAP transaction and receive adapted headers.
+     virtual void noteAdaptationAnswer(HttpMsg *message);
+@@ -141,7 +141,7 @@ class ServerStateData:
+     bool abortOnBadEntry(const char *abortReason);
+ 
+ #if USE_ADAPTATION
+-    bool startAdaptation(Adaptation::ServicePointer service, HttpRequest *cause);
++    void startAdaptation(const Adaptation::ServiceGroupPointer &group, HttpRequest *cause);
+     void adaptVirginReplyBody(const char *buf, ssize_t len);
+     void cleanAdaptation();
+     virtual bool doneWithAdaptation() const;   /**< did we end ICAP communication? */
+@@ -23,7 +23,8 @@ Adaptation::AccessCheck::Start(Method method, VectPoint vp,
+ 
+     if (Config::Enabled) {
+         // the new check will call the callback and delete self, eventually
+-        AccessCheck *check = new AccessCheck(method, vp, req, rep, cb, cbdata);
++        AccessCheck *check = new AccessCheck(
++            ServiceFilter(method, vp, req, rep), cb, cbdata);
+         check->check();
+         return true;
+     }
+@@ -32,71 +33,46 @@ Adaptation::AccessCheck::Start(Method method, VectPoint vp,
+     return false;
+ }
+ 
+-Adaptation::AccessCheck::AccessCheck(Method aMethod,
+-                                     VectPoint aPoint,
+-                                     HttpRequest *aReq,
+-                                     HttpReply *aRep,
++Adaptation::AccessCheck::AccessCheck(const ServiceFilter &aFilter,
+                                      AccessCheckCallback *aCallback,
+-                                     void *aCallbackData): AsyncJob("AccessCheck"), done(FALSE)
++                                     void *aCallbackData):
++    AsyncJob("AccessCheck"), filter(aFilter),
++    callback(aCallback),
++    callback_data(cbdataReference(aCallbackData)),
++    acl_checklist(NULL)
+ {
+-    // TODO: assign these at creation time
+-
+-    method = aMethod;
+-    point = aPoint;
+-
+-    req = HTTPMSGLOCK(aReq);
+-    rep = aRep ? HTTPMSGLOCK(aRep) : NULL;
+-
+-    callback = aCallback;
+-
+-    callback_data = cbdataReference(aCallbackData);
+-
+-    acl_checklist = NULL;
+-
+ #if ICAP_CLIENT
+-    Adaptation::Icap::History::Pointer h = req->icapHistory();
++    Adaptation::Icap::History::Pointer h = filter.request->icapHistory();
+     if (h != NULL)
+         h->start("ACL");
+ #endif
+ 
+-    debugs(93, 5, HERE << "AccessCheck constructed for " << methodStr(method) << " " << vectPointStr(point));
++    debugs(93, 5, HERE << "AccessCheck constructed for " <<
++        methodStr(filter.method) << " " << vectPointStr(filter.point));
+ }
+ 
+ Adaptation::AccessCheck::~AccessCheck()
+ {
+ #if ICAP_CLIENT
+-    Adaptation::Icap::History::Pointer h = req->icapHistory();
++    Adaptation::Icap::History::Pointer h = filter.request->icapHistory();
+     if (h != NULL)
+         h->stop("ACL");
+ #endif
+-    HTTPMSGUNLOCK(req);
+-    HTTPMSGUNLOCK(rep);
+     if (callback_data)
+         cbdataReferenceDone(callback_data);
+ }
+ 
+-/*
+- * Walk the access rules list and find all classes that have at least
+- * one service with matching method and vectoring point.
+- */
++/// Walk the access rules list to find rules with applicable service groups
+ void
+ Adaptation::AccessCheck::check()
+ {
+     debugs(93, 4, HERE << "start checking");
+ 
+     typedef AccessRules::iterator ARI;
+     for (ARI i = AllRules().begin(); i != AllRules().end(); ++i) {
+-
+-        /*
+-         * We only find the first matching service because we only need
+-         * one matching service to justify ACL-checking a class.  We might
+-         * use other services belonging to the class if the first service
+-         * turns out to be unusable for some reason.
+-         */
+         AccessRule *r = *i;
+-        ServicePointer service = findBestService(*r, false);
+-        if (service != NULL) {
+-            debugs(93, 5, HERE << "check: rule '" << r->id << "' has candidate service '" << service->cfg().key << "'");
++        if (isCandidate(*r)) {
++            debugs(93, 5, HERE << "check: rule '" << r->id << "' is a candidate");
+             candidates += r->id;
+         }
+     }
+@@ -118,18 +94,18 @@ Adaptation::AccessCheck::checkCandidates()
+         if (AccessRule *r = FindRule(topCandidate())) {
+             /* BUG 2526: what to do when r->acl is empty?? */
+             // XXX: we do not have access to conn->rfc931 here.
+-            acl_checklist = new ACLFilledChecklist(r->acl, req, dash_str);
+-            acl_checklist->reply = rep ? HTTPMSGLOCK(rep) : NULL;
++            acl_checklist = new ACLFilledChecklist(r->acl, filter.request, dash_str);
++            acl_checklist->reply = filter.reply ? HTTPMSGLOCK(filter.reply) : NULL;
+             acl_checklist->nonBlockingCheck(AccessCheckCallbackWrapper, this);
+             return;
+         }
+ 
+         candidates.shift(); // the rule apparently went away (reconfigure)
+     }
+ 
+-    // when there are no canidates, fake answer 1
+     debugs(93, 4, HERE << "NO candidates left");
+-    noteAnswer(1);
++    callBack(NULL);
++    Must(done());
+ }
+ 
+ void
+@@ -145,130 +121,75 @@ Adaptation::AccessCheck::AccessCheckCallbackWrapper(int answer, void *data)
+     ac->noteAnswer(answer==ACCESS_ALLOWED);
+ }
+ 
++/// process the results of the ACL check
+ void
+ Adaptation::AccessCheck::noteAnswer(int answer)
+ {
+-    debugs(93, 5, HERE << "AccessCheck::noteAnswer " << answer);
+-    if (candidates.size())
+-        debugs(93, 5, HERE << "was checking rule" << topCandidate());
+-
+-    if (!answer) {
+-        candidates.shift(); // the rule did not match
+-        checkCandidates();
+-        return;
++    Must(!candidates.empty()); // the candidate we were checking must be there
++    debugs(93,5, HERE << topCandidate() << " answer=" << answer);
++
++    if (answer) { // the rule matched
++        ServiceGroupPointer g = topGroup();
++        if (g != NULL) { // the corresponding group found
++            callBack(g);
++            Must(done());
++            return;
++        }
+     }
+ 
+-    /*
+-     * We use an event here to break deep function call sequences
+-     */
+-    // XXX: use AsyncCall for callback and remove
+-    CallJobHere(93, 5, this, Adaptation::AccessCheck::do_callback);
++    // no match or the group disappeared during reconfiguration
++    candidates.shift();
++    checkCandidates();
+ }
+ 
++/// call back with a possibly nil group; the job ends here because all failures
++/// at this point are fatal to the access check process
+ void
+-Adaptation::AccessCheck::do_callback()
++Adaptation::AccessCheck::callBack(const ServiceGroupPointer &g)
+ {
+-    debugs(93, 3, HERE);
+-
+-    if (candidates.size())
+-        debugs(93, 3, HERE << "was checking rule" << topCandidate());
++    debugs(93,3, HERE << g);
+ 
+     void *validated_cbdata;
+-    if (!cbdataReferenceValidDone(callback_data, &validated_cbdata)) {
+-        debugs(93,3,HERE << "do_callback: callback_data became invalid, skipping");
+-        return;
++    if (cbdataReferenceValidDone(callback_data, &validated_cbdata)) {
++        callback(g, validated_cbdata);
+     }
++    mustStop("done"); // called back or will never be able to call back
++}
+ 
+-    ServicePointer service = NULL;
++Adaptation::ServiceGroupPointer
++Adaptation::AccessCheck::topGroup() const
++{
++    ServiceGroupPointer g;
+     if (candidates.size()) {
+         if (AccessRule *r = FindRule(topCandidate())) {
+-            service = findBestService(*r, true);
+-            if (service != NULL)
+-                debugs(93,3,HERE << "do_callback: with service " << service->cfg().uri);
+-            else
+-                debugs(93,3,HERE << "do_callback: no service for rule" << r->id);
++            g = FindGroup(r->groupId);
++            debugs(93,5, HERE << "top group for " << r->id << " is " << g);
+         } else {
+-            debugs(93,3,HERE << "do_callback: no rule" << topCandidate());
++            debugs(93,5, HERE << "no rule for " << topCandidate());
+         }
+-        candidates.shift(); // done with topCandidate()
+     } else {
+-        debugs(93,3,HERE << "do_callback: no candidate rules");
++        debugs(93,5, HERE << "no candidates"); // should not happen
+     }
+ 
+-    callback(service, validated_cbdata);
+-    done = TRUE;
++    return g;
+ }
+ 
+-Adaptation::ServicePointer
+-Adaptation::AccessCheck::findBestService(AccessRule &r, bool preferUp)
++/** Returns true iff the rule's service group will be used after ACL matches.
++    Used to detect rules worth ACl-checking. */
++bool
++Adaptation::AccessCheck::isCandidate(AccessRule &r)
+ {
++    debugs(93,7,HERE << "checking candidacy of " << r.id << ", group " <<
++        r.groupId);
+ 
+-    const char *what = preferUp ? "up " : "";
+-    debugs(93,7,HERE << "looking for the first matching " <<
+-           what << "service in group " << r.groupId);
+-
+-    ServicePointer secondBest;
+-
+-    ServiceGroup *g = FindGroup(r.groupId);
++    ServiceGroupPointer g = FindGroup(r.groupId);
+ 
+     if (!g) {
+-        debugs(93,5,HERE << "lost " << r.groupId << " group in rule" << r.id);
+-        return ServicePointer();
+-    }
+-
+-    ServiceGroup::Loop loop(g->initialServices());
+-    typedef ServiceGroup::iterator SGI;
+-    for (SGI i = loop.begin; i != loop.end; ++i) {
+-
+-        ServicePointer service = FindService(*i);
+-
+-        if (!service)
+-            continue;
+-
+-        if (method != service->cfg().method)
+-            continue;
+-
+-        if (point != service->cfg().point)
+-            continue;
+-
+-        // sending a message to a broken service is likely to cause errors
+-        if (service->cfg().bypass && service->broken())
+-            continue;
+-
+-        if (service->up()) {
+-            // sending a message to a service that does not want it is useless
+-            // note that we cannot check wantsUrl for service that is not "up"
+-            // note that even essential services are skipped on unwanted URLs!
+-            if (!service->wantsUrl(req->urlpath))
+-                continue;
+-        } else {
+-            if (!secondBest)
+-                secondBest = service;
+-            if (preferUp) {
+-                // the caller asked for an "up" service and we can bypass this one
+-                if (service->cfg().bypass)
+-                    continue;
+-                debugs(93,5,HERE << "cannot skip an essential down service");
+-                what = "down-but-essential ";
+-            }
+-        }
+-
+-        debugs(93,5,HERE << "found first matching " <<
+-               what << "service for " << r.groupId << " group in rule" << r.id <<
+-               ": " << service->cfg().key);
+-
+-        return service;
+-    }
+-
+-    if (secondBest != NULL) {
+-        what = "down ";
+-        debugs(93,5,HERE << "found first matching " <<
+-               what << "service for " << r.groupId << " group in rule" << r.id <<
+-               ": " << secondBest->cfg().key);
+-        return secondBest;
++        debugs(93,7,HERE << "lost " << r.groupId << " group in rule" << r.id);
++        return false;
+     }
+ 
+-    debugs(93,5,HERE << "found no matching " <<
+-           what << "services for " << r.groupId << " group in rule" << r.id);
+-    return ServicePointer();
++    const bool wants = g->wants(filter);
++    debugs(93,7,HERE << r.groupId << (wants ? " wants" : " ignores"));
++    return wants;
+ }
+@@ -4,6 +4,7 @@
+ #include "base/AsyncJob.h"
+ #include "adaptation/Elements.h"
+ #include "adaptation/forward.h"
++#include "adaptation/ServiceFilter.h"
+ 
+ class HttpRequest;
+ class HttpReply;
+@@ -18,46 +19,40 @@ class AccessRule;
+ class AccessCheck: public virtual AsyncJob
+ {
+ public:
+-    typedef void AccessCheckCallback(ServicePointer match, void *data);
++    typedef void AccessCheckCallback(ServiceGroupPointer group, void *data);
+ 
+     // use this to start async ACL checks; returns true if started
+     static bool Start(Method method, VectPoint vp, HttpRequest *req,
+                       HttpReply *rep, AccessCheckCallback *cb, void *cbdata);
+ 
+ protected:
+     // use Start to start adaptation checks
+-    AccessCheck(Method, VectPoint, HttpRequest *, HttpReply *, AccessCheckCallback *, void *);
++    AccessCheck(const ServiceFilter &aFilter, AccessCheckCallback *, void *);
+     ~AccessCheck();
+ 
+ private:
+-    Method method;
+-    VectPoint point;
+-    HttpRequest *req;
+-    HttpReply *rep;
++    const ServiceFilter filter;
+     AccessCheckCallback *callback;
+     void *callback_data;
+     ACLFilledChecklist *acl_checklist;
+ 
+     typedef int Candidate;
+     typedef Vector<Candidate> Candidates;
+     Candidates candidates;
+-    Candidate topCandidate() { return *candidates.begin(); }
++    Candidate topCandidate() const { return *candidates.begin(); }
++    ServiceGroupPointer topGroup() const; // may return nil
+ 
+-    void do_callback();
+-    ServicePointer findBestService(AccessRule &r, bool preferUp);
+-    bool done;
++    void callBack(const ServiceGroupPointer &g);
++    bool isCandidate(AccessRule &r);
+ 
+ public:
+     void check();
+     void checkCandidates();
+     static void AccessCheckCallbackWrapper(int, void*);
+-#if 0
+-    static EVH AccessCheckCallbackEvent;
+-#endif
+     void noteAnswer(int answer);
+ 
+-//AsyncJob virtual methods
+-    virtual bool doneAll() const { return AsyncJob::doneAll() && done;}
++    // AsyncJob API
++    virtual bool doneAll() const { return false; } /// not done until mustStop
+ 
+ private:
+     CBDATA_CLASS2(AccessCheck);
+@@ -32,7 +32,7 @@ Adaptation::AccessRule::finalize()
+         debugs(93,7, HERE << "no service group: " << groupId);
+         // try to add a one-service group
+         if (FindService(groupId) != NULL) {
+-            ServiceGroup *g = new SingleService(groupId);
++            ServiceGroupPointer g = new SingleService(groupId);
+             g->finalize(); // explicit groups were finalized before rules
+             AllGroups().push_back(g);
+         }
+@@ -44,7 +44,7 @@ Adaptation::AccessRule::finalize()
+     }
+ }
+ 
+-Adaptation::ServiceGroup *
++Adaptation::ServiceGroupPointer
+ Adaptation::AccessRule::group()
+ {
+     return FindGroup(groupId);
+@@ -22,7 +22,7 @@ class AccessRule
+     void finalize();
+ 
+     // service group consisting of one or more services
+-    ServiceGroup *group();
++    ServiceGroupPointer group();
+ 
+ public:
+     typedef int Id;
+@@ -46,12 +46,16 @@
+ 
+ bool Adaptation::Config::Enabled = false;
+ char *Adaptation::Config::masterx_shared_name = NULL;
++int Adaptation::Config::service_iteration_limit = 16;
+ 
+ void
+ Adaptation::Config::parseService()
+ {
+     ServiceConfig *cfg = new ServiceConfig;
+-    cfg->parse();
++    if (!cfg->parse()) {
++        fatalf("%s:%d: malformed adaptation service configuration",
++            cfg_filename, config_lineno);
++    }
+     serviceConfigs.push_back(cfg);
+ }
+ 
+@@ -119,7 +123,6 @@ Adaptation::Config::Finalize(bool enabled)
+     Enabled = enabled;
+     debugs(93,1, "Adaptation support is " << (Enabled ? "on" : "off."));
+ 
+-    History::Configure();
+     FinalizeEach(AllServices(), "message adaptation services");
+     FinalizeEach(AllGroups(), "message adaptation service groups");
+     FinalizeEach(AllRules(), "message adaptation access rules");
+@@ -128,22 +131,34 @@ Adaptation::Config::Finalize(bool enabled)
+ void
+ Adaptation::Config::ParseServiceSet()
+ {
+-    ServiceSet *g = new ServiceSet();
++    Adaptation::Config::ParseServiceGroup(new ServiceSet);
++}
++
++void
++Adaptation::Config::ParseServiceChain()
++{
++    Adaptation::Config::ParseServiceGroup(new ServiceChain);
++}
++
++void
++Adaptation::Config::ParseServiceGroup(ServiceGroupPointer g)
++{
++    assert(g != NULL);
+     g->parse();
+     AllGroups().push_back(g);
+ }
+ 
+ void
+-Adaptation::Config::FreeServiceSet()
++Adaptation::Config::FreeServiceGroups()
+ {
+     while (!AllGroups().empty()) {
+-        delete AllGroups().back();
++        // groups are refcounted so we do not explicitly delete them
+         AllGroups().pop_back();
+     }
+ }
+ 
+ void
+-Adaptation::Config::DumpServiceSet(StoreEntry *entry, const char *name)
++Adaptation::Config::DumpServiceGroups(StoreEntry *entry, const char *name)
+ {
+     typedef Groups::iterator GI;
+     for (GI i = AllGroups().begin(); i != AllGroups().end(); ++i)
+@@ -194,7 +209,7 @@ Adaptation::Config::Config()
+ Adaptation::Config::~Config()
+ {
+     FreeAccess();
+-    FreeServiceSet();
++    FreeServiceGroups();
+ 
+     // invalidate each service so that it can be deleted when refcount=0
+     while (!AllServices().empty()) {
+@@ -3,34 +3,22 @@
+ 
+ #include "event.h"
+ #include "base/AsyncCall.h"
++#include "adaptation/forward.h"
+ #include "adaptation/Elements.h"
+ 
+ class acl_access;
+ class ConfigParser;
+ 
+-template <class C>
+-class RefCount;
+-
+ namespace Adaptation
+ {
+ 
+-class Service;
+-class ServiceConfig;
+-class Class;
+-
+-typedef RefCount<Service> ServicePointer;
+-
+-class ServiceGroup;
+-class AccessRule;
+-
+ class Config
+ {
+ public:
+     static void Finalize(bool enable);
+ 
+     static void ParseServiceSet(void);
+-    static void FreeServiceSet(void);
+-    static void DumpServiceSet(StoreEntry *, const char *);
++    static void ParseServiceChain(void);
+ 
+     static void ParseAccess(ConfigParser &parser);
+     static void FreeAccess(void);
+@@ -43,6 +31,7 @@ class Config
+ 
+     // these are global squid.conf options, documented elsewhere
+     static char *masterx_shared_name; // global TODO: do we need TheConfig?
++    static int service_iteration_limit;
+     // Options below are accessed via Icap::TheConfig or Ecap::TheConfig
+     // TODO: move ICAP-specific options to Icap::Config and add TheConfig
+     int onoff;
+@@ -60,7 +49,6 @@ class Config
+     void freeService(void);
+     void dumpService(StoreEntry *, const char *) const;
+     ServicePointer findService(const String&);
+-    Class * findClass(const String& key);
+ 
+     virtual void finalize();
+ 
+@@ -69,6 +57,10 @@ class Config
+     Config &operator =(const Config &); // unsupported
+ 
+     virtual ServicePointer createService(const ServiceConfig &cfg) = 0;
++
++    static void ParseServiceGroup(ServiceGroupPointer group);
++    static void FreeServiceGroups(void);
++    static void DumpServiceGroups(StoreEntry *, const char *);
+ };
+ 
+ } // namespace Adaptation
+@@ -6,6 +6,9 @@
+ #include "adaptation/Config.h"
+ #include "adaptation/History.h"
+ 
++/// impossible services value to identify unset theNextServices
++const static String TheNullServices(",null,");
++
+ Adaptation::History::Entry::Entry(const String &sid, const timeval &when):
+     service(sid), start(when), theRptm(-1), retried(false)
+ {
+@@ -30,6 +33,9 @@ int Adaptation::History::Entry::rptm()
+ }
+ 
+ 
++Adaptation::History::History(): theNextServices(TheNullServices) {
++}
++
+ int Adaptation::History::recordXactStart(const String &sid, const timeval &when, bool retrying)
+ {
+     if (retrying) {
+@@ -112,16 +118,21 @@ bool Adaptation::History::getXxRecord(String &name, String &value) const
+     return true;
+ }
+ 
+-
+-bool Adaptation::History::Enabled = false;
+-
+-void Adaptation::History::Configure()
++void Adaptation::History::updateNextServices(const String &services)
+ {
+-    const bool loggingNeedsUs = LogfileStatus == LOG_ENABLE &&
+-        alLogformatHasAdaptToken;
++    if (theNextServices != TheNullServices)
++       debugs(93,3, HERE << "old services: " << theNextServices);
++    debugs(93,3, HERE << "new services: " << services);
++    Must(services != TheNullServices);
++    theNextServices = services;
++}
+ 
+-    Enabled = Adaptation::Config::Enabled &&
+-        (loggingNeedsUs || Adaptation::Config::masterx_shared_name);
++bool Adaptation::History::extractNextServices(String &value)
++{
++    if (theNextServices == TheNullServices)
++       return false;
+ 
+-    // TODO: should we disable unneeded _parts_ of the history?
++    value = theNextServices;
++    theNextServices = TheNullServices; // prevents resetting the plan twice
++    return true;
+ }
+@@ -13,6 +13,8 @@ class History: public RefCountable {
+ public:
+     typedef RefCount<Adaptation::History> Pointer;
+ 
++    History();
++
+     /// record the start of a xact, return xact history ID
+     int recordXactStart(const String &serviceId, const timeval &when, bool retrying);
+ 
+@@ -31,8 +33,11 @@ class History: public RefCountable {
+     /// returns true and fills the record fields iff there is a db record
+     bool getXxRecord(String &name, String &value) const;
+ 
+-    static bool Enabled; ///< whether some configuration options require it
+-    static void Configure(); ///< determines whether the history is needed
++    /// sets or resets next services for the Adaptation::Iterator to notice
++    void updateNextServices(const String &services);
++
++    /// returns true, fills the value, and resets iff next services were set
++    bool extractNextServices(String &value);
+ 
+ private:
+     /// single Xaction stats (i.e., a historical record entry)
+@@ -60,6 +65,8 @@ class History: public RefCountable {
+     // theXx* will become a map<string,string>, but we only support one record
+     String theXxName; ///< name part of the cross-transactional database record
+     String theXxValue; ///< value part of the cross-xactional database record
++
++    String theNextServices; ///< services Adaptation::Iterator must use next
+ };
+ 
+ } // namespace Adaptation
+@@ -4,7 +4,6 @@
+ 
+ #include "squid.h"
+ #include "HttpMsg.h"
+-#include "adaptation/Service.h"
+ #include "adaptation/Initiator.h"
+ #include "adaptation/Initiate.h"
+ 
+@@ -30,11 +29,9 @@ class AnswerDialer: public UnaryMemFunT<Initiator, HttpMsg*>
+ 
+ /* Initiate */
+ 
+-Adaptation::Initiate::Initiate(const char *aTypeName,
+-                               Initiator *anInitiator, ServicePointer aService):
+-        AsyncJob(aTypeName), theInitiator(anInitiator), theService(aService)
++Adaptation::Initiate::Initiate(const char *aTypeName, Initiator *anInitiator):
++    AsyncJob(aTypeName), theInitiator(anInitiator)
+ {
+-    assert(theService != NULL);
+     assert(theInitiator);
+ }
+ 
+@@ -84,13 +81,6 @@ void Adaptation::Initiate::tellQueryAborted(bool final)
+     clearInitiator();
+ }
+ 
+-Adaptation::Service &
+-Adaptation::Initiate::service()
+-{
+-    assert(theService != NULL);
+-    return *theService;
+-}
+-
+ const char *Adaptation::Initiate::status() const
+ {
+     return AsyncJob::status(); // for now
+@@ -56,15 +56,13 @@ class Initiate: virtual public AsyncJob
+ {
+ 
+ public:
+-    Initiate(const char *aTypeName, Initiator *anInitiator, ServicePointer aService);
++    Initiate(const char *aTypeName, Initiator *anInitiator);
+     virtual ~Initiate();
+ 
+     // communication with the initiator
+     virtual void noteInitiatorAborted() = 0;
+ 
+ protected:
+-    Service &service();
+-
+     void sendAnswer(HttpMsg *msg); // send to the initiator
+     void tellQueryAborted(bool final); // tell initiator
+     void clearInitiator(); // used by noteInitiatorAborted; TODO: make private
+@@ -74,7 +72,6 @@ class Initiate: virtual public AsyncJob
+     virtual const char *status() const; // for debugging
+ 
+     InitiatorHolder theInitiator;
+-    ServicePointer theService;
+ 
+ private:
+     Initiate(const Initiate &); // no definition
+@@ -0,0 +1,211 @@
++/*
++ * DEBUG: section 93  Adaptation
++ */
++
++#include "squid.h"
++#include "TextException.h"
++#include "HttpRequest.h"
++#include "HttpReply.h"
++#include "HttpMsg.h"
++#include "adaptation/Config.h"
++#include "adaptation/Iterator.h"
++#include "adaptation/Service.h"
++#include "adaptation/ServiceFilter.h"
++#include "adaptation/ServiceGroups.h"
++
++
++Adaptation::Iterator::Iterator(Adaptation::Initiator *anInitiator,
++    HttpMsg *aMsg, HttpRequest *aCause,
++    const ServiceGroupPointer &aGroup):
++    AsyncJob("Iterator"),
++    Adaptation::Initiate("Iterator", anInitiator),
++    theGroup(aGroup),
++    theMsg(HTTPMSGLOCK(aMsg)),
++    theCause(aCause ? HTTPMSGLOCK(aCause) : NULL),
++    theLauncher(0),
++    iterations(0),
++    adapted(false)
++{
++}
++
++Adaptation::Iterator::~Iterator()
++{
++    assert(!theLauncher);
++    HTTPMSGUNLOCK(theMsg);
++    HTTPMSGUNLOCK(theCause);
++}
++
++void Adaptation::Iterator::start()
++{
++    Adaptation::Initiate::start();
++
++    thePlan = ServicePlan(theGroup, filter());
++    step();
++}
++
++void Adaptation::Iterator::step()
++{
++    ++iterations;
++    debugs(93,5, HERE << '#' << iterations << " plan: " << thePlan);
++
++    Must(!theLauncher);
++
++    if (thePlan.exhausted()) { // nothing more to do
++        sendAnswer(theMsg);
++        Must(done());
++        return;
++    }
++
++    if (iterations > Adaptation::Config::service_iteration_limit) {
++        debugs(93,DBG_CRITICAL, "Adaptation iterations limit (" <<
++            Adaptation::Config::service_iteration_limit << ") exceeded:\n" <<
++            "\tPossible service loop with " <<
++            theGroup->kind << " " << theGroup->id << ", plan=" << thePlan);
++        throw TexcHere("too many adaptations");
++    }
++
++    ServicePointer service = thePlan.current();
++    Must(service != NULL);
++    debugs(93,5, HERE << "using adaptation service: " << service->cfg().key);
++
++    theLauncher = initiateAdaptation(
++        service->makeXactLauncher(this, theMsg, theCause));
++    Must(theLauncher);
++    Must(!done());
++}
++
++void Adaptation::Iterator::noteAdaptationAnswer(HttpMsg *aMsg)
++{
++    // set theCause if we switched to request satisfaction mode
++    if (!theCause) { // probably sent a request message
++        if (dynamic_cast<HttpReply*>(aMsg)) { // we got a response message
++            if (HttpRequest *cause = dynamic_cast<HttpRequest*>(theMsg)) {
++                // definately sent request, now use it as the cause
++                theCause = cause; // moving the lock
++                theMsg = 0;
++                debugs(93,3, HERE << "in request satisfaction mode");
++            }
++        }
++    }
++
++    Must(aMsg);
++    HTTPMSGUNLOCK(theMsg);
++    theMsg = HTTPMSGLOCK(aMsg);
++    adapted = true;
++
++    clearAdaptation(theLauncher);
++    if (!updatePlan(true)) // do not immediatelly advance the new plan
++        thePlan.next(filter());
++    step();
++}
++
++void Adaptation::Iterator::noteInitiatorAborted()
++{
++    announceInitiatorAbort(theLauncher); // propogate to the transaction
++    clearInitiator();
++    mustStop("initiator gone");
++}
++
++void Adaptation::Iterator::noteAdaptationQueryAbort(bool final)
++{
++    debugs(93,5, HERE << "final: " << final << " plan: " << thePlan);
++    clearAdaptation(theLauncher);
++    updatePlan(false);
++
++    // can we replace the failed service (group-level bypass)?
++    const bool srcIntact = !theMsg->body_pipe || 
++        !theMsg->body_pipe->consumedSize();
++    // can we ignore the failure (compute while thePlan is not exhausted)?
++    Must(!thePlan.exhausted());
++    const bool canIgnore = thePlan.current()->cfg().bypass;
++    debugs(85,5, HERE << "flags: " << srcIntact << canIgnore << adapted);
++
++    if (srcIntact) {
++        if (thePlan.replacement(filter()) != NULL) {
++            debugs(93,3, HERE << "trying a replacement service");
++            step();
++            return;
++        }
++    }
++
++    if (canIgnore && srcIntact && adapted) {
++        debugs(85,3, HERE << "responding with older adapted msg");
++        sendAnswer(theMsg);
++        mustStop("sent older adapted msg");
++        return;
++    }
++
++    // caller may recover if we can ignore the error and virgin msg is intact
++    const bool useVirgin = canIgnore && !adapted && srcIntact;
++    tellQueryAborted(!useVirgin);
++    mustStop("group failure");
++}
++
++bool Adaptation::Iterator::doneAll() const
++{
++    return Adaptation::Initiate::doneAll() && thePlan.exhausted();
++}
++
++void Adaptation::Iterator::swanSong()
++{
++    if (theInitiator)
++        tellQueryAborted(true); // abnormal condition that should not happen
++
++    if (theLauncher)
++        clearAdaptation(theLauncher);
++
++    Adaptation::Initiate::swanSong();
++}
++
++bool Adaptation::Iterator::updatePlan(bool adopt)
++{
++    HttpRequest *r = theCause ? theCause : dynamic_cast<HttpRequest*>(theMsg);
++    Must(r);
++
++    Adaptation::History::Pointer ah = r->adaptHistory();
++    if (!ah)
++        return false; // the feature is not enabled or is not triggered
++
++    String services;
++    if (!ah->extractNextServices(services)) { // clears history
++        debugs(85,9, HERE << "no service-proposed plan received");
++        return false; // the service did not provide a new plan
++    }
++
++    if (!adopt) {
++        debugs(85,3, HERE << "rejecting service-proposed plan");
++        return false;
++    }
++  
++    debugs(85,3, HERE << "retiring old plan: " << thePlan);
++    theGroup = new DynamicServiceChain(services, theGroup); // refcounted
++    thePlan = ServicePlan(theGroup, filter());
++    debugs(85,3, HERE << "adopted service-proposed plan: " << thePlan);
++    return true;
++}
++
++Adaptation::ServiceFilter Adaptation::Iterator::filter() const
++{
++    // the method may differ from theGroup->method due to request satisfaction
++    Method method = methodNone;
++    // temporary variables, no locking needed
++    HttpRequest *req = NULL;
++    HttpReply *rep = NULL;
++
++    if (HttpRequest *r = dynamic_cast<HttpRequest*>(theMsg)) {
++        method = methodReqmod;
++        req = r;
++        rep = NULL;
++    } else
++    if (HttpReply *r = dynamic_cast<HttpReply*>(theMsg)) {
++        method = methodRespmod;
++        req = theCause;
++        rep = r;
++    } else {
++        Must(false); // should not happen
++    }
++
++    return ServiceFilter(method, theGroup->point, req, rep);
++}
++
++CBDATA_NAMESPACED_CLASS_INIT(Adaptation, Iterator);
+@@ -0,0 +1,65 @@
++#ifndef SQUID_ADAPTATION__ITERATOR_H
++#define SQUID_ADAPTATION__ITERATOR_H
++
++#include "adaptation/Initiator.h"
++#include "adaptation/Initiate.h"
++#include "adaptation/ServiceGroups.h"
++
++namespace Adaptation
++{
++
++/* Iterator is started by client or server Initiators. It iterates services
++   in a given group, starting transaction launcher for each service, according
++   to the service plan. Service plans support adaptation sets and chains.
++
++   Note: Initiate must be the first parent for cbdata to work. We use
++   a temporary InitiatorHolder/toCbdata hacks and do not call cbdata
++   operations on the initiator directly. 
++*/
++
++/// iterates services in ServiceGroup, starting adaptation launchers
++class Iterator: public Initiate, public Initiator
++{
++public:
++    Iterator(Adaptation::Initiator *anInitiator, 
++        HttpMsg *virginHeader, HttpRequest *virginCause,
++        const Adaptation::ServiceGroupPointer &aGroup);
++    virtual ~Iterator();
++
++    // Adaptation::Initiate: asynchronous communication with the initiator
++    void noteInitiatorAborted();
++
++    // Adaptation::Initiator: asynchronous communication with the current launcher
++    virtual void noteAdaptationAnswer(HttpMsg *message);
++    virtual void noteAdaptationQueryAbort(bool final);
++
++protected:
++    // Adaptation::Initiate API implementation
++    virtual void start();
++    virtual bool doneAll() const;
++    virtual void swanSong();
++
++    /// launches adaptation for the service selected by the plan
++    void step();
++
++    /// replace the current group and plan with service-proposed ones if needed
++    bool updatePlan(bool adopt); // returns true iff the plan was replaced
++
++    /// creates service filter for the current step
++    ServiceFilter filter() const;
++
++    ServiceGroupPointer theGroup; ///< the service group we are iterating
++    ServicePlan thePlan; ///< which services to use and in what order
++    HttpMsg *theMsg; ///< the message being adapted (virgin for each step)
++    HttpRequest *theCause; ///< the cause of the original virgin message
++    Adaptation::Initiate *theLauncher; ///< current transaction launcher
++    int iterations; ///< number of steps initiated
++    bool adapted; ///< whether the virgin message has been replaced
++
++    CBDATA_CLASS2(Iterator);
++};
++
++} // namespace Adaptation
++
++
++#endif /* SQUID_ADAPTATION__ITERATOR_H */
+@@ -29,6 +29,8 @@ libadaptation_la_SOURCES = \
+ 	Initiate.h \
+ 	Initiator.cc \
+ 	Initiator.h \
++	Iterator.cc \
++	Iterator.h \
+ 	Message.cc \
+ 	Message.h \
+ 	Service.cc \
+@@ -37,6 +39,8 @@ libadaptation_la_SOURCES = \
+ 	ServiceConfig.h \
+ 	ServiceGroups.cc \
+ 	ServiceGroups.h \
++	ServiceFilter.cc \
++	ServiceFilter.h \
+ 	History.cc \
+ 	History.h 
+ 
+@@ -3,6 +3,8 @@
+  */
+ 
+ #include "squid.h"
++#include "HttpRequest.h"
++#include "adaptation/ServiceFilter.h"
+ #include "adaptation/Service.h"
+ 
+ Adaptation::Service::Service(const ServiceConfig &aConfig): theConfig(aConfig)
+@@ -23,6 +25,32 @@ bool Adaptation::Service::broken() const
+     return probed() && !up();
+ }
+ 
++bool
++Adaptation::Service::wants(const ServiceFilter &filter) const
++{
++    if (cfg().method != filter.method)
++        return false;
++
++    if (cfg().point != filter.point)
++        return false;
++
++    // sending a message to a broken service is likely to cause errors
++    if (cfg().bypass && broken())
++        return false;
++
++    if (up()) {
++        // Sending a message to a service that does not want it is useless.
++        // note that we cannot check wantsUrl for service that is not "up"
++        // note that even essential services are skipped on unwanted URLs!
++        return wantsUrl(filter.request->urlpath);
++    }
++
++    // The service is down and is either not bypassable or not probed due
++    // to the bypass && broken() test above. Thus, we want to use it!
++    return true;
++}
++
++
+ Adaptation::Services &
+ Adaptation::AllServices()
+ {
+@@ -39,6 +39,8 @@ class Service: public RefCountable
+     typedef void Callback(void *data, Pointer &service);
+     void callWhenReady(Callback *cb, void *data);
+ 
++    bool wants(const ServiceFilter &filter) const;
++
+     // the methods below can only be called on an up() service
+     virtual bool wantsUrl(const String &urlPath) const = 0;
+ 
+@@ -7,7 +7,8 @@
+ #include "adaptation/ServiceConfig.h"
+ 
+ Adaptation::ServiceConfig::ServiceConfig():
+-        port(-1), method(methodNone), point(pointNone), bypass(false)
++    port(-1), method(methodNone), point(pointNone),
++    bypass(false), routing(false)
+ {}
+ 
+ const char *
+@@ -59,23 +60,85 @@ Adaptation::ServiceConfig::parse()
+ 
+     ConfigParser::ParseString(&key);
+     ConfigParser::ParseString(&method_point);
+-    ConfigParser::ParseBool(&bypass);
+-    ConfigParser::ParseString(&uri);
+-
+-    debugs(3, 5, HERE << cfg_filename << ':' << config_lineno << ": " <<
+-           key << " " << method_point << " " << bypass);
+-
+     method = parseMethod(method_point);
+     point = parseVectPoint(method_point);
+ 
+-    debugs(3, 5, HERE << cfg_filename << ':' << config_lineno << ": " <<
+-           "service_configConfig is " << methodStr() << "_" << vectPointStr());
++    // reset optional parameters in case we are reconfiguring
++    bypass = routing = false;
++
++    // handle optional service name=value parameters
++    const char *lastOption = NULL;
++    while (char *option = strtok(NULL, w_space)) {
++        if (strcmp(option, "0") == 0) { // backward compatibility
++            bypass = false;
++            continue;
++        }
++        if (strcmp(option, "1") == 0) { // backward compatibility
++            bypass = true;
++            continue;
++        }
++
++        const char *name = option;
++        char *value = strstr(option, "=");
++        if (!value) {
++            lastOption = option;
++            break;
++        }
++        *value = '\0'; // terminate option name
++        ++value; // skip '='
++
++        // TODO: warn if option is set twice?
++        bool grokked = false;
++        if (strcmp(name, "bypass") == 0)
++            grokked = grokBool(bypass, name, value);
++        else
++        if (strcmp(name, "routing") == 0)
++            grokked = grokBool(routing, name, value);
++        else {
++            debugs(3, 0, cfg_filename << ':' << config_lineno << ": " <<
++                "unknown adaptation service option: " << name << '=' << value);
++        }
++        if (!grokked)
++            return false;
++    }
++
++    // what is left must be the service URI
++    if (!grokUri(lastOption))
++        return false;
++
++    // there should be nothing else left
++    if (const char *tail = strtok(NULL, w_space)) {
++        debugs(3, 0, cfg_filename << ':' << config_lineno << ": " <<
++            "garbage after adaptation service URI: " << tail);
++        return false;
++    }
+ 
++    debugs(3,5, cfg_filename << ':' << config_lineno << ": " <<
++        "adaptation_service " << key << ' ' <<
++            methodStr() << "_" << vectPointStr() << ' ' <<
++            bypass << routing << ' ' <<
++            uri);
++
++    return true;
++}
++
++bool
++Adaptation::ServiceConfig::grokUri(const char *value)
++{
+     // TODO: find core code that parses URLs and extracts various parts
+ 
++    if (!value || !*value) {
++        debugs(3, 0, HERE << cfg_filename << ':' << config_lineno << ": " <<
++               "empty adaptation service URI");
++        return false;
++    }
++
++    uri = value;
++
+     // extract scheme and use it as the service_configConfig protocol
+     const char *schemeSuffix = "://";
+-    if (const String::size_type schemeEnd=uri.find(schemeSuffix))
++    const String::size_type schemeEnd = uri.find(schemeSuffix);
++    if (schemeEnd != String::npos)
+         protocol=uri.substr(0,schemeEnd);
+ 
+     debugs(3, 5, HERE << cfg_filename << ':' << config_lineno << ": " <<
+@@ -138,10 +201,22 @@ Adaptation::ServiceConfig::parse()
+     }
+ 
+     resource.limitInit(s, len + 1);
++    return true;
++}
++
+ 
+-    if ((bypass != 0) && (bypass != 1)) {
++bool
++Adaptation::ServiceConfig::grokBool(bool &var, const char *name, const char *value)
++{
++    if (!strcmp(value, "0") || !strcmp(value, "off"))
++        var = false;
++    else
++    if (!strcmp(value, "1") || !strcmp(value, "on"))
++        var = true;
++    else {
+         debugs(3, 0, HERE << cfg_filename << ':' << config_lineno << ": " <<
+-               "wrong bypass value; 0 or 1 expected: " << bypass);
++               "wrong value for boolean " << name << "; " <<
++               "'0', '1', 'on', or 'off' expected but got: " << value);
+         return false;
+     }
+ 
+@@ -32,10 +32,15 @@ class ServiceConfig
+     Method method;   // what is being adapted (REQMOD vs RESPMOD)
+     VectPoint point; // where the adaptation happens (pre- or post-cache)
+     bool bypass;
++    bool routing; ///< whether this service may determine the next service(s)
+ 
+ protected:
+     Method parseMethod(const char *buf) const;
+     VectPoint parseVectPoint(const char *buf) const;
++ 
++    /// interpret parsed values
++    bool grokBool(bool &var, const char *name, const char *value);
++    bool grokUri(const char *value);
+ };
+ 
+ } // namespace Adaptation
+@@ -0,0 +1,40 @@
++#include "squid.h"
++#include "HttpRequest.h"
++#include "HttpReply.h"
++#include "adaptation/ServiceFilter.h"
++
++
++Adaptation::ServiceFilter::ServiceFilter(Method aMethod, VectPoint aPoint,
++HttpRequest *aReq, HttpReply *aRep): method(aMethod), point(aPoint),
++    request(HTTPMSGLOCK(aReq)),
++    reply(aRep ? HTTPMSGLOCK(aRep) : NULL)
++{
++    // a lot of code assumes that there is always a virgin request or cause
++    assert(request);
++}
++
++Adaptation::ServiceFilter::ServiceFilter(const ServiceFilter &f):
++    method(f.method), point(f.point),
++    request(HTTPMSGLOCK(f.request)),
++    reply(f.reply ? HTTPMSGLOCK(f.reply) : NULL)
++{
++}
++
++Adaptation::ServiceFilter::~ServiceFilter()
++{
++    HTTPMSGUNLOCK(request);
++    HTTPMSGUNLOCK(reply);
++}
++
++Adaptation::ServiceFilter &Adaptation::ServiceFilter::operator =(const ServiceFilter &f)
++{
++    if (this != &f) {
++        method = f.method;
++        point = f.point;
++        HTTPMSGUNLOCK(request);
++        HTTPMSGUNLOCK(reply);
++        request = HTTPMSGLOCK(f.request);
++        reply = f.reply ? HTTPMSGLOCK(f.reply) : NULL;
++    }
++    return *this;
++}
+@@ -0,0 +1,31 @@
++#ifndef SQUID_ADAPTATION__SERVICE_FILTER_H
++#define SQUID_ADAPTATION__SERVICE_FILTER_H
++
++#include "adaptation/Elements.h"
++
++class HttpRequest;
++class HttpReply;
++
++namespace Adaptation
++{
++
++/// information used to search for adaptation services
++class ServiceFilter
++{
++public:
++    ServiceFilter(Method, VectPoint, HttpRequest *, HttpReply *); // locks
++    ServiceFilter(const ServiceFilter &f);
++    ~ServiceFilter(); // unlocks
++
++    ServiceFilter &operator =(const ServiceFilter &f);
++
++public:
++    Method method; ///< adaptation direction
++    VectPoint point; ///< adaptation location
++    HttpRequest *request; ///< HTTP request being adapted or cause; may be nil
++    HttpReply *reply; ///< HTTP response being adapted; may be nil
++};
++
++} // namespace Adaptation
++
++#endif /* SQUID_ADAPTATION__SERVICE_FILTER_H */
+@@ -5,10 +5,14 @@
+ #include "adaptation/Config.h"
+ #include "adaptation/AccessRule.h"
+ #include "adaptation/Service.h"
++#include "adaptation/ServiceFilter.h"
+ #include "adaptation/ServiceGroups.h"
+ 
++#define ServiceGroup ServiceGroup
+ 
+-Adaptation::ServiceGroup::ServiceGroup(const String &aKind): kind(aKind)
++Adaptation::ServiceGroup::ServiceGroup(const String &aKind, bool allSame):
++    kind(aKind), method(methodNone), point(pointNone),
++    allServicesSame(allSame)
+ {
+ }
+ 
+@@ -28,57 +32,252 @@ Adaptation::ServiceGroup::parse()
+     wordlistDestroy(&names);
+ }
+ 
++// Note: configuration code aside, this method is called by DynamicServiceChain
+ void
+ Adaptation::ServiceGroup::finalize()
+ {
+-    for (iterator i = services.begin(); i != services.end(); ++i) {
+-        const String &id = *i;
+-        // TODO: fail on failures
+-        if (!FindService(id))
+-            debugs(93,0, "ERROR: Unknown adaptation name: " << id);
++    // 1) warn if services have different methods or vectoring point
++    // 2) warn if all-same services have different bypass status
++    // 3) warn if there are seemingly identical services in the group
++    // TODO: optimize by remembering ServicePointers rather than IDs
++
++    String baselineKey;
++    bool baselineBypass = false;
++    for (Pos pos = 0; has(pos); ++pos) {
++        // TODO: quit on all errors
++        const String &sid = services[pos];
++        ServicePointer service = at(pos);
++        if (service != NULL) {
++            if (method == methodNone) { 
++                // optimization: cache values that should be the same
++                method = service->cfg().method;
++                point = service->cfg().point;
++            } else {
++                if (method != service->cfg().method)
++                    finalizeMsg("Inconsistent service method for", sid, true);
++                if (point != service->cfg().point)
++                    finalizeMsg("Inconsistent vectoring point for", sid, true);
++            }
++
++            checkUniqueness(pos);
++
++            if (allServicesSame) { 
++                if (!baselineKey.size()) {
++                    baselineKey = service->cfg().key;
++                    baselineBypass = service->cfg().bypass;
++                } else
++                if (baselineBypass != service->cfg().bypass) {
++                    debugs(93,0, "WARNING: Inconsistent bypass in " << kind <<
++                        ' ' << id << " may produce surprising results: " <<
++                        baselineKey << " vs. " << sid);
++                }
++            }
++        } else { 
++            finalizeMsg("ERROR: Unknown adaptation name", sid, true);
++        }
+     }
+     debugs(93,7, HERE << "finalized " << kind << ": " << id);
+ }
+ 
+-/* ServiceSet */
++/// checks that the service name or URI is not repeated later in the group
++void
++Adaptation::ServiceGroup::checkUniqueness(const Pos checkedPos) const
++{
++    ServicePointer checkedService = at(checkedPos);
++    if (!checkedService) // should not happen but be robust
++        return;
++
++    for (Pos p = checkedPos + 1; has(p); ++p) {
++        ServicePointer s = at(p);
++        if (s != NULL && s->cfg().key == checkedService->cfg().key)
++            finalizeMsg("duplicate service name", s->cfg().key, false);
++        else
++        if (s != NULL && s->cfg().uri == checkedService->cfg().uri)
++            finalizeMsg("duplicate service URI", s->cfg().uri, false);
++    }
++}
+ 
+-Adaptation::ServiceSet::ServiceSet(): ServiceGroup("adaptation set")
++/// emits a formatted warning or error message at the appropriate dbg level
++void
++Adaptation::ServiceGroup::finalizeMsg(const char *msg, const String &culprit,
++    bool error) const
+ {
++    const int level = error ? DBG_CRITICAL : DBG_IMPORTANT;
++    const char *pfx = error ? "ERROR: " : "WARNING: ";
++    debugs(93,level, pfx << msg << ' ' << culprit << " in " << kind << " '" <<
++        id << "'");
++}
++
++Adaptation::ServicePointer Adaptation::ServiceGroup::at(const Pos pos) const {
++    return FindService(services[pos]);
+ }
+ 
+-Adaptation::ServiceGroup::Loop Adaptation::ServiceSet::initialServices()
++/// \todo: optimize to cut search short instead of looking for the best svc
++bool
++Adaptation::ServiceGroup::wants(const ServiceFilter &filter) const
+ {
+-    return Loop(services.begin(), services.end());
++    Pos pos = 0;
++    return findService(filter, pos);
+ }
+ 
+-#if FUTURE_OPTIMIZATION
+-void
+-Adaptation::ServiceSet::finalize()
++bool
++Adaptation::ServiceGroup::findService(const ServiceFilter &filter, Pos &pos) const
+ {
+-    ServiceGroup::finalize();
++    if (method != filter.method || point != filter.point) {
++        debugs(93,5,HERE << id << " serves another location");
++        return false; // assume other services have the same wrong location
++    }
++
++    // find the next interested service, skipping problematic ones if possible
++    bool foundEssential = false;
++    Pos essPos = 0;
++    for (; has(pos); ++pos) {
++        debugs(93,9,HERE << id << " checks service at " << pos);
++        ServicePointer service = at(pos);
++
++        if (!service)
++            continue; // the service was lost due to reconfiguration
+ 
+-    for (wordlist *iter = service_names; iter; iter = iter->next) {
+-        ServicePointer match = Config::FindService(iter->id);
+-        if (match != NULL)
+-            services += match;
++        if (!service->wants(filter))
++            continue; // the service is not interested
++
++        if (service->up() || !service->probed()) {
++            debugs(93,9,HERE << id << " has matching service at " << pos);
++            return true;
++        }
++
++        if (service->cfg().bypass) { // we can safely ignore bypassable downers
++            debugs(93,9,HERE << id << " has bypassable service at " << pos);
++            continue;
++        }
++
++        if (!allServicesSame) { // cannot skip (i.e., find best) service
++            debugs(93,9,HERE << id << " has essential service at " << pos);
++            return true;
++        }
++
++        if (!foundEssential) {
++            debugs(93,9,HERE << id << " searches for best essential service from " << pos);
++            foundEssential = true;
++            essPos = pos;
++        }
+     }
++
++    if (foundEssential) {
++        debugs(93,9,HERE << id << " has best essential service at " << essPos);
++        pos = essPos;
++        return true;
++    }
++
++    debugs(93,5,HERE << id << " has no matching services");
++    return false;
++}
++
++bool
++Adaptation::ServiceGroup::findReplacement(const ServiceFilter &filter, Pos &pos) const
++{
++    return allServicesSame && findService(filter, pos);
++}
++
++bool
++Adaptation::ServiceGroup::findLink(const ServiceFilter &filter, Pos &pos) const
++{
++    return !allServicesSame && findService(filter, pos);
++}
++
++
++/* ServiceSet */
++
++Adaptation::ServiceSet::ServiceSet(): ServiceGroup("adaptation set", true)
++{
+ }
+-#endif
+ 
+ 
+ /* SingleService */
+ 
+ Adaptation::SingleService::SingleService(const String &aServiceId):
+-        ServiceGroup("single-service group")
++        ServiceGroup("single-service group", false)
+ {
+     id = aServiceId;
+     services.push_back(aServiceId);
+ }
+ 
+-Adaptation::ServiceGroup::Loop
+-Adaptation::SingleService::initialServices()
++
++/* ServiceChain */
++
++Adaptation::ServiceChain::ServiceChain(): ServiceGroup("adaptation chain", false)
++{
++}
++
++
++/* ServiceChain */
++
++Adaptation::DynamicServiceChain::DynamicServiceChain(const String &ids,
++    const ServiceGroupPointer prev)
++{
++    kind = "dynamic adaptation chain"; // TODO: optimize by using String const
++    id = ids; // use services ids as the dynamic group ID
++
++    // initialize cache to improve consistency checks in finalize()
++    if (prev != NULL) {
++        method = prev->method;
++        point = prev->point;
++    }
++
++    // populate services storage with supplied service ids
++    const char *item = NULL;
++    int ilen = 0;
++    const char *pos = NULL;
++    while (strListGetItem(&ids, ',', &item, &ilen, &pos))
++        services.push_back(item);
++
++    finalize(); // will report [dynamic] config errors
++}
++
++/* ServicePlan */
++
++Adaptation::ServicePlan::ServicePlan(): pos(0), atEof(true)
++{
++}
++
++Adaptation::ServicePlan::ServicePlan(const ServiceGroupPointer &g,
++    const ServiceFilter &filter):
++    group(g), pos(0), atEof(!g || !g->has(pos))
++{
++    // this will find the first service because starting pos is zero
++    if (!atEof && !group->findService(filter, pos))
++        atEof = true;
++}
++
++Adaptation::ServicePointer
++Adaptation::ServicePlan::current() const
+ {
+-    return Loop(services.begin(), services.end()); // there should be only one
++    // may return NULL even if not atEof
++    return atEof ? Adaptation::ServicePointer() : group->at(pos);
++}
++
++Adaptation::ServicePointer
++Adaptation::ServicePlan::replacement(const ServiceFilter &filter) {
++    if (!atEof && !group->findReplacement(filter, ++pos))
++        atEof = true;
++    return current();
++}
++
++Adaptation::ServicePointer
++Adaptation::ServicePlan::next(const ServiceFilter &filter) {
++    if (!atEof && !group->findLink(filter, ++pos))
++        atEof = true;
++    return current();
++}
++
++std::ostream &
++Adaptation::ServicePlan::print(std::ostream &os) const
++{
++    if (!group)
++        return os << "[nil]";
++
++    return os << group->id << '[' << pos << ".." << group->services.size() <<
++        (atEof ? ".]" : "]");
+ }
+ 
+ 
+@@ -91,7 +290,7 @@ Adaptation::AllGroups()
+     return TheGroups;
+ }
+ 
+-Adaptation::ServiceGroup *
++Adaptation::ServiceGroupPointer
+ Adaptation::FindGroup(const ServiceGroup::Id &id)
+ {
+     typedef Groups::iterator GI;
+@@ -3,68 +3,142 @@
+ 
+ #include "SquidString.h"
+ #include "Array.h"
++#include "RefCount.h"
++#include "adaptation/Elements.h"
+ #include "adaptation/forward.h"
+ 
+ namespace Adaptation
+ {
+ 
+ // Interface for grouping adaptation services together.
+ // Specific groups differ in how the first and the next services are selected
+-class ServiceGroup
++class ServiceGroup: public RefCountable
+ {
+ public:
++    typedef RefCount<ServiceGroup> Pointer;
++
+     typedef Vector<String> Store;
+-    typedef Store::iterator iterator;
+     typedef String Id;
+-
+-    // Information sufficient to iterate services stored in the group,
+-    // grouped together to simplify initial/sequentialServices interfaces.
+-    // The iterators point back to
+-    struct Loop {
+-        Loop(const iterator &b, const iterator &e): begin(b), end(e) {}
+-        iterator begin;
+-        iterator end;
+-    };
++    typedef unsigned int Pos; // Vector<>::poistion_type
++    friend class ServicePlan;
+ 
+ public:
+-    ServiceGroup(const String &aKind);
++    ServiceGroup(const String &aKind, bool areAllServicesSame);
+     virtual ~ServiceGroup();
+ 
+     virtual void parse();
+     virtual void finalize(); // called after all are parsed
+ 
+-    virtual Loop initialServices() = 0;
+-    // TODO: virtual Loop sequentialServices() = 0;
++    bool wants(const ServiceFilter &filter) const;
++
++protected:
++    ///< whether this group has a service at the specified pos
++    bool has(const Pos pos) const {
++        // does not check that the service at pos still exists
++        return pos < services.size(); // unsigned pos is never negative
++    }
++
++    /// these methods control group iteration; used by ServicePlan
++
++    /// find next to try after failure, starting with pos
++    bool findReplacement(const ServiceFilter &filter, Pos &pos) const;
++    /// find next to link after success, starting with pos
++    bool findLink(const ServiceFilter &filter, Pos &pos) const;
++
++private:
++    ServicePointer at(const Pos pos) const;
++    bool findService(const ServiceFilter &filter, Pos &pos) const;
++
++    void checkUniqueness(const Pos checkedPos) const;
++    void finalizeMsg(const char *msg, const String &culprit, bool error) const;
+ 
+ public:
+     String kind;
+     Id id;
+     Store services;
++
++    Method method; /// based on the first added service
++    VectPoint point; /// based on the first added service
++
++    const bool allServicesSame; // whether we can freely substitute services
+ };
+ 
+ // a group of equivalent services; one service per set is usually used
+ class ServiceSet: public ServiceGroup
+ {
+ public:
+     ServiceSet();
+-    virtual Loop initialServices();
++
++protected:
++    virtual bool replace(Pos &pos) const { return has(++pos); }
++    virtual bool advance(Pos &pos) const { return false; }
+ };
+ 
+ // corner case: a group consisting of one service
+ class SingleService: public ServiceGroup
+ {
+ public:
+     SingleService(const String &aServiceKey);
+-    virtual Loop initialServices();
++
++protected:
++    virtual bool replace(Pos &pos) const { return false; } 
++    virtual bool advance(Pos &pos) const { return false; }
++};
++
++/// a group of services that must be used one after another
++class ServiceChain: public ServiceGroup
++{
++public:
++    ServiceChain();
++
++protected:
++    virtual bool replace(Pos &pos) const { return false; } 
++    virtual bool advance(Pos &pos) const { return has(++pos); }
++};
++
++/// a temporary service chain built upon another service request
++class DynamicServiceChain: public ServiceChain
++{
++public:
++    DynamicServiceChain(const String &srvcs, const ServiceGroupPointer prev);
+ };
+ 
+-// TODO: a group of services that must be used one after another
+-// class ServiceChain: public ServiceGroup
+ 
++/** iterates services stored in a group; iteration is not linear because we
++    need to both replace failed services and advance to the next chain link */
++class ServicePlan {
++public:
++    typedef unsigned int Pos; // Vector<>::poistion_type
++
++public:
++    ServicePlan();
++    explicit ServicePlan(const ServiceGroupPointer &g, const ServiceFilter &filter);
++
++    ///< true iff there are no more services planned
++    bool exhausted() const { return atEof; }
++
++    /// returns nil if the plan is complete
++    ServicePointer current() const; ///< current service
++    ServicePointer replacement(const ServiceFilter &filter); ///< next to try after failure
++    ServicePointer next(const ServiceFilter &filter); ///< next in chain after success
++
++    std::ostream &print(std::ostream &os) const;
++
++private:
++    ServiceGroupPointer group; ///< the group we are iterating
++    Pos pos; ///< current service position within the group
++    bool atEof; ///< cached information for better performance
++};
++
++inline
++std::ostream &operator <<(std::ostream &os, const ServicePlan &p)
++{
++    return p.print(os);
++}
+ 
+-typedef Vector<Adaptation::ServiceGroup*> Groups;
++typedef Vector<ServiceGroupPointer> Groups;
+ extern Groups &AllGroups();
+-extern ServiceGroup *FindGroup(const ServiceGroup::Id &id);
++extern ServiceGroupPointer FindGroup(const ServiceGroup::Id &id);
+ 
+ 
+ } // namespace Adaptation
+@@ -15,7 +15,8 @@ Adaptation::Ecap::XactionRep::XactionRep(Adaptation::Initiator *anInitiator,
+         HttpMsg *virginHeader, HttpRequest *virginCause,
+         const Adaptation::ServicePointer &aService):
+         AsyncJob("Adaptation::Ecap::XactionRep"),
+-        Adaptation::Initiate("Adaptation::Ecap::XactionRep", anInitiator, aService),
++        Adaptation::Initiate("Adaptation::Ecap::XactionRep", anInitiator),
++        theService(aService),
+         theVirginRep(virginHeader), theCauseRep(NULL),
+         proxyingVb(opUndecided), proxyingAb(opUndecided),
+         adaptHistoryId(-1),
+@@ -41,6 +42,13 @@ Adaptation::Ecap::XactionRep::master(const AdapterXaction &x)
+     theMaster = x;
+ }
+ 
++Adaptation::Service &
++Adaptation::Ecap::XactionRep::service()
++{
++    Must(theService != NULL);
++    return *theService;
++}
++
+ void
+ Adaptation::Ecap::XactionRep::start()
+ {
+@@ -54,7 +62,7 @@ Adaptation::Ecap::XactionRep::start()
+     const HttpRequest *request = dynamic_cast<const HttpRequest*> (theCauseRep ?
+         theCauseRep->raw().header : theVirginRep.raw().header);
+     Must(request);
+-    Adaptation::History::Pointer ah = request->adaptHistory();
++    Adaptation::History::Pointer ah = request->adaptLogHistory();
+     if (ah != NULL) { 
+         // retrying=false because ecap never retries transactions
+         adaptHistoryId = ah->recordXactStart(service().cfg().key, current_time, false);
+@@ -90,7 +98,7 @@ Adaptation::Ecap::XactionRep::swanSong()
+     const HttpRequest *request = dynamic_cast<const HttpRequest*>(theCauseRep ?
+         theCauseRep->raw().header : theVirginRep.raw().header);
+     Must(request);
+-    Adaptation::History::Pointer ah = request->adaptHistory();
++    Adaptation::History::Pointer ah = request->adaptLogHistory();
+     if (ah != NULL && adaptHistoryId >= 0)
+         ah->recordXactFinish(adaptHistoryId);
+ 
+@@ -8,9 +8,9 @@
+ 
+ #include "BodyPipe.h"
+ #include "adaptation/Initiate.h"
+-#include "adaptation/Service.h"
+ #include "adaptation/Message.h"
+ #include "adaptation/ecap/MessageRep.h"
++#include "adaptation/ecap/ServiceRep.h"
+ #include <libecap/common/forward.h>
+ #include <libecap/common/memory.h>
+ #include <libecap/host/xaction.h>
+@@ -72,6 +72,8 @@ class XactionRep : public Adaptation::Initiate, public libecap::host::Xaction,
+     virtual const char *status() const;
+ 
+ protected:
++    Service &service();
++
+     Adaptation::Message &answer();
+ 
+     void dropVirgin(const char *reason);
+@@ -82,6 +84,7 @@ class XactionRep : public Adaptation::Initiate, public libecap::host::Xaction,
+ 
+ private:
+     AdapterXaction theMaster; // the actual adaptation xaction we represent
++    Adaptation::ServicePointer theService; ///< xaction's adaptation service
+ 
+     MessageRep theVirginRep;
+     MessageRep *theCauseRep;
+@@ -22,9 +22,12 @@ class Initiator;
+ class AccessCheck;
+ class AccessRule;
+ class ServiceGroup;
++class ServicePlan;
++class ServiceFilter;
+ class Message;
+ 
+ typedef RefCount<Service> ServicePointer;
++typedef RefCount<ServiceGroup> ServiceGroupPointer;
+ 
+ } // namespace Adaptation
+ 
+@@ -17,8 +17,8 @@
+ Adaptation::Icap::Launcher::Launcher(const char *aTypeName,
+                                      Adaptation::Initiator *anInitiator, Adaptation::ServicePointer &aService):
+         AsyncJob(aTypeName),
+-        Adaptation::Initiate(aTypeName, anInitiator, aService),
+-        theXaction(0), theLaunches(0)
++        Adaptation::Initiate(aTypeName, anInitiator),
++        theService(aService), theXaction(0), theLaunches(0)
+ {
+ }
+ 
+@@ -91,8 +91,8 @@ void Adaptation::Icap::Launcher::noteXactAbort(XactAbortInfo &info)
+     } else {
+         debugs(93,3, HERE << "cannot retry or repeat a failed transaction");
+         clearAdaptation(theXaction);
+-
+-        Must(done()); // swanSong will notify the initiator
++        tellQueryAborted(false); // caller decides based on bypass, consumption
++        Must(done());
+     }   
+ }
+ 
+@@ -104,7 +104,7 @@ bool Adaptation::Icap::Launcher::doneAll() const
+ void Adaptation::Icap::Launcher::swanSong()
+ {
+     if (theInitiator)
+-        tellQueryAborted(!service().cfg().bypass);
++        tellQueryAborted(true); // always final here because abnormal
+ 
+     if (theXaction)
+         clearAdaptation(theXaction);
+@@ -98,6 +98,7 @@ class Launcher: public Adaptation::Initiate, public Adaptation::Initiator
+ 
+     void launchXaction(const char *xkind);
+ 
++    Adaptation::ServicePointer theService; ///< ICAP service for all launches
+     Adaptation::Initiate *theXaction; ///< current ICAP transaction
+     int theLaunches; // the number of transaction launches
+ };
+@@ -47,6 +47,7 @@ Adaptation::Icap::ModXact::ModXact(Adaptation::Initiator *anInitiator, HttpMsg *
+         virginConsumed(0),
+         bodyParser(NULL),
+         canStartBypass(false), // too early
++        protectGroupBypass(true),
+         replyBodySize(0),
+         adaptHistoryId(-1)
+ {
+@@ -75,7 +76,7 @@ void Adaptation::Icap::ModXact::start()
+     Adaptation::Icap::Xaction::start();
+ 
+     // reserve an adaptation history slot (attempts are known at this time)
+-    Adaptation::History::Pointer ah = virginRequest().adaptHistory();
++    Adaptation::History::Pointer ah = virginRequest().adaptLogHistory();
+     if (ah != NULL)
+         adaptHistoryId = ah->recordXactStart(service().cfg().key, icap_tr_start, attempts > 1);
+ 
+@@ -356,7 +357,7 @@ const char *Adaptation::Icap::ModXact::virginContentData(const Adaptation::Icap:
+ void Adaptation::Icap::ModXact::virginConsume()
+ {
+     debugs(93, 9, HERE << "consumption guards: " << !virgin.body_pipe << isRetriable <<
+-           isRepeatable << canStartBypass);
++           isRepeatable << canStartBypass << protectGroupBypass);
+ 
+     if (!virgin.body_pipe)
+         return; // nothing to consume
+@@ -365,7 +366,7 @@ void Adaptation::Icap::ModXact::virginConsume()
+         return; // do not consume if we may have to retry later
+ 
+     BodyPipe &bp = *virgin.body_pipe;
+-    const bool wantToPostpone = isRepeatable || canStartBypass;
++    const bool wantToPostpone = isRepeatable || canStartBypass || protectGroupBypass;
+ 
+     // Why > 2? HttpState does not use the last bytes in the buffer
+     // because delayAwareRead() is arguably broken. See
+@@ -403,7 +404,7 @@ void Adaptation::Icap::ModXact::virginConsume()
+         virginConsumed += size;
+         Must(!isRetriable); // or we should not be consuming
+         disableRepeats("consumed content");
+-        disableBypass("consumed content");
++        disableBypass("consumed content", true);
+     }
+ }
+ 
+@@ -521,9 +522,9 @@ void Adaptation::Icap::ModXact::echoMore()
+         debugs(93,5, HERE << "echoed " << size << " out of " << sizeMax <<
+                " bytes");
+         virginBodySending.progress(size);
+-        virginConsume();
+         disableRepeats("echoed content");
+-        disableBypass("echoed content");
++        disableBypass("echoed content", true);
++        virginConsume();
+     }
+ 
+     if (virginBodyEndReached(virginBodySending)) {
+@@ -610,7 +611,7 @@ void Adaptation::Icap::ModXact::callException(const std::exception &e)
+ 
+ void Adaptation::Icap::ModXact::bypassFailure()
+ {
+-    disableBypass("already started to bypass");
++    disableBypass("already started to bypass", false);
+ 
+     Must(!isRetriable); // or we should not be bypassing
+     // TODO: should the same be enforced for isRepeatable? Check icap_repeat??
+@@ -632,12 +633,16 @@ void Adaptation::Icap::ModXact::bypassFailure()
+     }
+ }
+ 
+-void Adaptation::Icap::ModXact::disableBypass(const char *reason)
++void Adaptation::Icap::ModXact::disableBypass(const char *reason, bool includingGroupBypass)
+ {
+     if (canStartBypass) {
+         debugs(93,7, HERE << "will never start bypass because " << reason);
+         canStartBypass = false;
+     }
++    if (protectGroupBypass && includingGroupBypass) {
++        debugs(93,7, HERE << "not protecting group bypass because " << reason);
++        protectGroupBypass = false;
++    }
+ }
+ 
+ 
+@@ -685,7 +690,7 @@ void Adaptation::Icap::ModXact::parseHeaders()
+ void Adaptation::Icap::ModXact::startSending()
+ {
+     disableRepeats("sent headers");
+-    disableBypass("sent headers");
++    disableBypass("sent headers", true);
+     sendAnswer(adapted.header);
+ 
+     if (state.sending == State::sendingVirgin)
+@@ -737,14 +742,24 @@ void Adaptation::Icap::ModXact::parseIcapHead()
+ 
+     // update the cross-transactional database if needed (all status codes!)
+     if (const char *xxName = Adaptation::Config::masterx_shared_name) {
+-        Adaptation::History::Pointer ah = request->adaptHistory();
++        Adaptation::History::Pointer ah = request->adaptHistory(true);
+         if (ah != NULL) {
+             const String val = icapReply->header.getByName(xxName);
+             if (val.size() > 0) // XXX: HttpHeader lacks empty value detection
+                 ah->updateXxRecord(xxName, val);
+         }
+     }
+ 
++    // update the adaptation plan if needed (all status codes!)
++    if (service().cfg().routing) {
++        String services;
++        if (icapReply->header.getList(HDR_X_NEXT_SERVICES, &services)) {
++            Adaptation::History::Pointer ah = request->adaptHistory(true);
++            if (ah != NULL)
++                ah->updateNextServices(services);
++        }
++    } // TODO: else warn (occasionally!) if we got HDR_X_NEXT_SERVICES
++
+     // We need to store received ICAP headers for <icapLastHeader logformat option.
+     // If we already have stored headers from previous ICAP transaction related to this
+     // request, old headers will be replaced with the new one.
+@@ -818,13 +833,14 @@ void Adaptation::Icap::ModXact::handle204NoContent()
+ void Adaptation::Icap::ModXact::prepEchoing()
+ {
+     disableRepeats("preparing to echo content");
+-    disableBypass("preparing to echo content");
++    disableBypass("preparing to echo content", true);
+     setOutcome(xoEcho);
+ 
+     // We want to clone the HTTP message, but we do not want
+     // to copy some non-HTTP state parts that HttpMsg kids carry in them.
+     // Thus, we cannot use a smart pointer, copy constructor, or equivalent.
+     // Instead, we simply write the HTTP message and "clone" it by parsing.
++    // TODO: use HttpMsg::clone()!
+ 
+     HttpMsg *oldHead = virgin.header;
+     debugs(93, 7, HERE << "cloning virgin message " << oldHead);
+@@ -838,8 +854,10 @@ void Adaptation::Icap::ModXact::prepEchoing()
+     // allocate the adapted message and copy metainfo
+     Must(!adapted.header);
+     HttpMsg *newHead = NULL;
+-    if (dynamic_cast<const HttpRequest*>(oldHead)) {
++    if (const HttpRequest *oldR = dynamic_cast<const HttpRequest*>(oldHead)) {
+         HttpRequest *newR = new HttpRequest;
++        newR->canonical = oldR->canonical ?
++            xstrdup(oldR->canonical) : NULL; // parse() does not set it
+         newHead = newR;
+     } else if (dynamic_cast<const HttpReply*>(oldHead)) {
+         HttpReply *newRep = new HttpReply;
+@@ -936,6 +954,9 @@ bool Adaptation::Icap::ModXact::parseHead(HttpMsg *head)
+         return false;
+     }
+ 
++    if (HttpRequest *r = dynamic_cast<HttpRequest*>(head))
++        urlCanonical(r); // parse does not set HttpRequest::canonical
++
+     debugs(93, 5, HERE << "parse success, consume " << head->hdr_sz << " bytes, return true");
+     readBuf.consume(head->hdr_sz);
+     return true;
+@@ -976,7 +997,7 @@ void Adaptation::Icap::ModXact::parseBody()
+     // TODO: do we really need this if we disable when sending headers?
+     if (adapted.body_pipe->buf().contentSize() > 0) { // parsed something sometime
+         disableRepeats("sent adapted content");
+-        disableBypass("sent adapted content");
++        disableBypass("sent adapted content", true);
+     }
+ 
+     if (parsed) {
+@@ -1076,7 +1097,7 @@ void Adaptation::Icap::ModXact::swanSong()
+     stopSending(false);
+ 
+     // update adaptation history if start was called and we reserved a slot
+-    Adaptation::History::Pointer ah = virginRequest().adaptHistory();
++    Adaptation::History::Pointer ah = virginRequest().adaptLogHistory();
+     if (ah != NULL && adaptHistoryId >= 0)
+         ah->recordXactFinish(adaptHistoryId);
+ 
+@@ -1173,7 +1194,7 @@ void Adaptation::Icap::ModXact::makeRequestHeaders(MemBuf &buf)
+ 
+     // share the cross-transactional database records if needed
+     if (Adaptation::Config::masterx_shared_name) {
+-        Adaptation::History::Pointer ah = request->adaptHistory();
++        Adaptation::History::Pointer ah = request->adaptHistory(true);
+         if (ah != NULL) {
+             String name, value;
+             if (ah->getXxRecord(name, value)) {
+@@ -1245,12 +1266,12 @@ void Adaptation::Icap::ModXact::makeRequestHeaders(MemBuf &buf)
+ 
+     buf.append(ICAP::crlf, 2); // terminate ICAP header
+ 
++    // fill icapRequest for logging
++    Must(icapRequest->parseCharBuf(buf.content(), buf.contentSize()));
++
+     // start ICAP request body with encapsulated HTTP headers
+     buf.append(httpBuf.content(), httpBuf.contentSize());
+ 
+-    // TODO: write IcapRequest class?
+-    icapRequest->parseHeader(buf.content(),buf.contentSize());
+-
+     httpBuf.clean();
+ }
+ 
+@@ -1276,7 +1297,8 @@ void Adaptation::Icap::ModXact::encapsulateHead(MemBuf &icapBuf, const char *sec
+ 
+     if (const HttpRequest* old_request = dynamic_cast<const HttpRequest*>(head)) {
+         HttpRequest* new_request = new HttpRequest;
+-        urlParse(old_request->method, old_request->canonical,new_request);
++        assert(old_request->canonical);
++        urlParse(old_request->method, old_request->canonical, new_request);
+         new_request->http_ver = old_request->http_ver;
+         headClone = new_request;
+     } else if (const HttpReply *old_reply = dynamic_cast<const HttpReply*>(head)) {
+@@ -1441,6 +1463,9 @@ void Adaptation::Icap::ModXact::fillPendingStatus(MemBuf &buf) const
+ 
+     if (canStartBypass)
+         buf.append("Y", 1);
++
++    if (protectGroupBypass)
++        buf.append("G", 1);
+ }
+ 
+ void Adaptation::Icap::ModXact::fillDoneStatus(MemBuf &buf) const
+@@ -229,7 +229,7 @@ class ModXact: public Xaction, public BodyProducer, public BodyConsumer
+     void bypassFailure();
+ 
+     void startSending();
+-    void disableBypass(const char *reason);
++    void disableBypass(const char *reason, bool includeGroupBypass);
+ 
+     void prepEchoing();
+     void echoMore();
+@@ -264,6 +264,7 @@ class ModXact: public Xaction, public BodyProducer, public BodyConsumer
+     ChunkedCodingParser *bodyParser; // ICAP response body parser
+ 
+     bool canStartBypass; // enables bypass of transaction failures
++    bool protectGroupBypass; // protects ServiceGroup-wide bypass of failures
+ 
+     uint64_t replyBodySize; ///< dechunked ICAP reply body size
+ 
+@@ -25,11 +25,12 @@ static PconnPool *icapPconnPool = new PconnPool("ICAP Servers");
+ 
+ Adaptation::Icap::Xaction::Xaction(const char *aTypeName, Adaptation::Initiator *anInitiator, Adaptation::Icap::ServiceRep::Pointer &aService):
+         AsyncJob(aTypeName),
+-        Adaptation::Initiate(aTypeName, anInitiator, aService.getRaw()),
++        Adaptation::Initiate(aTypeName, anInitiator),
+         icapRequest(NULL),
+         icapReply(NULL),
+         attempts(0),
+         connection(-1),
++        theService(aService),
+         commBuf(NULL), commBufSize(0),
+         commEof(false),
+         reuseConnection(true),
+@@ -55,9 +56,8 @@ Adaptation::Icap::Xaction::~Xaction()
+ Adaptation::Icap::ServiceRep &
+ Adaptation::Icap::Xaction::service()
+ {
+-    Adaptation::Icap::ServiceRep *s = dynamic_cast<Adaptation::Icap::ServiceRep*>(&Initiate::service());
+-    Must(s);
+-    return *s;
++    Must(theService != NULL);
++    return *theService;
+ }
+ 
+ void Adaptation::Icap::Xaction::disableRetries()
+@@ -140,6 +140,7 @@ class Xaction: public Adaptation::Initiate
+ 
+ protected:
+     int connection;     // FD of the ICAP server connection
++    Adaptation::Icap::ServiceRep::Pointer theService;
+ 
+     /*
+      * We have two read buffers.   We would prefer to read directly
+@@ -0,0 +1,85 @@
++/**
++\defgroup Adaptation
++\ingroup Components
++ 
++
++\section Term Terminology
++
++- <b>Adaptation</b>: Message (header and/or body) inspection, recording, or
++  modification outside of Squid core functionality. These notes cover two
++  adaptation APIs: ICAP (RFC 3507) and eCAP (www.e-cap.org).
++
++- <b>Master transaction</b>: HTTP request and response sequence with the
++  addition of adaptation transactions such as ICAP and eCAP exchanges.
++
++- <b>Service</b>: Specific adaptation identified by a URI. For example, an
++  ICAP server may provide request filtering and virus monitoring services.
++
++- <b>Optional service</b>: An optional service or its adaptation results may
++  be completely ignored or bypassed if it helps keeping master transaction
++  alive.
++
++- <b>Optional transaction</b>: Adaptation transactions with optional services
++  may be called optional.
++
++- <b>Essential service</b>: A service that is not optional. If an essential
++  service fails (and there are no replacements), the master transaction must
++  fail.
++
++- <b>Essential transaction</b>: Adaptation transactions with essential
++  services may be called optional.
++
++- <b>Virgin</b>: Being sent or related to something being sent to the
++  adaptation service. In a service chain environment, only the first link
++  receives its virgin message from the master transaction.
++
++- <b>Adapted</b>: Being received or related to something being received from
++  the adaptation service. In a service chain environment, only the last link
++  sends the adapted message to the master transaction.
++
++
++\section ServiceGroups Service sets and chains
++
++Service sets and chains are implemented as ServiceGroup class kids. They are
++very similar in most code aspects. The primary external difference is that
++ServiceSet can "replace" a service and ServiceChain can find the "next"
++service.  The internal group maintenance code is implemented in ServiceGroup
++and is parametrized by the kids (see the allServicesSame member).
++
++If an ICAP service with the routing=1 option in squid.conf returns an ICAP
++X-Next-Services response header during a successful REQMOD or RESPMOD
++transaction, Squid abandones the original adaptation plan and forms a new
++adaptation chain consisting of services identified in the X-Next-Services
++header value (using a comma-separated list of adaptation service names from
++squid.conf).  The dynamically created chain is destroyed once the new plan is
++completed or replaced.
++
++
++\section Layers Adaptation layers
++
++Here is a typical adaptation code sequence:
++
++- Master caller (client- or server-side): Checks ACL and starts
++  Adaptation::Iterator for the ACL-selected ServiceGroup.
++
++- Adaptation::Iterator: Creates ServicePlan and executes it, launching one
++  service adaptation per step. Abandons the original plan and builds a dynamic
++  chain if requested by an eligible service. Aborts adaptations with the
++  number of steps exceeding adaptation_service_iteration_limit. This layer
++  focus is service set and chain support.
++
++- Transactions Launchers (Adaptation::Icap::Launcher and
++  Adaptation::Ecap::XactionRep). Start an ICAP or eCAP transaction(s). ICAP
++  Launcher retries or repeats ICAP transactions if needed.  ICAP retries or
++  repeats have a single-service scope and are invisible to
++  Adaptation::Iterator. See below for eCAP which lacks this layer.
++
++- Adaptation::Icap::ModXact and Adaptation::Ecap::XactionRep: Communicates
++  with ICAP or eCAP service to perform the actual adaptation. For optional
++  services, handles some failures by short-circuiting adaptation (i.e.,
++  cloning the virgin message).
++
++All of the above classes except master callers are Adaptation::Initiate kids.
++All of the above classes except transactions are Adaptation::Initiator kids.
++
++*/
+@@ -65,6 +65,7 @@
+ #include "adaptation/Config.h"
+ 
+ static void parse_adaptation_service_set_type();
++static void parse_adaptation_service_chain_type();
+ static void parse_adaptation_access_type();
+ 
+ #endif
+@@ -3552,6 +3553,12 @@ parse_adaptation_service_set_type()
+     Adaptation::Config::ParseServiceSet();
+ }
+ 
++static void
++parse_adaptation_service_chain_type()
++{
++    Adaptation::Config::ParseServiceChain();
++}
++
+ static void
+ parse_adaptation_access_type()
+ {
+@@ -25,8 +25,9 @@ http_header_access
+ http_header_replace
+ http_port_list
+ https_port_list
+-adaptation_access_type	adaptation_service_set acl icap_service icap_class
+-adaptation_service_set_type	icap_service
++adaptation_access_type	adaptation_service_set adaptation_service_chain acl icap_service icap_class
++adaptation_service_set_type	icap_service ecap_service
++adaptation_service_chain_type	icap_service ecap_service
+ icap_access_type	icap_class acl
+ icap_class_type		icap_service
+ icap_service_type
+@@ -5566,27 +5566,63 @@ IFDEF: ICAP_CLIENT
+ LOC: Adaptation::Icap::TheConfig
+ DEFAULT: none
+ DOC_START
+-	Defines a single ICAP service
++	Defines a single ICAP service using the following format:
+ 
+-	icap_service servicename vectoring_point bypass service_url
++	icap_service service_name vectoring_point [options] service_url
+ 
+-	vectoring_point = reqmod_precache|reqmod_postcache|respmod_precache|respmod_postcache
++	service_name: ID
++		an opaque identifier which must be unique in squid.conf
++
++	vectoring_point: reqmod_precache|reqmod_postcache|respmod_precache|respmod_postcache
+ 		This specifies at which point of transaction processing the
+ 		ICAP service should be activated. *_postcache vectoring points
+ 		are not yet supported.
+-	bypass = 1|0
+-		If set to 1, the ICAP service is treated as optional. If the
+-		service cannot be reached or malfunctions, Squid will try to
+-		ignore any errors and process the message as if the service
+-		was not enabled. No all ICAP errors can be bypassed.
+-		If set to 0, the ICAP service is treated as essential and all
+-		ICAP errors will result in an error page returned to the
+-		HTTP client.
+-	service_url = icap://servername:port/service
++
++	service_url: icap://servername:port/servicepath
++		ICAP server and service location.
++
++	ICAP does not allow a single service to handle both REQMOD and RESPMOD
++	transactions. Squid does not enforce that requirement. You can specify
++	services with the same service_url and different vectoring_points. You
++	can even specify multiple identical services as long as their
++	service_names differ.
++
++
++	Service options are separated by white space. ICAP services support
++	the following name=value options:
++
++	bypass=on|off|1|0
++		If set to 'on' or '1', the ICAP service is treated as
++		optional. If the service cannot be reached or malfunctions,
++		Squid will try to ignore any errors and process the message as
++		if the service was not enabled. No all ICAP errors can be
++		bypassed.  If set to 0, the ICAP service is treated as
++		essential and all ICAP errors will result in an error page
++		returned to the HTTP client.
++
++		Bypass is off by default: services are treated as essential.
++
++	routing=on|off|1|0
++		If set to 'on' or '1', the ICAP service is allowed to
++		dynamically change the current message adaptation plan by
++		returning a chain of services to be used next. The services
++		are specified using the X-Next-Services ICAP response header
++		value, formatted as a comma-separated list of service names.
++		Each named service should be configured in squid.conf and
++		should have the same method and vectoring point as the current
++		ICAP transaction.  Services violating these rules are ignored.
++		An empty X-Next-Services value results in an empty plan which
++		ends the current adaptation. 
++
++		Routing is not allowed by default: the ICAP X-Next-Services
++		response header is ignored.
++
++	Older icap_service format without optional named parameters is
++	deprecated but supported for backward compatibility.
+ 
+ Example:
+-icap_service service_1 reqmod_precache 0 icap://icap1.mydomain.net:1344/reqmod
+-icap_service service_2 respmod_precache 0 icap://icap2.mydomain.net:1344/respmod
++icap_service svcBlocker reqmod_precache bypass=0 icap://icap1.mydomain.net:1344/reqmod
++icap_service svcLogger reqmod_precache routing=on icap://icap2.mydomain.net:1344/respmod
+ DOC_END
+ 
+ NAME: icap_class
+@@ -5595,15 +5631,13 @@ IFDEF: ICAP_CLIENT
+ LOC: none
+ DEFAULT: none
+ DOC_START
+-	This depricated option was documented to define an ICAP service
++	This deprecated option was documented to define an ICAP service
+ 	chain, even though it actually defined a set of similar, redundant
+ 	services, and the chains were not supported. 
+ 
+ 	To define a set of redundant services, please use the
+-	adaptation_service_set directive.
+-
+-	If you need adaptation service chains, patches or sponsorship
+-	is welcome.
++	adaptation_service_set directive. For service chains, use
++	adaptation_service_chain.
+ DOC_END
+ 
+ NAME: icap_access
+@@ -5612,7 +5646,7 @@ IFDEF: ICAP_CLIENT
+ LOC: none
+ DEFAULT: none
+ DOC_START
+-        This option is depricated. Please use adaptation_access, which
++	This option is deprecated. Please use adaptation_access, which
+ 	has the same ICAP functionality, but comes with better
+ 	documentation, and eCAP support.
+ DOC_END
+@@ -5685,24 +5719,81 @@ LOC: none
+ DEFAULT: none
+ DOC_START
+ 
+-	Defines a named adaptation service set. The set is populated in
+-	the order of adaptation_service_set directives in this file.
+-	When adaptation ACLs are processed, the first and only the first
+-	applicable adaptation service from the set will be used. Thus,
+-	the set should group similar, redundant services, rather than a
+-	chain of complementary services.
++	Configures an ordered set of similar, redundant services. This is
++	useful when hot standby or backup adaptation servers are available.
++
++	    adaptation_service_set set_name service_name1 service_name2 ...
++
++ 	The named services are used in the set declaration order. The first
++	applicable adaptation service from the set is used first. The next
++	applicable service is tried if and only if the transaction with the
++	previous service fails and the message waiting to be adapted is still
++	intact.
+ 
+-	If you have a single adaptation service, you do not need to
+-	define a set containing it because adaptation_access accepts
+-	service names.
++	When adaptation starts, broken services are ignored as if they were
++	not a part of the set. A broken service is a down optional service.
+ 
+-	See also: adaptation_access
++	The services in a set must be attached to the same vectoring point
++	(e.g., pre-cache) and use the same adaptation method (e.g., REQMOD).
++
++	If all services in a set are optional then adaptation failures are
++	bypassable. If all services in the set are essential, then a
++	transaction failure with one service may still be retried using
++	another service from the set, but when all services fail, the master
++	transaction fails as well.
++
++	A set may contain a mix of optional and essential services, but that
++	is likely to lead to surprising results because broken services become
++	ignored (see above), making previously bypassable failures fatal.
++	Technically, it is the bypassability of the last failed service that
++	matters.
++
++	See also: adaptation_access adaptation_service_chain
+ 
+ Example:
+ adaptation_service_set svcBlocker urlFilterPrimary urlFilterBackup
+ adaptation service_set svcLogger loggerLocal loggerRemote
+ DOC_END
+ 
++NAME: adaptation_service_chain
++TYPE: adaptation_service_chain_type
++IFDEF: USE_ADAPTATION
++LOC: none
++DEFAULT: none
++DOC_START
++
++	Configures a list of complementary services that will be applied
++	one-by-one, forming an adaptation chain or pipeline. This is useful
++	when Squid must perform different adaptations on the same message.
++
++	    adaptation_service_chain chain_name service_name1 svc_name2 ...
++
++ 	The named services are used in the chain declaration order. The first
++	applicable adaptation service from the chain is used first. The next
++	applicable service is applied to the successful adaptation results of
++	the previous service in the chain.
++
++	When adaptation starts, broken services are ignored as if they were
++	not a part of the chain. A broken service is a down optional service.
++
++	Request satisfaction terminates the adaptation chain because Squid
++	does not currently allow declaration of RESPMOD services at the
++	"reqmod_precache" vectoring point (see icap_service or ecap_service).
++
++	The services in a chain must be attached to the same vectoring point
++	(e.g., pre-cache) and use the same adaptation method (e.g., REQMOD).
++
++	A chain may contain a mix of optional and essential services. If an
++	essential adaptation fails (or the failure cannot be bypassed for
++	other reasons), the master transaction fails. Otherwise, the failure
++	is bypassed as if the failed adaptation service was not in the chain.
++
++	See also: adaptation_access adaptation_service_set
++
++Example:
++adaptation_service_chain svcRequest requestLogger urlFilter leakDetector
++DOC_END
++
+ NAME: adaptation_access
+ TYPE: adaptation_access_type
+ IFDEF: USE_ADAPTATION
+@@ -5742,6 +5833,24 @@ Example:
+ adaptation_access service_1 allow all
+ DOC_END
+ 
++NAME: adaptation_service_iteration_limit
++TYPE: int
++IFDEF: USE_ADAPTATION
++LOC: Adaptation::Config::service_iteration_limit
++DEFAULT: 16
++DOC_START
++	Limits the number of iterations allowed when applying adaptation
++	services to a message. If your longest adaptation set or chain
++	may have more than 16 services, increase the limit beyond its
++	default value of 16. If detecting infinite iteration loops sooner
++	is critical, make the iteration limit match the actual number
++	of services in your longest adaptation set or chain.
++
++	Infinite adaptation loops are most likely with routing services.
++
++	See also: icap_service routing=1
++DOC_END
++
+ NAME: adaptation_masterx_shared_names
+ TYPE: string
+ IFDEF: USE_ADAPTATION
+@@ -63,11 +63,12 @@
+ 
+ #if USE_ADAPTATION
+ #include "adaptation/AccessCheck.h"
++#include "adaptation/Iterator.h"
+ #include "adaptation/Service.h"
+ #if ICAP_CLIENT
+ #include "adaptation/icap/History.h"
+ #endif
+-static void adaptationAclCheckDoneWrapper(Adaptation::ServicePointer service, void *data);
++//static void adaptationAclCheckDoneWrapper(Adaptation::ServicePointer service, void *data);
+ #endif
+ 
+ 
+@@ -619,18 +620,18 @@ ClientRequestContext::clientAccessCheckDone(int answer)
+ 
+ #if USE_ADAPTATION
+ static void
+-adaptationAclCheckDoneWrapper(Adaptation::ServicePointer service, void *data)
++adaptationAclCheckDoneWrapper(Adaptation::ServiceGroupPointer g, void *data)
+ {
+     ClientRequestContext *calloutContext = (ClientRequestContext *)data;
+ 
+     if (!calloutContext->httpStateIsValid())
+         return;
+ 
+-    calloutContext->adaptationAclCheckDone(service);
++    calloutContext->adaptationAclCheckDone(g);
+ }
+ 
+ void
+-ClientRequestContext::adaptationAclCheckDone(Adaptation::ServicePointer service)
++ClientRequestContext::adaptationAclCheckDone(Adaptation::ServiceGroupPointer g)
+ {
+     debugs(93,3,HERE << this << " adaptationAclCheckDone called");
+     assert(http);
+@@ -651,18 +652,13 @@ ClientRequestContext::adaptationAclCheckDone(Adaptation::ServicePointer service)
+     }
+ #endif
+ 
+-    if (http->startAdaptation(service))
+-        return;
+-
+-    if (!service || service->cfg().bypass) {
+-        // handle ICAP start failure when no service was selected
+-        // or where the selected service was optional
++    if (!g) {
++        debugs(85,3, HERE << "no adaptation needed");
+         http->doCallouts();
+         return;
+     }
+ 
+-    // handle start failure for an essential ICAP service
+-    http->handleAdaptationFailure();
++    http->startAdaptation(g);
+ }
+ 
+ #endif
+@@ -1336,29 +1332,19 @@ ClientHttpRequest::doCallouts()
+ #endif
+ 
+ #if USE_ADAPTATION
+-/*
+- * Initiate an ICAP transaction.  Return false on errors.
+- * The caller must handle errors.
+- */
+-bool
+-ClientHttpRequest::startAdaptation(Adaptation::ServicePointer service)
++/// Initiate an asynchronous adaptation transaction which will call us back.
++void
++ClientHttpRequest::startAdaptation(const Adaptation::ServiceGroupPointer &g)
+ {
+-    debugs(85, 3, HERE << this << " ClientHttpRequest::startAdaptation() called");
+-    if (!service) {
+-        debugs(85, 3, "ClientHttpRequest::startAdaptation fails: lack of service");
+-        return false;
+-    }
+-    if (service->broken()) {
+-        debugs(85, 3, "ClientHttpRequest::startAdaptation fails: broken service");
+-        return false;
+-    }
+-
++    debugs(85, 3, HERE << "adaptation needed for " << this);
+     assert(!virginHeadSource);
+     assert(!adaptedBodySource);
+-    virginHeadSource = initiateAdaptation(service->makeXactLauncher(
+-                                              this, request, NULL));
++    virginHeadSource = initiateAdaptation(
++        new Adaptation::Iterator(this, request, NULL, g));
+ 
+-    return virginHeadSource != NULL;
++    // we could try to guess whether we can bypass this adaptation 
++    // initiation failure, but it should not really happen
++    assert(virginHeadSource != NULL); // Must, really
+ }
+ 
+ void
+@@ -159,7 +159,7 @@ class ClientHttpRequest
+ #if USE_ADAPTATION
+ 
+ public:
+-    bool startAdaptation(Adaptation::ServicePointer);
++    void startAdaptation(const Adaptation::ServiceGroupPointer &g);
+ 
+     // private but exposed for ClientRequestContext
+     void handleAdaptationFailure(bool bypassable = false);

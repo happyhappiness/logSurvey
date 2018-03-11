@@ -1,0 +1,248 @@
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: Server.cc,v 1.12 2007/06/19 20:58:26 rousskov Exp $
++ * $Id: Server.cc,v 1.13 2007/06/25 22:34:24 rousskov Exp $
+  *
+  * DEBUG:
+  * AUTHOR: Duane Wessels
+@@ -43,7 +43,8 @@
+ #include "ICAP/ICAPModXact.h"
+ #endif
+ 
+-ServerStateData::ServerStateData(FwdState *theFwdState): requestSender(NULL)
++ServerStateData::ServerStateData(FwdState *theFwdState): requestSender(NULL),
++    icapAccessCheckPending(false)
+ {
+     fwd = theFwdState;
+     entry = fwd->entry;
+@@ -481,4 +482,44 @@ ServerStateData::handleIcapAborted(bool bypassable)
+     abortTransaction("ICAP failure");
+ }
+ 
++HttpRequest *
++ServerStateData::originalRequest()
++{
++    return request;
++}
++
++void
++ServerStateData::icapAclCheckDone(ICAPServiceRep::Pointer service)
++{
++    icapAccessCheckPending = false;
++
++    if (abortOnBadEntry("entry went bad while waiting for ICAP ACL check"))
++        return;
++
++    const bool startedIcap = startIcap(service, originalRequest());
++
++    if (!startedIcap && (!service || service->bypass)) {
++        // handle ICAP start failure when no service was selected
++        // or where the selected service was optional
++        entry->replaceHttpReply(reply);
++
++        haveParsedReplyHeaders();
++        processReplyBody();
++
++        return;
++    }
++
++    if (!startedIcap) {
++        // handle start failure for an essential ICAP service
++        ErrorState *err = errorCon(ERR_ICAP_FAILURE,
++            HTTP_INTERNAL_SERVER_ERROR, originalRequest());
++        err->xerrno = errno;
++        errorAppendEntry(entry, err);
++        abortTransaction("ICAP start failure");
++        return;
++    }
++
++    processReplyBody();
++}
++
+ #endif
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: Server.h,v 1.4 2007/05/08 16:46:37 rousskov Exp $
++ * $Id: Server.h,v 1.5 2007/06/25 22:34:24 rousskov Exp $
+  *
+  * AUTHOR: Duane Wessels
+  *
+@@ -86,7 +86,9 @@ class ServerStateData:
+     virtual void abortTransaction(const char *reason) = 0;
+ 
+ #if ICAP_CLIENT
+-    virtual void icapAclCheckDone(ICAPServiceRep::Pointer) = 0;
++    void icapAclCheckDone(ICAPServiceRep::Pointer);
++    // a hack to reach HttpStateData::orignal_request
++    virtual  HttpRequest *originalRequest();
+ 
+     // ICAPInitiator: start an ICAP transaction and receive adapted headers.
+     virtual void noteIcapAnswer(HttpMsg *message);
+@@ -96,6 +98,7 @@ class ServerStateData:
+     virtual void noteMoreBodySpaceAvailable(BodyPipe &);
+     virtual void noteBodyConsumerAborted(BodyPipe &);
+ #endif
++    virtual void processReplyBody() = 0;
+ 
+ public: // should be protected
+     void serverComplete(); // call when no server communication is expected
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: ftp.cc,v 1.425 2007/06/19 20:27:00 rousskov Exp $
++ * $Id: ftp.cc,v 1.426 2007/06/25 22:34:24 rousskov Exp $
+  *
+  * DEBUG: section 9     File Transfer Protocol (FTP)
+  * AUTHOR: Harvest Derived
+@@ -228,14 +228,6 @@ class FtpStateData : public ServerStateData
+ private:
+     // BodyConsumer for HTTP: consume request body.
+     virtual void handleRequestBodyProducerAborted();
+-
+-#if ICAP_CLIENT
+-public:
+-    void icapAclCheckDone(ICAPServiceRep::Pointer);
+-
+-    bool icapAccessCheckPending;
+-#endif
+-
+ };
+ 
+ CBDATA_CLASS_INIT(FtpStateData);
+@@ -3396,32 +3388,4 @@ icapAclCheckDoneWrapper(ICAPServiceRep::Pointer service, void *data)
+     ftpState->icapAclCheckDone(service);
+ }
+ 
+-// TODO: merge with http.cc and move to Server.cc?
+-void
+-FtpStateData::icapAclCheckDone(ICAPServiceRep::Pointer service)
+-{
+-    icapAccessCheckPending = false;
+-
+-    const bool startedIcap = startIcap(service, request);
+-
+-    if (!startedIcap && (!service || service->bypass)) {
+-        // handle ICAP start failure when no service was selected
+-        // or where the selected service was optional
+-        entry->replaceHttpReply(reply);
+-        processReplyBody();
+-        return;
+-    }
+-
+-    if (!startedIcap) {
+-        // handle start failure for an essential ICAP service
+-        ErrorState *err = errorCon(ERR_ICAP_FAILURE, HTTP_INTERNAL_SERVER_ERROR, request);
+-        err->xerrno = errno;
+-        errorAppendEntry(entry, err);
+-        comm_close(ctrl.fd);
+-        return;
+-    }
+-
+-    processReplyBody();
+-}
+-
+ #endif
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: http.cc,v 1.526 2007/06/19 21:19:04 rousskov Exp $
++ * $Id: http.cc,v 1.527 2007/06/25 22:34:24 rousskov Exp $
+  *
+  * DEBUG: section 11    Hypertext Transfer Protocol (HTTP)
+  * AUTHOR: Harvest Derived
+@@ -659,10 +659,6 @@ HttpStateData::failReply(HttpReply *reply, http_status const & status)
+     reply->sline.version = HttpVersion(1, 0);
+     reply->sline.status = status;
+     entry->replaceHttpReply(reply);
+-
+-    if (eof == 1) {
+-        serverComplete();
+-    }
+ }
+ 
+ void
+@@ -783,10 +779,6 @@ HttpStateData::processReplyHeader()
+ 
+     haveParsedReplyHeaders();
+ 
+-    if (eof == 1) {
+-        serverComplete();
+-    }
+-
+     ctx_exit(ctx);
+ }
+ 
+@@ -1960,37 +1952,11 @@ icapAclCheckDoneWrapper(ICAPServiceRep::Pointer service, void *data)
+     http->icapAclCheckDone(service);
+ }
+ 
+-void
+-HttpStateData::icapAclCheckDone(ICAPServiceRep::Pointer service)
++// TODO: why does FtpStateData not need orig_request?
++HttpRequest *
++HttpStateData::originalRequest()
+ {
+-    icapAccessCheckPending = false;
+-
+-    const bool startedIcap = startIcap(service, orig_request);
+-
+-    if (!startedIcap && (!service || service->bypass)) {
+-        // handle ICAP start failure when no service was selected
+-        // or where the selected service was optional
+-        entry->replaceHttpReply(reply);
+-
+-        haveParsedReplyHeaders();
+-        processReplyBody();
+-
+-        if (eof == 1)
+-            serverComplete();
+-
+-        return;
+-    }
+-
+-    if (!startedIcap) {
+-        // handle start failure for an essential ICAP service
+-        ErrorState *err = errorCon(ERR_ICAP_FAILURE, HTTP_INTERNAL_SERVER_ERROR, orig_request);
+-        err->xerrno = errno;
+-        errorAppendEntry(entry, err);
+-        comm_close(fd);
+-        return;
+-    }
+-
+-    processReplyBody();
++    return orig_request;
+ }
+ 
+ #endif
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: http.h,v 1.28 2007/04/20 07:29:47 wessels Exp $
++ * $Id: http.h,v 1.29 2007/06/25 22:34:24 rousskov Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -84,17 +84,17 @@ class HttpStateData : public ServerStateData
+ 
+     void processSurrogateControl(HttpReply *);
+ 
+-#if ICAP_CLIENT
+-    void icapAclCheckDone(ICAPServiceRep::Pointer);
+-    bool icapAccessCheckPending;
+-#endif
+-
+     /*
+      * getReply() public only because it is called from a static function
+      * as httpState->getReply()
+      */
+     const HttpReply * getReply() const { assert(reply); return reply; }
+ 
++protected:
++#if ICAP_CLIENT
++    virtual HttpRequest *originalRequest();
++#endif
++
+ private:
+     enum ConnectionStatus {
+         INCOMPLETE_MSG,

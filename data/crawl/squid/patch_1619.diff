@@ -1,0 +1,208 @@
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: client_side.cc,v 1.269 1998/04/09 02:51:43 wessels Exp $
++ * $Id: client_side.cc,v 1.270 1998/04/09 20:42:05 rousskov Exp $
+  *
+  * DEBUG: section 33    Client-side Routines
+  * AUTHOR: Duane Wessels
+@@ -558,6 +558,7 @@ clientUpdateCounters(clientHttpRequest * http)
+     i = &http->request->hier.icp;
+     if (0 != i->stop.tv_sec && 0 != i->start.tv_sec)
+ 	statHistCount(&Counter.icp.query_svc_time, tvSubUsec(i->start, i->stop));
++
+ #if SQUID_PEER_DIGEST
+     H = &http->request->hier;
+     if (H->peer_select_start.tv_sec && H->store_complete_stop.tv_sec)
+@@ -576,12 +577,24 @@ clientUpdateCounters(clientHttpRequest * http)
+     } else {
+ 	assert(H->alg == PEER_SA_NONE);
+     }
++    /*
++     * account for outgoing digest traffic (this has nothing to do with
++     * SQUID_PEER_DIGEST, but counters are all in SQUID_PEER_DIGEST ifdefs)
++     */
++    if (http->internal && strStr(http->request->urlpath, StoreDigestUrlPath)) {
++	kb_incr(&Counter.cd.kbytes_sent, http->out.size);
++	Counter.cd.msgs_sent++;
++    }
++    /* @?@ split this ugly if-monster */
+     if (/* we used ICP or CD for peer selecton */
+ 	H->alg != PEER_SA_NONE &&
+ 	/* a successful CD lookup was made */
+ 	H->cd_lookup != LOOKUP_NONE &&
+ 	/* it was not a CD miss (we go direct on CD MISSes) */
+ 	!(H->alg == PEER_SA_DIGEST && H->cd_lookup == LOOKUP_MISS) &&
++	/* request was cachable */
++	!EBIT_TEST(http->request->flags, REQ_NOCACHE) &&
++	EBIT_TEST(http->request->flags, REQ_CACHABLE) &&
+ 	/* paranoid: we have a reply pointer */
+ 	(reply = storeEntryReply(http->entry))) {
+ 	const char *x_cache_fld = httpHeaderGetLastStr(&reply->header, HDR_X_CACHE);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: peer_digest.cc,v 1.6 1998/04/09 11:42:36 rousskov Exp $
++ * $Id: peer_digest.cc,v 1.7 1998/04/09 20:42:06 rousskov Exp $
+  *
+  * DEBUG: section 72    Peer Digest Routines
+  * AUTHOR: Alex Rousskov
+@@ -38,6 +38,7 @@
+ /* local prototypes */
+ static void peerDigestClean(peer *p);
+ static time_t peerDigestNextDisDelay(const peer *p);
++static time_t peerDigestExpiresDelay(const peer *p, const StoreEntry *e);
+ static void peerDigestDisable(peer *p);
+ static void peerDigestDelay(peer *p, int disable, time_t delay);
+ static void peerDigestValidate(peer *p);
+@@ -87,7 +88,7 @@ static void
+ peerDigestClean(peer *p)
+ {
+     if (!cbdataValid(p))
+-	debug(72, 2) ("peerDigest: note: peer %s was reset or deleted\n", p->host);
++	debug(72, 2) ("peerDigest: note: peer '%s' was reset or deleted\n", p->host);
+     assert(!EBIT_TEST(p->digest.flags, PD_REQUESTED));
+     peerDigestDisable(p);
+     cbdataUnlock(p);
+@@ -100,6 +101,7 @@ peerDigestDisable(peer *p)
+     peerDigestDelay(p, 1, -1);
+ }
+ 
++/* next delay for a disabled entry */
+ static time_t
+ peerDigestNextDisDelay(const peer *p)
+ {
+@@ -109,6 +111,19 @@ peerDigestNextDisDelay(const peer *p)
+ 	PeerDigestRequestMinGap;       /* minimal delay */
+ }
+ 
++/* artificially increases expires to avoid race conditions */
++static time_t
++peerDigestExpiresDelay(const peer *p, const StoreEntry *e)
++{
++    assert(p);
++    if (!e)
++	return 0;
++    if (e->expires > 0)
++	return e->expires + PeerDigestRequestMinGap - squid_curtime;
++    return PeerDigestRequestMinGap;
++}
++
++
+ /* delays/disables digest for a psecified delay (disables forever if negative delay) */
+ static void
+ peerDigestDelay(peer *p, int disable, time_t delay)
+@@ -159,11 +174,13 @@ peerDigestValidate(peer *p)
+ 	    e ? "has" : "no", storeKeyText(key), mkrfc1123(e ? e->expires : 0));
+     }
+     /* currently we rely on entry->expire information */
+-    do_request = !e || e->expires <= squid_curtime;
+-    /* artificially increase expires to avoid race conditions */
+-    req_time = e ? e->expires+PeerDigestRequestMinGap : squid_curtime;
+-    if (req_time < squid_curtime)
+-	req_time = squid_curtime;
++    {
++	const time_t exp_delay = peerDigestExpiresDelay(p, e);
++	do_request = exp_delay <= 0;
++	req_time = squid_curtime + exp_delay;
++	if (req_time < squid_curtime)
++	    req_time = squid_curtime;
++    }
+     /* do not request too often from one peer */
+     if (req_time - p->digest.last_req_timestamp < PeerDigestRequestMinGap) {
+ 	if (do_request) {
+@@ -474,7 +491,8 @@ peerDigestFetchFinish(DigestFetchState *fetch, char *buf, const char *err_msg)
+ 	/* disable for a while */
+ 	EBIT_CLR(peer->digest.flags, PD_USABLE);
+ 	peerDigestDelay(peer, 1, 
+-	    max_delay(expires - squid_curtime, 
++	    max_delay(
++		peerDigestExpiresDelay(peer, fetch->entry),
+ 		peerDigestNextDisDelay(peer)));
+ 	/* release buggy entry */
+ 	storeReleaseRequest(fetch->entry);
+@@ -483,7 +501,8 @@ peerDigestFetchFinish(DigestFetchState *fetch, char *buf, const char *err_msg)
+ 	EBIT_SET(peer->digest.flags, PD_USABLE);
+ 	EBIT_CLR(peer->digest.flags, PD_DISABLED);
+ 	peer->digest.last_dis_delay = 0;
+-	peerDigestDelay(peer, 0, max_delay(expires - squid_curtime, 0));
++	peerDigestDelay(peer, 0,
++	    max_delay(peerDigestExpiresDelay(peer, fetch->entry), 0));
+     }
+     storeUnregister(fetch->entry, fetch);
+     storeUnlockObject(fetch->entry);
+@@ -496,7 +515,9 @@ peerDigestFetchFinish(DigestFetchState *fetch, char *buf, const char *err_msg)
+     peer->digest.last_req_timestamp = squid_curtime;
+     peer->digest.last_fetch_resp_time = fetch_resp_time;
+     EBIT_CLR(peer->digest.flags, PD_REQUESTED);
++    /* update stats */
+     kb_incr(&Counter.cd.kbytes_recv, (size_t)b_read);
++    Counter.cd.msgs_recv++;
+     debug(72, 2) ("peerDigestFetchFinish: %s done; took: %d secs; expires: %s\n",
+ 	peer->host, fetch_resp_time, mkrfc1123(expires));
+ }
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: stat.cc,v 1.228 1998/04/09 00:18:21 rousskov Exp $
++ * $Id: stat.cc,v 1.229 1998/04/09 20:42:07 rousskov Exp $
+  *
+  * DEBUG: section 18    Cache Manager Statistics
+  * AUTHOR: Harvest Derived
+@@ -651,6 +651,14 @@ statAvgDump(StoreEntry * sentry, int minutes, int hours)
+     storeAppendPrintf(sentry, "client_http.hit_median_svc_time = %f seconds\n",
+ 	x / 1000.0);
+ #if SQUID_PEER_DIGEST
++    storeAppendPrintf(sentry, "cd.msgs_sent = %f/sec\n",
++	XAVG(cd.msgs_sent));
++    storeAppendPrintf(sentry, "cd.msgs_recv = %f/sec\n",
++	XAVG(cd.msgs_recv));
++    storeAppendPrintf(sentry, "cd.kbytes_sent = %f/sec\n",
++	XAVG(cd.kbytes_sent.kb));
++    storeAppendPrintf(sentry, "cd.kbytes_recv = %f/sec\n",
++	XAVG(cd.kbytes_recv.kb));
+     x = statHistDeltaMedian(&l->cd.client_svc_time,
+ 	&f->cd.client_svc_time);
+     storeAppendPrintf(sentry, "cd.client_median_svc_time = %f seconds\n",
+@@ -983,6 +991,21 @@ statCountersDump(StoreEntry * sentry)
+     storeAppendPrintf(sentry, "icp.kbytes_recv = %d\n",
+ 	(int) f->icp.kbytes_recv.kb);
+ 
++#if SQUID_PEER_DIGEST
++    storeAppendPrintf(sentry, "cd.msgs_sent = %d\n",
++	f->cd.msgs_sent);
++    storeAppendPrintf(sentry, "cd.msgs_recv = %d\n",
++	f->cd.msgs_recv);
++    storeAppendPrintf(sentry, "cd.memory = %d\n",
++	(int)f->cd.memory.kb);
++    storeAppendPrintf(sentry, "cd.local_memory = %d\n",
++	store_digest ? store_digest->mask_size/1024 : 0);
++    storeAppendPrintf(sentry, "cd.kbytes_sent = %d\n",
++	(int) f->cd.kbytes_sent.kb);
++    storeAppendPrintf(sentry, "cd.kbytes_recv = %d\n",
++	(int) f->cd.kbytes_recv.kb);
++#endif
++
+ #if TOO_MUCH_OUTPUT
+     storeAppendPrintf(sentry, "icp.query_svc_time histogram:\n");
+     statHistDump(&f->icp.query_svc_time, sentry, NULL);
+@@ -1095,6 +1118,10 @@ statDigestBlob(StoreEntry * sentry)
+ 	(int) f->icp.kbytes_recv.kb);
+     storeAppendPrintf(sentry, "cd.times_used = %d\n",
+ 	f->cd.times_used);
++    storeAppendPrintf(sentry, "cd.msgs_sent = %d\n",
++	f->cd.msgs_sent);
++    storeAppendPrintf(sentry, "cd.msgs_recv = %d\n",
++	f->cd.msgs_recv);
+     storeAppendPrintf(sentry, "cd.kbytes_sent = %d\n",
+ 	(int) f->cd.kbytes_sent.kb);
+     storeAppendPrintf(sentry, "cd.kbytes_recv = %d\n",
+@@ -1205,6 +1205,8 @@ struct _StatCounters {
+ 	kb_t kbytes_sent;
+ 	kb_t kbytes_recv;
+ 	kb_t memory;
++	int msgs_sent;
++	int msgs_recv;
+         cd_guess_stats guess;
+ 	StatHist client_svc_time;
+ 	StatHist server_svc_time;

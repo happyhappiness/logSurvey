@@ -1,1552 +1,1234 @@
-@@ -176,6 +176,7 @@ class CommAcceptCbPtrFun: public CallDialer,
- {
- public:
-     typedef CommAcceptCbParams Params;
-+    typedef RefCount<CommAcceptCbPtrFun> Pointer;
- 
-     CommAcceptCbPtrFun(IOACB *aHandler, const CommAcceptCbParams &aParams);
-     void dial();
-@@ -259,11 +260,19 @@ template <class Dialer>
- class CommCbFunPtrCallT: public AsyncCall
- {
- public:
-+    typedef RefCount<CommCbFunPtrCallT<Dialer> > Pointer;
-     typedef typename Dialer::Params Params;
- 
-     inline CommCbFunPtrCallT(int debugSection, int debugLevel,
-                              const char *callName, const Dialer &aDialer);
- 
-+    inline CommCbFunPtrCallT(const CommCbFunPtrCallT &o) :
-+            AsyncCall(o.debugSection, o.debugLevel, o.name),
-+            dialer(o.dialer)
-+        {}
-+
-+    ~CommCbFunPtrCallT() {}
-+
-     virtual CallDialer* getDialer() { return &dialer; }
- 
- public:
-@@ -272,6 +281,9 @@ class CommCbFunPtrCallT: public AsyncCall
- protected:
-     inline virtual bool canFire();
-     inline virtual void fire();
-+
-+private:
-+    CommCbFunPtrCallT & operator=(const CommCbFunPtrCallT &); // not defined. not permitted.
- };
- 
- // Conveninece wrapper: It is often easier to call a templated function than
-@@ -3,23 +3,28 @@
-  */
- 
- #include "squid.h"
-+#include "comm.h"
- #include "ProtoPort.h"
- #if HAVE_LIMITS
- #include <limits>
- #endif
- 
--http_port_list::http_port_list(const char *aProtocol)
-+http_port_list::http_port_list(const char *aProtocol) :
-+        listenFd(-1)
- #if USE_SSL
--        :
--        http(*this), dynamicCertMemCacheSize(std::numeric_limits<size_t>::max())
-+        , http(*this)
-+        , dynamicCertMemCacheSize(std::numeric_limits<size_t>::max())
- #endif
- {
-     protocol = xstrdup(aProtocol);
- }
- 
- http_port_list::~http_port_list()
- {
--    delete listener;
-+    if (listenFd >= 0) {
-+        comm_close(listenFd);
-+        listenFd = -1;
-+    }
- 
-     safe_free(name);
-     safe_free(defaultsite);
-@@ -4,9 +4,7 @@
- #ifndef SQUID_PROTO_PORT_H
- #define SQUID_PROTO_PORT_H
- 
--//#include "typedefs.h"
- #include "cbdata.h"
--#include "comm/ListenStateData.h"
- 
- #if USE_SSL
- #include "ssl/gadgets.h"
-@@ -43,11 +41,11 @@ struct http_port_list {
-     } tcp_keepalive;
- 
-     /**
--     * The FD listening socket handler.
--     * If not NULL we are actively listening for client requests.
--     * delete to close the socket.
-+     * The FD listening socket.
-+     * If >= 0 we are actively listening for client requests.
-+     * use comm_close(listenFd) to stop.
-      */
--    Comm::ListenStateData *listener;
-+    int listenFd;
- 
- #if USE_SSL
-     // XXX: temporary hack to ease move of SSL options to http_port
-@@ -84,6 +84,10 @@ class AsyncCall: public RefCountable
- 
- private:
-     const char *isCanceled; // set to the cancelation reason by cancel()
-+
-+    // not implemented to prevent nil calls from being passed around and unknowingly scheduled, for now.
-+    AsyncCall();
-+    AsyncCall(const AsyncCall &);
- };
- 
- inline
-@@ -122,6 +126,12 @@ class AsyncCallT: public AsyncCall
-                const Dialer &aDialer): AsyncCall(aDebugSection, aDebugLevel, aName),
-             dialer(aDialer) {}
- 
-+    AsyncCallT(const AsyncCallT<Dialer> &o):
-+            AsyncCall(o.debugSection, o.debugLevel, o.name),
-+            dialer(o.dialer) {}
-+
-+    ~AsyncCallT() {}
-+
-     CallDialer *getDialer() { return &dialer; }
- 
- protected:
-@@ -132,6 +142,9 @@ class AsyncCallT: public AsyncCall
-     virtual void fire() { dialer.dial(*this); }
- 
-     Dialer dialer;
-+
-+private:
-+    AsyncCallT & operator=(const AsyncCallT &); // not defined. call assignments not permitted.
- };
- 
- template <class Dialer>
-@@ -42,7 +42,7 @@ class CallSubscription: public Subscription
- public:
-     /// Must be passed an object. nil pointers are not permitted.
-     explicit CallSubscription(const RefCount<Call_> &aCall) : call(aCall) { assert(aCall != NULL); }
--    virtual AsyncCall::Pointer callback() const { return new Call_(call); }
-+    virtual AsyncCall::Pointer callback() const { return new Call_(*call); }
- 
- private:
-     const RefCount<Call_> call; ///< gets copied to create callback calls
-@@ -96,9 +96,10 @@
- #include "ClientRequestContext.h"
- #include "clientStream.h"
- #include "comm.h"
--#include "comm/Write.h"
--#include "comm/ListenStateData.h"
-+#include "CommCalls.h"
- #include "comm/Loops.h"
-+#include "comm/Write.h"
-+#include "comm/TcpAcceptor.h"
- #include "ConnectionDetail.h"
- #include "eui/Config.h"
- #include "fde.h"
-@@ -108,6 +109,7 @@
- #include "ident/Config.h"
- #include "ident/Ident.h"
- #include "ip/Intercept.h"
-+#include "ipc/FdNotes.h"
- #include "ipc/StartListening.h"
- #include "MemBuf.h"
- #include "MemObject.h"
-@@ -134,34 +136,33 @@
- #define comm_close comm_lingering_close
- #endif
- 
--/// dials clientHttpConnectionOpened or clientHttpsConnectionOpened call
-+/// dials clientListenerConnectionOpened call
- class ListeningStartedDialer: public CallDialer, public Ipc::StartListeningCb
- {
- public:
--    typedef void (*Handler)(int fd, int errNo, http_port_list *portCfg);
--    ListeningStartedDialer(Handler aHandler, http_port_list *aPortCfg):
--            handler(aHandler), portCfg(aPortCfg) {}
-+    typedef void (*Handler)(int fd, int flags, int errNo, http_port_list *portCfg, const Ipc::FdNoteId note, const Subscription::Pointer &sub);
-+    ListeningStartedDialer(Handler aHandler, int openFlags, http_port_list *aPortCfg, const Ipc::FdNoteId note, const Subscription::Pointer &aSub):
-+            handler(aHandler), portCfg(aPortCfg), portTypeNote(note), commOpenListenerFlags(openFlags), sub(aSub) {}
- 
-     virtual void print(std::ostream &os) const {
-         startPrint(os) <<
-         ", port=" << (void*)portCfg << ')';
-     }
- 
-     virtual bool canDial(AsyncCall &) const { return true; }
--    virtual void dial(AsyncCall &) { (handler)(fd, errNo, portCfg); }
-+    virtual void dial(AsyncCall &) { (handler)(fd, commOpenListenerFlags, errNo, portCfg, portTypeNote, sub); }
- 
- public:
-     Handler handler;
- 
- private:
--    http_port_list *portCfg; ///< from Config.Sockaddr.http
-+    http_port_list *portCfg;   ///< from Config.Sockaddr.http
-+    Ipc::FdNoteId portTypeNote;    ///< Type of IPC socket being opened
-+    int commOpenListenerFlags; ///< flags used by comm_open_listener
-+    Subscription::Pointer sub; ///< The handler to be subscribed for this connetion listener
- };
+@@ -6,21 +6,30 @@
+ #  Uncomment and customize the following to suit your needs:
+ #
  
 -
--static void clientHttpConnectionOpened(int fd, int errNo, http_port_list *s);
--#if USE_SSL
--static void clientHttpsConnectionOpened(int fd, int errNo, http_port_list *s);
--#endif
-+static void clientListenerConnectionOpened(int fd, int flags, int errNo, http_port_list *s, const Ipc::FdNoteId portTypeNote, const Subscription::Pointer &sub);
+ libexec_PROGRAMS = mswin_check_ad_group
  
- /* our socket-related context */
+ mswin_check_ad_group_SOURCES = mswin_check_ad_group.c mswin_check_ad_group.h
  
-@@ -3115,14 +3116,14 @@ connStateCreate(const Ip::Address &peer, const Ip::Address &me, int fd, http_por
+ INCLUDES = \
+ 	-I$(top_srcdir) \
++	-I$(top_srcdir)/src \
+ 	-I$(top_srcdir)/include
  
- /** Handle a new connection on HTTP socket. */
- void
--httpAccept(int sock, int newfd, ConnectionDetail *details,
--           comm_err_t flag, int xerrno, void *data)
-+httpAccept(int, int newfd, ConnectionDetail *details, comm_err_t flag, int xerrno, void *data)
- {
-     http_port_list *s = (http_port_list *)data;
-     ConnStateData *connState = NULL;
++#
++# Currently activeds and adsiid libraries are not available on MinGW or Cygwin,
++# so the following library list is just a placeholder for future MinGW/Cygwin releases.
++# This helper can be compiled only using Microsoft Visual Studio.
++#
+ LDADD = \
+ 	$(top_builddir)/compat/libcompat.la \
+ 	-L$(top_builddir)/lib -lmiscutil \
+ 	-lnetapi32 \
+ 	-ladvapi32 \
++	-lole32 \
++	-loleaut32 \
+ 	-lntdll \
++	-lactiveds \
++	-ladsiid \
+ 	$(XTRA_LIBS)
  
-     if (flag != COMM_OK) {
--        debugs(33, 1, "httpAccept: FD " << sock << ": accept failure: " << xstrerr(xerrno));
-+        // Its possible the call was still queued when the client disconnected
-+        debugs(33, 2, "httpAccept: FD " << s->listenFd << ": accept failure: " << xstrerr(xerrno));
-         return;
-     }
- 
-@@ -3361,15 +3362,14 @@ clientNegotiateSSL(int fd, void *data)
- 
- /** handle a new HTTPS connection */
- static void
--httpsAccept(int sock, int newfd, ConnectionDetail *details,
--            comm_err_t flag, int xerrno, void *data)
-+httpsAccept(int, int newfd, ConnectionDetail *details, comm_err_t flag, int xerrno, void *data)
- {
-     https_port_list *s = (https_port_list *)data;
-     SSL_CTX *sslContext = s->staticSslContext.get();
- 
-     if (flag != COMM_OK) {
--        errno = xerrno;
--        debugs(33, 1, "httpsAccept: FD " << sock << ": accept failure: " << xstrerr(xerrno));
-+        // Its possible the call was still queued when the client disconnected
-+        debugs(33, 2, "httpsAccept: FD " << s->listenFd << ": accept failure: " << xstrerr(xerrno));
-         return;
-     }
- 
-@@ -3552,15 +3552,15 @@ ConnStateData::switchToHttps(const char *host)
- 
- /// check FD after clientHttp[s]ConnectionOpened, adjust HttpSockets as needed
- static bool
--OpenedHttpSocket(int fd, const char *msgIfFail)
-+OpenedHttpSocket(int fd, const Ipc::FdNoteId portType)
- {
-     if (fd < 0) {
-         Must(NHttpSockets > 0); // we tried to open some
-         --NHttpSockets; // there will be fewer sockets than planned
-         Must(HttpSockets[NHttpSockets] < 0); // no extra fds received
- 
-         if (!NHttpSockets) // we could not open any listen sockets at all
--            fatal(msgIfFail);
-+            fatalf("Unable to open %s",FdNote(portType));
- 
-         return false;
-     }
-@@ -3616,13 +3616,16 @@ clientHttpConnectionsOpen(void)
-         const int openFlags = COMM_NONBLOCKING |
-                               (s->spoof_client_ip ? COMM_TRANSPARENT : 0);
- 
--        AsyncCall::Pointer callback = asyncCall(33,2,
--                                                "clientHttpConnectionOpened",
--                                                ListeningStartedDialer(&clientHttpConnectionOpened, s));
--        Ipc::StartListening(SOCK_STREAM, IPPROTO_TCP, s->s, openFlags,
--                            Ipc::fdnHttpSocket, callback);
-+        // setup the subscriptions such that new connections accepted by listenConn are handled by HTTP
-+        typedef CommCbFunPtrCallT<CommAcceptCbPtrFun> AcceptCall;
-+        RefCount<AcceptCall> subCall = commCbCall(5, 5, "httpAccept", CommAcceptCbPtrFun(httpAccept, s));
-+        Subscription::Pointer sub = new CallSubscription<AcceptCall>(subCall);
-+
-+        AsyncCall::Pointer listenCall = asyncCall(33,2, "clientListenerConnectionOpened",
-+                                                  ListeningStartedDialer(&clientListenerConnectionOpened, openFlags, s, Ipc::fdnHttpSocket, sub));
-+        Ipc::StartListening(SOCK_STREAM, IPPROTO_TCP, s->s, openFlags, Ipc::fdnHttpSocket, listenCall);
- 
--        HttpSockets[NHttpSockets++] = -1; // set in clientHttpConnectionOpened
-+        HttpSockets[NHttpSockets++] = -1; // set in clientListenerConnectionOpened
-     }
- 
- #if USE_SSL
-@@ -3635,27 +3638,27 @@ clientHttpConnectionsOpen(void)
- 
- /// process clientHttpConnectionsOpen result
- static void
--clientHttpConnectionOpened(int fd, int, http_port_list *s)
-+clientListenerConnectionOpened(int fd, int flags, int errNo, http_port_list *s, const Ipc::FdNoteId portTypeNote, const Subscription::Pointer &sub)
- {
--    if (!OpenedHttpSocket(fd, "Cannot open HTTP Port"))
-+    s->listenFd = fd;
-+    if (!OpenedHttpSocket(s->listenFd, portTypeNote))
-         return;
- 
-     Must(s);
-+    Must(s->listenFd >= 0);
- 
--    AsyncCall::Pointer call = commCbCall(5,5, "SomeCommAcceptHandler(httpAccept)",
--                                         CommAcceptCbPtrFun(httpAccept, s));
-+    // TCP: setup a job to handle accept() with subscribed handler
-+    AsyncJob::Start(new Comm::TcpAcceptor(s->listenFd, s->s, flags, FdNote(portTypeNote), sub));
- 
--    s->listener = new Comm::ListenStateData(fd, call, true);
--
--    debugs(1, 1, "Accepting " <<
-+    debugs(1, 1, "Accepting" <<
-            (s->intercepted ? " intercepted" : "") <<
-            (s->spoof_client_ip ? " spoofing" : "") <<
-            (s->sslBump ? " bumpy" : "") <<
-            (s->accel ? " accelerated" : "")
--           << " HTTP connections at " << s->s
--           << ", FD " << fd << "." );
-+           << FdNote(portTypeNote) << " connections at "
-+           << " FD " << s->listenFd << " on " << s->s);
- 
--    Must(AddOpenedHttpSocket(fd)); // otherwise, we have received a fd we did not ask for
-+    Must(AddOpenedHttpSocket(s->listenFd)); // otherwise, we have received a fd we did not ask for
- }
- 
- #if USE_SSL
-@@ -3677,35 +3680,23 @@ clientHttpsConnectionsOpen(void)
-             continue;
-         }
- 
--        AsyncCall::Pointer call = asyncCall(33, 2, "clientHttpsConnectionOpened",
--                                            ListeningStartedDialer(&clientHttpsConnectionOpened, &s->http));
--
--        Ipc::StartListening(SOCK_STREAM, IPPROTO_TCP, s->http.s, COMM_NONBLOCKING,
--                            Ipc::fdnHttpsSocket, call);
--
--        HttpSockets[NHttpSockets++] = -1;
--    }
--}
--
--/// process clientHttpsConnectionsOpen result
--static void
--clientHttpsConnectionOpened(int fd, int, http_port_list *s)
--{
--    if (!OpenedHttpSocket(fd, "Cannot open HTTPS Port"))
--        return;
--
--    Must(s);
-+        const int openFlags = COMM_NONBLOCKING |
-+                              (s->spoof_client_ip ? COMM_TRANSPARENT : 0);
- 
--    AsyncCall::Pointer call = commCbCall(5,5, "SomeCommAcceptHandler(httpsAccept)",
--                                         CommAcceptCbPtrFun(httpsAccept, s));
-+        // setup the subscriptions such that new connections accepted by listenConn are handled by HTTPS
-+        typedef CommCbFunPtrCallT<CommAcceptCbPtrFun> AcceptCall;
-+        RefCount<AcceptCall> subCall = commCbCall(5, 5, "httpsAccept", CommAcceptCbPtrFun(httpsAccept, s));
-+        Subscription::Pointer sub = new CallSubscription<AcceptCall>(subCall);
- 
--    s->listener = new Comm::ListenStateData(fd, call, true);
-+        AsyncCall::Pointer listenCall = asyncCall(33, 2, "clientListenerConnectionOpened",
-+                                                  ListeningStartedDialer(&clientListenerConnectionOpened, openFlags,
-+                                                                         &s->http, Ipc::fdnHttpsSocket, sub));
- 
--    debugs(1, 1, "Accepting HTTPS connections at " << s->s << ", FD " << fd << ".");
-+        Ipc::StartListening(SOCK_STREAM, IPPROTO_TCP, s->s, openFlags, Ipc::fdnHttpsSocket, listenCall);
- 
--    Must(AddOpenedHttpSocket(fd)); // otherwise, we have received a fd we did not ask for
-+        HttpSockets[NHttpSockets++] = -1;
-+    }
- }
--
- #endif
- 
- void
-@@ -3724,19 +3715,19 @@ void
- clientHttpConnectionsClose(void)
- {
-     for (http_port_list *s = Config.Sockaddr.http; s; s = s->next) {
--        if (s->listener) {
--            debugs(1, 1, "FD " << s->listener->fd << " Closing HTTP connection");
--            delete s->listener;
--            s->listener = NULL;
-+        if (s->listenFd >= 0) {
-+            debugs(1, 1, "FD " << s->listenFd << " Closing HTTP connection");
-+            comm_close(s->listenFd);
-+            s->listenFd = -1;
-         }
-     }
- 
- #if USE_SSL
-     for (http_port_list *s = Config.Sockaddr.https; s; s = s->next) {
--        if (s->listener) {
--            debugs(1, 1, "FD " << s->listener->fd << " Closing HTTPS connection");
--            delete s->listener;
--            s->listener = NULL;
-+        if (s->listenFd >= 0) {
-+            debugs(1, 1, "FD " << s->listenFd << " Closing HTTPS connection");
-+            comm_close(s->listenFd);
-+            s->listenFd = -1;
-         }
-     }
- #endif
-@@ -40,9 +40,9 @@
- #include "comm/AcceptLimiter.h"
- #include "comm/comm_internal.h"
- #include "comm/IoCallback.h"
--#include "comm/Write.h"
--#include "comm/ListenStateData.h"
- #include "comm/Loops.h"
-+#include "comm/Write.h"
-+#include "comm/TcpAcceptor.h"
- #include "CommIO.h"
- #include "CommRead.h"
- #include "ConnectionDetail.h"
-@@ -144,7 +144,7 @@ fd_debug_t *fdd_table = NULL;
- bool
- isOpen(const int fd)
- {
--    return fd_table[fd].flags.open != 0;
-+    return fd >= 0 && fd_table[fd].flags.open != 0;
- }
- 
- /**
-@@ -1,6 +1,6 @@
- #include "config.h"
- #include "comm/AcceptLimiter.h"
--#include "comm/ListenStateData.h"
-+#include "comm/TcpAcceptor.h"
- #include "fde.h"
- 
- Comm::AcceptLimiter Comm::AcceptLimiter::Instance_;
-@@ -11,22 +11,41 @@ Comm::AcceptLimiter &Comm::AcceptLimiter::Instance()
- }
- 
- void
--Comm::AcceptLimiter::defer(Comm::ListenStateData *afd)
-+Comm::AcceptLimiter::defer(Comm::TcpAcceptor *afd)
- {
-     afd->isLimited++;
-     debugs(5, 5, HERE << "FD " << afd->fd << " x" << afd->isLimited);
-     deferred.push_back(afd);
- }
- 
-+void
-+Comm::AcceptLimiter::removeDead(const Comm::TcpAcceptor *afd)
-+{
-+    for (unsigned int i = 0; i < deferred.size() && afd->isLimited > 0; i++) {
-+        if (deferred[i] == afd) {
-+            deferred[i]->isLimited--;
-+            deferred[i] = NULL; // fast. kick() will skip empty entries later.
-+            debugs(5, 5, HERE << "FD " << afd->fd << " x" << afd->isLimited);
-+        }
-+    }
-+}
-+
- void
- Comm::AcceptLimiter::kick()
- {
-+    // TODO: this could be optimized further with an iterator to search
-+    //       looking for first non-NULL, followed by dumping the first N
-+    //       with only one shift()/pop_front operation
-+
-     debugs(5, 5, HERE << " size=" << deferred.size());
--    if (deferred.size() > 0 && fdNFree() >= RESERVED_FD) {
--        debugs(5, 5, HERE << " doing one.");
-+    while (deferred.size() > 0 && fdNFree() >= RESERVED_FD) {
-         /* NP: shift() is equivalent to pop_front(). Giving us a FIFO queue. */
--        ListenStateData *temp = deferred.shift();
--        temp->isLimited--;
--        temp->acceptNext();
-+        TcpAcceptor *temp = deferred.shift();
-+        if (temp != NULL) {
-+            debugs(5, 5, HERE << " doing one.");
-+            temp->isLimited--;
-+            temp->acceptNext();
-+            break;
-+        }
-     }
- }
-@@ -6,7 +6,7 @@
- namespace Comm
- {
- 
--class ListenStateData;
-+class TcpAcceptor;
- 
- /**
-  * FIFO Queue holding listener socket handlers which have been activated
-@@ -25,7 +25,10 @@ class AcceptLimiter
-     static AcceptLimiter &Instance();
- 
-     /** delay accepting a new client connection. */
--    void defer(Comm::ListenStateData *afd);
-+    void defer(Comm::TcpAcceptor *afd);
-+
-+    /** remove all records of an acceptor. Only to be called by the ConnAcceptor::swanSong() */
-+    void removeDead(const Comm::TcpAcceptor *afd);
- 
-     /** try to accept and begin processing any delayed client connections. */
-     void kick();
-@@ -34,7 +37,7 @@ class AcceptLimiter
-     static AcceptLimiter Instance_;
- 
-     /** FIFO queue */
--    Vector<Comm::ListenStateData*> deferred;
-+    Vector<Comm::TcpAcceptor*> deferred;
- };
- 
- }; // namepace Comm
-@@ -1,54 +0,0 @@
--#ifndef SQUID_LISTENERSTATEDATA_H
--#define SQUID_LISTENERSTATEDATA_H
--
--#include "base/AsyncCall.h"
--#include "comm.h"
--#if HAVE_MAP
--#include <map>
--#endif
--
--class ConnectionDetail;
--
--namespace Comm
--{
--
--class ListenStateData
--{
--
--public:
--    ListenStateData(int fd, AsyncCall::Pointer &call, bool accept_many);
--    ListenStateData(const ListenStateData &r); // not implemented.
--    ~ListenStateData();
--
--    void subscribe(AsyncCall::Pointer &call);
--    void acceptNext();
--    void notify(int newfd, comm_err_t flag, const ConnectionDetail &details);
--
--    int fd;
--
--    /// errno code of the last accept() or listen() action if one occurred.
--    int errcode;
--
--    /// whether this socket is delayed and on the AcceptLimiter queue.
--    int32_t isLimited;
--
--private:
--    /// Method to test if there are enough file escriptors to open a new client connection
--    /// if not the accept() will be postponed
--    static bool okToAccept();
--
--    /// Method callback for whenever an FD is ready to accept a client connection.
--    static void doAccept(int fd, void *data);
--
--    void acceptOne();
--    int oldAccept(ConnectionDetail &details);
--
--    AsyncCall::Pointer theCallback;
--    bool mayAcceptMore;
--
--    void setListen();
--};
--
--} // namespace Comm
--
--#endif /* SQUID_LISTENERSTATEDATA_H */
-@@ -7,15 +7,15 @@ noinst_LTLIBRARIES = libcomm.la
- libcomm_la_SOURCES= \
- 	AcceptLimiter.cc \
- 	AcceptLimiter.h \
--	ListenStateData.cc \
--	ListenStateData.h \
- 	Loops.h \
- 	ModDevPoll.cc \
- 	ModEpoll.cc \
- 	ModKqueue.cc \
- 	ModPoll.cc \
- 	ModSelect.cc \
- 	ModSelectWin32.cc \
-+	TcpAcceptor.cc \
-+	TcpAcceptor.h \
- 	\
- 	IoCallback.cc \
- 	IoCallback.h \
-@@ -33,16 +33,104 @@
-  */
- 
- #include "squid.h"
-+#include "base/TextException.h"
- #include "CommCalls.h"
- #include "comm/AcceptLimiter.h"
- #include "comm/comm_internal.h"
--#include "comm/ListenStateData.h"
- #include "comm/Loops.h"
-+#include "comm/TcpAcceptor.h"
- #include "ConnectionDetail.h"
- #include "fde.h"
- #include "protos.h"
- #include "SquidTime.h"
- 
-+namespace Comm {
-+    CBDATA_CLASS_INIT(TcpAcceptor);
-+};
-+
-+Comm::TcpAcceptor::TcpAcceptor(const int listenFd, const Ip::Address &laddr, int flags,
-+                               const char *note, const Subscription::Pointer &aSub) :
-+        AsyncJob("Comm::TcpAcceptor"),
-+        errcode(0),
-+        fd(listenFd),
-+        isLimited(0),
-+        theCallSub(aSub),
-+        local_addr(laddr)
-+{}
-+
-+void
-+Comm::TcpAcceptor::subscribe(const Subscription::Pointer &aSub)
-+{
-+    debugs(5, 5, HERE << status() << " AsyncCall Subscription: " << aSub);
-+    unsubscribe("subscription change");
-+    theCallSub = aSub;
-+}
-+
-+void
-+Comm::TcpAcceptor::unsubscribe(const char *reason)
-+{
-+    debugs(5, 5, HERE << status() << " AsyncCall Subscription " << theCallSub << " removed: " << reason);
-+    theCallSub = NULL;
-+}
-+
-+void
-+Comm::TcpAcceptor::start()
-+{
-+    debugs(5, 5, HERE << status() << " AsyncCall Subscription: " << theCallSub);
-+
-+    Must(isOpen(fd));
-+
-+    setListen();
-+
-+    // if no error so far start accepting connections.
-+    if (errcode == 0)
-+        SetSelect(fd, COMM_SELECT_READ, doAccept, this, 0);
-+}
-+
-+bool
-+Comm::TcpAcceptor::doneAll() const
-+{
-+    // stop when FD is closed
-+    if (!isOpen(fd)) {
-+        return AsyncJob::doneAll();
-+    }
-+
-+    // stop when handlers are gone
-+    if (theCallSub == NULL) {
-+        return AsyncJob::doneAll();
-+    }
-+
-+    // open FD with handlers...keep accepting.
-+    return false;
-+}
-+
-+void
-+Comm::TcpAcceptor::swanSong()
-+{
-+    debugs(5,5, HERE);
-+    unsubscribe("swanSong");
-+    fd = -1;
-+    AcceptLimiter::Instance().removeDead(this);
-+    AsyncJob::swanSong();
-+}
-+
-+const char *
-+Comm::TcpAcceptor::status() const
-+{
-+    static char ipbuf[MAX_IPSTRLEN] = {'\0'};
-+    if (ipbuf[0] == '\0')
-+        local_addr.ToHostname(ipbuf, MAX_IPSTRLEN);
-+
-+    static MemBuf buf;
-+    buf.reset();
-+    buf.Printf(" FD %d, %s",fd, ipbuf);
-+
-+    const char *jobStatus = AsyncJob::status();
-+    buf.append(jobStatus, strlen(jobStatus));
-+
-+    return buf.content();
-+}
-+
- /**
-  * New-style listen and accept routines
+ EXTRA_DIST = readme.txt
+@@ -2,7 +2,7 @@
+  * mswin_check_ad_group: lookup group membership in a Windows
+  * Active Directory domain
   *
-@@ -51,11 +139,11 @@
-  * accept()ed some time later.
-  */
- void
--Comm::ListenStateData::setListen()
-+Comm::TcpAcceptor::setListen()
- {
-     errcode = 0; // reset local errno copy.
-     if (listen(fd, Squid_MaxFD >> 2) < 0) {
--        debugs(50, 0, HERE << "listen(FD " << fd << ", " << (Squid_MaxFD >> 2) << "): " << xstrerror());
-+        debugs(50, DBG_CRITICAL, "ERROR: listen(" << status() << ", " << (Squid_MaxFD >> 2) << "): " << xstrerror());
-         errcode = errno;
-         return;
-     }
-@@ -67,37 +155,19 @@ Comm::ListenStateData::setListen()
-         debugs(5, DBG_IMPORTANT, "Installing accept filter '" << Config.accept_filter << "' on FD " << fd);
-         xstrncpy(afa.af_name, Config.accept_filter, sizeof(afa.af_name));
-         if (setsockopt(fd, SOL_SOCKET, SO_ACCEPTFILTER, &afa, sizeof(afa)) < 0)
--            debugs(5, DBG_CRITICAL, "SO_ACCEPTFILTER '" << Config.accept_filter << "': '" << xstrerror());
-+            debugs(5, DBG_CRITICAL, "WARNING: SO_ACCEPTFILTER '" << Config.accept_filter << "': '" << xstrerror());
- #elif defined(TCP_DEFER_ACCEPT)
-         int seconds = 30;
-         if (strncmp(Config.accept_filter, "data=", 5) == 0)
-             seconds = atoi(Config.accept_filter + 5);
-         if (setsockopt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &seconds, sizeof(seconds)) < 0)
--            debugs(5, DBG_CRITICAL, "TCP_DEFER_ACCEPT '" << Config.accept_filter << "': '" << xstrerror());
-+            debugs(5, DBG_CRITICAL, "WARNING: TCP_DEFER_ACCEPT '" << Config.accept_filter << "': '" << xstrerror());
- #else
--        debugs(5, DBG_CRITICAL, "accept_filter not supported on your OS");
-+        debugs(5, DBG_CRITICAL, "WARNING: accept_filter not supported on your OS");
- #endif
-     }
- }
- 
--Comm::ListenStateData::ListenStateData(int aFd, AsyncCall::Pointer &call, bool accept_many) :
--        fd(aFd),
--        theCallback(call),
--        mayAcceptMore(accept_many)
--{
--    assert(aFd >= 0);
--    debugs(5, 5, HERE << "FD " << fd << " AsyncCall: " << call);
--    assert(isOpen(aFd));
--    setListen();
--    SetSelect(fd, COMM_SELECT_READ, doAccept, this, 0);
--}
--
--Comm::ListenStateData::~ListenStateData()
--{
--    comm_close(fd);
--    fd = -1;
--}
--
- /**
-  * This private callback is called whenever a filedescriptor is ready
-  * to dupe itself and fob off an accept()ed connection
-@@ -108,23 +178,30 @@ Comm::ListenStateData::~ListenStateData()
-  * done later when enough sockets become available.
-  */
- void
--Comm::ListenStateData::doAccept(int fd, void *data)
-+Comm::TcpAcceptor::doAccept(int fd, void *data)
- {
--    debugs(5, 2, HERE << "New connection on FD " << fd);
-+    try {
-+        debugs(5, 2, HERE << "New connection on FD " << fd);
- 
--    assert(isOpen(fd));
--    ListenStateData *afd = static_cast<ListenStateData*>(data);
-+        Must(isOpen(fd));
-+        TcpAcceptor *afd = static_cast<TcpAcceptor*>(data);
-+
-+        if (!okToAccept()) {
-+            AcceptLimiter::Instance().defer(afd);
-+        } else {
-+            afd->acceptNext();
-+        }
-+        SetSelect(fd, COMM_SELECT_READ, Comm::TcpAcceptor::doAccept, afd, 0);
- 
--    if (!okToAccept()) {
--        AcceptLimiter::Instance().defer(afd);
--    } else {
--        afd->acceptNext();
-+    } catch(const std::exception &e) {
-+        fatalf("FATAL: error while accepting new client connection: %s\n", e.what());
-+    } catch(...) {
-+        fatal("FATAL: error while accepting new client connection: [unkown]\n");
-     }
--    SetSelect(fd, COMM_SELECT_READ, Comm::ListenStateData::doAccept, afd, 0);
- }
- 
- bool
--Comm::ListenStateData::okToAccept()
-+Comm::TcpAcceptor::okToAccept()
- {
-     static time_t last_warn = 0;
- 
-@@ -140,7 +217,7 @@ Comm::ListenStateData::okToAccept()
- }
- 
- void
--Comm::ListenStateData::acceptOne()
-+Comm::TcpAcceptor::acceptOne()
- {
-     /*
-      * We don't worry about running low on FDs here.  Instead,
-@@ -149,69 +226,75 @@ Comm::ListenStateData::acceptOne()
-      */
- 
-     /* Accept a new connection */
--    ConnectionDetail connDetails;
--    int newfd = oldAccept(connDetails);
-+    ConnectionDetail newConnDetails;
-+    int newFd = -1;
-+    const comm_err_t flag = oldAccept(newConnDetails, &newFd);
- 
-     /* Check for errors */
--    if (newfd < 0) {
-+    if (!isOpen(newFd)) {
- 
--        if (newfd == COMM_NOMESSAGE) {
-+        if (flag == COMM_NOMESSAGE) {
-             /* register interest again */
--            debugs(5, 5, HERE << "try later: FD " << fd << " handler: " << theCallback);
-+            debugs(5, 5, HERE << "try later: FD " << fd << " handler Subscription: " << theCallSub);
-             SetSelect(fd, COMM_SELECT_READ, doAccept, this, 0);
-             return;
-         }
- 
-         // A non-recoverable error; notify the caller */
--        debugs(5, 5, HERE << "non-recoverable error: FD " << fd << " handler: " << theCallback);
--        notify(-1, COMM_ERROR, connDetails);
--        mayAcceptMore = false;
-+        debugs(5, 5, HERE << "non-recoverable error:" << status() << " handler Subscription: " << theCallSub);
-+        notify(flag, newConnDetails, newFd);
-+        mustStop("Listener socket closed");
-         return;
-     }
- 
--    debugs(5, 5, HERE << "accepted: FD " << fd <<
--           " newfd: " << newfd << " from: " << connDetails.peer <<
--           " handler: " << theCallback);
--    notify(newfd, COMM_OK, connDetails);
-+    debugs(5, 5, HERE << "Listener: FD " << fd <<
-+           " accepted new connection from " << newConnDetails.peer <<
-+           " handler Subscription: " << theCallSub);
-+    notify(flag, newConnDetails, newFd);
- }
- 
- void
--Comm::ListenStateData::acceptNext()
-+Comm::TcpAcceptor::acceptNext()
- {
--    assert(isOpen(fd));
-+    Must(isOpen(fd));
-     debugs(5, 2, HERE << "connection on FD " << fd);
-     acceptOne();
- }
- 
-+// XXX: obsolete comment?
-+// NP: can't be a const function because syncWithComm() side effects hit theCallSub->callback().
- void
--Comm::ListenStateData::notify(int newfd, comm_err_t flag, const ConnectionDetail &connDetails)
-+Comm::TcpAcceptor::notify(const comm_err_t flag, const ConnectionDetail &connDetails, int newFd) const
- {
-     // listener socket handlers just abandon the port with COMM_ERR_CLOSING
-     // it should only happen when this object is deleted...
-     if (flag == COMM_ERR_CLOSING) {
-         return;
-     }
- 
--    if (theCallback != NULL) {
--        typedef CommAcceptCbParams Params;
--        Params &params = GetCommParams<Params>(theCallback);
-+    if (theCallSub != NULL) {
-+        AsyncCall::Pointer call = theCallSub->callback();
-+        CommAcceptCbParams &params = GetCommParams<CommAcceptCbParams>(call);
-         params.fd = fd;
--        params.nfd = newfd;
-+        params.nfd = newFd;
-         params.details = connDetails;
-         params.flag = flag;
-         params.xerrno = errcode;
--        ScheduleCallHere(theCallback);
--        if (!mayAcceptMore)
--            theCallback = NULL;
-+        ScheduleCallHere(call);
-     }
- }
- 
- /**
-  * accept() and process
-- * Wait for an incoming connection on FD.
-+ * Wait for an incoming connection on our listener socket.
+- * (C)2008 Guido Serassio - Acme Consulting S.r.l.
++ * (C)2008-2009 Guido Serassio - Acme Consulting S.r.l.
+  *
+  * Authors:
+  *  Guido Serassio <guido.serassio@acmeconsulting.it>
+@@ -31,12 +31,23 @@
+  *
+  * History:
+  *
++ * Version 2.1
++ * 20-09-2009 Guido Serassio
++ *              Added explicit Global Catalog query
 + *
-+ * \retval COMM_OK         success. details parameter filled.
-+ * \retval COMM_NOMESSAGE  attempted accept() but nothing useful came in.
-+ * \retval COMM_ERROR      an outright failure occured.
-+ *                         Or if this client has too many connections already.
-  */
--int
--Comm::ListenStateData::oldAccept(ConnectionDetail &details)
-+comm_err_t
-+Comm::TcpAcceptor::oldAccept(ConnectionDetail &details, int *newFd)
- {
-     PROF_start(comm_accept);
-     statCounter.syscalls.sock.accepts++;
-@@ -228,17 +311,19 @@ Comm::ListenStateData::oldAccept(ConnectionDetail &details)
-         PROF_stop(comm_accept);
++ * Version 2.0
++ * 20-07-2009 Guido Serassio
++ *              Global groups support rewritten, now is based on ADSI.
++ *              New Features:
++ *              - support for Domain Local, Domain Global ad Universal 
++ *                groups
++ *              - full group nesting support
+  * Version 1.0
+  * 02-05-2008 Guido Serassio
+  *              First release, based on mswin_check_lm_group.
+  *
+  * This is a helper for the external ACL interface for Squid Cache
+- *
++ * 
+  * It reads from the standard input the domain username and a list of
+  * groups and tries to match it against the groups membership of the
+  * specified username.
+@@ -66,12 +77,23 @@ int _wcsicmp(const wchar_t *, const wchar_t *);
+ #undef assert
+ #include <assert.h>
+ #include <windows.h>
++#include <objbase.h>
++#include <initguid.h>
++#include <adsiid.h>
++#include <iads.h>
++#include <adshlp.h>
++#include <adserr.h>
+ #include <lm.h>
+-#include <dsgetdc.h>
+ #include <dsrole.h>
++#include <sddl.h>
  
-         if (ignoreErrno(errno)) {
--            debugs(50, 5, HERE << "FD " << fd << ": " << xstrerror());
-+            debugs(50, 5, HERE << status() << ": " << xstrerror());
-             return COMM_NOMESSAGE;
-         } else if (ENFILE == errno || EMFILE == errno) {
--            debugs(50, 3, HERE << "FD " << fd << ": " << xstrerror());
-+            debugs(50, 3, HERE << status() << ": " << xstrerror());
-             return COMM_ERROR;
-         } else {
--            debugs(50, 1, HERE << "FD " << fd << ": " << xstrerror());
-+            debugs(50, 1, HERE << status() << ": " << xstrerror());
-             return COMM_ERROR;
-         }
-     }
+ #include "util.h"
  
-+    Must(sock >= 0);
-+    *newFd = sock;
-     details.peer = *gai;
++enum ADSI_PATH {
++    LDAP_MODE,
++    GC_MODE
++} ADSI_Path;
++
+ #define BUFSIZE 8192		/* the stdin buffer size */
+ int use_global = 0;
+ char debug_enabled = 0;
+@@ -81,9 +103,203 @@ char *machinedomain;
+ int use_case_insensitive_compare = 0;
+ char *DefaultDomain = NULL;
+ const char NTV_VALID_DOMAIN_SEPARATOR[] = "\\/";
++int numberofgroups = 0;
++int WIN32_COM_initialized = 0;
++char *WIN32_ErrorMessage = NULL;
++wchar_t **User_Groups;
++int User_Groups_Count = 0;
  
-     if ( Config.client_ip_max_connections >= 0) {
-@@ -249,15 +334,16 @@ Comm::ListenStateData::oldAccept(ConnectionDetail &details)
-         }
-     }
+ #include "mswin_check_ad_group.h"
  
-+    // lookup the local-end details of this new connection
-     details.me.InitAddrInfo(gai);
--
-     details.me.SetEmpty();
-     getsockname(sock, gai->ai_addr, &gai->ai_addrlen);
-     details.me = *gai;
--
--    commSetCloseOnExec(sock);
-+    details.me.FreeAddrInfo(gai);
- 
-     /* fdstat update */
-+    // XXX : these are not all HTTP requests. use a note about type and ip:port details->
-+    // so we end up with a uniform "(HTTP|FTP-data|HTTPS|...) remote-ip:remote-port"
-     fd_open(sock, FD_SOCKET, "HTTP Request");
- 
-     fdd_table[sock].close_file = NULL;
-@@ -266,15 +352,16 @@ Comm::ListenStateData::oldAccept(ConnectionDetail &details)
-     fde *F = &fd_table[sock];
-     details.peer.NtoA(F->ipaddr,MAX_IPSTRLEN);
-     F->remote_port = details.peer.GetPort();
--    F->local_addr.SetPort(details.me.GetPort());
-+    F->local_addr = details.me;
-     F->sock_family = details.me.IsIPv6()?AF_INET6:AF_INET;
--    details.me.FreeAddrInfo(gai);
- 
-+    // set socket flags
-+    commSetCloseOnExec(sock);
-     commSetNonBlocking(sock);
- 
-     /* IFF the socket is (tproxy) transparent, pass the flag down to allow spoofing */
-     F->flags.transparent = fd_table[fd].flags.transparent;
- 
-     PROF_stop(comm_accept);
--    return sock;
-+    return COMM_OK;
- }
-@@ -0,0 +1,99 @@
-+#ifndef SQUID_COMM_TCPACCEPTOR_H
-+#define SQUID_COMM_TCPACCEPTOR_H
++wchar_t *My_NameTranslate(wchar_t *, int, int);
++char *Get_WIN32_ErrorMessage(HRESULT);
 +
-+#include "base/AsyncCall.h"
-+#include "base/Subscription.h"
-+#include "CommCalls.h"
-+#include "comm_err_t.h"
-+#include "comm/TcpAcceptor.h"
-+#include "ip/Address.h"
 +
-+#if HAVE_MAP
-+#include <map>
-+#endif
-+
-+namespace Comm
-+{
-+
-+class AcceptLimiter;
-+
-+/**
-+ * Listens on an FD for new incoming connections and
-+ * emits an active FD descriptor for the new client.
-+ *
-+ * Handles all event limiting required to quash inbound connection
-+ * floods within the global FD limits of available Squid_MaxFD and
-+ * client_ip_max_connections.
-+ *
-+ * Fills the emitted connection with all connection details able to
-+ * be looked up. Currently these are the local/remote IP:port details
-+ * and the listening socket transparent-mode flag.
-+ */
-+class TcpAcceptor : public AsyncJob
-+{
-+private:
-+    virtual void start();
-+    virtual bool doneAll() const;
-+    virtual void swanSong();
-+    virtual const char *status() const;
-+
-+    TcpAcceptor(const TcpAcceptor &); // not implemented.
-+
-+public:
-+    TcpAcceptor(const int listenFd, const Ip::Address &laddr, int flags,
-+                const char *note, const Subscription::Pointer &aSub);
-+
-+    /** Subscribe a handler to receive calls back about new connections.
-+     * Unsubscribes any existing subscribed handler.
-+     */
-+    void subscribe(const Subscription::Pointer &aSub);
-+
-+    /** Remove the currently waiting callback subscription.
-+     * Already scheduled callbacks remain scheduled.
-+     */
-+    void unsubscribe(const char *reason);
-+
-+    /** Try and accept another connection (synchronous).
-+     * If one is pending already the subscribed callback handler will be scheduled
-+     * to handle it before this method returns.
-+     */
-+    void acceptNext();
-+
-+    /// Call the subscribed callback handler with details about a new connection.
-+    void notify(const comm_err_t flags, const ConnectionDetail &newConnDetails, const int newFd) const;
-+
-+    /// errno code of the last accept() or listen() action if one occurred.
-+    int errcode;
-+
-+    /// conn being listened on for new connections
-+    /// Reserved for read-only use.
-+    // NP: public only until we can hide it behind connection handles
-+    int fd;
-+
-+protected:
-+    friend class AcceptLimiter;
-+    int32_t isLimited;                   ///< whether this socket is delayed and on the AcceptLimiter queue.
-+
-+private:
-+    Subscription::Pointer theCallSub;    ///< used to generate AsyncCalls handling our events.
-+
-+    /// IP Address and port being listened on
-+    Ip::Address local_addr;
-+
-+    /// Method to test if there are enough file descriptors to open a new client connection
-+    /// if not the accept() will be postponed
-+    static bool okToAccept();
-+
-+    /// Method callback for whenever an FD is ready to accept a client connection.
-+    static void doAccept(int fd, void *data);
-+
-+    void acceptOne();
-+    comm_err_t oldAccept(ConnectionDetail &newConnDetails, int *fd);
-+    void setListen();
-+
-+    CBDATA_CLASS2(TcpAcceptor);
-+};
-+
-+} // namespace Comm
-+
-+#endif /* SQUID_COMM_TCPACCEPTOR_H */
-@@ -34,8 +34,9 @@
- 
- #include "squid.h"
- #include "comm.h"
-+#include "CommCalls.h"
-+#include "comm/TcpAcceptor.h"
- #include "comm/Write.h"
--#include "comm/ListenStateData.h"
- #include "compat/strtoll.h"
- #include "ConnectionDetail.h"
- #include "errorpage.h"
-@@ -153,13 +154,11 @@ class FtpChannel
- 
-     void clear(); /// just resets fd and close handler. does not close active connections.
- 
--    int fd; /// channel descriptor; \todo: remove because the closer has it
-+    int fd; /// channel descriptor
- 
--    /** Current listening socket handler. delete on shutdown or abort.
--     * FTP stores a copy of the FD in the field fd above.
--     * Use close() to properly close the channel.
--     */
--    Comm::ListenStateData *listener;
-+    Ip::Address local; ///< The local IP address:port this channel is using
-+
-+    int flags; ///< socket flags used when opening.
- 
- private:
-     AsyncCall::Pointer closer; /// Comm close handler callback
-@@ -245,6 +244,12 @@ class FtpStateData : public ServerStateData
-     void completedListing(void);
-     void dataComplete();
-     void dataRead(const CommIoCbParams &io);
-+
-+    /// ignore timeout on CTRL channel. set read timeout on DATA channel.
-+    void switchTimeoutToDataChannel();
-+    /// create a data channel acceptor and start listening.
-+    void listenForDataChannel(const int fd, const char *note);
-+
-     int checkAuth(const HttpHeader * req_hdr);
-     void checkUrlpath();
-     void buildTitleUrl();
-@@ -443,6 +448,7 @@ FTPSM *FTP_SM_FUNCS[] = {
- void
- FtpStateData::ctrlClosed(const CommCloseCbParams &io)
- {
-+    debugs(9, 4, HERE);
-     ctrl.clear();
-     deleteThis("FtpStateData::ctrlClosed");
- }
-@@ -451,10 +457,10 @@ FtpStateData::ctrlClosed(const CommCloseCbParams &io)
- void
- FtpStateData::dataClosed(const CommCloseCbParams &io)
- {
--    if (data.listener) {
--        delete data.listener;
--        data.listener = NULL;
--        data.fd = -1;
-+    debugs(9, 4, HERE);
-+    if (data.fd >= 0) {
-+        comm_close(data.fd);
-+        // NP clear() does the: data.fd = -1;
-     }
-     data.clear();
-     failed(ERR_FTP_FAILURE, 0);
-@@ -605,6 +611,46 @@ FtpStateData::loginParser(const char *login, int escaped)
-     debugs(9, 9, HERE << ": OUT: login='" << login << "', escaped=" << escaped << ", user=" << user << ", password=" << password);
- }
- 
 +void
-+FtpStateData::switchTimeoutToDataChannel()
++CloseCOM(void)
 +{
-+    commSetTimeout(ctrl.fd, -1, NULL, NULL);
-+
-+    typedef CommCbMemFunT<FtpStateData, CommTimeoutCbParams> TimeoutDialer;
-+    AsyncCall::Pointer timeoutCall = JobCallback(9, 5, TimeoutDialer, this, FtpStateData::ftpTimeout);
-+    commSetTimeout(data.fd, Config.Timeout.read, timeoutCall);
++    if (WIN32_COM_initialized == 1)
++	CoUninitialize();
 +}
 +
-+void
-+FtpStateData::listenForDataChannel(const int fd, const char *note)
++
++HRESULT
++GetLPBYTEtoOctetString(VARIANT * pVar, LPBYTE * ppByte)
 +{
-+    assert(data.fd < 0);
++    HRESULT hr = E_FAIL;
++    void HUGEP *pArray;
++    long lLBound, lUBound, cElements;
 +
-+    typedef CommCbMemFunT<FtpStateData, CommAcceptCbParams> AcceptDialer;
-+    typedef AsyncCallT<AcceptDialer> AcceptCall;
-+    RefCount<AcceptCall> call = static_cast<AcceptCall*>(JobCallback(11, 5, AcceptDialer, this, FtpStateData::ftpAcceptDataConnection));
-+    Subscription::Pointer sub = new CallSubscription<AcceptCall>(call);
++    if ((!pVar) || (!ppByte))
++	return E_INVALIDARG;
++    if ((pVar->n1.n2.vt) != (VT_UI1 | VT_ARRAY))
++	return E_INVALIDARG;
 +
-+    /* open the conn if its not already open */
-+    int newFd = fd;
-+    if (newFd < 0) {
-+        newFd = comm_open_listener(SOCK_STREAM, IPPROTO_TCP, data.local, data.flags, note);
-+        if (newFd < 0) {
-+            debugs(5, DBG_CRITICAL, HERE << "comm_open_listener failed:" << data.local << " error: " << errno);
-+            return;
-+        }
-+        debugs(9, 3, HERE << "Unconnected data socket created on FD " << newFd << ", " << data.local);
++    hr = SafeArrayGetLBound(V_ARRAY(pVar), 1, &lLBound);
++    hr = SafeArrayGetUBound(V_ARRAY(pVar), 1, &lUBound);
++
++    cElements = lUBound - lLBound + 1;
++    hr = SafeArrayAccessData(V_ARRAY(pVar), &pArray);
++    if (SUCCEEDED(hr)) {
++	LPBYTE pTemp = (LPBYTE) pArray;
++	*ppByte = (LPBYTE) CoTaskMemAlloc(cElements);
++	if (*ppByte)
++	    memcpy(*ppByte, pTemp, cElements);
++	else
++	    hr = E_OUTOFMEMORY;
 +    }
++    SafeArrayUnaccessData(V_ARRAY(pVar));
 +
-+    assert(newFd >= 0);
-+    Comm::TcpAcceptor *tmp = new Comm::TcpAcceptor(newFd, data.local, data.flags, note, sub);
-+    AsyncJob::Start(tmp);
-+
-+    // Ensure we have a copy of the FD opened for listening and a close handler on it.
-+    data.opened(newFd, dataCloser());
-+    switchTimeoutToDataChannel();
++    return hr;
 +}
 +
- void
- FtpStateData::ftpTimeout(const CommTimeoutCbParams &io)
- {
-@@ -1066,10 +1112,16 @@ FtpStateData::parseListing()
- 
-     usable = end - sbuf;
- 
--    debugs(9, 3, HERE << "usable = " << usable);
-+    debugs(9, 3, HERE << "usable = " << usable << " of " << len << " bytes.");
- 
-     if (usable == 0) {
--        debugs(9, 3, HERE << "didn't find end for " << entry->url()  );
-+        if (buf[0] == '\0' && len == 1) {
-+            debugs(9, 3, HERE << "NIL ends data from " << entry->url() << " transfer problem?");
-+            data.readBuf->consume(len);
-+        } else {
-+            debugs(9, 3, HERE << "didn't find end for " << entry->url());
-+            debugs(9, 3, HERE << "buffer remains (" << len << " bytes) '" << rfc1738_do_escape(buf,0) << "'");
-+        }
-         xfree(sbuf);
-         return;
-     }
-@@ -1138,7 +1190,14 @@ FtpStateData::dataComplete()
-      * status code after the data command.  FtpStateData was being
-      * deleted in the middle of dataRead().
-      */
--    scheduleReadControlReply(0);
-+    /* AYJ: 2011-01-13: Bug 2581.
-+     * 226 status is possibly waiting in the ctrl buffer.
-+     * The connection will hang if we DONT send buffered_ok.
-+     * This happens on all transfers which can be completly sent by the
-+     * server before the 150 started status message is read in by Squid.
-+     * ie all transfers of about one packet hang.
-+     */
-+    scheduleReadControlReply(1);
- }
- 
- void
-@@ -1674,7 +1733,7 @@ FtpStateData::scheduleReadControlReply(int buffered_ok)
-          * establish one on the control socket.
-          */
- 
--        if (data.fd > -1) {
-+        if (data.fd >= 0) {
-             AsyncCall::Pointer nullCall =  NULL;
-             commSetTimeout(data.fd, -1, nullCall);
-         }
-@@ -2722,27 +2781,24 @@ FtpStateData::ftpPasvCallback(int fd, const DnsLookupDetails &dns, comm_err_t st
- static int
- ftpOpenListenSocket(FtpStateData * ftpState, int fallback)
- {
--    int fd;
--    Ip::Address addr;
-     struct addrinfo *AI = NULL;
--    int on = 1;
-     int x = 0;
- 
-     /// Close old data channels, if any. We may open a new one below.
--    ftpState->data.close();
-+    if ((ftpState->data.flags & COMM_REUSEADDR))
-+        // NP: in fact it points to the control channel. just clear it.
-+        ftpState->data.clear();
++
++wchar_t *
++Get_primaryGroup(IADs * pUser)
++{
++    HRESULT hr;
++    VARIANT var;
++    unsigned User_primaryGroupID;
++    char tmpSID[SECURITY_MAX_SID_SIZE * 2];
++    wchar_t *wc = NULL, *result = NULL;
++    int wcsize;
++
++    VariantInit(&var);
++
++    /* Get the primaryGroupID property */
++    hr = pUser->lpVtbl->Get(pUser, L"primaryGroupID", &var);
++    if (SUCCEEDED(hr)) {
++	User_primaryGroupID = var.n1.n2.n3.uintVal;
++    } else {
++	debug("Get_primaryGroup: cannot get primaryGroupID, ERROR: %s\n", Get_WIN32_ErrorMessage(hr));
++	VariantClear(&var);
++	return result;
++    }
++    VariantClear(&var);
++
++    /*Get the objectSid property */
++    hr = pUser->lpVtbl->Get(pUser, L"objectSid", &var);
++    if (SUCCEEDED(hr)) {
++	PSID pObjectSID;
++	LPBYTE pByte = NULL;
++	char *szSID = NULL;
++	hr = GetLPBYTEtoOctetString(&var, &pByte);
++
++	pObjectSID = (PSID) pByte;
++
++	/* Convert SID to string. */
++	ConvertSidToStringSid(pObjectSID, &szSID);
++	CoTaskMemFree(pByte);
++
++	*(strrchr(szSID, '-') + 1) = '\0';
++	sprintf(tmpSID, "%s%u", szSID, User_primaryGroupID);
++
++	wcsize = MultiByteToWideChar(CP_ACP, 0, tmpSID, -1, wc, 0);
++	wc = (wchar_t *) xmalloc(wcsize * sizeof(wchar_t));
++	MultiByteToWideChar(CP_ACP, 0, tmpSID, -1, wc, wcsize);
++	LocalFree(szSID);
++
++	result = My_NameTranslate(wc, ADS_NAME_TYPE_SID_OR_SID_HISTORY_NAME, ADS_NAME_TYPE_1779);
++	safe_free(wc);
++
++	if (result == NULL)
++	    debug("Get_primaryGroup: cannot get DN for %s.\n", tmpSID);
++	else
++	    debug("Get_primaryGroup: Primary group DN: %S.\n", result);
++    } else
++	debug("Get_primaryGroup: cannot get objectSid, ERROR: %s\n", Get_WIN32_ErrorMessage(hr));
++    VariantClear(&var);
++    return result;
++}
++
++
++char *
++Get_WIN32_ErrorMessage(HRESULT hr)
++{
++    FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
++	FORMAT_MESSAGE_IGNORE_INSERTS,
++	NULL,
++	hr,
++	MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
++	(LPTSTR) & WIN32_ErrorMessage,
++	0,
++	NULL);
++    return WIN32_ErrorMessage;
++}
++
++
++wchar_t *
++My_NameTranslate(wchar_t * name, int in_format, int out_format)
++{
++    IADsNameTranslate *pNto;
++    HRESULT hr;
++    BSTR bstr;
++    wchar_t *wc;
++
++    if (WIN32_COM_initialized == 0) {
++	hr = CoInitialize(NULL);
++	if (FAILED(hr)) {
++	    debug("My_NameTranslate: cannot initialize COM interface, ERROR: %s\n", Get_WIN32_ErrorMessage(hr));
++	    /* This is a fatal error */
++	    exit(1);
++	}
++	WIN32_COM_initialized = 1;
++    }
++    hr = CoCreateInstance(&CLSID_NameTranslate,
++	NULL,
++	CLSCTX_INPROC_SERVER,
++	&IID_IADsNameTranslate,
++	(void **) &pNto);
++    if (FAILED(hr)) {
++	debug("My_NameTranslate: cannot create COM instance, ERROR: %s\n", Get_WIN32_ErrorMessage(hr));
++	/* This is a fatal error */
++	exit(1);
++    }
++    hr = pNto->lpVtbl->Init(pNto, ADS_NAME_INITTYPE_GC, L"");
++    if (FAILED(hr)) {
++	debug("My_NameTranslate: cannot initialise NameTranslate API, ERROR: %s\n", Get_WIN32_ErrorMessage(hr));
++	pNto->lpVtbl->Release(pNto);
++	/* This is a fatal error */
++	exit(1);
++    }
++    hr = pNto->lpVtbl->Set(pNto, in_format, name);
++    if (FAILED(hr)) {
++	debug("My_NameTranslate: cannot set translate of %S, ERROR: %s\n", name, Get_WIN32_ErrorMessage(hr));
++	pNto->lpVtbl->Release(pNto);
++	return NULL;
++    }
++    hr = pNto->lpVtbl->Get(pNto, out_format, &bstr);
++    if (FAILED(hr)) {
++	debug("My_NameTranslate: cannot get translate of %S, ERROR: %s\n", name, Get_WIN32_ErrorMessage(hr));
++	pNto->lpVtbl->Release(pNto);
++	return NULL;
++    }
++    debug("My_NameTranslate: %S translated to %S\n", name, bstr);
++
++    wc = (wchar_t *) xmalloc((wcslen(bstr) + 1) * sizeof(wchar_t));
++    wcscpy(wc, bstr);
++    SysFreeString(bstr);
++    pNto->lpVtbl->Release(pNto);
++    return wc;
++}
++
++
++wchar_t *
++GetLDAPPath(wchar_t * Base_DN, int query_mode)
++{
++    wchar_t *wc;
++
++    wc = (wchar_t *) xmalloc((wcslen(Base_DN) + 8) * sizeof(wchar_t));
++
++    if (query_mode == LDAP_MODE)
++    wcscpy(wc, L"LDAP://");
 +    else
-+        ftpState->data.close();
++	wcscpy(wc, L"GC://");
++    wcscat(wc, Base_DN);
++
++    return wc;
++}
++
+ 
+ char *
+ GetDomainName(void)
+@@ -93,74 +309,237 @@ GetDomainName(void)
+     DWORD netret;
+ 
+     if ((netret = DsRoleGetPrimaryDomainInformation(NULL, DsRolePrimaryDomainInfoBasic, (PBYTE *) & pDSRoleInfo) == ERROR_SUCCESS)) {
+-        /*
+-         * Check the machine role.
+-         */
+-
+-        if ((pDSRoleInfo->MachineRole == DsRole_RoleMemberWorkstation) ||
+-                (pDSRoleInfo->MachineRole == DsRole_RoleMemberServer) ||
+-                (pDSRoleInfo->MachineRole == DsRole_RoleBackupDomainController) ||
+-                (pDSRoleInfo->MachineRole == DsRole_RolePrimaryDomainController)) {
+-
+-            size_t len = wcslen(pDSRoleInfo->DomainNameFlat);
+-
+-            /* allocate buffer for str + null termination */
+-            safe_free(DomainName);
+-            DomainName = (char *) xmalloc(len + 1);
+-            if (DomainName == NULL)
+-                return NULL;
+-
+-            /* copy unicode buffer */
+-            WideCharToMultiByte(CP_ACP, 0, pDSRoleInfo->DomainNameFlat, -1, DomainName, len, NULL, NULL);
+-
+-            /* add null termination */
+-            DomainName[len] = '\0';
+-
+-            /*
+-             * Member of a domain. Display it in debug mode.
+-             */
+-            debug("Member of Domain %s\n", DomainName);
+-            debug("Into forest %S\n", pDSRoleInfo->DomainForestName);
+-
+-        } else {
+-            debug("Not a Domain member\n");
+-        }
++	/* 
++	 * Check the machine role.
++	 */
++
++	if ((pDSRoleInfo->MachineRole == DsRole_RoleMemberWorkstation) ||
++	    (pDSRoleInfo->MachineRole == DsRole_RoleMemberServer) ||
++	    (pDSRoleInfo->MachineRole == DsRole_RoleBackupDomainController) ||
++	    (pDSRoleInfo->MachineRole == DsRole_RolePrimaryDomainController)) {
++
++	    size_t len = wcslen(pDSRoleInfo->DomainNameFlat);
++
++	    /* allocate buffer for str + null termination */
++	    safe_free(DomainName);
++	    DomainName = (char *) xmalloc(len + 1);
++
++	    /* copy unicode buffer */
++	    WideCharToMultiByte(CP_ACP, 0, pDSRoleInfo->DomainNameFlat, -1, DomainName, len, NULL, NULL);
++
++	    /* add null termination */
++	    DomainName[len] = '\0';
++
++	    /* 
++	     * Member of a domain. Display it in debug mode.
++	     */
++	    debug("Member of Domain %s\n", DomainName);
++	    debug("Into forest %S\n", pDSRoleInfo->DomainForestName);
++
++	} else {
++	    debug("Not a Domain member\n");
++	}
+     } else
+-        debug("DsRoleGetPrimaryDomainInformation Error: %ld\n", netret);
++	debug("GetDomainName: ERROR DsRoleGetPrimaryDomainInformation returned: %s\n", Get_WIN32_ErrorMessage(netret));
  
      /*
-      * Set up a listen socket on the same local address as the
-      * control connection.
+      * Free the allocated memory.
       */
--
--    addr.InitAddrInfo(AI);
--
-+    ftpState->data.local.InitAddrInfo(AI);
-     x = getsockname(ftpState->ctrl.fd, AI->ai_addr, &AI->ai_addrlen);
--
--    addr = *AI;
--
--    addr.FreeAddrInfo(AI);
-+    ftpState->data.local = *AI;
-+    ftpState->data.local.FreeAddrInfo(AI);
+     if (pDSRoleInfo != NULL)
+-        DsRoleFreeMemory(pDSRoleInfo);
++	DsRoleFreeMemory(pDSRoleInfo);
  
-     if (x) {
-         debugs(9, DBG_CRITICAL, HERE << "getsockname(" << ftpState->ctrl.fd << ",..): " << xstrerror());
-@@ -2754,38 +2810,18 @@ ftpOpenListenSocket(FtpStateData * ftpState, int fallback)
-      * used for both control and data.
-      */
-     if (fallback) {
-+        int on = 1;
-         setsockopt(ftpState->ctrl.fd, SOL_SOCKET, SO_REUSEADDR, (char *) &on, sizeof(on));
-+        ftpState->ctrl.flags |= COMM_REUSEADDR;
-+        ftpState->data.flags |= COMM_REUSEADDR;
-     } else {
-         /* if not running in fallback mode a new port needs to be retrieved */
--        addr.SetPort(0);
--    }
--
--    fd = comm_open(SOCK_STREAM,
--                   IPPROTO_TCP,
--                   addr,
--                   COMM_NONBLOCKING | (fallback ? COMM_REUSEADDR : 0),
--                   ftpState->entry->url());
--    debugs(9, 3, HERE << "Unconnected data socket created on FD " << fd  );
--
--    if (fd < 0) {
--        debugs(9, DBG_CRITICAL, HERE << "comm_open failed");
--        return -1;
--    }
--
--    typedef CommCbMemFunT<FtpStateData, CommAcceptCbParams> acceptDialer;
--    AsyncCall::Pointer acceptCall = JobCallback(11, 5,
--                                    acceptDialer, ftpState, FtpStateData::ftpAcceptDataConnection);
--    ftpState->data.listener = new Comm::ListenStateData(fd, acceptCall, false);
--
--    if (!ftpState->data.listener || ftpState->data.listener->errcode != 0) {
--        comm_close(fd);
--        return -1;
-+        ftpState->data.local.SetPort(0);
-+        ftpState->data.flags = COMM_NONBLOCKING;
-     }
- 
--    ftpState->data.opened(fd, ftpState->dataCloser());
--    ftpState->data.port = comm_local_port(fd);
--    ftpState->data.host = NULL;
--    return fd;
-+    ftpState->listenForDataChannel((fallback?ftpState->ctrl.fd:-1), ftpState->entry->url());
-+    return ftpState->data.fd;
+     return DomainName;
  }
  
- /// \ingroup ServerProtocolFTPInternal
-@@ -2881,6 +2917,7 @@ ftpSendEPRT(FtpStateData * ftpState)
-     debugs(9, 3, HERE);
-     ftpState->flags.pasv_supported = 0;
-     fd = ftpOpenListenSocket(ftpState, 0);
-+    debugs(9, 3, "Listening for FTP data connection with FD " << fd);
- 
-     Ip::Address::InitAddrInfo(AI);
- 
-@@ -2933,77 +2970,68 @@ ftpReadEPRT(FtpStateData * ftpState)
-  */
- void FtpStateData::ftpAcceptDataConnection(const CommAcceptCbParams &io)
++
++int
++add_User_Group(wchar_t * Group)
++{
++    wchar_t **array;
++
++    if (User_Groups_Count == 0) {
++	User_Groups = (wchar_t **) xmalloc(sizeof(wchar_t *));
++	*User_Groups = NULL;
++	User_Groups_Count++;
++    }
++    array = User_Groups;
++    while (*array) {
++	if (wcscmp(Group, *array) == 0)
++	    return 0;
++	array++;
++    }
++    User_Groups = (wchar_t **) xrealloc(User_Groups, sizeof(wchar_t *) * (User_Groups_Count + 1));
++    User_Groups[User_Groups_Count] = NULL;
++    User_Groups[User_Groups_Count - 1] = (wchar_t *) xmalloc((wcslen(Group) + 1) * sizeof(wchar_t));
++    wcscpy(User_Groups[User_Groups_Count - 1], Group);
++    User_Groups_Count++;
++
++    return 1;
++}
++
++
++/* returns 0 on match, -1 if no match */
++static int
++wccmparray(const wchar_t * str, const wchar_t ** array)
++{
++    while (*array) {
++	debug("Windows group: %S, Squid group: %S\n", str, *array);
++	if (wcscmp(str, *array) == 0)
++	    return 0;
++	array++;
++    }
++    return -1;
++}
++
++
+ /* returns 0 on match, -1 if no match */
+ static int
+ wcstrcmparray(const wchar_t * str, const char **array)
  {
--    char ntoapeer[MAX_IPSTRLEN];
--    debugs(9, 3, "ftpAcceptDataConnection");
--
--    // one connection accepted. the handler has stopped listening. drop our local pointer to it.
--    data.listener = NULL;
-+    debugs(9, 3, HERE);
+     WCHAR wszGroup[GNLEN + 1];	// Unicode Group
  
-     if (EBIT_TEST(entry->flags, ENTRY_ABORTED)) {
-         abortTransaction("entry aborted when accepting data conn");
-         return;
+     while (*array) {
+-        MultiByteToWideChar(CP_ACP, 0, *array,
+-                            strlen(*array) + 1, wszGroup, sizeof(wszGroup) / sizeof(wszGroup[0]));
+-        debug("Windows group: %S, Squid group: %S\n", str, wszGroup);
+-        if ((use_case_insensitive_compare ? _wcsicmp(str, wszGroup) : wcscmp(str, wszGroup)) == 0)
+-            return 0;
+-        array++;
++	MultiByteToWideChar(CP_ACP, 0, *array,
++	    strlen(*array) + 1, wszGroup, sizeof(wszGroup) / sizeof(wszGroup[0]));
++	debug("Windows group: %S, Squid group: %S\n", str, wszGroup);
++	if ((use_case_insensitive_compare ? _wcsicmp(str, wszGroup) : wcscmp(str, wszGroup)) == 0)
++	    return 0;
++	array++;
      }
+     return -1;
+ }
  
-+    if (io.flag != COMM_OK) {
-+        data.close();
-+        debugs(9, DBG_IMPORTANT, "FTP AcceptDataConnection: FD " << io.fd << ": " << xstrerr(io.xerrno));
-+        /** \todo Need to send error message on control channel*/
-+        ftpFail(this);
-+        return;
-+    }
 +
-+    /* data listening conn is no longer even open. abort. */
-+    if (data.fd <= 0 || fd_table[data.fd].flags.open == 0) {
-+        data.clear(); // ensure that it's cleared and not just closed.
-+        return;
-+    }
++HRESULT
++Recursive_Memberof(IADs * pObj)
++{
++    VARIANT var;
++    long lBound, uBound;
++    HRESULT hr;
 +
-     /** \par
-      * When squid.conf ftp_sanitycheck is enabled, check the new connection is actually being
-      * made by the remote client which is connected to the FTP control socket.
-+     * Or the one which we were told to listen for by control channel messages (may differ under NAT).
-      * This prevents third-party hacks, but also third-party load balancing handshakes.
++    VariantInit(&var);
++    hr = pObj->lpVtbl->Get(pObj, L"memberOf", &var);
++    if (SUCCEEDED(hr)) {
++	if (VT_BSTR == var.n1.n2.vt) {
++	    if (add_User_Group(var.n1.n2.n3.bstrVal)) {
++		wchar_t *Group_Path;
++		IADs *pGrp;
++
++		Group_Path = GetLDAPPath(var.n1.n2.n3.bstrVal, GC_MODE);
++		hr = ADsGetObject(Group_Path, &IID_IADs, (void **) &pGrp);
++		if (SUCCEEDED(hr)) {
++		    hr = Recursive_Memberof(pGrp);
++		    pGrp->lpVtbl->Release(pGrp);
++		    safe_free(Group_Path);
++		    Group_Path = GetLDAPPath(var.n1.n2.n3.bstrVal, LDAP_MODE);
++		hr = ADsGetObject(Group_Path, &IID_IADs, (void **) &pGrp);
++		if (SUCCEEDED(hr)) {
++		    hr = Recursive_Memberof(pGrp);
++		    pGrp->lpVtbl->Release(pGrp);
++		} else
++		    debug("Recursive_Memberof: ERROR ADsGetObject for %S failed: %s\n", Group_Path, Get_WIN32_ErrorMessage(hr));
++		} else
++		    debug("Recursive_Memberof: ERROR ADsGetObject for %S failed: %s\n", Group_Path, Get_WIN32_ErrorMessage(hr));
++		safe_free(Group_Path);
++	    }
++	} else {
++	    if (SUCCEEDED(SafeArrayGetLBound(V_ARRAY(&var), 1, &lBound)) &&
++		SUCCEEDED(SafeArrayGetUBound(V_ARRAY(&var), 1, &uBound))) {
++		VARIANT elem;
++		while (lBound <= uBound) {
++		    hr = SafeArrayGetElement(V_ARRAY(&var), &lBound, &elem);
++		    if (SUCCEEDED(hr)) {
++			if (add_User_Group(elem.n1.n2.n3.bstrVal)) {
++			    wchar_t *Group_Path;
++			    IADs *pGrp;
++
++			    Group_Path = GetLDAPPath(elem.n1.n2.n3.bstrVal, GC_MODE);
++			    hr = ADsGetObject(Group_Path, &IID_IADs, (void **) &pGrp);
++			    if (SUCCEEDED(hr)) {
++				hr = Recursive_Memberof(pGrp);
++				pGrp->lpVtbl->Release(pGrp);
++				safe_free(Group_Path);
++				Group_Path = GetLDAPPath(elem.n1.n2.n3.bstrVal, LDAP_MODE);
++				hr = ADsGetObject(Group_Path, &IID_IADs, (void **) &pGrp);
++				if (SUCCEEDED(hr)) {
++				    hr = Recursive_Memberof(pGrp);
++				    pGrp->lpVtbl->Release(pGrp);
++				    safe_free(Group_Path);
++				} else
++				    debug("Recursive_Memberof: ERROR ADsGetObject for %S failed: %s\n", Group_Path, Get_WIN32_ErrorMessage(hr));
++			    } else
++				debug("Recursive_Memberof: ERROR ADsGetObject for %S failed: %s\n", Group_Path, Get_WIN32_ErrorMessage(hr));
++			    safe_free(Group_Path);
++			}
++			VariantClear(&elem);
++		    } else {
++			debug("Recursive_Memberof: ERROR SafeArrayGetElement failed: %s\n", Get_WIN32_ErrorMessage(hr));
++			VariantClear(&elem);
++		    }
++		    ++lBound;
++		}
++	    } else
++		debug("Recursive_Memberof: ERROR SafeArrayGetxBound failed: %s\n", Get_WIN32_ErrorMessage(hr));
++	}
++	VariantClear(&var);
++    } else {
++	if (hr != E_ADS_PROPERTY_NOT_FOUND)
++	    debug("Recursive_Memberof: ERROR getting memberof attribute: %s\n", Get_WIN32_ErrorMessage(hr));
++    }
++    return hr;
++}
++
++
++static wchar_t **
++build_groups_DN_array(const char **array, char *userdomain)
++{
++    wchar_t *wc = NULL;
++    int wcsize;
++    int source_group_format;
++    char Group[GNLEN + 1];
++
++    wchar_t **wc_array, **entry;
++
++    entry = wc_array = (wchar_t **) xmalloc((numberofgroups + 1) * sizeof(wchar_t *));
++
++    while (*array) {
++	if (strchr(*array, '/') != NULL) {
++	    strncpy(Group, *array, GNLEN);
++	    source_group_format = ADS_NAME_TYPE_CANONICAL;
++	} else {
++	    source_group_format = ADS_NAME_TYPE_NT4;
++	    if (strchr(*array, '\\') == NULL) {
++		strcpy(Group, userdomain);
++		strcat(Group, "\\");
++		strncat(Group, *array, GNLEN - sizeof(userdomain) - 1);
++	    } else
++		strncpy(Group, *array, GNLEN);
++	}
++
++	wcsize = MultiByteToWideChar(CP_ACP, 0, Group, -1, wc, 0);
++	wc = (wchar_t *) xmalloc(wcsize * sizeof(wchar_t));
++	MultiByteToWideChar(CP_ACP, 0, Group, -1, wc, wcsize);
++	*entry = My_NameTranslate(wc, source_group_format, ADS_NAME_TYPE_1779);
++	safe_free(wc);
++	array++;
++	if (*entry == NULL) {
++	    debug("build_groups_DN_array: cannot get DN for '%s'.\n", Group);
++	    continue;
++	}
++	entry++;
++    }
++    *entry = NULL;
++    return wc_array;
++}
++
++
+ /* returns 1 on success, 0 on failure */
+ int
+ Valid_Local_Groups(char *UserName, const char **Groups)
+ {
+     int result = 0;
+     char *Domain_Separator;
+-    WCHAR wszUserName[UNLEN + 1];	// Unicode user name
++    WCHAR wszUserName[UNLEN + 1];	/* Unicode user name */
+ 
+     LPLOCALGROUP_USERS_INFO_0 pBuf;
+     LPLOCALGROUP_USERS_INFO_0 pTmpBuf;
+@@ -175,58 +554,60 @@ Valid_Local_Groups(char *UserName, const char **Groups)
+     LPBYTE pBufTmp = NULL;
+ 
+     if ((Domain_Separator = strchr(UserName, '/')) != NULL)
+-        *Domain_Separator = '\\';
++	*Domain_Separator = '\\';
+ 
+     debug("Valid_Local_Groups: checking group membership of '%s'.\n", UserName);
+ 
+-    /* Convert ANSI User Name and Group to Unicode */
++/* Convert ANSI User Name and Group to Unicode */
+ 
+     MultiByteToWideChar(CP_ACP, 0, UserName,
+-                        strlen(UserName) + 1, wszUserName, sizeof(wszUserName) / sizeof(wszUserName[0]));
++	strlen(UserName) + 1, wszUserName, sizeof(wszUserName) / sizeof(wszUserName[0]));
+ 
+     /*
+-     * Call the NetUserGetLocalGroups function
++     * Call the NetUserGetLocalGroups function 
+      * specifying information level 0.
+-     *
+-     * The LG_INCLUDE_INDIRECT flag specifies that the
+-     * function should also return the names of the local
++     * 
++     * The LG_INCLUDE_INDIRECT flag specifies that the 
++     * function should also return the names of the local 
+      * groups in which the user is indirectly a member.
       */
-     if (Config.Ftp.sanitycheck) {
-+        char ntoapeer[MAX_IPSTRLEN];
-         io.details.peer.NtoA(ntoapeer,MAX_IPSTRLEN);
- 
--        if (strcmp(fd_table[ctrl.fd].ipaddr, ntoapeer) != 0) {
-+        if (strcmp(fd_table[ctrl.fd].ipaddr, ntoapeer) != 0 &&
-+                strcmp(fd_table[data.fd].ipaddr, ntoapeer) != 0) {
-             debugs(9, DBG_IMPORTANT,
-                    "FTP data connection from unexpected server (" <<
-                    io.details.peer << "), expecting " <<
--                   fd_table[ctrl.fd].ipaddr);
-+                   fd_table[ctrl.fd].ipaddr << " or " << fd_table[data.fd].ipaddr);
- 
--            /* close the bad soures connection down ASAP. */
-+            /* close the bad sources connection down ASAP. */
-             comm_close(io.nfd);
- 
--            /* we are ony accepting once, so need to re-open the listener socket. */
--            typedef CommCbMemFunT<FtpStateData, CommAcceptCbParams> acceptDialer;
--            AsyncCall::Pointer acceptCall = JobCallback(11, 5,
--                                            acceptDialer, this, FtpStateData::ftpAcceptDataConnection);
--            data.listener = new Comm::ListenStateData(data.fd, acceptCall, false);
-+            /* drop the bad connection (io) by ignoring the attempt. */
-             return;
-         }
-     }
- 
--    if (io.flag != COMM_OK) {
--        debugs(9, DBG_IMPORTANT, "ftpHandleDataAccept: FD " << io.nfd << ": " << xstrerr(io.xerrno));
--        /** \todo XXX Need to set error message */
--        ftpFail(this);
--        return;
--    }
--
-     /**\par
--     * Replace the Listen socket with the accepted data socket */
-+     * Replace the Listening socket with the accepted data socket */
-     data.close();
-     data.opened(io.nfd, dataCloser());
-     data.port = io.details.peer.GetPort();
--    io.details.peer.NtoA(data.host,SQUIDHOSTNAMELEN);
-+    data.host = xstrdup(fd_table[io.nfd].ipaddr);
- 
-     debugs(9, 3, "ftpAcceptDataConnection: Connected data socket on " <<
-            "FD " << io.nfd << " to " << io.details.peer << " FD table says: " <<
-            "ctrl-peer= " << fd_table[ctrl.fd].ipaddr << ", " <<
-            "data-peer= " << fd_table[data.fd].ipaddr);
- 
-+    assert(haveControlChannel("ftpAcceptDataConnection"));
-+    assert(ctrl.message == NULL);
- 
--    AsyncCall::Pointer nullCall = NULL;
--    commSetTimeout(ctrl.fd, -1, nullCall);
--
--    typedef CommCbMemFunT<FtpStateData, CommTimeoutCbParams> TimeoutDialer;
--    AsyncCall::Pointer timeoutCall =  JobCallback(9, 5,
--                                      TimeoutDialer, this, FtpStateData::ftpTimeout);
--    commSetTimeout(data.fd, Config.Timeout.read, timeoutCall);
--
--    /*\todo XXX We should have a flag to track connect state...
--     *    host NULL -> not connected, port == local port
--     *    host set  -> connected, port == remote port
+     nStatus = NetUserGetLocalGroups(NULL,
+-                                    wszUserName,
+-                                    dwLevel,
+-                                    dwFlags,
+-                                    &pBufTmp,
+-                                    dwPrefMaxLen,
+-                                    &dwEntriesRead,
+-                                    &dwTotalEntries);
++	wszUserName,
++	dwLevel,
++	dwFlags,
++	&pBufTmp,
++	dwPrefMaxLen,
++	&dwEntriesRead,
++	&dwTotalEntries);
+     pBuf = (LPLOCALGROUP_USERS_INFO_0) pBufTmp;
+     /*
+      * If the call succeeds,
+      */
+     if (nStatus == NERR_Success) {
+-        if ((pTmpBuf = pBuf) != NULL) {
+-            for (i = 0; i < dwEntriesRead; i++) {
+-                assert(pTmpBuf != NULL);
+-                if (pTmpBuf == NULL) {
+-                    result = 0;
+-                    break;
+-                }
+-                if (wcstrcmparray(pTmpBuf->lgrui0_name, Groups) == 0) {
+-                    result = 1;
+-                    break;
+-                }
+-                pTmpBuf++;
+-                dwTotalCount++;
+-            }
+-        }
+-    } else
+-        result = 0;
+-    /*
+-     * Free the allocated memory.
 -     */
--    /* Restart state (SENT_NLST/LIST/RETR) */
--    FTP_SM_FUNCS[state] (this);
-+    // Ctrl channel operations will determine what happens to this data connection
++	if ((pTmpBuf = pBuf) != NULL) {
++	    for (i = 0; i < dwEntriesRead; i++) {
++		assert(pTmpBuf != NULL);
++		if (pTmpBuf == NULL) {
++		    result = 0;
++		    break;
++		}
++		if (wcstrcmparray(pTmpBuf->lgrui0_name, Groups) == 0) {
++		    result = 1;
++		    break;
++		}
++		pTmpBuf++;
++		dwTotalCount++;
++	    }
++	}
++    } else {
++	debug("Valid_Local_Groups: ERROR NetUserGetLocalGroups returned: %s\n", Get_WIN32_ErrorMessage(nStatus));
++	result = 0;
++    }
++/*
++ * Free the allocated memory.
++ */
+     if (pBuf != NULL)
+-        NetApiBufferFree(pBuf);
++	NetApiBufferFree(pBuf);
+     return result;
  }
  
- /// \ingroup ServerProtocolFTPInternal
-@@ -3075,34 +3103,17 @@ void FtpStateData::readStor()
-             return;
-         }
- 
--        /*\par
--         * When client status is 125, or 150 without a hostname, Begin data transfer. */
-+        /* When client status is 125, or 150 without a hostname, Begin data transfer. */
-         debugs(9, 3, HERE << "starting data transfer");
-+        switchTimeoutToDataChannel();
-         sendMoreRequestBody();
--        /** \par
--         * Cancel the timeout on the Control socket and
--         * establish one on the data socket.
--         */
--        AsyncCall::Pointer nullCall = NULL;
--        commSetTimeout(ctrl.fd, -1, nullCall);
--
--        typedef CommCbMemFunT<FtpStateData, CommTimeoutCbParams> TimeoutDialer;
--        AsyncCall::Pointer timeoutCall =  JobCallback(9, 5,
--                                          TimeoutDialer, this, FtpStateData::ftpTimeout);
--
--        commSetTimeout(data.fd, Config.Timeout.read, timeoutCall);
--
-         state = WRITING_DATA;
-         debugs(9, 3, HERE << "writing data channel");
-     } else if (code == 150) {
-         /*\par
--         * When client code is 150 with a hostname, Accept data channel. */
-+         * When client code is 150 without a hostname, Accept data channel. */
-         debugs(9, 3, "ftpReadStor: accepting data channel");
--        typedef CommCbMemFunT<FtpStateData, CommAcceptCbParams> acceptDialer;
--        AsyncCall::Pointer acceptCall = JobCallback(11, 5,
--                                        acceptDialer, this, FtpStateData::ftpAcceptDataConnection);
--
--        data.listener = new Comm::ListenStateData(data.fd, acceptCall, false);
-+        listenForDataChannel(data.fd, data.host);
-     } else {
-         debugs(9, DBG_IMPORTANT, HERE << "Unexpected reply code "<< std::setfill('0') << std::setw(3) << code);
-         ftpFail(this);
-@@ -3222,34 +3233,15 @@ ftpReadList(FtpStateData * ftpState)
- 
-     if (code == 125 || (code == 150 && ftpState->data.host)) {
-         /* Begin data transfer */
--        /* XXX what about Config.Timeout.read? */
-+        debugs(9, 3, HERE << "begin data transfer from " << ftpState->data.host << " (" << ftpState->data.local << ")");
-+        ftpState->switchTimeoutToDataChannel();
-         ftpState->maybeReadVirginBody();
-         ftpState->state = READING_DATA;
--        /*
--         * Cancel the timeout on the Control socket and establish one
--         * on the data socket
--         */
--        AsyncCall::Pointer nullCall = NULL;
--        commSetTimeout(ftpState->ctrl.fd, -1, nullCall);
-         return;
-     } else if (code == 150) {
-         /* Accept data channel */
--        typedef CommCbMemFunT<FtpStateData, CommAcceptCbParams> acceptDialer;
--        AsyncCall::Pointer acceptCall = JobCallback(11, 5,
--                                        acceptDialer, ftpState, FtpStateData::ftpAcceptDataConnection);
--
--        ftpState->data.listener = new Comm::ListenStateData(ftpState->data.fd, acceptCall, false);
--        /*
--         * Cancel the timeout on the Control socket and establish one
--         * on the data socket
--         */
--        AsyncCall::Pointer nullCall = NULL;
--        commSetTimeout(ftpState->ctrl.fd, -1, nullCall);
--
--        typedef CommCbMemFunT<FtpStateData, CommTimeoutCbParams> TimeoutDialer;
--        AsyncCall::Pointer timeoutCall =  JobCallback(9, 5,
--                                          TimeoutDialer, ftpState,FtpStateData::ftpTimeout);
--        commSetTimeout(ftpState->data.fd, Config.Timeout.read, timeoutCall);
-+        debugs(9, 3, HERE << "accept data channel from " << ftpState->data.host << " (" << ftpState->data.local << ")");
-+        ftpState->listenForDataChannel(ftpState->data.fd, ftpState->data.host);
-         return;
-     } else if (!ftpState->flags.tried_nlst && code > 300) {
-         ftpSendNlst(ftpState);
-@@ -3285,32 +3277,12 @@ ftpReadRetr(FtpStateData * ftpState)
-     if (code == 125 || (code == 150 && ftpState->data.host)) {
-         /* Begin data transfer */
-         debugs(9, 3, HERE << "reading data channel");
--        /* XXX what about Config.Timeout.read? */
-+        ftpState->switchTimeoutToDataChannel();
-         ftpState->maybeReadVirginBody();
-         ftpState->state = READING_DATA;
--        /*
--         * Cancel the timeout on the Control socket and establish one
--         * on the data socket
--         */
--        AsyncCall::Pointer nullCall = NULL;
--        commSetTimeout(ftpState->ctrl.fd, -1, nullCall);
-     } else if (code == 150) {
-         /* Accept data channel */
--        typedef CommCbMemFunT<FtpStateData, CommAcceptCbParams> acceptDialer;
--        AsyncCall::Pointer acceptCall = JobCallback(11, 5,
--                                        acceptDialer, ftpState, FtpStateData::ftpAcceptDataConnection);
--        ftpState->data.listener = new Comm::ListenStateData(ftpState->data.fd, acceptCall, false);
--        /*
--         * Cancel the timeout on the Control socket and establish one
--         * on the data socket
--         */
--        AsyncCall::Pointer nullCall = NULL;
--        commSetTimeout(ftpState->ctrl.fd, -1, nullCall);
--
--        typedef CommCbMemFunT<FtpStateData, CommTimeoutCbParams> TimeoutDialer;
--        AsyncCall::Pointer timeoutCall =  JobCallback(9, 5,
--                                          TimeoutDialer, ftpState,FtpStateData::ftpTimeout);
--        commSetTimeout(ftpState->data.fd, Config.Timeout.read, timeoutCall);
-+        ftpState->listenForDataChannel(ftpState->data.fd, ftpState->data.host);
-     } else if (code >= 300) {
-         if (!ftpState->flags.try_slash_hack) {
-             /* Try this as a directory missing trailing slash... */
-@@ -3965,22 +3937,25 @@ FtpChannel::opened(int aFd, const AsyncCall::Pointer &aCloser)
-     fd = aFd;
-     closer = aCloser;
-     comm_add_close_handler(fd, closer);
-+
-+    // grab the local IP address:port details for this connection
-+    struct addrinfo *AI = NULL;
-+    local.InitAddrInfo(AI);
-+    getsockname(aFd, AI->ai_addr, &AI->ai_addrlen);
-+    local = *AI;
-+    local.FreeAddrInfo(AI);
- }
- 
- /// planned close: removes the close handler and calls comm_close
- void
- FtpChannel::close()
+@@ -236,125 +617,132 @@ int
+ Valid_Global_Groups(char *UserName, const char **Groups)
  {
-     // channels with active listeners will be closed when the listener handler dies.
--    if (listener) {
--        delete listener;
--        listener = NULL;
--        comm_remove_close_handler(fd, closer);
--        closer = NULL;
--        fd = -1;
--    } else if (fd >= 0) {
--        comm_remove_close_handler(fd, closer);
--        closer = NULL;
-+    if (fd >= 0) {
-+        if (closer != NULL) {
-+            comm_remove_close_handler(fd, closer);
-+            closer = NULL;
-+        }
-         comm_close(fd); // we do not expect to be called back
-         fd = -1;
+     int result = 0;
+-    WCHAR wszUserName[UNLEN + 1];	// Unicode user name
+-
+-    WCHAR wszDomainControllerName[UNCLEN + 1];
+-
++    WCHAR wszUser[DNLEN + UNLEN + 2];	/* Unicode user name */
+     char NTDomain[DNLEN + UNLEN + 2];
++
+     char *domain_qualify = NULL;
+-    char User[UNLEN + 1];
++    char User[DNLEN + UNLEN + 2];
+     size_t j;
+ 
+-    LPGROUP_USERS_INFO_0 pUsrBuf = NULL;
+-    LPGROUP_USERS_INFO_0 pTmpBuf;
+-    PDOMAIN_CONTROLLER_INFO pDCInfo = NULL;
+-    DWORD dwLevel = 0;
+-    DWORD dwPrefMaxLen = -1;
+-    DWORD dwEntriesRead = 0;
+-    DWORD dwTotalEntries = 0;
+-    NET_API_STATUS nStatus;
+-    DWORD i;
+-    DWORD dwTotalCount = 0;
+-    LPBYTE pBufTmp = NULL;
++    wchar_t *User_DN, *User_LDAP_path, *User_PrimaryGroup;
++    wchar_t **wszGroups, **tmp;
++    IADs *pUser;
++    HRESULT hr;
+ 
+     strncpy(NTDomain, UserName, sizeof(NTDomain));
+ 
+     for (j = 0; j < strlen(NTV_VALID_DOMAIN_SEPARATOR); j++) {
+-        if ((domain_qualify = strchr(NTDomain, NTV_VALID_DOMAIN_SEPARATOR[j])) != NULL)
+-            break;
++	if ((domain_qualify = strchr(NTDomain, NTV_VALID_DOMAIN_SEPARATOR[j])) != NULL)
++	    break;
      }
+     if (domain_qualify == NULL) {
+-        strcpy(User, NTDomain);
+-        strcpy(NTDomain, DefaultDomain);
++	strncpy(User, DefaultDomain, DNLEN);
++	strcat(User, "\\");
++	strncat(User, UserName, UNLEN);
++	strncpy(NTDomain, DefaultDomain, DNLEN);
+     } else {
+-        strcpy(User, domain_qualify + 1);
+-        domain_qualify[0] = '\0';
+-        strlwr(NTDomain);
++	domain_qualify[0] = '\\';
++	strncpy(User, NTDomain, DNLEN + UNLEN + 2);
++	domain_qualify[0] = '\0';
+     }
+ 
+-    debug("Valid_Global_Groups: checking group membership of '%s\\%s'.\n", NTDomain, User);
++    debug("Valid_Global_Groups: checking group membership of '%s'.\n", User);
+ 
+     /* Convert ANSI User Name to Unicode */
+ 
+     MultiByteToWideChar(CP_ACP, 0, User,
+-                        strlen(User) + 1, wszUserName,
+-                        sizeof(wszUserName) / sizeof(wszUserName[0]));
+-
+-    /* Query AD for a DC */
++	strlen(User) + 1, wszUser,
++	sizeof(wszUser) / sizeof(wszUser[0]));
+ 
+-    if (DsGetDcName(NULL, NTDomain, NULL, NULL, DS_IS_FLAT_NAME | DS_RETURN_FLAT_NAME, &pDCInfo) != NO_ERROR) {
+-        fprintf(stderr, "%s DsGetDcName() failed.'\n", myname);
+-        if (pDCInfo != NULL)
+-            NetApiBufferFree(pDCInfo);
+-        return result;
++    /* Get CN of User */
++    if ((User_DN = My_NameTranslate(wszUser, ADS_NAME_TYPE_NT4, ADS_NAME_TYPE_1779)) == NULL) {
++	debug("Valid_Global_Groups: cannot get DN for '%s'.\n", User);
++	return result;
+     }
+-    /* Convert ANSI Domain Controller Name to Unicode */
+-
+-    MultiByteToWideChar(CP_ACP, 0, pDCInfo->DomainControllerName,
+-                        strlen(pDCInfo->DomainControllerName) + 1, wszDomainControllerName,
+-                        sizeof(wszDomainControllerName) / sizeof(wszDomainControllerName[0]));
+-
+-    debug("Using '%S' as DC for '%s' user's domain.\n", wszDomainControllerName, NTDomain);
+-    debug("DC Active Directory Site is %s\n", pDCInfo->DcSiteName);
+-    debug("Machine Active Directory Site is %s\n", pDCInfo->ClientSiteName);
++    wszGroups = build_groups_DN_array(Groups, NTDomain);
++
++    User_LDAP_path = GetLDAPPath(User_DN, GC_MODE);
++
++    hr = ADsGetObject(User_LDAP_path, &IID_IADs, (void **) &pUser);
++    if (SUCCEEDED(hr)) {
++	wchar_t *User_PrimaryGroup_Path;
++	IADs *pGrp;
++
++	User_PrimaryGroup = Get_primaryGroup(pUser);
++	if (User_PrimaryGroup == NULL)
++	    debug("Valid_Global_Groups: cannot get Primary Group for '%s'.\n", User);
++	else {
++	    add_User_Group(User_PrimaryGroup);
++	    User_PrimaryGroup_Path = GetLDAPPath(User_PrimaryGroup, GC_MODE);
++	    hr = ADsGetObject(User_PrimaryGroup_Path, &IID_IADs, (void **) &pGrp);
++	    if (SUCCEEDED(hr)) {
++		hr = Recursive_Memberof(pGrp);
++		pGrp->lpVtbl->Release(pGrp);
++		safe_free(User_PrimaryGroup_Path);
++		User_PrimaryGroup_Path = GetLDAPPath(User_PrimaryGroup, LDAP_MODE);
++	    hr = ADsGetObject(User_PrimaryGroup_Path, &IID_IADs, (void **) &pGrp);
++	    if (SUCCEEDED(hr)) {
++		hr = Recursive_Memberof(pGrp);
++		pGrp->lpVtbl->Release(pGrp);
++	    } else
++		debug("Valid_Global_Groups: ADsGetObject for %S failed, ERROR: %s\n", User_PrimaryGroup_Path, Get_WIN32_ErrorMessage(hr));
++	    } else
++		debug("Valid_Global_Groups: ADsGetObject for %S failed, ERROR: %s\n", User_PrimaryGroup_Path, Get_WIN32_ErrorMessage(hr));
++	    safe_free(User_PrimaryGroup_Path);
++	}
++	hr = Recursive_Memberof(pUser);
++	pUser->lpVtbl->Release(pUser);
++	safe_free(User_LDAP_path);
++	User_LDAP_path = GetLDAPPath(User_DN, LDAP_MODE);
++	hr = ADsGetObject(User_LDAP_path, &IID_IADs, (void **) &pUser);
++	if (SUCCEEDED(hr)) {
++	    hr = Recursive_Memberof(pUser);
++	    pUser->lpVtbl->Release(pUser);
++	} else
++	    debug("Valid_Global_Groups: ADsGetObject for %S failed, ERROR: %s\n", User_LDAP_path, Get_WIN32_ErrorMessage(hr));
++
++	tmp = User_Groups;
++	while (*tmp) {
++	    if (wccmparray(*tmp, wszGroups) == 0) {
++		result = 1;
++		break;
++	    }
++	    tmp++;
++	}
++    } else
++	debug("Valid_Global_Groups: ADsGetObject for %S failed, ERROR: %s\n", User_LDAP_path, Get_WIN32_ErrorMessage(hr));
++
++    safe_free(User_DN);
++    safe_free(User_LDAP_path);
++    safe_free(User_PrimaryGroup);
++    tmp = wszGroups;
++    while (*tmp) {
++	safe_free(*tmp);
++	tmp++;
++    }
++    safe_free(wszGroups);
+ 
+-    /*
+-     * Call the NetUserGetGroups function
+-     * specifying information level 0.
+-     */
+-    dwLevel = 0;
+-    pBufTmp = NULL;
+-    nStatus = NetUserGetGroups(wszDomainControllerName,
+-                               wszUserName,
+-                               dwLevel,
+-                               &pBufTmp,
+-                               dwPrefMaxLen,
+-                               &dwEntriesRead,
+-                               &dwTotalEntries);
+-    pUsrBuf = (LPGROUP_USERS_INFO_0) pBufTmp;
+-    /*
+-     * If the call succeeds,
+-     */
+-    if (nStatus == NERR_Success) {
+-        if ((pTmpBuf = pUsrBuf) != NULL) {
+-            for (i = 0; i < dwEntriesRead; i++) {
+-                assert(pTmpBuf != NULL);
+-                if (pTmpBuf == NULL) {
+-                    result = 0;
+-                    break;
+-                }
+-                if (wcstrcmparray(pTmpBuf->grui0_name, Groups) == 0) {
+-                    result = 1;
+-                    break;
+-                }
+-                pTmpBuf++;
+-                dwTotalCount++;
+-            }
+-        }
+-    } else {
+-        result = 0;
+-        fprintf(stderr, "%s NetUserGetGroups() failed.'\n", myname);
++    tmp = User_Groups;
++    while (*tmp) {
++	safe_free(*tmp);
++	tmp++;
+     }
+-    /*
+-     * Free the allocated memory.
+-     */
+-    if (pUsrBuf != NULL)
+-        NetApiBufferFree(pUsrBuf);
+-    if (pDCInfo != NULL)
+-        NetApiBufferFree((LPVOID) pDCInfo);
++    safe_free(User_Groups);
++    User_Groups_Count = 0;
++
+     return result;
+ }
+ 
+ static void
+ usage(char *program)
+ {
+-    fprintf(stderr, "Usage: %s [-D domain][-G][-P][-c][-d][-h]\n"
+-            " -D    default user Domain\n"
+-            " -G    enable Domain Global group mode\n"
+-            " -c    use case insensitive compare\n"
+-            " -d    enable debugging\n"
+-            " -h    this message\n",
+-            program);
++    fprintf(stderr, "Usage: %s [-D domain][-G][-c][-d][-h]\n"
++	" -D    default user Domain\n"
++	" -G    enable Active Directory Global group mode\n"
++	" -c    use case insensitive compare (local mode only)\n"
++	" -d    enable debugging\n"
++	" -h    this message\n",
++	program);
+ }
+ 
+ void
+@@ -364,32 +752,32 @@ process_options(int argc, char *argv[])
+ 
+     opterr = 0;
+     while (-1 != (opt = getopt(argc, argv, "D:Gcdh"))) {
+-        switch (opt) {
+-        case 'D':
+-            DefaultDomain = xstrndup(optarg, DNLEN + 1);
+-            strlwr(DefaultDomain);
+-            break;
+-        case 'G':
+-            use_global = 1;
+-            break;
+-        case 'c':
+-            use_case_insensitive_compare = 1;
+-            break;
+-        case 'd':
+-            debug_enabled = 1;
+-            break;
+-        case 'h':
+-            usage(argv[0]);
+-            exit(0);
+-        case '?':
+-            opt = optopt;
+-            /* fall thru to default */
+-        default:
+-            fprintf(stderr, "%s Unknown option: -%c. Exiting\n", myname, opt);
+-            usage(argv[0]);
+-            exit(1);
+-            break;		/* not reached */
+-        }
++	switch (opt) {
++	case 'D':
++	    DefaultDomain = xstrndup(optarg, DNLEN + 1);
++	    strlwr(DefaultDomain);
++	    break;
++	case 'G':
++	    use_global = 1;
++	    break;
++	case 'c':
++	    use_case_insensitive_compare = 1;
++	    break;
++	case 'd':
++	    debug_enabled = 1;
++	    break;
++	case 'h':
++	    usage(argv[0]);
++	    exit(0);
++	case '?':
++	    opt = optopt;
++	    /* fall thru to default */
++	default:
++	    fprintf(stderr, "%s Unknown option: -%c. Exiting\n", myname, opt);
++	    usage(argv[0]);
++	    exit(1);
++	    break;		/* not reached */
++	}
+     }
+     return;
+ }
+@@ -407,11 +795,11 @@ main(int argc, char *argv[])
+     int n;
+ 
+     if (argc > 0) {		/* should always be true */
+-        myname = strrchr(argv[0], '/');
+-        if (myname == NULL)
+-            myname = argv[0];
++	myname = strrchr(argv[0], '/');
++	if (myname == NULL)
++	    myname = argv[0];
+     } else {
+-        myname = "(unknown)";
++	myname = "(unknown)";
+     }
+     mypid = getpid();
+ 
+@@ -422,64 +810,68 @@ main(int argc, char *argv[])
+     process_options(argc, argv);
+ 
+     if (use_global) {
+-        if ((machinedomain = GetDomainName()) == NULL) {
+-            fprintf(stderr, "%s Can't read machine domain\n", myname);
+-            exit(1);
+-        }
+-        strlwr(machinedomain);
+-        if (!DefaultDomain)
+-            DefaultDomain = xstrdup(machinedomain);
++	if ((machinedomain = GetDomainName()) == NULL) {
++	    fprintf(stderr, "%s Can't read machine domain\n", myname);
++	    exit(1);
++	}
++	strlwr(machinedomain);
++	if (!DefaultDomain)
++	    DefaultDomain = xstrdup(machinedomain);
+     }
+     debug("External ACL win32 group helper build " __DATE__ ", " __TIME__
+-          " starting up...\n");
++	" starting up...\n");
+     if (use_global)
+-        debug("Domain Global group mode enabled using '%s' as default domain.\n", DefaultDomain);
++	debug("Domain Global group mode enabled using '%s' as default domain.\n", DefaultDomain);
+     if (use_case_insensitive_compare)
+-        debug("Warning: running in case insensitive mode !!!\n");
++	debug("Warning: running in case insensitive mode !!!\n");
++
++    atexit(CloseCOM);
++
+ 
+     /* Main Loop */
+     while (fgets(buf, sizeof(buf), stdin)) {
+-        if (NULL == strchr(buf, '\n')) {
+-            /* too large message received.. skip and deny */
+-            fprintf(stderr, "%s: ERROR: Too large: %s\n", argv[0], buf);
+-            while (fgets(buf, sizeof(buf), stdin)) {
+-                fprintf(stderr, "%s: ERROR: Too large..: %s\n", argv[0], buf);
+-                if (strchr(buf, '\n') != NULL)
+-                    break;
+-            }
+-            goto error;
+-        }
+-        if ((p = strchr(buf, '\n')) != NULL)
+-            *p = '\0';		/* strip \n */
+-        if ((p = strchr(buf, '\r')) != NULL)
+-            *p = '\0';		/* strip \r */
+-
+-        debug("Got '%s' from Squid (length: %d).\n", buf, strlen(buf));
+-
+-        if (buf[0] == '\0') {
+-            fprintf(stderr, "Invalid Request\n");
+-            goto error;
+-        }
+-        username = strtok(buf, " ");
+-        for (n = 0; (group = strtok(NULL, " ")) != NULL; n++) {
+-            rfc1738_unescape(group);
+-            groups[n] = group;
+-        }
+-        groups[n] = NULL;
+-
+-        if (NULL == username) {
+-            fprintf(stderr, "Invalid Request\n");
+-            goto error;
+-        }
+-        rfc1738_unescape(username);
+-
+-        if ((use_global ? Valid_Global_Groups(username, groups) : Valid_Local_Groups(username, groups))) {
+-            printf("OK\n");
+-        } else {
+-error:
+-            printf("ERR\n");
+-        }
+-        err = 0;
++	if (NULL == strchr(buf, '\n')) {
++	    /* too large message received.. skip and deny */
++	    fprintf(stderr, "%s: ERROR: Too large: %s\n", argv[0], buf);
++	    while (fgets(buf, sizeof(buf), stdin)) {
++		fprintf(stderr, "%s: ERROR: Too large..: %s\n", argv[0], buf);
++		if (strchr(buf, '\n') != NULL)
++		    break;
++	    }
++	    goto error;
++	}
++	if ((p = strchr(buf, '\n')) != NULL)
++	    *p = '\0';		/* strip \n */
++	if ((p = strchr(buf, '\r')) != NULL)
++	    *p = '\0';		/* strip \r */
++
++	debug("Got '%s' from Squid (length: %d).\n", buf, strlen(buf));
++
++	if (buf[0] == '\0') {
++	    fprintf(stderr, "Invalid Request\n");
++	    goto error;
++	}
++	username = strtok(buf, " ");
++	for (n = 0; (group = strtok(NULL, " ")) != NULL; n++) {
++	    rfc1738_unescape(group);
++	    groups[n] = group;
++	}
++	groups[n] = NULL;
++	numberofgroups = n;
++
++	if (NULL == username) {
++	    fprintf(stderr, "Invalid Request\n");
++	    goto error;
++	}
++	rfc1738_unescape(username);
++
++	if ((use_global ? Valid_Global_Groups(username, groups) : Valid_Local_Groups(username, groups))) {
++	    SEND("OK");
++	} else {
++	  error:
++	    SEND("ERR");
++	}
++	err = 0;
+     }
+     return 0;
+ }
+@@ -39,29 +39,39 @@
+ #include <unistd.h>
+ static char *__foo;
+ extern char debug_enabled;
++extern char *WIN32_ErrorMessage;
+ #define debug(X...) if (debug_enabled) { \
+                     fprintf(stderr,"%s[%d](%s:%d): ", myname, mypid, \
+                     ((__foo=strrchr(__FILE__,'/'))==NULL?__FILE__:__foo+1),\
+                     __LINE__);\
+-                    fprintf(stderr,X); }
++                    fprintf(stderr,X); \
++                    if (WIN32_ErrorMessage != NULL){ \
++                    LocalFree(WIN32_ErrorMessage); \
++                    WIN32_ErrorMessage = NULL; \
++                    } }
+ #else /* DEBUG */
+ #define debug(X...)		/* */
+ #endif /* DEBUG */
+ #else /* __GNUC__ */
+ extern char debug_enabled;
++extern char *WIN32_ErrorMessage;
+ static void
+ debug(char *format,...)
+ {
+ #ifdef DEBUG
+ #ifdef _SQUID_MSWIN_
+     if (debug_enabled) {
+-        va_list args;
++	va_list args;
+ 
+-        va_start(args, format);
+-        fprintf(stderr, "%s[%d]: ", myname, mypid);
+-        vfprintf(stderr, format, args);
+-        fprintf(stderr, "\n");
+-        va_end(args);
++	va_start(args, format);
++	fprintf(stderr, "%s[%d]: ", myname, mypid);
++	vfprintf(stderr, format, args);
++	fprintf(stderr, "\n");
++	va_end(args);
++	if (WIN32_ErrorMessage != NULL) {
++	    LocalFree(WIN32_ErrorMessage);
++	    WIN32_ErrorMessage = NULL;
++	}
+     }
+ #endif /* _SQUID_MSWIN_ */
+ #endif /* DEBUG */
+@@ -1,5 +1,5 @@
+ 
+-This is the readme.txt file for mswin_check_ad_group, an external
++This is the readme.txt file for mswin_check_ad_group 2.0, an external
+ helper for the External ACL Scheme for Squid.
+ 
+ 
+@@ -9,18 +9,36 @@ It reads from the standard input the domain username and a list of groups
+ and tries to match it against the groups membership of the specified
+ username.
+ 
++Two running mode are available:
++
++- Local mode:
++membership is checked against machine's local groups, cannot be used when
++running on a Domain Controller.
++
++- Active Directory Global mode:
++membership is checked against the whole Active Directory Forest of the
++machine where Squid is running.
++
+ The minimal Windows version needed to run mswin_check_ad_group is
+ a Windows 2000 SP4 member of an Active Directory Domain.
+ 
++When running in Active Directory Global mode, all types of Active Directory 
++security groups are supported:
++- Domain Global
++- Domain Local from user's domain
++- Universal
++and Active Directory group nesting is fully supported.
++
++
+ ==============
+ Program Syntax
+ ==============
+ 
+-mswin_check_lm_group [-D domain][-G][-c][-d][-h]
++mswin_check_ad_group [-D domain][-G][-c][-d][-h]
+ 
+ -D domain specify the default user's domain
+--G        start helper in Domain Global Group mode
+--c        use case insensitive compare
++-G        start helper in Active Directory Global mode
++-c        use case insensitive compare (local mode only)
+ -d        enable debugging
+ -h        this message
+ 
+@@ -29,18 +47,32 @@ mswin_check_lm_group [-D domain][-G][-c][-d][-h]
+ squid.conf usage
+ ================
+ 
++When running in Active Directory Global mode, the AD Group can be specified using the
++following syntax:
++
++1. Plain NT4 Group Name
++2. Full NT4 Group Name
++3. Active Directory Canonical name
++
++As Example:
++1. Proxy-Users
++2. MYDOMAIN\Proxy-Users
++3. mydomain.local/Groups/Proxy-Users
++
++When using Plain NT4 Group Name, the Group is searched in the user's domain.  
++
+ external_acl_type AD_global_group %LOGIN c:/squid/libexec/mswin_check_ad_group.exe -G
+ external_acl_type NT_local_group %LOGIN c:/squid/libexec/mswin_check_ad_group.exe
+ 
+-acl GProxyUsers external AD_global_group GProxyUsers
++acl GProxyUsers external AD_global_group MYDOMAIN\GProxyUsers
+ acl LProxyUsers external NT_local_group LProxyUsers
+ acl password proxy_auth REQUIRED
+ 
+ http_access allow password GProxyUsers
+ http_access allow password LProxyUsers
+ http_access deny all
+ 
+-In the previous example all validated AD users member of GProxyUsers Global 
++In the previous example all validated AD users member of MYDOMAIN\GProxyUsers 
+ domain group or member of LProxyUsers machine local group are allowed to 
+ use the cache.
+ 
+@@ -55,8 +87,12 @@ and the DomainUsers files will contain only the following line:
+ "Domain Users"
+ 
+ NOTES: 
+-- The standard group name comparison is case sensitive, so group name
+-  must be specified with same case as in the Active Directory Domain.
++- When running in Active Directory Global mode, for better performance,
++  all Domain Controllers of the Active Directory forest should be configured
++  as Global Catalog.
++- When running in local mode, the standard group name comparison is case
++  sensitive, so group name must be specified with same case as in the
++  local SAM database.
+   It's possible to enable case insensitive group name comparison (-c),
+   but on some not-english locales, the results can be unexpected.
+ - Native WIN32 NTLM and Basic Helpers must be used without the

@@ -1,90 +1,523 @@
-@@ -37,24 +37,36 @@ class PortCfg;
+@@ -46,8 +46,6 @@ AnyP::PortCfg::PortCfg() :
+ #if USE_OPENSSL
+     ,
+     clientca(NULL),
+-    dhfile(NULL),
+-    tls_dh(NULL),
+     sslContextSessionId(NULL),
+     generateHostCertificates(false),
+     dynamicCertMemCacheSize(std::numeric_limits<size_t>::max()),
+@@ -57,9 +55,7 @@ AnyP::PortCfg::PortCfg() :
+     certsToChain(),
+     untrustedSigningCert(),
+     untrustedSignPkey(),
+-    clientCA(),
+-    dhParams(),
+-    eecdhCurve(NULL)
++    clientCA()
+ #endif
+ {
+     memset(&tcp_keepalive, 0, sizeof(tcp_keepalive));
+@@ -77,10 +73,7 @@ AnyP::PortCfg::~PortCfg()
  
- /**
-  * Badly named.
-- * This is in fact the processing context for a single HTTP request.
-+ * This is in fact the processing context for a single HTTP transaction.
-  *
-- * Managing what has been done, and what happens next to the data buffer
-- * holding what we hope is an HTTP request.
-+ * A context lifetime extends from directly after a request has been parsed
-+ * off the client connection buffer, until the last byte of both request
-+ * and reply payload (if any) have been written.
-  *
-- * Parsing is still a mess of global functions done in conjunction with the
-- * real socket controller which generated ClientHttpRequest.
-- * It also generates one of us and passes us control from there based on
-- * the results of the parse.
-+ * (NOTE: it is not certain yet if an early reply to a POST/PUT is sent by
-+ * the server whether the context will remain in the pipeline until its
-+ * request payload has finished being read. It is supposed to, but may not)
-  *
-- * After that all the request interpretation and adaptation is in our scope.
-- * Then finally the reply fetcher is created by this and we get the result
-- * back. Which we then have to manage writing of it to the ConnStateData.
-+ * Contexts self-register with the Pipeline being managed by the Server
-+ * for the connection on which the request was received.
-  *
-- * The socket level management is done by a ConnStateData which owns us.
-+ * When HTTP/1 pipeline is operating there may be multiple transactions using
-+ * the clientConnection. Only the back() context may read from the connection,
-+ * and only the front() context may write to it. A context which needs to read
-+ * or write to the connection but does not meet those criteria must be shifted
-+ * to the deferred state.
+ #if USE_OPENSSL
+     safe_free(clientca);
+-    safe_free(dhfile);
+-    safe_free(tls_dh);
+     safe_free(sslContextSessionId);
+-    safe_free(eecdhCurve);
+ #endif
+ }
+ 
+@@ -108,10 +101,6 @@ AnyP::PortCfg::clone() const
+ #if USE_OPENSSL
+     if (clientca)
+         b->clientca = xstrdup(clientca);
+-    if (dhfile)
+-        b->dhfile = xstrdup(dhfile);
+-    if (tls_dh)
+-        b->tls_dh = xstrdup(tls_dh);
+     if (sslContextSessionId)
+         b->sslContextSessionId = xstrdup(sslContextSessionId);
+ 
+@@ -158,24 +147,6 @@ AnyP::PortCfg::configureSslServerContext()
+ 
+     secure.updateTlsVersionLimits();
+ 
+-    const char *dhParamsFile = dhfile; // backward compatibility for dhparams= configuration
+-    safe_free(eecdhCurve); // clear any previous EECDH configuration
+-    if (tls_dh && *tls_dh) {
+-        eecdhCurve = xstrdup(tls_dh);
+-        char *p = strchr(eecdhCurve, ':');
+-        if (p) {  // tls-dh=eecdhCurve:dhParamsFile
+-            *p = '\0';
+-            dhParamsFile = p+1;
+-        } else {  // tls-dh=dhParamsFile
+-            dhParamsFile = tls_dh;
+-            // a NULL eecdhCurve means "do not use EECDH"
+-            safe_free(eecdhCurve);
+-        }
+-    }
+-
+-    if (dhParamsFile && *dhParamsFile)
+-        dhParams.reset(Ssl::readDHParams(dhParamsFile));
+-
+     staticSslContext.reset(sslCreateServerContext(*this));
+ 
+     if (!staticSslContext) {
+@@ -14,7 +14,7 @@
+ #include "anyp/TrafficMode.h"
+ #include "comm/Connection.h"
+ #include "SBuf.h"
+-#include "security/PeerOptions.h"
++#include "security/ServerOptions.h"
+ 
+ #if USE_OPENSSL
+ #include "ssl/gadgets.h"
+@@ -70,12 +70,10 @@ class PortCfg : public RefCountable
+     Comm::ConnectionPointer listenConn;
+ 
+     /// TLS configuration options for this listening port
+-    Security::PeerOptions secure;
++    Security::ServerOptions secure;
+ 
+ #if USE_OPENSSL
+     char *clientca;
+-    char *dhfile;
+-    char *tls_dh;
+     char *sslContextSessionId; ///< "session id context" for staticSslContext
+     bool generateHostCertificates; ///< dynamically make host cert for sslBump
+     size_t dynamicCertMemCacheSize; ///< max size of generated certificates memory cache
+@@ -88,8 +86,6 @@ class PortCfg : public RefCountable
+     Ssl::EVP_PKEY_Pointer untrustedSignPkey; ///< private key for signing untrusted generated certificates
+ 
+     Ssl::X509_NAME_STACK_Pointer clientCA; ///< CA certificates to use when verifying client certificates
+-    Ssl::DH_Pointer dhParams; ///< DH parameters for temporary/ephemeral DH key exchanges
+-    char *eecdhCurve; ///< Elliptic curve for ephemeral EC-based DH key exchanges
+ #endif
+ };
+ 
+@@ -3588,11 +3588,7 @@ parse_port_option(AnyP::PortCfgPointer &s, char *token)
+     } else if (strncmp(token, "dhparams=", 9) == 0) {
+         debugs(3, DBG_PARSE_NOTE(DBG_IMPORTANT), "WARNING: '" << token << "' is deprecated " <<
+                "in " << cfg_directive << ". Use 'tls-dh=' instead.");
+-        safe_free(s->dhfile);
+-        s->dhfile = xstrdup(token + 9);
+-    } else if (strncmp(token, "tls-dh=", 7) == 0) {
+-        safe_free(s->tls_dh);
+-        s->tls_dh = xstrdup(token + 7);
++        s->secure.parse(token);
+     } else if (strncmp(token, "sslflags=", 9) == 0) {
+         // NP: deprecation warnings output by secure.parse() when relevant
+         s->secure.parse(token+3);
+@@ -3803,12 +3799,6 @@ dump_generic_port(StoreEntry * e, const char *n, const AnyP::PortCfgPointer &s)
+     s->secure.dumpCfg(e, "tls-");
+ 
+ #if USE_OPENSSL
+-    if (s->dhfile)
+-        storeAppendPrintf(e, " dhparams=%s", s->dhfile);
+-
+-    if (s->tls_dh)
+-        storeAppendPrintf(e, " tls-dh=%s", s->tls_dh);
+-
+     if (s->sslContextSessionId)
+         storeAppendPrintf(e, " sslcontext=%s", s->sslContextSessionId);
+ 
+@@ -18,4 +18,6 @@ libsecurity_la_SOURCES= \
+ 	LockingPointer.h \
+ 	PeerOptions.cc \
+ 	PeerOptions.h \
++	ServerOptions.cc \
++	ServerOptions.h \
+ 	Session.h
+@@ -24,12 +24,13 @@ class PeerOptions
+ public:
+     PeerOptions() : parsedOptions(0), parsedFlags(0), sslVersion(0), encryptTransport(false) {}
+     PeerOptions(const PeerOptions &);
++    virtual ~PeerOptions() = default;
+ 
+     /// parse a TLS squid.conf option
+-    void parse(const char *);
++    virtual void parse(const char *);
+ 
+     /// reset the configuration details to default
+-    void clear() {*this = PeerOptions();}
++    virtual void clear() {*this = PeerOptions();}
+ 
+     /// generate a security client-context from these configured options
+     Security::ContextPointer createClientContext(bool setOptions);
+@@ -44,7 +45,7 @@ class PeerOptions
+     void updateContextCrl(Security::ContextPointer &);
+ 
+     /// output squid.conf syntax with 'pfx' prefix on parameters for the stored settings
+-    void dumpCfg(Packable *, const char *pfx) const;
++    virtual void dumpCfg(Packable *, const char *pfx) const;
+ 
+ private:
+     long parseOptions();
+@@ -0,0 +1,164 @@
++/*
++ * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
 + *
-+ * When a context is completed the finished() method needs to be called which
-+ * will perform all cleanup and deregistration operations. If the reason for
-+ * finishing is an error, then notifyIoError() needs to be called prior to
-+ * the finished() method.
-+ * Alternatively the initiateClose() method can be called to terminate the
-+ * whole client connection and all other pending contexts.
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#include "squid.h"
++#include "base/Packable.h"
++#include "globals.h"
++#include "security/ServerOptions.h"
++
++#if HAVE_OPENSSL_ERR_H
++#include <openssl/err.h>
++#endif
++#if HAVE_OPENSSL_X509_H
++#include <openssl/x509.h>
++#endif
++
++Security::ServerOptions::ServerOptions(const Security::ServerOptions &s) :
++    dh(s.dh),
++    dhParamsFile(s.dhParamsFile),
++    eecdhCurve(s.eecdhCurve),
++    parsedDhParams(s.parsedDhParams)
++{
++}
++
++void
++Security::ServerOptions::parse(const char *token)
++{
++    if (!*token) {
++        // config says just "ssl" or "tls" (or "tls-")
++        encryptTransport = true;
++        return;
++    }
++
++    // parse the server-only options
++    if (strncmp(token, "dh=", 3) == 0) {
++        // clear any previous Diffi-Helman configuration
++        dh.clear();
++        dhParamsFile.clear();
++        eecdhCurve.clear();
++
++        dh.append(token + 3);
++
++        if (!dh.isEmpty()) {
++            auto pos = dh.find(':');
++            if (pos != SBuf::npos) {  // tls-dh=eecdhCurve:dhParamsFile
++                eecdhCurve = dh.substr(0,pos);
++                dhParamsFile = dh.substr(pos+1);
++            } else {  // tls-dh=dhParamsFile
++                dhParamsFile = dh;
++                // empty eecdhCurve means "do not use EECDH"
++            }
++        }
++
++        loadDhParams();
++
++    } else if (strncmp(token, "dhparams=", 9) == 0) {
++        if (!eecdhCurve.isEmpty()) {
++            debugs(83, DBG_PARSE_NOTE(1), "UPGRADE WARNING: EECDH settings in tls-dh= override dhparams=");
++            return;
++        }
++
++        // backward compatibility for dhparams= configuration
++        dh.clear();
++        dh.append(token + 9);
++        dhParamsFile = dh;
++
++        loadDhParams();
++
++    } else {
++        // parse generic TLS options
++        Security::PeerOptions::parse(token);
++    }
++}
++
++void
++Security::ServerOptions::dumpCfg(Packable *p, const char *pfx) const
++{
++    // dump out the generic TLS options
++    Security::PeerOptions::dumpCfg(p, pfx);
++
++    if (!encryptTransport)
++        return; // no other settings are relevant
++
++    // dump the server-only options
++    if (!dh.isEmpty())
++        p->appendf(" %sdh=" SQUIDSBUFPH, pfx, SQUIDSBUFPRINT(dh));
++}
++
++void
++Security::ServerOptions::loadDhParams()
++{
++    if (dhParamsFile.isEmpty())
++        return;
++
++#if USE_OPENSSL
++    DH *dhp = nullptr;
++    if (FILE *in = fopen(dhParamsFile.c_str(), "r")) {
++        dhp = PEM_read_DHparams(in, NULL, NULL, NULL);
++        fclose(in);
++    }
++
++    if (!dhp) {
++        debugs(83, DBG_IMPORTANT, "WARNING: Failed to read DH parameters '" << dhParamsFile << "'");
++        return;
++    }
++
++    int codes;
++    if (DH_check(dhp, &codes) == 0) {
++        if (codes) {
++            debugs(83, DBG_IMPORTANT, "WARNING: Failed to verify DH parameters '" << dhParamsFile << "' (" << std::hex << codes << ")");
++            DH_free(dhp);
++            dhp = nullptr;
++        }
++    }
++
++    parsedDhParams.reset(dhp);
++#endif
++}
++
++void
++Security::ServerOptions::updateContextEecdh(Security::ContextPointer &ctx)
++{
++    // set Elliptic Curve details into the server context
++    if (!eecdhCurve.isEmpty()) {
++        debugs(83, 9, "Setting Ephemeral ECDH curve to " << eecdhCurve << ".");
++
++#if USE_OPENSSL && OPENSSL_VERSION_NUMBER >= 0x0090800fL && !defined(OPENSSL_NO_ECDH)
++        int nid = OBJ_sn2nid(eecdhCurve.c_str());
++        if (!nid) {
++            debugs(83, DBG_CRITICAL, "ERROR: Unknown EECDH curve '" << eecdhCurve << "'");
++            return;
++        }
++
++        auto ecdh = EC_KEY_new_by_curve_name(nid);
++        if (!ecdh) {
++            auto ssl_error = ERR_get_error();
++            debugs(83, DBG_CRITICAL, "ERROR: Unable to configure Ephemeral ECDH: " << ERR_error_string(ssl_error, NULL));
++            return;
++        }
++
++        if (SSL_CTX_set_tmp_ecdh(ctx, ecdh) != 0) {
++            auto ssl_error = ERR_get_error();
++            debugs(83, DBG_CRITICAL, "ERROR: Unable to set Ephemeral ECDH: " << ERR_error_string(ssl_error, NULL));
++        }
++        EC_KEY_free(ecdh);
++
++#else
++        debugs(83, DBG_CRITICAL, "ERROR: EECDH is not available in this build." <<
++               " Please link against OpenSSL>=0.9.8 and ensure OPENSSL_NO_ECDH is not set.");
++#endif
++    }
++
++    // set DH parameters into the server context
++#if USE_OPENSSL
++    if (parsedDhParams.get()) {
++        SSL_CTX_set_tmp_dh(ctx, parsedDhParams.get());
++    }
++#endif
++}
++
+@@ -0,0 +1,48 @@
++/*
++ * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
 + *
-+ * The socket level management is done by a Server which owns us.
-  * The scope of this objects control over a socket consists of the data
-- * buffer received from ConnStateData with an initially unknown length.
-- * When that length is known it sets the end bounary of our acces to the
-+ * buffer received from the Server with an initially unknown length.
-+ * When that length is known it sets the end boundary of our access to the
-  * buffer.
-  *
-  * The individual processing actions are done by other Jobs which we
-@@ -151,19 +163,30 @@ namespace Ssl
- class ServerBump;
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_SRC_SECURITY_SERVEROPTIONS_H
++#define SQUID_SRC_SECURITY_SERVEROPTIONS_H
++
++#include "security/PeerOptions.h"
++
++namespace Security
++{
++
++/// TLS squid.conf settings for a listening port
++class ServerOptions : public PeerOptions
++{
++public:
++    ServerOptions() : PeerOptions() {}
++    explicit ServerOptions(const Security::ServerOptions &);
++    virtual ~ServerOptions() = default;
++
++    /* Security::PeerOptions API */
++    virtual void parse(const char *);
++    virtual void clear() {*this = ServerOptions();}
++    virtual void dumpCfg(Packable *, const char *pfx) const;
++
++    /// update the context with DH, EDH, EECDH settings
++    void updateContextEecdh(Security::ContextPointer &);
++
++private:
++    void loadDhParams();
++
++//public:
++    SBuf dh;            ///< Diffi-Helman cipher config
++
++private:
++    SBuf dhParamsFile;  ///< Diffi-Helman ciphers parameter file
++    SBuf eecdhCurve;    ///< Elliptic curve for ephemeral EC-based DH key exchanges
++
++    Security::DhePointer parsedDhParams; ///< DH parameters for temporary/ephemeral DH key exchanges
++};
++
++} // namespace Security
++
++#endif /* SQUID_SRC_SECURITY_SERVEROPTIONS_H */
+@@ -52,6 +52,7 @@ namespace Security
+ 
+ class EncryptorAnswer;
+ class PeerOptions;
++class ServerOptions;
+ 
+ #if USE_OPENSSL
+ CtoCpp1(X509_free, X509 *)
+@@ -75,6 +76,13 @@ typedef void *CrlPointer;
+ 
+ typedef std::list<Security::CrlPointer> CertRevokeList;
+ 
++#if USE_OPENSSL
++CtoCpp1(DH_free, DH *);
++typedef Security::LockingPointer<DH, DH_free_cpp, CRYPTO_LOCK_DH> DhePointer;
++#else
++typedef void *DhePointer;
++#endif
++
+ } // namespace Security
+ 
+ #endif /* SQUID_SRC_SECURITY_FORWARD_H */
+@@ -72,9 +72,6 @@ typedef TidyPointer<SSL_CTX, SSL_CTX_free_cpp> SSL_CTX_Pointer;
+ CtoCpp1(SSL_free, SSL *)
+ typedef TidyPointer<SSL, SSL_free_cpp> SSL_Pointer;
+ 
+-CtoCpp1(DH_free, DH *);
+-typedef TidyPointer<DH, DH_free_cpp> DH_Pointer;
+-
+ sk_free_wrapper(sk_X509_NAME, STACK_OF(X509_NAME) *, X509_NAME_free)
+ typedef TidyPointer<STACK_OF(X509_NAME), sk_X509_NAME_free_wrapper> X509_NAME_STACK_Pointer;
+ 
+@@ -471,30 +471,6 @@ ssl_initialize(void)
+     ssl_ex_index_ssl_validation_counter = SSL_get_ex_new_index(0, (void *) "ssl_validation_counter", NULL, NULL, &ssl_free_int);
+ }
+ 
+-DH *
+-Ssl::readDHParams(const char *dhfile)
+-{
+-    FILE *in = fopen(dhfile, "r");
+-    DH *dh = NULL;
+-    int codes;
+-
+-    if (in) {
+-        dh = PEM_read_DHparams(in, NULL, NULL, NULL);
+-        fclose(in);
+-    }
+-
+-    if (!dh)
+-        debugs(83, DBG_IMPORTANT, "WARNING: Failed to read DH parameters '" << dhfile << "'");
+-    else if (dh && DH_check(dh, &codes) == 0) {
+-        if (codes) {
+-            debugs(83, DBG_IMPORTANT, "WARNING: Failed to verify DH parameters '" << dhfile  << "' (" << std::hex << codes  << ")");
+-            DH_free(dh);
+-            dh = NULL;
+-        }
+-    }
+-    return dh;
+-}
+-
+ #if defined(SSL3_FLAGS_NO_RENEGOTIATE_CIPHERS)
+ static void
+ ssl_info_cb(const SSL *ssl, int where, int ret)
+@@ -507,29 +483,6 @@ ssl_info_cb(const SSL *ssl, int where, int ret)
  }
  #endif
-+
- /**
-- * Manages a connection to a client.
-+ * Legacy Server code managing a connection to a client.
-+ *
-+ * NP: presents AsyncJob API but does not operate autonomously as a Job.
-+ *     So Must() is not safe to use.
-+ *
-+ * Multiple requests (up to pipeline_prefetch) can be pipelined.
-+ * This object is responsible for managing which one is currently being
-+ * fulfilled and what happens to the queue if the current one causes the client
-+ * connection to be closed early.
-+ *
-+ * Act as a manager for the client connection and passes data in buffer to a
-+ * Parser relevant to the state (message headers vs body) that is being
-+ * processed.
-  *
-- * Multiple requests (up to pipeline_prefetch) can be pipelined. This object is responsible for managing
-- * which one is currently being fulfilled and what happens to the queue if the current one
-- * causes the client connection to be closed early.
-+ * Performs HTTP message processing to kick off the actual HTTP request
-+ * handling objects (ClientSocketContext, ClientHttpRequest, HttpRequest).
-  *
-- * Act as a manager for the connection and passes data in buffer to the current parser.
-- * the parser has ambiguous scope at present due to being made from global functions
-- * I believe this object uses the parser to identify boundaries and kick off the
-- * actual HTTP request handling objects (ClientSocketContext, ClientHttpRequest, HttpRequest)
-+ * Performs SSL-Bump processing for switching between HTTP and HTTPS protocols.
-  *
-- * If the above can be confirmed accurate we can call this object PipelineManager or similar
-+ * To terminate a ConnStateData close() the client Comm::Connection it is
-+ * managing, or for graceful half-close use the stopReceiving() or
-+ * stopSending() methods.
-  */
- class ConnStateData : public Server, public HttpControlMsgSink, public RegisteredRunner
+ 
+-static bool
+-configureSslEECDH(SSL_CTX *sslContext, const char *curve)
+-{
+-#if OPENSSL_VERSION_NUMBER >= 0x0090800fL && !defined(OPENSSL_NO_ECDH)
+-    int nid = OBJ_sn2nid(curve);
+-    if (!nid) {
+-        debugs(83, DBG_CRITICAL, "ERROR: Unknown EECDH curve '" << curve << "'");
+-        return false;
+-    }
+-
+-    EC_KEY *ecdh = EC_KEY_new_by_curve_name(nid);
+-    if (ecdh == NULL)
+-        return false;
+-
+-    const bool ok = SSL_CTX_set_tmp_ecdh(sslContext, ecdh) != 0;
+-    EC_KEY_free(ecdh);
+-    return ok;
+-#else
+-    debugs(83, DBG_CRITICAL, "ERROR: EECDH is not available in this build. Please link against OpenSSL>=0.9.8 and ensure OPENSSL_NO_ECDH is not set.");
+-    return false;
+-#endif
+-}
+-
+ static bool
+ configureSslContext(SSL_CTX *sslContext, AnyP::PortCfg &port)
  {
+@@ -566,16 +519,7 @@ configureSslContext(SSL_CTX *sslContext, AnyP::PortCfg &port)
+     debugs(83, 9, "Setting RSA key generation callback.");
+     SSL_CTX_set_tmp_rsa_callback(sslContext, ssl_temp_rsa_cb);
+ 
+-    if (port.eecdhCurve) {
+-        debugs(83, 9, "Setting Ephemeral ECDH curve to " << port.eecdhCurve << ".");
+-
+-        if (!configureSslEECDH(sslContext, port.eecdhCurve)) {
+-            ssl_error = ERR_get_error();
+-            debugs(83, DBG_CRITICAL, "ERROR: Unable to configure Ephemeral ECDH: " << ERR_error_string(ssl_error, NULL));
+-            return false;
+-        }
+-    }
+-
++    port.secure.updateContextEecdh(sslContext);
+     port.secure.updateContextCa(sslContext);
+ 
+     if (port.clientCA.get()) {
+@@ -603,10 +547,6 @@ configureSslContext(SSL_CTX *sslContext, AnyP::PortCfg &port)
+         SSL_CTX_set_verify(sslContext, SSL_VERIFY_NONE, NULL);
+     }
+ 
+-    if (port.dhParams.get()) {
+-        SSL_CTX_set_tmp_dh(sslContext, port.dhParams.get());
+-    }
+-
+     if (port.secure.parsedFlags & SSL_FLAG_DONT_VERIFY_DOMAIN)
+         SSL_CTX_set_ex_data(sslContext, ssl_ctx_ex_index_dont_verify_domain, (void *) -1);
+ 
+@@ -155,12 +155,6 @@ inline const char *bumpMode(int bm)
+     return (0 <= bm && bm < Ssl::bumpEnd) ? Ssl::BumpModeStr[bm] : NULL;
+ }
+ 
+-/**
+- \ingroup ServerProtocolSSLAPI
+- * Load DH params from file
+- */
+-DH *readDHParams(const char *dhfile);
+-
+ /**
+   \ingroup ServerProtocolSSLAPI
+   * Generate a certificate to be used as untrusted signing certificate, based on a trusted CA
+@@ -28,3 +28,8 @@ long Security::PeerOptions::parseOptions() STUB_RETVAL(0)
+ long Security::PeerOptions::parseFlags() STUB_RETVAL(0)
+ void parse_securePeerOptions(Security::PeerOptions *) STUB
+ 
++#include "security/ServerOptions.h"
++//Security::ServerOptions::ServerOptions(const Security::ServerOptions &) STUB
++void Security::ServerOptions::parse(const char *) STUB
++void Security::ServerOptions::dumpCfg(Packable *, const char *) const STUB
++void Security::ServerOptions::updateContextEecdh(Security::ContextPointer &) STUB
+@@ -72,7 +72,6 @@ namespace Ssl
+ //GETX509ATTRIBUTE GetX509CAAttribute;
+ //GETX509ATTRIBUTE GetX509Fingerprint;
+ const char *BumpModeStr[] = {""};
+-DH *readDHParams(const char *dhfile) STUB_RETVAL(NULL)
+ bool generateUntrustedCert(Security::CertPointer & untrustedCert, EVP_PKEY_Pointer & untrustedPkey, Security::CertPointer const & cert, EVP_PKEY_Pointer const & pkey) STUB_RETVAL(false)
+ SSL_CTX * generateSslContext(CertificateProperties const &properties, AnyP::PortCfg &port) STUB_RETVAL(NULL)
+ bool verifySslCertificate(SSL_CTX * sslContext,  CertificateProperties const &properties) STUB_RETVAL(false)

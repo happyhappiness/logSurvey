@@ -1,659 +1,164 @@
-@@ -48,6 +48,7 @@
- #include "mgr/Command.h"
- #include "mgr/Forwarder.h"
- #include "mgr/FunAction.h"
-+#include "mgr/QueryParams.h"
- #include "protos.h" /* rotate_logs() */
- #include "SquidTime.h"
- #include "Store.h"
-@@ -176,7 +177,21 @@ CacheManager::ParseUrl(const char *url)
-     LOCAL_ARRAY(char, host, MAX_URL);
-     LOCAL_ARRAY(char, request, MAX_URL);
-     LOCAL_ARRAY(char, password, MAX_URL);
--    t = sscanf(url, "cache_object://%[^/]/%[^@]@%s", host, request, password);
-+    LOCAL_ARRAY(char, params, MAX_URL);
-+    host[0] = 0;
-+    request[0] = 0;
-+    password[0] = 0;
-+    params[0] = 0;
-+    int pos = -1;
-+    int len = strlen(url);
-+    Must(len > 0);
-+    t = sscanf(url, "cache_object://%[^/]/%[^@?]%n@%[^?]?%s", host, request, &pos, password, params);
+@@ -16,7 +16,9 @@ Ipc::FdNote(int fdNoteId)
+     static const char *FdNotes[Ipc::fdnEnd] = {
+         "None", // fdnNone
+         "HTTP Socket", // fdnHttpSocket
+-        "HTTPS Socket" // fdnHttpsSocket
++        "HTTPS Socket", // fdnHttpsSocket
++        "Incoming SNMP Socket", // fdnInSnmpSocket
++        "Outgoing SNMP Socket" // fdnOutSnmpSocket
+     };
+ 
+     if (fdnNone < fdNoteId && fdNoteId < fdnEnd)
+@@ -14,7 +14,8 @@ namespace Ipc
+ /// We cannot send char* FD notes to other processes. Pass int IDs and convert.
+ 
+ /// fd_note() label ID
+-typedef enum { fdnNone, fdnHttpSocket, fdnHttpsSocket, fdnEnd } FdNoteId;
++typedef enum { fdnNone, fdnHttpSocket, fdnHttpsSocket,
++               fdnInSnmpSocket, fdnOutSnmpSocket, fdnEnd } FdNoteId;
+ 
+ extern const char *FdNote(int fdNodeId); ///< converts FdNoteId into a string
+ 
+@@ -34,10 +34,30 @@
+ #include "cache_snmp.h"
+ #include "acl/FilledChecklist.h"
+ #include "ip/IpAddress.h"
++#include "ipc/StartListening.h"
+ 
+ #define SNMP_REQUEST_SIZE 4096
+ #define MAX_PROTOSTAT 5
+ 
 +
-+    if (pos >0 && url[pos] == '?') {
-+        ++pos;
-+        if (pos < len)
-+            xstrncpy(params, url + pos, sizeof(params));
-+    }
++/// dials snmpConnectionOpened call
++class SnmpListeningStartedDialer: public CallDialer,
++    public Ipc::StartListeningCb
++{
++public:
++    typedef void (*Handler)(int fd, int errNo);
++    SnmpListeningStartedDialer(Handler aHandler): handler(aHandler) {}
++
++    virtual void print(std::ostream &os) const { startPrint(os) << ')'; }
++
++    virtual bool canDial(AsyncCall &) const { return true; }
++    virtual void dial(AsyncCall &) { (handler)(fd, errNo); }
++
++public:
++    Handler handler;
++};
++
++
+ IpAddress theOutSNMPAddr;
  
-     if (t < 2)
-         xstrncpy(request, "menu", MAX_URL);
-@@ -204,10 +219,12 @@ CacheManager::ParseUrl(const char *url)
-     }
+ typedef struct _mib_tree_entry mib_tree_entry;
+@@ -58,6 +78,9 @@ struct _mib_tree_entry {
+ mib_tree_entry *mib_tree_head;
+ mib_tree_entry *mib_tree_last;
  
-     Mgr::Command::Pointer cmd = new Mgr::Command;
-+    if (!Mgr::QueryParams::Parse(params, cmd->params.queryParams))
-+        return NULL;
-     cmd->profile = profile;
-     cmd->params.httpUri = url;
-     cmd->params.userName = String();
--    cmd->params.password = t == 3 ? String(password) : String();
-+    cmd->params.password = password;
-     cmd->params.actionName = request;
-     return cmd;
- }
-@@ -27,6 +27,7 @@ Mgr::ActionParams::ActionParams(const Ipc::TypedMsgHdr &msg)
-     msg.getString(actionName);
-     msg.getString(userName);
-     msg.getString(password);
-+    queryParams.unpack(msg);
- }
- 
++static void snmpIncomingConnectionOpened(int fd, int errNo);
++static void snmpOutgoingConnectionOpened(int fd, int errNo);
++
+ static mib_tree_entry * snmpAddNodeStr(const char *base_str, int o, oid_ParseFn * parsefunction, instance_Fn * instancefunction);
+ static mib_tree_entry *snmpAddNode(oid * name, int len, oid_ParseFn * parsefunction, instance_Fn * instancefunction, int children,...);
+ static oid *snmpCreateOid(int length,...);
+@@ -278,54 +301,71 @@ snmpInit(void)
  void
-@@ -39,4 +40,5 @@ Mgr::ActionParams::pack(Ipc::TypedMsgHdr &msg) const
-     msg.putString(actionName);
-     msg.putString(userName);
-     msg.putString(password);
-+    queryParams.pack(msg);
- }
-@@ -10,6 +10,7 @@
- 
- #include "HttpRequestMethod.h"
- #include "ipc/forward.h"
-+#include "mgr/QueryParams.h"
- 
- namespace Mgr
+ snmpConnectionOpen(void)
  {
-@@ -33,7 +34,7 @@ class ActionParams
-     String actionName; ///< action name (and credentials realm)
-     String userName; ///< user login name; currently only used for logging
-     String password; ///< user password; used for acceptance check and cleared
+-    struct addrinfo *xaddr = NULL;
+-    int x;
 -
-+    QueryParams queryParams;
- };
+     debugs(49, 5, "snmpConnectionOpen: Called");
  
- } // namespace Mgr
-@@ -10,21 +10,26 @@
- #include "comm/Write.h"
- #include "CommCalls.h"
- #include "HttpReply.h"
-+#include "HttpRequest.h"
- #include "ipc/UdsOp.h"
- #include "mgr/ActionWriter.h"
-+#include "mgr/IntParam.h"
- #include "mgr/Inquirer.h"
-+#include "mgr/Command.h"
- #include "mgr/Request.h"
- #include "mgr/Response.h"
- #include "SquidTime.h"
-+#include "errorpage.h"
- #include <memory>
-+#include <algorithm>
- 
- 
- CBDATA_NAMESPACED_CLASS_INIT(Mgr, Inquirer);
- 
- 
- Mgr::Inquirer::Inquirer(Action::Pointer anAction,
-                         const Request &aCause, const Ipc::StrandCoords &coords):
--        Ipc::Inquirer(aCause.clone(), coords, anAction->atomic() ? 10 : 100),
-+        Ipc::Inquirer(aCause.clone(), applyQueryParams(coords, aCause.params.queryParams), anAction->atomic() ? 10 : 100),
-         aggrAction(anAction),
-         fd(Ipc::ImportFdIntoComm(aCause.fd, SOCK_STREAM, IPPROTO_TCP, Ipc::fdnHttpSocket))
- {
-@@ -63,10 +68,22 @@ Mgr::Inquirer::start()
-     Must(fd >= 0);
-     Must(aggrAction != NULL);
- 
--    std::auto_ptr<HttpReply> reply(new HttpReply);
--    reply->setHeaders(HTTP_OK, NULL, "text/plain", -1, squid_curtime, squid_curtime);
--    reply->header.putStr(HDR_CONNECTION, "close"); // until we chunk response
--    std::auto_ptr<MemBuf> replyBuf(reply->pack());
-+    std::auto_ptr<MemBuf> replyBuf;
-+    if (strands.empty()) {
-+        LOCAL_ARRAY(char, url, MAX_URL);
-+        snprintf(url, MAX_URL, "%s", aggrAction->command().params.httpUri.termedBuf());
-+        HttpRequest *req = HttpRequest::CreateFromUrl(url);
-+        ErrorState *err = errorCon(ERR_INVALID_URL, HTTP_NOT_FOUND, req);
-+        std::auto_ptr<HttpReply> reply(err->BuildHttpReply());
-+        replyBuf.reset(reply->pack());
-+        errorStateFree(err);
-+    }
-+    else {
-+        std::auto_ptr<HttpReply> reply(new HttpReply);
-+        reply->setHeaders(HTTP_OK, NULL, "text/plain", -1, squid_curtime, squid_curtime);
-+        reply->header.putStr(HDR_CONNECTION, "close"); // until we chunk response
-+        replyBuf.reset(reply->pack());
-+    }
-     writer = asyncCall(16, 5, "Mgr::Inquirer::noteWroteHeader",
-                        CommCbMemFunT<Inquirer, CommIoCbParams>(this, &Inquirer::noteWroteHeader));
-     Comm::Write(fd, replyBuf.get(), writer);
-@@ -107,7 +124,7 @@ Mgr::Inquirer::aggregate(Ipc::Response::Pointer aResponse)
- void
- Mgr::Inquirer::sendResponse()
- {
--    if (aggrAction->aggregatable()) {
-+    if (!strands.empty() && aggrAction->aggregatable()) {
-         removeCloseHandler();
-         AsyncJob::Start(new ActionWriter(aggrAction, fd));
-         fd = -1; // should not close fd because we passed it to ActionWriter
-@@ -119,3 +136,46 @@ Mgr::Inquirer::doneAll() const
- {
-     return !writer && Ipc::Inquirer::doneAll();
- }
+     if (Config.Port.snmp > 0) {
+         Config.Addrs.snmp_incoming.SetPort(Config.Port.snmp);
+-        enter_suid();
+-        theInSnmpConnection = comm_open_listener(SOCK_DGRAM,
 +
-+Ipc::StrandCoords
-+Mgr::Inquirer::applyQueryParams(const Ipc::StrandCoords& aStrands, const QueryParams& aParams)
-+{
-+    Ipc::StrandCoords strands;
++        AsyncCall::Pointer call = asyncCall(49, 2,
++            "snmpIncomingConnectionOpened",
++            SnmpListeningStartedDialer(&snmpIncomingConnectionOpened));
 +
-+    QueryParam::Pointer processesParam = aParams.get("processes");
-+    QueryParam::Pointer workersParam = aParams.get("workers");
-+
-+    if (processesParam == NULL || workersParam == NULL) {
-+        if (processesParam != NULL) {
-+            IntParam* param = dynamic_cast<IntParam*>(processesParam.getRaw());
-+            if (param != NULL && param->type == QueryParam::ptInt) {
-+                const std::vector<int>& processes = param->value();
-+                for (Ipc::StrandCoords::const_iterator iter = aStrands.begin();
-+                     iter != aStrands.end(); ++iter)
-+                {
-+                    if (std::find(processes.begin(), processes.end(), iter->kidId) != processes.end())
-+                        strands.push_back(*iter);
-+                }
-+            }
-+        } else if (workersParam != NULL) {
-+            IntParam* param = dynamic_cast<IntParam*>(workersParam.getRaw());
-+            if (param != NULL && param->type == QueryParam::ptInt) {
-+                const std::vector<int>& workers = param->value();
-+                for (size_t i = 0; i < aStrands.size(); ++i)
-+                {
-+                    if (std::find(workers.begin(), workers.end(), i + 1) != workers.end())
-+                        strands.push_back(aStrands[i]);
-+                }
-+            }
-+        } else {
-+            strands = aStrands;
-+        }
-+    }
-+
-+    debugs(0, 0, HERE << "strands kid IDs = ");
-+    for (Ipc::StrandCoords::const_iterator iter = strands.begin(); iter != strands.end(); ++iter) {
-+        debugs(0, 0, HERE << iter->kidId);
-+    }
-+
-+    return strands;
-+}
-@@ -39,7 +39,8 @@ class Inquirer: public Ipc::Inquirer
-     void noteWroteHeader(const CommIoCbParams& params);
-     void noteCommClosed(const CommCloseCbParams& params);
-     void removeCloseHandler();
++        Ipc::StartListening(SOCK_DGRAM,
+                               IPPROTO_UDP,
+                               Config.Addrs.snmp_incoming,
+                               COMM_NONBLOCKING,
+-                              "SNMP Port");
+-        leave_suid();
 -
-+    Ipc::StrandCoords applyQueryParams(const Ipc::StrandCoords& aStrands,
-+                                       const QueryParams& aParams);
- private:
-     Action::Pointer aggrAction; //< action to aggregate
+-        if (theInSnmpConnection < 0)
+-            fatal("Cannot open SNMP Port");
+-
+-        commSetSelect(theInSnmpConnection, COMM_SELECT_READ, snmpHandleUdp, NULL, 0);
+-
+-        debugs(1, 1, "Accepting SNMP messages on " << Config.Addrs.snmp_incoming << ", FD " << theInSnmpConnection << ".");
++                              Ipc::fdnInSnmpSocket, call);
  
-@@ -0,0 +1,48 @@
-+/*
-+ * $Id$
-+ *
-+ * DEBUG: section 16    Cache Manager API
-+ *
-+ */
+         if (!Config.Addrs.snmp_outgoing.IsNoAddr()) {
+             Config.Addrs.snmp_outgoing.SetPort(Config.Port.snmp);
+-            enter_suid();
+-            theOutSnmpConnection = comm_open_listener(SOCK_DGRAM,
 +
-+#include "config.h"
-+#include "base/TextException.h"
-+#include "ipc/TypedMsgHdr.h"
-+#include "mgr/IntParam.h"
++            AsyncCall::Pointer call = asyncCall(49, 2,
++                "snmpOutgoingConnectionOpened",
++                SnmpListeningStartedDialer(&snmpOutgoingConnectionOpened));
 +
-+
-+Mgr::IntParam::IntParam():
-+    QueryParam(QueryParam::ptInt), array()
-+{
-+}
-+
-+Mgr::IntParam::IntParam(const std::vector<int>& anArray):
-+    QueryParam(QueryParam::ptInt), array(anArray)
-+{
-+}
-+
-+void
-+Mgr::IntParam::pack(Ipc::TypedMsgHdr& msg) const
-+{
-+    msg.putPod(type);
-+    msg.putInt(array.size());
-+    typedef std::vector<int>::const_iterator Iterator;
-+    for (Iterator iter = array.begin(); iter != array.end(); ++iter)
-+        msg.putInt(*iter);
-+}
-+
-+void
-+Mgr::IntParam::unpackValue(const Ipc::TypedMsgHdr& msg)
-+{
-+    array.clear();
-+    int count = msg.getInt();
-+    Must(count >= 0);
-+    for ( ; count > 0; --count)
-+        array.push_back(msg.getInt());
-+}
-+
-+const std::vector<int>&
-+Mgr::IntParam::value() const
-+{
-+    return array;
-+}
-@@ -0,0 +1,35 @@
-+/*
-+ * $Id$
-+ *
-+ * DEBUG: section 16    Cache Manager API
-+ *
-+ */
-+
-+#ifndef SQUID_MGR_INT_PARAM_H
-+#define SQUID_MGR_INT_PARAM_H
-+
-+#include "ipc/forward.h"
-+#include "mgr/forward.h"
-+#include "mgr/QueryParam.h"
-+#include <vector>
-+
-+
-+namespace Mgr
-+{
-+
-+class IntParam: public QueryParam
-+{
-+public:
-+    IntParam();
-+    IntParam(const std::vector<int>& anArray);
-+    virtual void pack(Ipc::TypedMsgHdr& msg) const;
-+    virtual void unpackValue(const Ipc::TypedMsgHdr& msg);
-+    const std::vector<int>& value() const;
-+
-+private:
-+    std::vector<int> array;
-+};
-+
-+} // namespace Mgr
-+
-+#endif /* SQUID_MGR_INT_PARAM_H */
-@@ -44,4 +44,11 @@ libmgr_la_SOURCES = \
- 	StoreIoAction.cc \
- 	StoreIoAction.h \
- 	StoreToCommWriter.cc \
--	StoreToCommWriter.h
-+	StoreToCommWriter.h \
-+	QueryParam.h \
-+	QueryParams.cc \
-+	QueryParams.h \
-+	IntParam.cc \
-+	IntParam.h \
-+	StringParam.cc \
-+	StringParam.h
-@@ -0,0 +1,40 @@
-+/*
-+ * $Id$
-+ *
-+ * DEBUG: section 16    Cache Manager API
-+ *
-+ */
-+
-+#ifndef SQUID_MGR_QUERY_PARAM_H
-+#define SQUID_MGR_QUERY_PARAM_H
-+
-+#include "ipc/forward.h"
-+#include "RefCount.h"
-+
-+
-+namespace Mgr
-+{
-+
-+class QueryParam: public RefCountable
-+{
-+public:
-+    typedef enum {ptInt = 1, ptString} Type;
-+    typedef RefCount<QueryParam> Pointer;
-+
-+public:
-+    QueryParam(Type aType): type(aType) {}
-+    virtual ~QueryParam() {}
-+    virtual void pack(Ipc::TypedMsgHdr& msg) const = 0; ///< store parameter into msg
-+    virtual void unpackValue(const Ipc::TypedMsgHdr& msg) = 0; ///< load parameter value from msg
-+
-+private:
-+    QueryParam(const QueryParam&); // not implemented
-+    QueryParam& operator= (const QueryParam&); // not implemented
-+
-+public:
-+    Type type;
-+};
-+
-+} // namespace Mgr
-+
-+#endif /* SQUID_MGR_QUERY_PARAM_H */
-@@ -0,0 +1,139 @@
-+/*
-+ * $Id$
-+ *
-+ * DEBUG: section 16    Cache Manager API
-+ *
-+ */
-+
-+#include "config.h"
-+#include "base/TextException.h"
-+#include "ipc/TypedMsgHdr.h"
-+#include "mgr/IntParam.h"
-+#include "mgr/StringParam.h"
-+#include "mgr/QueryParams.h"
-+#include <regex.h>
-+
-+
-+Mgr::QueryParam::Pointer
-+Mgr::QueryParams::get(const String& name) const
-+{
-+    Must(name.size() != 0);
-+    Params::const_iterator pos = find(name);
-+    return (pos == params.end() ? NULL : pos->second);
-+}
-+
-+void
-+Mgr::QueryParams::pack(Ipc::TypedMsgHdr& msg) const
-+{
-+    msg.putInt(params.size());
-+    for (Params::const_iterator iter = params.begin(); iter != params.end(); ++iter) {
-+        Must(iter->first.size() != 0);
-+        msg.putString(iter->first);
-+        Must(iter->second != NULL);
-+        iter->second->pack(msg);
-+    }
-+}
-+
-+void
-+Mgr::QueryParams::unpack(const Ipc::TypedMsgHdr& msg)
-+{
-+    int count = msg.getInt();
-+    Must(count >= 0);
-+    params.clear();
-+    for ( ; count > 0; --count) {
-+        String name;
-+        msg.getString(name);
-+        Must(name.size() != 0);
-+        QueryParam::Type type;
-+        msg.getPod(type);
-+        QueryParam::Pointer value = CreateParam(type);
-+        value->unpackValue(msg);
-+        params.push_back(Param(name, value));
-+    }
-+}
-+
-+Mgr::QueryParams::Params::const_iterator
-+Mgr::QueryParams::find(const String& name) const
-+{
-+    Must(name.size() != 0);
-+    Params::const_iterator iter = params.begin();
-+    for ( ; iter != params.end(); ++iter) {
-+        if (name.caseCmp(iter->first) == 0)
-+            break;
-+    }
-+    return iter;
-+}
-+
-+bool
-+Mgr::QueryParams::ParseParam(const String& paramStr, Param& param)
-+{
-+    bool parsed = false;
-+    regmatch_t pmatch[3];
-+    regex_t intExpr;
-+    regcomp(&intExpr, "^([a-z][a-z0-9_]*)=([0-9]+((,[0-9]+))*)$", REG_EXTENDED | REG_ICASE);
-+    regex_t stringExpr;
-+    regcomp(&stringExpr, "^([a-z][a-z0-9_]*)=([^&= ]+)$", REG_EXTENDED | REG_ICASE);
-+    if (regexec(&intExpr, paramStr.termedBuf(), 3, pmatch, 0) == 0) {
-+        param.first = paramStr.substr(pmatch[1].rm_so, pmatch[1].rm_eo);
-+        std::vector<int> array;
-+        int n = pmatch[2].rm_so;
-+        for (int i = n; i < pmatch[2].rm_eo; ++i) {
-+            if (paramStr[i] == ',') {
-+                array.push_back(atoi(paramStr.substr(n, i).termedBuf()));
-+                n = i + 1;
-+            }
-+        }
-+        if (n < pmatch[2].rm_eo)
-+            array.push_back(atoi(paramStr.substr(n, pmatch[2].rm_eo).termedBuf()));
-+        param.second = new IntParam(array);
-+        parsed = true;
-+    } else if (regexec(&stringExpr, paramStr.termedBuf(), 3, pmatch, 0) == 0) {
-+        param.first = paramStr.substr(pmatch[1].rm_so, pmatch[1].rm_eo);
-+        param.second = new StringParam(paramStr.substr(pmatch[2].rm_so, pmatch[2].rm_eo));
-+        parsed = true;
-+    }
-+    regfree(&stringExpr);
-+    regfree(&intExpr);
-+    return parsed;
-+}
-+
-+bool
-+Mgr::QueryParams::Parse(const String& aParamsStr, QueryParams& aParams)
-+{
-+    if (aParamsStr.size() != 0) {
-+        Param param;
-+        size_t n = 0;
-+        size_t len = aParamsStr.size();
-+        for (size_t i = n; i < len; ++i) {
-+            if (aParamsStr[i] == '&') {
-+                if (!ParseParam(aParamsStr.substr(n, i), param))
-+                    return false;
-+                aParams.params.push_back(param);
-+                n = i + 1;
-+            }
-+        }
-+        if (n < len) {
-+            if (!ParseParam(aParamsStr.substr(n, len), param))
-+                return false;
-+            aParams.params.push_back(param);
++             Ipc::StartListening(SOCK_DGRAM,
+                                    IPPROTO_UDP,
+                                    Config.Addrs.snmp_outgoing,
+                                    COMM_NONBLOCKING,
+-                                   "SNMP Port");
+-            leave_suid();
++                                   Ipc::fdnOutSnmpSocket, call);
 +        }
 +    }
-+    return true;
 +}
-+
-+Mgr::QueryParam::Pointer
-+Mgr::QueryParams::CreateParam(QueryParam::Type aType)
-+{
-+    switch(aType) {
-+    case QueryParam::ptInt:
-+        return new IntParam();
-+
-+    case QueryParam::ptString:
-+        return new StringParam();
-+
-+    default:
-+        throw TexcHere("unknown parameter type");
-+        break;
-+    }
-+    return NULL;
-+}
-@@ -0,0 +1,49 @@
-+/*
-+ * $Id$
-+ *
-+ * DEBUG: section 16    Cache Manager API
-+ *
-+ */
-+
-+#ifndef SQUID_MGR_QUERY_PARAMS_H
-+#define SQUID_MGR_QUERY_PARAMS_H
-+
-+#include "ipc/forward.h"
-+#include "mgr/QueryParam.h"
-+#include "SquidString.h"
-+#include <vector>
-+#include <utility>
-+
-+
-+namespace Mgr
-+{
-+
-+class QueryParams
-+{
-+public:
-+    typedef std::pair<String, QueryParam::Pointer> Param;
-+    typedef std::vector<Param> Params;
-+
-+public:
-+    /// returns query parameter by name
-+    QueryParam::Pointer get(const String& name) const;
-+    void pack(Ipc::TypedMsgHdr& msg) const; ///< store params into msg
-+    void unpack(const Ipc::TypedMsgHdr& msg); ///< load params from msg
-+    /// parses the query string parameters
-+    static bool Parse(const String& aParamsStr, QueryParams& aParams);
-+
-+private:
-+    /// find query parameter by name
-+    Params::const_iterator find(const String& name) const;
-+    /// creates a parameter of the specified type
-+    static QueryParam::Pointer CreateParam(QueryParam::Type aType);
-+    /// parses string like "param=value"; returns true if success
-+    static bool ParseParam(const String& paramStr, Param& param);
-+
-+private:
-+    Params params;
-+};
-+
-+} // namespace Mgr
-+
-+#endif /* SQUID_MGR_QUERY_PARAMS_H */
-@@ -0,0 +1,40 @@
-+/*
-+ * $Id$
-+ *
-+ * DEBUG: section 16    Cache Manager API
-+ *
-+ */
-+
-+#include "config.h"
-+#include "ipc/TypedMsgHdr.h"
-+#include "mgr/StringParam.h"
-+
-+
-+Mgr::StringParam::StringParam():
-+    QueryParam(QueryParam::ptString), str()
-+{
-+}
-+
-+Mgr::StringParam::StringParam(const String& aString):
-+    QueryParam(QueryParam::ptString), str(aString)
-+{
-+}
-+
-+void
-+Mgr::StringParam::pack(Ipc::TypedMsgHdr& msg) const
-+{
-+    msg.putPod(type);
-+    msg.putString(str);
-+}
-+
-+void
-+Mgr::StringParam::unpackValue(const Ipc::TypedMsgHdr& msg)
-+{
-+    msg.getString(str);
-+}
-+
-+const String&
-+Mgr::StringParam::value() const
-+{
-+    return str;
-+}
-@@ -0,0 +1,35 @@
-+/*
-+ * $Id$
-+ *
-+ * DEBUG: section 16    Cache Manager API
-+ *
-+ */
-+
-+#ifndef SQUID_MGR_STRING_PARAM_H
-+#define SQUID_MGR_STRING_PARAM_H
-+
-+#include "ipc/forward.h"
-+#include "mgr/forward.h"
-+#include "mgr/QueryParam.h"
-+#include "SquidString.h"
-+
-+
-+namespace Mgr
-+{
-+
-+class StringParam: public QueryParam
-+{
-+public:
-+    StringParam();
-+    StringParam(const String& aString);
-+    virtual void pack(Ipc::TypedMsgHdr& msg) const;
-+    virtual void unpackValue(const Ipc::TypedMsgHdr& msg);
-+    const String& value() const;
-+
-+private:
-+    String str;
-+};
-+
-+} // namespace Mgr
-+
-+#endif /* SQUID_MGR_STRING_PARAM_H */
-@@ -20,6 +20,8 @@ class ActionWriter;
- class Command;
- class Request;
- class Response;
-+class QueryParam;
-+class QueryParams;
  
- typedef RefCount<Action> ActionPointer;
- typedef RefCount<ActionProfile> ActionProfilePointer;
-@@ -132,6 +132,8 @@ typedef struct {
-     char *user_name;
-     char *passwd;
-     char *pub_auth;
-+    char *workers;
-+    char *processes;
- } cachemgr_request;
+-            if (theOutSnmpConnection < 0)
+-                fatal("Cannot open Outgoing SNMP Port");
++static void
++snmpIncomingConnectionOpened(int fd, int errNo)
++{
++    theInSnmpConnection = fd;
++    if (theInSnmpConnection < 0)
++        fatal("Cannot open Incoming SNMP Port");
  
- /*
-@@ -839,12 +841,14 @@ process_request(cachemgr_request * req)
-     S.FreeAddrInfo(AI);
+-            commSetSelect(theOutSnmpConnection,
+-                          COMM_SELECT_READ,
+-                          snmpHandleUdp,
+-                          NULL, 0);
++    commSetSelect(theInSnmpConnection, COMM_SELECT_READ, snmpHandleUdp, NULL,
++        0);
  
-     l = snprintf(buf, sizeof(buf),
--                 "GET cache_object://%s/%s HTTP/1.0\r\n"
-+                 "GET cache_object://%s/%s%s%s HTTP/1.0\r\n"
-                  "Accept: */*\r\n"
-                  "%s"			/* Authentication info or nothing */
-                  "\r\n",
-                  req->hostname,
-                  req->action,
-+                 req->workers? "?workers=" : (req->processes ? "?processes=" : ""),
-+                 req->workers? req->workers : (req->processes ? req->processes: ""),
-                  make_auth_header(req));
-     if (write(s, buf, l) < 0) {
-         fprintf(stderr,"ERROR: (%d) writing request: '%s'\n", errno, buf);
-@@ -1009,6 +1013,10 @@ read_request(void)
-             req->pub_auth = xstrdup(q), decode_pub_auth(req);
-         else if (0 == strcasecmp(t, "operation"))
-             req->action = xstrdup(q);
-+        else if(0 == strcasecmp(t, "workers") && strlen(q))
-+            req->workers = xstrdup(q);
-+         else if(0 == strcasecmp(t, "processes") && strlen(q))
-+            req->processes = xstrdup(q);
-     }
+-            debugs(1, 1, "Outgoing SNMP messages on " << Config.Addrs.snmp_outgoing << ", FD " << theOutSnmpConnection << ".");
++    debugs(1, 1, "Accepting SNMP messages on " << Config.Addrs.snmp_incoming <<
++        ", FD " << theInSnmpConnection << ".");
  
-     if (req->server && !req->hostname) {
-@@ -1020,8 +1028,8 @@ read_request(void)
-     }
+-            fd_note(theOutSnmpConnection, "Outgoing SNMP socket");
++    if (Config.Addrs.snmp_outgoing.IsNoAddr())
++        theOutSnmpConnection = theInSnmpConnection;
++}
++
++static void
++snmpOutgoingConnectionOpened(int fd, int errNo)
++{
++    theOutSnmpConnection = fd;
++    if (theOutSnmpConnection < 0)
++        fatal("Cannot open Outgoing SNMP Port");
++
++    commSetSelect(theOutSnmpConnection, COMM_SELECT_READ, snmpHandleUdp, NULL,
++        0);
++
++    debugs(1, 1, "Outgoing SNMP messages on " << Config.Addrs.snmp_outgoing <<
++        ", FD " << theOutSnmpConnection << ".");
++
++    {
++        struct addrinfo *xaddr = NULL;
++        int x;
  
-     make_pub_auth(req);
--    debug("cmgr: got req: host: '%s' port: %d uname: '%s' passwd: '%s' auth: '%s' oper: '%s'\n",
--          safe_str(req->hostname), req->port, safe_str(req->user_name), safe_str(req->passwd), safe_str(req->pub_auth), safe_str(req->action));
-+    debug("cmgr: got req: host: '%s' port: %d uname: '%s' passwd: '%s' auth: '%s' oper: '%s' workers: '%s' processes: '%s'\n",
-+          safe_str(req->hostname), req->port, safe_str(req->user_name), safe_str(req->passwd), safe_str(req->pub_auth), safe_str(req->action), safe_str(req->workers), safe_str(req->processes));
-     return req;
- }
+-            fd_note(theInSnmpConnection, "Incoming SNMP socket");
+-        } else {
+-            theOutSnmpConnection = theInSnmpConnection;
+-        }
+ 
+         theOutSNMPAddr.SetEmpty();
  

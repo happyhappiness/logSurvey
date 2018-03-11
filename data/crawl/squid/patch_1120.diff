@@ -1,0 +1,954 @@
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: HttpMsg.cc,v 1.14 2005/03/06 21:08:13 serassio Exp $
++ * $Id: HttpMsg.cc,v 1.15 2005/09/12 23:28:57 wessels Exp $
+  *
+  * DEBUG: section 74    HTTP Message
+  * AUTHOR: Alex Rousskov
+@@ -34,7 +34,23 @@
+  */
+ 
+ #include "squid.h"
+-#include "HttpVersion.h"
++#include "HttpMsg.h"
++#include "HttpRequest.h"
++#include "HttpReply.h"
++
++HttpMsg::HttpMsg(http_hdr_owner_type owner): header(owner),
++        cache_control(NULL), hdr_sz(0), content_length(0), protocol(PROTO_NONE),
++        pstate(psReadyToParseStartLine)
++{}
++
++
++HttpMsgParseState &operator++ (HttpMsgParseState &aState)
++{
++    int tmp = (int)aState;
++    aState = (HttpMsgParseState)(++tmp);
++    return aState;
++}
++
+ 
+ /* find end of headers */
+ int
+@@ -96,6 +112,177 @@ httpMsgIsolateHeaders(const char **parse_start, const char **blk_start, const ch
+     return 1;
+ }
+ 
++/* find first CRLF */
++static int
++httpMsgIsolateStart(const char **parse_start, const char **blk_start, const char **blk_end)
++{
++    int slen = strcspn(*parse_start, "\r\n");
++
++    if (!(*parse_start)[slen])  /* no CRLF found */
++        return 0;
++
++    *blk_start = *parse_start;
++
++    *blk_end = *blk_start + slen;
++
++    while (**blk_end == '\r')   /* CR */
++        (*blk_end)++;
++
++    if (**blk_end == '\n')      /* LF */
++        (*blk_end)++;
++
++    *parse_start = *blk_end;
++
++    return 1;
++}
++
++// negative return is the negated HTTP_ error code
++// zero return means need more data
++// positive return is the size of parsed headers
++bool HttpMsg::parse(MemBuf *buf, bool eof, http_status *error)
++{
++    assert(error);
++    *error = HTTP_STATUS_NONE;
++
++    // httpMsgParseStep() and debugging require 0-termination, unfortunately
++    buf->terminate(); // does not affect content size
++
++    // find the end of headers
++    // TODO: Remove? httpReplyParseStep() should do similar checks
++    const size_t hdr_len = headersEnd(buf->content(), buf->contentSize());
++
++    if (hdr_len <= 0) {
++        debugs(58, 3, "HttpMsg::parse: failed to find end of headers " <<
++               "(eof: " << eof << ") in '" << buf->content() << "'");
++
++        if (eof) // iff we have seen the end, this is an error
++            *error = HTTP_INVALID_HEADER;
++
++        return false;
++    }
++
++    // TODO: move to httpReplyParseStep()
++    if (hdr_len > Config.maxReplyHeaderSize) {
++        debugs(58, 1, "HttpMsg::parse: Too large reply header (" <<
++               hdr_len << " > " << Config.maxReplyHeaderSize);
++        *error = HTTP_HEADER_TOO_LARGE;
++        return false;
++    }
++
++    if (!sanityCheckStartLine(buf, error))	// redundant; could be remvoed
++        return false;
++
++    const int res = httpMsgParseStep(buf->content(), eof);
++
++    if (res < 0) { // error
++        debugs(58, 3, "HttpMsg::parse: cannot parse isolated headers " <<
++               "in '" << buf->content() << "'");
++        *error = HTTP_INVALID_HEADER;
++        return false;
++    }
++
++    if (res == 0) {
++        debugs(58, 2, "HttpMsg::parse: strange, need more data near '" <<
++               buf->content() << "'");
++        return false; // but this should not happen due to headersEnd() above
++    }
++
++    assert(res > 0);
++    debugs(58, 9, "HttpMsg::parse success (" << hdr_len << " bytes) " <<
++           "near '" << buf->content() << "'");
++
++    if (hdr_sz != (int)hdr_len) {
++        debugs(58, 1, "internal HttpMsg::parse vs. headersEnd error: " <<
++               hdr_sz << " != " << hdr_len);
++        hdr_sz = (int)hdr_len; // because old http.cc code used hdr_len
++    }
++
++    return true;
++}
++
++
++
++/*
++ * parses a 0-terminating buffer into HttpMsg.
++ * Returns:
++ *      1 -- success
++ *       0 -- need more data (partial parse)
++ *      -1 -- parse error
++ */
++int
++HttpMsg::httpMsgParseStep(const char *buf, int atEnd)
++{
++    const char *parse_start = buf;
++    const char *blk_start, *blk_end;
++    const char **parse_end_ptr = &blk_end;
++    assert(parse_start);
++    assert(pstate < psParsed);
++    HttpReply *rep = dynamic_cast<HttpReply*>(this);
++    HttpRequest *req = dynamic_cast<HttpRequest*>(this);
++
++    *parse_end_ptr = parse_start;
++
++    if (pstate == psReadyToParseStartLine) {
++        if (!httpMsgIsolateStart(&parse_start, &blk_start, &blk_end))
++            return 0;
++
++        if (rep) {
++            if (!httpStatusLineParse(&rep->sline, rep->protoPrefix, blk_start, blk_end))
++                return httpMsgParseError();
++        } else if (req) {
++            if (!req->parseRequestLine(blk_start, blk_end))
++                return httpMsgParseError();
++        }
++
++        *parse_end_ptr = parse_start;
++
++        hdr_sz = *parse_end_ptr - buf;
++
++        ++pstate;
++    }
++
++    if (pstate == psReadyToParseHeaders) {
++        if (!httpMsgIsolateHeaders(&parse_start, &blk_start, &blk_end)) {
++            if (atEnd)
++                blk_start = parse_start, blk_end = blk_start + strlen(blk_start);
++            else
++                return 0;
++        }
++
++        if (!httpHeaderParse(&header, blk_start, blk_end))
++            return httpMsgParseError();
++
++        if (rep)
++            httpReplyHdrCacheInit(rep);
++        else if (req)
++            httpRequestHdrCacheInit(req);
++
++        *parse_end_ptr = parse_start;
++
++        hdr_sz = *parse_end_ptr - buf;
++
++        ++pstate;
++    }
++
++    return 1;
++}
++
++
++/* handy: resets and returns -1 */
++int
++HttpMsg::httpMsgParseError()
++{
++    reset();
++    /* indicate an error */
++
++    if (HttpReply *rep = dynamic_cast<HttpReply*>(this))
++        rep->sline.status = HTTP_INVALID_HEADER;
++
++    return -1;
++}
++
++
++
+ /* returns true if connection should be "persistent"
+  * after processing this message */
+ int
+@@ -109,7 +296,7 @@ httpMsgIsPersistent(HttpVersion const &http_ver, const HttpHeader * hdr)
+          * a "Connection: close" header.
+          */
+         return !httpHeaderHasConnDir(hdr, "close");
+-    } else {
++    } else
+ #else
+     {
+ #endif
+@@ -120,16 +307,24 @@ httpMsgIsPersistent(HttpVersion const &http_ver, const HttpHeader * hdr)
+          */
+         const char *agent = httpHeaderGetStr(hdr, HDR_USER_AGENT);
+ 
+-        if (agent && !httpHeaderHas(hdr, HDR_VIA))
+-        {
+-            if (!strncasecmp(agent, "Mozilla/3.", 10))
+-                return 0;
++    if (agent && !httpHeaderHas(hdr, HDR_VIA)) {
++        if (!strncasecmp(agent, "Mozilla/3.", 10))
++            return 0;
+ 
+-            if (!strncasecmp(agent, "Netscape/3.", 11))
+-                return 0;
+-        }
+-
+-        /* for old versions of HTTP: persistent if has "keep-alive" */
+-        return httpHeaderHasConnDir(hdr, "keep-alive");
++        if (!strncasecmp(agent, "Netscape/3.", 11))
++            return 0;
+     }
++
++    /* for old versions of HTTP: persistent if has "keep-alive" */
++    return httpHeaderHasConnDir(hdr, "keep-alive");
++}
+ }
++
++void HttpMsg::packInto(Packer *p, bool full_uri) const
++{
++    packFirstLineInto(p, full_uri);
++    httpHeaderPackInto(&header, p);
++    packerAppend(p, "\r\n", 2);
++}
++
++
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: HttpReply.cc,v 1.72 2005/08/31 19:15:35 wessels Exp $
++ * $Id: HttpReply.cc,v 1.73 2005/09/12 23:28:57 wessels Exp $
+  *
+  * DEBUG: section 58    HTTP Reply (Response)
+  * AUTHOR: Alex Rousskov
+@@ -33,10 +33,9 @@
+  *
+  */
+ 
+-#include "HttpReply.h"
+ #include "squid.h"
+ #include "Store.h"
+-#include "HttpHeader.h"
++#include "HttpReply.h"
+ #include "HttpHdrContRange.h"
+ #include "ACLChecklist.h"
+ 
+@@ -51,29 +50,19 @@ static http_hdr_type Denied304HeadersArr[] =
+         HDR_OTHER
+     };
+ 
+-HttpMsgParseState &operator++ (HttpMsgParseState &aState)
+-{
+-    int tmp = (int)aState;
+-    aState = (HttpMsgParseState)(++tmp);
+-    return aState;
+-}
+-
+ 
+ /* local routines */
+ static void httpReplyClean(HttpReply * rep);
+ static void httpReplyDoDestroy(HttpReply * rep);
+-static void httpReplyHdrCacheInit(HttpReply * rep);
+ static void httpReplyHdrCacheClean(HttpReply * rep);
+-static int httpReplyParseStep(HttpReply * rep, const char *parse_start, int atEnd);
+-static int httpReplyParseError(HttpReply * rep);
+-static int httpReplyIsolateStart(const char **parse_start, const char **blk_start, const char **blk_end);
+ static time_t httpReplyHdrExpirationTime(const HttpReply * rep);
+ 
+ 
+ /* module initialization */
+ void
+ httpReplyInitModule(void)
+ {
++    assert(HTTP_STATUS_NONE == 0); // HttpReply::parse() interface assumes that
+     httpHeaderMaskInit(&Denied304HeadersMask, 0);
+     httpHeaderCalcMask(&Denied304HeadersMask, (const int *) Denied304HeadersArr, countof(Denied304HeadersArr));
+ }
+@@ -87,13 +76,16 @@ httpReplyCreate(void)
+     return rep;
+ }
+ 
+-HttpReply::HttpReply() : hdr_sz (0), content_length (0), date (0), last_modified (0), expires (0), cache_control (NULL), surrogate_control (NULL), content_range (NULL), keep_alive (0), pstate(psReadyToParseStartLine), header (hoReply)
++HttpReply::HttpReply() : HttpMsg(hoReply), date (0), last_modified (0), expires (0), surrogate_control (NULL), content_range (NULL), keep_alive (0), protoPrefix("HTTP/")
+ {
+-    assert(this);
+     httpBodyInit(&body);
+     httpReplyHdrCacheInit(this);
+     httpStatusLineInit(&sline);
++}
+ 
++void HttpReply::reset()
++{
++    httpReplyReset(this);
+ }
+ 
+ static void
+@@ -118,8 +110,14 @@ httpReplyDestroy(HttpReply * rep)
+ void
+ httpReplyReset(HttpReply * rep)
+ {
++    // reset should not reset the protocol; could have made protoPrefix a
++    // virtual function instead, but it is not clear whether virtual methods
++    // are allowed with MEMPROXY_CLASS() and whether some cbdata void*
++    // conversions are not going to kill virtual tables
++    const String pfx = rep->protoPrefix;
+     httpReplyClean(rep);
+     *rep = HttpReply();
++    rep->protoPrefix = pfx;
+ }
+ 
+ /* absorb: copy the contents of a new reply to the old one, destroy new one */
+@@ -142,7 +140,7 @@ httpReplyAbsorb(HttpReply * rep, HttpReply * new_rep)
+  * end is, but is unable to NULL-terminate the buffer.  This function
+  * returns true on success.
+  */
+-int
++bool
+ httpReplyParse(HttpReply * rep, const char *buf, ssize_t end)
+ {
+     /*
+@@ -160,7 +158,7 @@ httpReplyParse(HttpReply * rep, const char *buf, ssize_t end)
+     memBufDefInit(&mb);
+     memBufAppend(&mb, buf, end);
+     memBufAppend(&mb, "\0", 1);
+-    success = httpReplyParseStep(rep, mb.buf, 0);
++    success = rep->httpMsgParseStep(mb.buf, 0);
+     memBufClean(&mb);
+     return success == 1;
+ }
+@@ -436,7 +434,7 @@ httpReplyHdrExpirationTime(const HttpReply * rep)
+ }
+ 
+ /* sync this routine when you update HttpReply struct */
+-static void
++void
+ httpReplyHdrCacheInit(HttpReply * rep)
+ {
+     const HttpHeader *hdr = &rep->header;
+@@ -479,98 +477,6 @@ httpReplyHdrCacheClean(HttpReply * rep)
+         httpHdrContRangeDestroy(rep->content_range);
+ }
+ 
+-/*
+- * parses a 0-terminating buffer into HttpReply. 
+- * Returns:
+- *      1 -- success 
+- *       0 -- need more data (partial parse)
+- *      -1 -- parse error
+- */
+-static int
+-httpReplyParseStep(HttpReply * rep, const char *buf, int atEnd)
+-{
+-    const char *parse_start = buf;
+-    const char *blk_start, *blk_end;
+-    const char **parse_end_ptr = &blk_end;
+-    assert(rep);
+-    assert(parse_start);
+-    assert(rep->pstate < psParsed);
+-
+-    *parse_end_ptr = parse_start;
+-
+-    if (rep->pstate == psReadyToParseStartLine) {
+-        if (!httpReplyIsolateStart(&parse_start, &blk_start, &blk_end))
+-            return 0;
+-
+-        if (!httpStatusLineParse(&rep->sline, blk_start, blk_end))
+-            return httpReplyParseError(rep);
+-
+-        *parse_end_ptr = parse_start;
+-
+-        rep->hdr_sz = *parse_end_ptr - buf;
+-
+-        ++rep->pstate;
+-    }
+-
+-    if (rep->pstate == psReadyToParseHeaders) {
+-        if (!httpMsgIsolateHeaders(&parse_start, &blk_start, &blk_end)) {
+-            if (atEnd)
+-                blk_start = parse_start, blk_end = blk_start + strlen(blk_start);
+-            else
+-                return 0;
+-        }
+-
+-        if (!httpHeaderParse(&rep->header, blk_start, blk_end))
+-            return httpReplyParseError(rep);
+-
+-        httpReplyHdrCacheInit(rep);
+-
+-        *parse_end_ptr = parse_start;
+-
+-        rep->hdr_sz = *parse_end_ptr - buf;
+-
+-        ++rep->pstate;
+-    }
+-
+-    return 1;
+-}
+-
+-/* handy: resets and returns -1 */
+-static int
+-httpReplyParseError(HttpReply * rep)
+-{
+-    assert(rep);
+-    /* reset */
+-    httpReplyReset(rep);
+-    /* indicate an error */
+-    rep->sline.status = HTTP_INVALID_HEADER;
+-    return -1;
+-}
+-
+-/* find first CRLF */
+-static int
+-httpReplyIsolateStart(const char **parse_start, const char **blk_start, const char **blk_end)
+-{
+-    int slen = strcspn(*parse_start, "\r\n");
+-
+-    if (!(*parse_start)[slen])	/* no CRLF found */
+-        return 0;
+-
+-    *blk_start = *parse_start;
+-
+-    *blk_end = *blk_start + slen;
+-
+-    while (**blk_end == '\r')	/* CR */
+-        (*blk_end)++;
+-
+-    if (**blk_end == '\n')	/* LF */
+-        (*blk_end)++;
+-
+-    *parse_start = *blk_end;
+-
+-    return 1;
+-}
+-
+ /*
+  * Returns the body size of a HTTP response
+  */
+@@ -592,3 +498,19 @@ httpReplyBodySize(method_t method, HttpReply const * reply)
+ 
+     return reply->content_length;
+ }
++
++bool HttpReply::sanityCheckStartLine(MemBuf *buf, http_status *error)
++{
++    if (buf->contentSize() >= protoPrefix.size() && protoPrefix.cmp(buf->content(), protoPrefix.size()) != 0) {
++        debugs(58, 3, "HttpReply::sanityCheckStartLine: missing protocol prefix (" << protoPrefix.buf() << ") in '" << buf->content() << "'");
++        *error = HTTP_INVALID_HEADER;
++        return false;
++    }
++
++    return true;
++}
++
++void HttpReply::packFirstLineInto(Packer *p, bool unused) const
++{
++    httpStatusLinePackInto(&sline, p);
++}
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: HttpReply.h,v 1.8 2005/08/31 19:15:35 wessels Exp $
++ * $Id: HttpReply.h,v 1.9 2005/09/12 23:28:57 wessels Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -34,8 +34,7 @@
+ #ifndef SQUID_HTTPREPLY_H
+ #define SQUID_HTTPREPLY_H
+ 
+-#include "typedefs.h"
+-#include "HttpHeader.h"
++#include "HttpMsg.h"
+ #include "HttpStatusLine.h"
+ 
+ /* Http Reply */
+@@ -47,8 +46,8 @@ extern void httpReplyDestroy(HttpReply * rep);
+ extern void httpReplyReset(HttpReply * rep);
+ /* absorb: copy the contents of a new reply to the old one, destroy new one */
+ extern void httpReplyAbsorb(HttpReply * rep, HttpReply * new_rep);
+-/* parse returns -1,0,+1 on error,need-more-data,success */
+-extern int httpReplyParse(HttpReply * rep, const char *buf, ssize_t);
++/* parse returns true on success */
++extern bool httpReplyParse(HttpReply * rep, const char *buf, ssize_t);
+ extern void httpReplyPackHeadersInto(const HttpReply * rep, Packer * p);
+ extern void httpReplyPackInto(const HttpReply * rep, Packer * p);
+ /* ez-routines */
+@@ -76,38 +75,44 @@ extern int httpReplyHasCc(const HttpReply * rep, http_hdr_cc_type type);
+ extern void httpRedirectReply(HttpReply *, http_status, const char *);
+ extern int httpReplyBodySize(method_t, HttpReply const *);
+ extern int httpReplyValidatorsMatch (HttpReply const *, HttpReply const *);
++extern void httpReplyHdrCacheInit(HttpReply * rep);
++
+ 
+ /* Sync changes here with HttpReply.cc */
+ 
+ class HttpHdrContRange;
+ 
+-class HttpReply
++class HttpReply: public HttpMsg
+ {
+ 
+ public:
+     MEMPROXY_CLASS(HttpReply);
+     HttpReply();
+-    /* unsupported, writable, may disappear/change in the future */
+-    int hdr_sz;			/* sums _stored_ status-line, headers, and <CRLF> */
++
++    virtual void reset();
++
++    // returns true on success
++    // returns false and sets *error to zero when needs more data
++    // returns false and sets *error to a positive http_status code on error
++    virtual bool sanityCheckStartLine(MemBuf *buf, http_status *error);
+ 
+     /* public, readable; never update these or their .hdr equivalents directly */
+-    int content_length;
+     time_t date;
+     time_t last_modified;
+     time_t expires;
+     String content_type;
+-    HttpHdrCc *cache_control;
+     HttpHdrSc *surrogate_control;
+     HttpHdrContRange *content_range;
+     short int keep_alive;
+ 
+-    /* public, readable */
+-    HttpMsgParseState pstate;	/* the current parsing state */
+-
+     /* public, writable, but use httpReply* interfaces when possible */
+     HttpStatusLine sline;
+-    HttpHeader header;
+     HttpBody body;		/* for small constant memory-resident text bodies only */
++
++    String protoPrefix;       // e.g., "HTTP/"
++
++protected:
++    virtual void packFirstLineInto(Packer * p, bool) const;
+ };
+ 
+ MEMPROXY_CLASS_INLINE(HttpReply)
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: HttpRequest.cc,v 1.48 2005/04/18 21:52:41 hno Exp $
++ * $Id: HttpRequest.cc,v 1.49 2005/09/12 23:28:57 wessels Exp $
+  *
+  * DEBUG: section 73    HTTP Request
+  * AUTHOR: Duane Wessels
+@@ -34,19 +34,16 @@
+  * Copyright (c) 2003, Robert Collins <robertc@squid-cache.org>
+  */
+ 
+-#include "HttpRequest.h"
+ #include "squid.h"
++#include "HttpRequest.h"
+ #include "AuthUserRequest.h"
+ #include "HttpHeaderRange.h"
+ 
+-static void httpRequestHdrCacheInit(HttpRequest * req);
+-
+-HttpRequest::HttpRequest()  : header(hoRequest)
++HttpRequest::HttpRequest()  : HttpMsg(hoRequest)
+ {
+     /* We should initialise these ... */
+ #if 0
+     method_t method;
+-    protocol_t protocol;
+     char login[MAX_LOGIN_SZ];
+     char host[SQUIDHOSTNAMELEN + 1];
+     auth_user_request_t *auth_user_request;
+@@ -55,9 +52,7 @@ HttpRequest::HttpRequest()  : header(hoRequest)
+     char *canonical;
+     int link_count;		/* free when zero */
+     request_flags flags;
+-    HttpHdrCc *cache_control;
+     HttpHdrRange *range;
+-    HttpVersion http_ver;
+     time_t ims;
+     int imslen;
+     int max_forwards;
+@@ -68,9 +63,7 @@ HttpRequest::HttpRequest()  : header(hoRequest)
+     struct IN_ADDR my_addr;
+     unsigned short my_port;
+     unsigned short client_port;
+-    HttpHeader header;
+     ConnStateData::Pointer body_connection;	/* used by clientReadBody() */
+-    int content_length;
+     HierarchyLogEntry hier;
+     err_type errType;
+     char *peer_login;		/* Configured peer login:password */
+@@ -103,40 +96,73 @@ requestCreate(method_t method, protocol_t protocol, const char *aUrlpath)
+     return req;
+ }
+ 
++void HttpRequest::reset()
++{
++    clean();
++    *this = HttpRequest(); // XXX: ugly; merge with clean()
++}
++
+ void
+ requestDestroy(HttpRequest * req)
+ {
+     assert(req);
++    req->clean();
++    delete req;
++}
+ 
+-    if (req->body_connection.getRaw() != NULL)
++// note: this is a very low-level method that leaves us in inconsistent state
++// suitable for deletion or assignment only; XXX: should be merged with reset()
++void HttpRequest::clean()
++{
++    if (body_connection.getRaw() != NULL)
+         fatal ("request being destroyed with body connection intact\n");
+ 
+-    if (req->auth_user_request)
+-        req->auth_user_request->unlock();
++    if (auth_user_request)
++        auth_user_request->unlock();
+ 
+-    safe_free(req->canonical);
++    safe_free(canonical);
+ 
+-    safe_free(req->vary_headers);
++    safe_free(vary_headers);
+ 
+-    req->urlpath.clean();
++    urlpath.clean();
+ 
+-    httpHeaderClean(&req->header);
++    httpHeaderClean(&header);
+ 
+-    if (req->cache_control)
+-        httpHdrCcDestroy(req->cache_control);
++    if (cache_control)
++        httpHdrCcDestroy(cache_control);
+ 
+-    if (req->range)
+-        delete req->range;
++    if (range)
++        delete range;
+ 
+-    req->tag.clean();
++    tag.clean();
+ 
+-    req->extacl_user.clean();
++    extacl_user.clean();
+ 
+-    req->extacl_passwd.clean();
++    extacl_passwd.clean();
+ 
+-    req->extacl_log.clean();
++    extacl_log.clean();
++}
+ 
+-    delete req;
++bool HttpRequest::sanityCheckStartLine(MemBuf *buf, http_status *error)
++{
++    /*
++     * Just see if the request buffer starts with a known
++     * HTTP request method.  NOTE this whole function is somewhat
++     * superfluous and could just go away.
++     */
++
++    if (METHOD_NONE == urlParseMethod(buf->content())) {
++        debug(73, 3)("HttpRequest::sanityCheckStartLine: did not find HTTP request method\n");
++        return false;
++    }
++
++    return true;
++}
++
++bool HttpRequest::parseRequestLine(const char *start, const char *end)
++{
++    fatal("HttpRequest::parseRequestLine not implemented yet");
++    return false;
+ }
+ 
+ HttpRequest *
+@@ -241,7 +267,7 @@ httpRequestHdrAllowed(const HttpHeaderEntry * e, String * strConn)
+ }
+ 
+ /* sync this routine when you update HttpRequest struct */
+-static void
++void
+ httpRequestHdrCacheInit(HttpRequest * req)
+ {
+     const HttpHeader *hdr = &req->header;
+@@ -313,3 +339,23 @@ request_flags::destinationIPLookedUp() const
+ {
+     return destinationIPLookedUp_;
+ }
++
++const char *HttpRequest::packableURI(bool full_uri) const
++{
++    if (full_uri)
++        return urlCanonical((HttpRequest*)this);
++
++    if (urlpath.size())
++        return urlpath.buf();
++
++    return "/";
++}
++
++void HttpRequest::packFirstLineInto(Packer * p, bool full_uri) const
++{
++    // form HTTP request-line
++    packerPrintf(p, "%s %s HTTP/%d.%d\r\n",
++                 RequestMethodStr[method],
++                 packableURI(full_uri),
++                 http_ver.major, http_ver.minor);
++}
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: HttpRequest.h,v 1.11 2005/04/18 21:52:41 hno Exp $
++ * $Id: HttpRequest.h,v 1.12 2005/09/12 23:28:57 wessels Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -34,10 +34,8 @@
+ #ifndef SQUID_HTTPREQUEST_H
+ #define SQUID_HTTPREQUEST_H
+ 
+-#include "typedefs.h"
+-#include "HttpHeader.h"
++#include "HttpMsg.h"
+ #include "client_side.h"
+-#include "HttpVersion.h"
+ #include "HierarchyLogEntry.h"
+ 
+ /*  Http Request */
+@@ -51,21 +49,23 @@ extern void httpRequestPack(const HttpRequest * req, Packer * p);
+ extern int httpRequestPrefixLen(const HttpRequest * req);
+ extern int httpRequestHdrAllowed(const HttpHeaderEntry * e, String * strConnection);
+ extern int httpRequestHdrAllowedByName(http_hdr_type id);
++extern void httpRequestHdrCacheInit(HttpRequest * req);
++
+ 
+ class HttpHdrRange;
+ 
+-class HttpRequest
++class HttpRequest: public HttpMsg
+ {
+ 
+ public:
+     MEMPROXY_CLASS(HttpRequest);
+     HttpRequest();
+-    virtual ~HttpRequest() {}
++
++    virtual void reset();
+ 
+     bool multipartRangeRequest() const;
+ 
+     method_t method;
+-    protocol_t protocol;
+     char login[MAX_LOGIN_SZ];
+     char host[SQUIDHOSTNAMELEN + 1];
+     auth_user_request_t *auth_user_request;
+@@ -74,9 +74,7 @@ class HttpRequest
+     char *canonical;
+     int link_count;		/* free when zero */
+     request_flags flags;
+-    HttpHdrCc *cache_control;
+     HttpHdrRange *range;
+-    HttpVersion http_ver;
+     time_t ims;
+     int imslen;
+     int max_forwards;
+@@ -87,9 +85,7 @@ class HttpRequest
+     struct IN_ADDR my_addr;
+     unsigned short my_port;
+     unsigned short client_port;
+-    HttpHeader header;
+     ConnStateData::Pointer body_connection;	/* used by clientReadBody() */
+-    int content_length;
+     HierarchyLogEntry hier;
+     err_type errType;
+     char *peer_login;		/* Configured peer login:password */
+@@ -100,6 +96,19 @@ class HttpRequest
+     String extacl_user;		/* User name returned by extacl lookup */
+     String extacl_passwd;	/* Password returned by extacl lookup */
+     String extacl_log;		/* String to be used for access.log purposes */
++
++public:
++    bool parseRequestLine(const char *start, const char *end);
++
++private:
++    const char *packableURI(bool full_uri) const;
++
++protected:
++    virtual void packFirstLineInto(Packer * p, bool full_uri) const;
++    virtual bool sanityCheckStartLine(MemBuf *buf, http_status *error);
++
++public: // should be private
++    void clean(); // low-level; treat as private
+ };
+ 
+ MEMPROXY_CLASS_INLINE(HttpRequest)
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: HttpStatusLine.cc,v 1.28 2003/09/01 03:49:37 robertc Exp $
++ * $Id: HttpStatusLine.cc,v 1.29 2005/09/12 23:28:57 wessels Exp $
+  *
+  * DEBUG: section 57    HTTP Status-line
+  * AUTHOR: Alex Rousskov
+@@ -79,15 +79,18 @@ httpStatusLinePackInto(const HttpStatusLine * sline, Packer * p)
+ 
+ /* pack fields using Packer */
+ int
+-httpStatusLineParse(HttpStatusLine * sline, const char *start, const char *end)
++httpStatusLineParse(HttpStatusLine * sline, const String &protoPrefix, const char *start, const char *end)
+ {
+     assert(sline);
+     sline->status = HTTP_INVALID_HEADER;	/* Squid header parsing error */
+ 
+-    if (strncasecmp(start, "HTTP/", 5))
++    // XXX: HttpReply::parse() has a similar check but is using
++    // casesensitive comparison (which is required by HTTP errata?)
++
++    if (protoPrefix.caseCmp(start, protoPrefix.size()) != 0)
+         return 0;
+ 
+-    start += 5;
++    start += protoPrefix.size();
+ 
+     if (!xisdigit(*start))
+         return 0;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: HttpStatusLine.h,v 1.1 2003/09/01 03:49:37 robertc Exp $
++ * $Id: HttpStatusLine.h,v 1.2 2005/09/12 23:28:57 wessels Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -56,8 +56,8 @@ SQUIDCEXTERN void httpStatusLineSet(HttpStatusLine * sline, HttpVersion version,
+ SQUIDCEXTERN const char *httpStatusLineReason(const HttpStatusLine * sline);
+ /* parse/pack */
+ /* parse a 0-terminating buffer and fill internal structires; returns true on success */
+-SQUIDCEXTERN int httpStatusLineParse(HttpStatusLine * sline, const char *start,
+-                                     const char *end);
++SQUIDCEXTERN int httpStatusLineParse(HttpStatusLine * sline, const String &protoPrefix,
++                                     const char *start, const char *end);
+ /* pack fields using Packer */
+ SQUIDCEXTERN void httpStatusLinePackInto(const HttpStatusLine * sline, Packer * p);
+ 
+@@ -1,7 +1,7 @@
+ #
+ #  Makefile for the Squid Object Cache server
+ #
+-#  $Id: Makefile.am,v 1.109 2005/08/23 10:52:05 serassio Exp $
++#  $Id: Makefile.am,v 1.110 2005/09/12 23:28:57 wessels Exp $
+ #
+ #  Uncomment and customize the following to suit your needs:
+ #
+@@ -412,6 +412,7 @@ squid_SOURCES = \
+ 	HttpHeaderTools.cc \
+ 	HttpBody.cc \
+ 	HttpMsg.cc \
++	HttpMsg.h \
+ 	HttpReply.cc \
+ 	HttpReply.h \
+ 	HttpRequest.cc \
+@@ -17,7 +17,7 @@
+ #
+ #  Makefile for the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.346 2005/08/24 00:10:54 hno Exp $
++#  $Id: Makefile.in,v 1.347 2005/09/12 23:28:57 wessels Exp $
+ #
+ #  Uncomment and customize the following to suit your needs:
+ #
+@@ -190,7 +190,7 @@ am__squid_SOURCES_DIST = access_log.cc AccessLogEntry.h acl.cc ACL.h \
+ 	HttpHdrRange.cc HttpHdrSc.cc HttpHdrScTarget.cc \
+ 	HttpHdrContRange.cc HttpHdrContRange.h HttpHeader.cc \
+ 	HttpHeader.h HttpHeaderRange.h HttpHeaderTools.cc HttpBody.cc \
+-	HttpMsg.cc HttpReply.cc HttpReply.h HttpRequest.cc \
++	HttpMsg.cc HttpMsg.h HttpReply.cc HttpReply.h HttpRequest.cc \
+ 	HttpRequest.h HttpVersion.h icmp.cc ICP.h icp_v2.cc icp_v3.cc \
+ 	ACLIdent.cc ACLIdent.h ident.cc int.cc internal.cc ipc.cc \
+ 	ipcache.cc IPInterception.cc IPInterception.h leakfinder.cc \
+@@ -1061,6 +1061,7 @@ squid_SOURCES = \
+ 	HttpHeaderTools.cc \
+ 	HttpBody.cc \
+ 	HttpMsg.cc \
++	HttpMsg.h \
+ 	HttpReply.cc \
+ 	HttpReply.h \
+ 	HttpRequest.cc \
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: client_side.h,v 1.10 2005/04/18 21:52:42 hno Exp $
++ * $Id: client_side.h,v 1.11 2005/09/12 23:28:57 wessels Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -230,4 +230,6 @@ class ClientBody
+     HttpRequest *request;
+ };
+ 
++const char *findTrailingHTTPVersion(const char *uriAndHTTPVersion, const char *end = NULL);
++
+ #endif /* SQUID_CLIENTSIDE_H */
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: protos.h,v 1.508 2005/08/31 19:15:36 wessels Exp $
++ * $Id: protos.h,v 1.509 2005/09/12 23:28:57 wessels Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -434,9 +434,6 @@ SQUIDCEXTERN void httpHeaderEntryPackInto(const HttpHeaderEntry * e, Packer * p)
+ SQUIDCEXTERN void httpHeaderStoreReport(StoreEntry * e);
+ SQUIDCEXTERN void httpHdrMangleList(HttpHeader *, HttpRequest *, int req_or_rep);
+ 
+-/* Http Msg (currently in HttpReply.c @?@ ) */
+-SQUIDCEXTERN int httpMsgIsolateHeaders(const char **parse_start, const char **blk_start, const char **blk_end);
+-
+ SQUIDCEXTERN void icmpOpen(void);
+ SQUIDCEXTERN void icmpClose(void);
+ 

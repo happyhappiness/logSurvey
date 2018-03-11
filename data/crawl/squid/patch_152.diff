@@ -1,140 +1,1611 @@
-@@ -66,6 +66,8 @@ class StoreEntry : public hash_link, public Packable
-     }
-     virtual bool isAccepting() const;
-     virtual size_t bytesWanted(Range<size_t> const aRange, bool ignoreDelayPool = false) const;
-+    /// flags [truncated or too big] entry with ENTRY_BAD_LENGTH and releases it
-+    void lengthWentBad(const char *reason);
-     virtual void complete();
-     virtual store_client_t storeClientType() const;
-     virtual char const *getSerialisedMetaData();
-@@ -958,6 +958,8 @@ ClientSocketContext::lengthToSend(Range<int64_t> const &available)
- void
- ClientSocketContext::noteSentBodyBytes(size_t bytes)
- {
-+    debugs(33, 7, bytes << " body bytes");
-+
-     http->out.offset += bytes;
+@@ -400,7 +400,7 @@ FwdState::startConnectionOrFail()
+         // Done here before anything else so the errors get logged for
+         // this server link regardless of what happens when connecting to it.
+         // IF sucessfuly connected this top destination will become the serverConnection().
+-        request->hier.note(serverDestinations[0], request->GetHost());
++        request->hier.note(serverDestinations[0], request->url.host());
+         request->clearError();
  
-     if (!http->request->range)
-@@ -1238,6 +1238,11 @@ clientReplyContext::replyStatus()
-             return STREAM_FAILED;
+         connectStart();
+@@ -848,7 +848,7 @@ FwdState::connectStart()
+     // Use pconn to avoid opening a new connection.
+     const char *host = NULL;
+     if (!serverDestinations[0]->getPeer())
+-        host = request->GetHost();
++        host = request->url.host();
+ 
+     Comm::ConnectionPointer temp;
+     // Avoid pconns after races so that the same client does not suffer twice.
+@@ -926,7 +926,7 @@ FwdState::dispatch()
+ 
+     EBIT_SET(entry->flags, ENTRY_DISPATCHED);
+ 
+-    netdbPingSite(request->GetHost());
++    netdbPingSite(request->url.host());
+ 
+     /* Retrieves remote server TOS or MARK value, and stores it as part of the
+      * original client request FD object. It is later used to forward
+@@ -70,12 +70,9 @@ HttpRequest::init()
+     method = Http::METHOD_NONE;
+     url.clear();
+     urlpath = NULL;
+-    host[0] = '\0';
+-    host_is_numeric = -1;
+ #if USE_AUTH
+     auth_user_request = NULL;
+ #endif
+-    port = 0;
+     canonical = NULL;
+     memset(&flags, '\0', sizeof(flags));
+     range = NULL;
+@@ -186,10 +183,9 @@ HttpRequest::clone() const
+     copy->body_pipe = body_pipe;
+ 
+     copy->url.userInfo(url.userInfo());
+-    strncpy(copy->host, host, sizeof(host)); // SQUIDHOSTNAMELEN
+-    copy->host_addr = host_addr;
++    copy->url.host(url.host());
++    copy->url.port(url.port());
+ 
+-    copy->port = port;
+     // urlPath handled in ctor
+     copy->canonical = canonical ? xstrdup(canonical) : NULL;
+ 
+@@ -10,7 +10,6 @@
+ #define SQUID_HTTPREQUEST_H
+ 
+ #include "base/CbcPointer.h"
+-#include "Debug.h"
+ #include "dns/forward.h"
+ #include "err_type.h"
+ #include "HierarchyLogEntry.h"
+@@ -67,25 +66,13 @@ class HttpRequest: public HttpMsg
+     /// whether the client is likely to be able to handle a 1xx reply
+     bool canHandle1xx() const;
+ 
+-    /* Now that we care what host contains it is better off being protected. */
+-    /* HACK: These two methods are only inline to get around Makefile dependancies */
+-    /*      caused by HttpRequest being used in places it really shouldn't.        */
+-    /*      ideally they would be methods of URL instead. */
++    /* HACK: This method is only inline to get around Makefile dependancies */
++    /*      caused by HttpRequest being used in places it really shouldn't. */
++    /*      ideally URL would be used directly instead.                     */
+     inline void SetHost(const char *src) {
+-        host_addr.setEmpty();
+-        host_addr = src;
+-        if (host_addr.isAnyAddr()) {
+-            xstrncpy(host, src, SQUIDHOSTNAMELEN);
+-            host_is_numeric = 0;
+-        } else {
+-            host_addr.toHostStr(host, SQUIDHOSTNAMELEN);
+-            debugs(23, 3, "HttpRequest::SetHost() given IP: " << host_addr);
+-            host_is_numeric = 1;
+-        }
++        url.host(src);
+         safe_free(canonical); // force its re-build
+     };
+-    inline const char* GetHost(void) const { return host; };
+-    inline int GetHostIsNumeric(void) const { return host_is_numeric; };
+ 
+ #if USE_ADAPTATION
+     /// Returns possibly nil history, creating it if adapt. logging is enabled
+@@ -114,14 +101,9 @@ class HttpRequest: public HttpMsg
+ 
+ public:
+     HttpRequestMethod method;
+-
+-    // TODO expand to include all URI parts
+-    URL url; ///< the request URI (scheme and userinfo only)
++    URL url; ///< the request URI
+ 
+ private:
+-    char host[SQUIDHOSTNAMELEN];
+-    int host_is_numeric;
+-
+ #if USE_ADAPTATION
+     mutable Adaptation::History::Pointer adaptHistory_; ///< per-HTTP transaction info
+ #endif
+@@ -130,11 +112,9 @@ class HttpRequest: public HttpMsg
+ #endif
+ 
+ public:
+-    Ip::Address host_addr;
+ #if USE_AUTH
+     Auth::UserRequest::Pointer auth_user_request;
+ #endif
+-    unsigned short port;
+ 
+     String urlpath;
+ 
+@@ -10,34 +10,64 @@
+ #define SQUID_SRC_URL_H
+ 
+ #include "anyp/UriScheme.h"
++#include "ip/Address.h"
++#include "rfc2181.h"
+ #include "SBuf.h"
+ 
+ /**
+  * The URL class represents a Uniform Resource Location
++ *
++ * Governed by RFC 3986
+  */
+ class URL
+ {
+     MEMPROXY_CLASS(URL);
+ 
+ public:
+-    URL() : scheme_() {}
+-    URL(AnyP::UriScheme const &aScheme) : scheme_(aScheme) {}
++    URL() : scheme_(), hostIsNumeric_(false), port_(0) {*host_=0;}
++    URL(AnyP::UriScheme const &aScheme) : scheme_(aScheme), hostIsNumeric_(false), port_(0) {*host_=0;}
+ 
+     void clear() {
+         scheme_=AnyP::PROTO_NONE;
++        hostIsNumeric_ = false;
++        *host_ = 0;
++        hostAddr_.setEmpty();
++        port_ = 0;
++        touch();
+     }
++    void touch(); ///< clear the cached URI display forms
+ 
+     AnyP::UriScheme const & getScheme() const {return scheme_;}
+ 
+     /// convert the URL scheme to that given
+-    void setScheme(const AnyP::ProtocolType &p) {scheme_=p;}
++    void setScheme(const AnyP::ProtocolType &p) {scheme_=p; touch();}
+ 
+-    void userInfo(const SBuf &s) {userInfo_=s;}
++    void userInfo(const SBuf &s) {userInfo_=s; touch();}
+     const SBuf &userInfo() const {return userInfo_;}
+ 
++    void host(const char *src);
++    const char *host(void) const {return host_;}
++    int hostIsNumeric(void) const {return hostIsNumeric_;}
++    Ip::Address const & hostIP(void) const {return hostAddr_;}
++
++    void port(unsigned short p) {port_=p; touch();}
++    unsigned short port() const {return port_;}
++
+     /// the static '*' pseudo-URL
+     static const SBuf &Asterisk();
+ 
++    /**
++     * The authority-form URI for currently stored values.
++     *
++     * As defined by RFC 7230 section 5.3.3 this form omits the
++     * userinfo@ field from RFC 3986 defined authority segment.
++     *
++     * \param requirePort when true the port will be included, otherwise
++     *                    port will be elided when it is the default for
++     *                    the current scheme.
++     */
++    SBuf &authority(bool requirePort = false) const;
++
+ private:
+     /**
+      \par
+@@ -62,6 +92,18 @@ class URL
+     AnyP::UriScheme scheme_;
+ 
+     SBuf userInfo_; // aka 'URL-login'
++
++    // XXX: uses char[] instead of SBUf to reduce performance regressions
++    //      from c_str() since most code using this is not yet using SBuf
++    char host_[SQUIDHOSTNAMELEN];   ///< string representation of the URI authority name or IP
++    bool hostIsNumeric_;            ///< whether the authority 'host' is a raw-IP
++    Ip::Address hostAddr_;          ///< binary representation of the URI authority if it is a raw-IP
++
++    unsigned short port_;   ///< URL port
++
++    // pre-assembled URL forms
++    mutable SBuf authorityHttp_;     ///< RFC 7230 section 5.3.3 authority, maybe without default-port
++    mutable SBuf authorityWithPort_; ///< RFC 7230 section 5.3.3 authority with explicit port
+ };
+ 
+ class HttpRequest;
+@@ -110,7 +152,6 @@ char *urlInternal(const char *dir, const char *name);
+  */
+ int matchDomainName(const char *host, const char *domain, bool honorWildcards = false);
+ int urlCheckRequest(const HttpRequest *);
+-int urlDefaultPort(AnyP::ProtocolType p);
+ char *urlHostname(const char *url);
+ void urlExtMethodConfigure(void);
+ 
+@@ -602,7 +602,7 @@ ACLSourceASNStrategy ACLSourceASNStrategy::Instance_;
+ int
+ ACLDestinationASNStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &)
+ {
+-    const ipcache_addrs *ia = ipcache_gethostbyname(checklist->request->GetHost(), IP_LOOKUP_IF_MISS);
++    const ipcache_addrs *ia = ipcache_gethostbyname(checklist->request->url.host(), IP_LOOKUP_IF_MISS);
+ 
+     if (ia) {
+         for (int k = 0; k < (int) ia->count; ++k) {
+@@ -614,7 +614,7 @@ ACLDestinationASNStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist
+ 
+     } else if (!checklist->request->flags.destinationIpLookedUp) {
+         /* No entry in cache, lookup not attempted */
+-        debugs(28, 3, "asnMatchAcl: Can't yet compare '" << AclMatchedName << "' ACL for '" << checklist->request->GetHost() << "'");
++        debugs(28, 3, "can't yet compare '" << AclMatchedName << "' ACL for " << checklist->request->url.host());
+         if (checklist->goAsync(DestinationIPLookup::Instance()))
+             return -1;
+         // else fall through to noaddr match, hiding the lookup failure (XXX)
+@@ -46,28 +46,28 @@ ACLDestinationDomainStrategy::match (ACLData<MatchType> * &data, ACLFilledCheckl
+ {
+     assert(checklist != NULL && checklist->request != NULL);
+ 
+-    if (data->match(checklist->request->GetHost())) {
++    if (data->match(checklist->request->url.host())) {
+         return 1;
+     }
+ 
+     if (flags.isSet(ACL_F_NO_LOOKUP)) {
+-        debugs(28, 3, "aclMatchAcl:  No-lookup DNS ACL '" << AclMatchedName << "' for '" << checklist->request->GetHost() << "'");
++        debugs(28, 3, "No-lookup DNS ACL '" << AclMatchedName << "' for " << checklist->request->url.host());
+         return 0;
+     }
+ 
+     /* numeric IPA? no, trust the above result. */
+-    if (checklist->request->GetHostIsNumeric() == 0) {
++    if (!checklist->request->url.hostIsNumeric()) {
+         return 0;
+     }
+ 
+     /* do we already have the rDNS? match on it if we do. */
+     if (checklist->dst_rdns) {
+-        debugs(28, 3, "aclMatchAcl: '" << AclMatchedName << "' match with stored rDNS '" << checklist->dst_rdns << "' for '" << checklist->request->GetHost() << "'");
++        debugs(28, 3, "'" << AclMatchedName << "' match with stored rDNS '" << checklist->dst_rdns << "' for " << checklist->request->url.host());
+         return data->match(checklist->dst_rdns);
+     }
+ 
+     /* raw IP without rDNS? look it up and wait for the result */
+-    const ipcache_addrs *ia = ipcacheCheckNumeric(checklist->request->GetHost());
++    const ipcache_addrs *ia = ipcacheCheckNumeric(checklist->request->url.host());
+     if (!ia) {
+         /* not a valid IPA */
+         checklist->dst_rdns = xstrdup("invalid");
+@@ -82,7 +82,7 @@ ACLDestinationDomainStrategy::match (ACLData<MatchType> * &data, ACLFilledCheckl
+         return data->match(fqdn);
+     } else if (!checklist->destinationDomainChecked()) {
+         /* FIXME: Using AclMatchedName here is not OO correct. Should find a way to the current acl */
+-        debugs(28, 3, "aclMatchAcl: Can't yet compare '" << AclMatchedName << "' ACL for '" << checklist->request->GetHost() << "'");
++        debugs(28, 3, "Can't yet compare '" << AclMatchedName << "' ACL for " << checklist->request->url.host());
+         if (checklist->goAsync(DestinationDomainLookup::Instance()))
+             return -1;
+         // else fall through to "none" match, hiding the lookup failure (XXX)
+@@ -43,17 +43,17 @@ ACLDestinationIP::match(ACLChecklist *cl)
+     }
+ 
+     if (flags.isSet(ACL_F_NO_LOOKUP)) {
+-        if (!checklist->request->GetHostIsNumeric()) {
+-            debugs(28, 3, "aclMatchAcl:  No-lookup DNS ACL '" << AclMatchedName << "' for '" << checklist->request->GetHost() << "'");
++        if (!checklist->request->url.hostIsNumeric()) {
++            debugs(28, 3, "No-lookup DNS ACL '" << AclMatchedName << "' for " << checklist->request->url.host());
+             return 0;
          }
  
-+        if (EBIT_TEST(http->storeEntry()->flags, ENTRY_BAD_LENGTH)) {
-+            debugs(88, 5, "clientReplyStatus: truncated response body");
-+            return STREAM_UNPLANNED_COMPLETE;
-+        }
-+
-         if (!done) {
-             debugs(88, 5, "clientReplyStatus: closing, !done, but read 0 bytes");
-             return STREAM_FAILED;
-@@ -798,8 +798,22 @@ Client::endAdaptedBodyConsumption()
- // premature end of the adapted response body
- void Client::handleAdaptedBodyProducerAborted()
- {
-+    if (abortOnBadEntry("entry went bad while waiting for the now-aborted adapted body"))
-+        return;
-+
-+    Must(adaptedBodySource != nullptr);
-+    if (!adaptedBodySource->exhausted()) {
-+        debugs(11,5, "waiting to consume the remainder of the aborted adapted body");
-+        return; // resumeBodyStorage() should eventually consume the rest
-+    }
-+
-     stopConsumingFrom(adaptedBodySource);
--    handleAdaptationAborted();
-+
-+    if (handledEarlyAdaptationAbort())
-+        return;
-+
-+    entry->lengthWentBad("body adaptation aborted");
-+    handleAdaptationCompleted(); // the user should get a truncated response
- }
- 
- // common part of noteAdaptationAnswer and handleAdaptedBodyProductionEnded
-@@ -832,18 +846,29 @@ Client::handleAdaptationAborted(bool bypassable)
-         return;
- 
-     // TODO: bypass if possible
-+    if (!handledEarlyAdaptationAbort())
-+        abortTransaction("adaptation failure with a filled entry");
-+}
- 
-+/// If the store entry is still empty, fully handles adaptation abort, returning
-+/// true. Otherwise just updates the request error detail and returns false.
-+bool
-+Client::handledEarlyAdaptationAbort()
-+{
-     if (entry->isEmpty()) {
--        debugs(11,9, HERE << "creating ICAP error entry after ICAP failure");
-+        debugs(11,8, "adaptation failure with an empty entry: " << *entry);
-         ErrorState *err = new ErrorState(ERR_ICAP_FAILURE, Http::scInternalServerError, request);
-         err->detailError(ERR_DETAIL_ICAP_RESPMOD_EARLY);
-         fwd->fail(err);
-         fwd->dontRetry(true);
--    } else if (request) { // update logged info directly
--        request->detailError(ERR_ICAP_FAILURE, ERR_DETAIL_ICAP_RESPMOD_LATE);
-+        abortTransaction("adaptation failure with an empty entry");
-+        return true; // handled
+-        if (ACLIP::match(checklist->request->host_addr))
++        if (ACLIP::match(checklist->request->url.hostIP()))
+             return 1;
+         return 0;
      }
  
--    abortTransaction("ICAP failure");
-+    if (request) // update logged info directly
-+        request->detailError(ERR_ICAP_FAILURE, ERR_DETAIL_ICAP_RESPMOD_LATE);
-+
-+    return false; // the caller must handle
+-    const ipcache_addrs *ia = ipcache_gethostbyname(checklist->request->GetHost(), IP_LOOKUP_IF_MISS);
++    const ipcache_addrs *ia = ipcache_gethostbyname(checklist->request->url.host(), IP_LOOKUP_IF_MISS);
+ 
+     if (ia) {
+         /* Entry in cache found */
+@@ -66,7 +66,7 @@ ACLDestinationIP::match(ACLChecklist *cl)
+         return 0;
+     } else if (!checklist->request->flags.destinationIpLookedUp) {
+         /* No entry in cache, lookup not attempted */
+-        debugs(28, 3, "aclMatchAcl: Can't yet compare '" << name << "' ACL for '" << checklist->request->GetHost() << "'");
++        debugs(28, 3, "can't yet compare '" << name << "' ACL for " << checklist->request->url.host());
+         if (checklist->goAsync(DestinationIPLookup::Instance()))
+             return -1;
+         // else fall through to mismatch, hiding the lookup failure (XXX)
+@@ -87,7 +87,7 @@ void
+ DestinationIPLookup::checkForAsync(ACLChecklist *cl)const
+ {
+     ACLFilledChecklist *checklist = Filled(cl);
+-    ipcache_nbgethostbyname(checklist->request->GetHost(), LookupDone, checklist);
++    ipcache_nbgethostbyname(checklist->request->url.host(), LookupDone, checklist);
  }
  
- // adaptation service wants us to deny HTTP client access to this response
-@@ -124,6 +124,7 @@ class Client:
-     void handleAdaptationCompleted();
-     void handleAdaptationBlocked(const Adaptation::Answer &answer);
-     void handleAdaptationAborted(bool bypassable = false);
-+    bool handledEarlyAdaptationAbort();
+ void
+@@ -523,7 +523,7 @@ ACLIP::empty() const
+ }
  
-     /// called by StoreEntry when it has more buffer space available
-     void resumeBodyStorage();
-@@ -19,6 +19,7 @@
- #include "profiler/Profiler.h"
- #include "servers/Http1Server.h"
- #include "SquidConfig.h"
-+#include "Store.h"
+ int
+-ACLIP::match(Ip::Address &clientip)
++ACLIP::match(const Ip::Address &clientip)
+ {
+     static acl_ip_data ClientAddress;
+     /*
+@@ -63,7 +63,7 @@ class ACLIP : public ACL
  
- CBDATA_NAMESPACED_CLASS_INIT(Http1, Server);
+ protected:
  
-@@ -250,6 +251,7 @@ Http::One::Server::handleReply(HttpReply *rep, StoreIOBuffer receivedData)
-     // the last-chunk if there was no error, ignoring responseFinishedOrFailed.
-     const bool mustSendLastChunk = http->request->flags.chunkedReply &&
-                                    !http->request->flags.streamError &&
-+                                   !EBIT_TEST(http->storeEntry()->flags, ENTRY_BAD_LENGTH) &&
-                                    !context->startOfOutput();
-     const bool responseFinishedOrFailed = !rep &&
-                                           !receivedData.data &&
-@@ -1083,6 +1083,14 @@ storeCheckCachableStats(StoreEntry *sentry)
-                       store_check_cachable_hist.yes.Default);
+-    int match(Ip::Address &);
++    int match(const Ip::Address &);
+     IPSplay *data;
+ 
+ };
+@@ -104,7 +104,7 @@ ACLServerNameStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *ch
+     }
+ 
+     if (serverName == NULL)
+-        serverName = checklist->request->GetHost();
++        serverName = checklist->request->url.host();
+ 
+     if (serverName && data->match(serverName)) {
+         return 1;
+@@ -13,9 +13,9 @@
+ #include "HttpRequest.h"
+ 
+ int
+-ACLUrlPortStrategy::match (ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &)
++ACLUrlPortStrategy::match(ACLData<MatchType> * &data, ACLFilledChecklist *checklist, ACLFlags &)
+ {
+-    return data->match (checklist->request->port);
++    return data->match(checklist->request->url.port());
+ }
+ 
+ ACLUrlPortStrategy *
+@@ -29,3 +29,40 @@ AnyP::UriScheme::c_str() const
+     return out;
+ }
+ 
++unsigned short
++AnyP::UriScheme::defaultPort() const
++{
++    switch (theScheme_) {
++
++    case AnyP::PROTO_HTTP:
++        return 80;
++
++    case AnyP::PROTO_HTTPS:
++        return 443;
++
++    case AnyP::PROTO_FTP:
++        return 21;
++
++    case AnyP::PROTO_COAP:
++    case AnyP::PROTO_COAPS:
++        // coaps:// default is TBA as of draft-ietf-core-coap-08.
++        // Assuming IANA policy of allocating same port for base and TLS protocol versions will occur.
++        return 5683;
++
++    case AnyP::PROTO_GOPHER:
++        return 70;
++
++    case AnyP::PROTO_WAIS:
++        return 210;
++
++    case AnyP::PROTO_CACHE_OBJECT:
++        return CACHE_HTTP_PORT;
++
++    case AnyP::PROTO_WHOIS:
++        return 43;
++
++    default:
++        return 0;
++    }
++}
++
+@@ -39,6 +39,8 @@ class UriScheme
+      */
+     char const *c_str() const;
+ 
++    unsigned short defaultPort() const;
++
+ private:
+     /// This is a typecode pointer into the enum/registry of protocols handled.
+     AnyP::ProtocolType theScheme_;
+@@ -172,10 +172,10 @@ carpSelectParent(HttpRequest * request)
+                     key.append("://");
+             }
+             if (tp->options.carp_key.host) {
+-                key.append(request->GetHost());
++                key.append(request->url.host());
+             }
+             if (tp->options.carp_key.port) {
+-                key.appendf(":%d", request->port);
++                key.appendf(":%u", request->url.port());
+             }
+             if (tp->options.carp_key.path) {
+                 String::size_type pos;
+@@ -2388,9 +2388,9 @@ bool ConnStateData::serveDelayedError(ClientSocketContext *context)
+     // when we can extract the intended name from the bumped HTTP request.
+     if (X509 *srvCert = sslServerBump->serverCert.get()) {
+         HttpRequest *request = http->request;
+-        if (!Ssl::checkX509ServerValidity(srvCert, request->GetHost())) {
++        if (!Ssl::checkX509ServerValidity(srvCert, request->url.host())) {
+             debugs(33, 2, "SQUID_X509_V_ERR_DOMAIN_MISMATCH: Certificate " <<
+-                   "does not match domainname " << request->GetHost());
++                   "does not match domainname " << request->url.host());
+ 
+             bool allowDomainMismatch = false;
+             if (Config.ssl_client.cert_error) {
+@@ -2410,7 +2410,7 @@ bool ConnStateData::serveDelayedError(ClientSocketContext *context)
+ 
+                 // Fill the server IP and hostname for error page generation.
+                 HttpRequest::Pointer const & peekerRequest = sslServerBump->request;
+-                request->hier.note(peekerRequest->hier.tcpServer, request->GetHost());
++                request->hier.note(peekerRequest->hier.tcpServer, request->url.host());
+ 
+                 // Create an error object and fill it
+                 ErrorState *err = new ErrorState(ERR_SECURE_CONNECT_FAIL, Http::scServiceUnavailable, request);
+@@ -2564,20 +2564,17 @@ clientProcessRequest(ConnStateData *conn, const Http1::RequestParserPointer &hp,
+     }
+ 
+     if (internalCheck(request->urlpath.termedBuf())) {
+-        if (internalHostnameIs(request->GetHost()) && request->port == getMyPort()) {
+-            debugs(33, 2, "internal URL found: " << request->url.getScheme() << "://" << request->GetHost() <<
+-                   ':' << request->port);
++        if (internalHostnameIs(request->url.host()) && request->url.port() == getMyPort()) {
++            debugs(33, 2, "internal URL found: " << request->url.getScheme() << "://" << request->url.authority(true));
+             http->flags.internal = true;
+         } else if (Config.onoff.global_internal_static && internalStaticCheck(request->urlpath.termedBuf())) {
+-            debugs(33, 2, "internal URL found: " << request->url.getScheme() << "://" << request->GetHost() <<
+-                   ':' << request->port << " (global_internal_static on)");
++            debugs(33, 2, "internal URL found: " << request->url.getScheme() << "://" << request->url.authority(true) << " (global_internal_static on)");
+             request->url.setScheme(AnyP::PROTO_HTTP);
+             request->SetHost(internalHostname());
+-            request->port = getMyPort();
++            request->url.port(getMyPort());
+             http->flags.internal = true;
+         } else
+-            debugs(33, 2, "internal URL found: " << request->url.getScheme() << "://" << request->GetHost() <<
+-                   ':' << request->port << " (not this proxy)");
++            debugs(33, 2, "internal URL found: " << request->url.getScheme() << "://" << request->url.authority(true) << " (not this proxy)");
+     }
+ 
+     request->flags.internal = http->flags.internal;
+@@ -3785,7 +3782,7 @@ ConnStateData::postHttpsAccept()
+         static char ip[MAX_IPSTRLEN];
+         assert(clientConnection->flags & (COMM_TRANSPARENT | COMM_INTERCEPTION));
+         request->SetHost(clientConnection->local.toStr(ip, sizeof(ip)));
+-        request->port = clientConnection->local.port();
++        request->url.port(clientConnection->local.port());
+         request->myportname = port->name;
+ 
+         ACLFilledChecklist *acl_checklist = new ACLFilledChecklist(Config.accessList.ssl_bump, request, NULL);
+@@ -4066,8 +4063,8 @@ ConnStateData::switchToHttps(HttpRequest *request, Ssl::BumpMode bumpServerMode)
+ {
+     assert(!switchedToHttps_);
+ 
+-    sslConnectHostOrIp = request->GetHost();
+-    resetSslCommonName(request->GetHost());
++    sslConnectHostOrIp = request->url.host();
++    resetSslCommonName(request->url.host());
+ 
+     // We are going to read new request
+     flags.readMore = true;
+@@ -4805,8 +4802,8 @@ ConnStateData::pinNewConnection(const Comm::ConnectionPointer &pinServer, HttpRe
+     // when pinning an SSL bumped connection, the request may be NULL
+     const char *pinnedHost = "[unknown]";
+     if (request) {
+-        pinning.host = xstrdup(request->GetHost());
+-        pinning.port = request->port;
++        pinning.host = xstrdup(request->url.host());
++        pinning.port = request->url.port();
+         pinnedHost = pinning.host;
+     } else {
+         pinning.port = pinServer->remote.port();
+@@ -4890,9 +4887,9 @@ ConnStateData::validatePinnedConnection(HttpRequest *request, const CachePeer *a
+     bool valid = true;
+     if (!Comm::IsConnOpen(pinning.serverConnection))
+         valid = false;
+-    else if (pinning.auth && pinning.host && request && strcasecmp(pinning.host, request->GetHost()) != 0)
++    else if (pinning.auth && pinning.host && request && strcasecmp(pinning.host, request->url.host()) != 0)
+         valid = false;
+-    else if (request && pinning.port != request->port)
++    else if (request && pinning.port != request->url.port())
+         valid = false;
+     else if (pinning.peer && !cbdataReferenceValid(pinning.peer))
+         valid = false;
+@@ -956,7 +956,7 @@ clientReplyContext::purgeRequest()
+     }
+ 
+     /* Release both IP cache */
+-    ipcacheInvalidate(http->request->GetHost());
++    ipcacheInvalidate(http->request->url.host());
+ 
+     if (!http->flags.purging)
+         purgeRequestFindObjectToPurge();
+@@ -1644,7 +1644,7 @@ clientReplyContext::identifyFoundObject(StoreEntry *newEntry)
+       * 'invalidate' the cached IP entries for this request ???
+       */
+     if (r->flags.noCache || r->flags.noCacheHack())
+-        ipcacheInvalidateNegative(r->GetHost());
++        ipcacheInvalidateNegative(r->url.host());
+ 
+ #if USE_CACHE_DIGESTS
+     lookup_type = http->storeEntry() ? "HIT" : "MISS";
+@@ -648,11 +648,11 @@ ClientRequestContext::hostHeaderVerify()
+         }
+     }
+ 
+-    debugs(85, 3, HERE << "validate host=" << host << ", port=" << port << ", portStr=" << (portStr?portStr:"NULL"));
++    debugs(85, 3, "validate host=" << host << ", port=" << port << ", portStr=" << (portStr?portStr:"NULL"));
+     if (http->request->flags.intercepted || http->request->flags.interceptTproxy) {
+         // verify the Host: port (if any) matches the apparent destination
+         if (portStr && port != http->getConn()->clientConnection->local.port()) {
+-            debugs(85, 3, HERE << "FAIL on validate port " << http->getConn()->clientConnection->local.port() <<
++            debugs(85, 3, "FAIL on validate port " << http->getConn()->clientConnection->local.port() <<
+                    " matches Host: port " << port << " (" << portStr << ")");
+             hostHeaderVerifyFailed("intercepted port", portStr);
+         } else {
+@@ -662,28 +662,28 @@ ClientRequestContext::hostHeaderVerify()
+             ipcache_nbgethostbyname(host, hostHeaderIpVerifyWrapper, this);
+         }
+     } else if (!Config.onoff.hostStrictVerify) {
+-        debugs(85, 3, HERE << "validate skipped.");
++        debugs(85, 3, "validate skipped.");
+         http->doCallouts();
+-    } else if (strlen(host) != strlen(http->request->GetHost())) {
++    } else if (strlen(host) != strlen(http->request->url.host())) {
+         // Verify forward-proxy requested URL domain matches the Host: header
+-        debugs(85, 3, HERE << "FAIL on validate URL domain length " << http->request->GetHost() << " matches Host: " << host);
+-        hostHeaderVerifyFailed(host, http->request->GetHost());
+-    } else if (matchDomainName(host, http->request->GetHost()) != 0) {
++        debugs(85, 3, "FAIL on validate URL domain length " << http->request->url.host() << " matches Host: " << host);
++        hostHeaderVerifyFailed(host, http->request->url.host());
++    } else if (matchDomainName(host, http->request->url.host()) != 0) {
+         // Verify forward-proxy requested URL domain matches the Host: header
+-        debugs(85, 3, HERE << "FAIL on validate URL domain " << http->request->GetHost() << " matches Host: " << host);
+-        hostHeaderVerifyFailed(host, http->request->GetHost());
+-    } else if (portStr && port != http->request->port) {
++        debugs(85, 3, "FAIL on validate URL domain " << http->request->url.host() << " matches Host: " << host);
++        hostHeaderVerifyFailed(host, http->request->url.host());
++    } else if (portStr && port != http->request->url.port()) {
+         // Verify forward-proxy requested URL domain matches the Host: header
+-        debugs(85, 3, HERE << "FAIL on validate URL port " << http->request->port << " matches Host: port " << portStr);
++        debugs(85, 3, "FAIL on validate URL port " << http->request->url.port() << " matches Host: port " << portStr);
+         hostHeaderVerifyFailed("URL port", portStr);
+-    } else if (!portStr && http->request->method != Http::METHOD_CONNECT && http->request->port != urlDefaultPort(http->request->url.getScheme())) {
++    } else if (!portStr && http->request->method != Http::METHOD_CONNECT && http->request->url.port() != http->request->url.getScheme().defaultPort()) {
+         // Verify forward-proxy requested URL domain matches the Host: header
+         // Special case: we don't have a default-port to check for CONNECT. Assume URL is correct.
+-        debugs(85, 3, "FAIL on validate URL port " << http->request->port << " matches Host: default port " << urlDefaultPort(http->request->url.getScheme()));
++        debugs(85, 3, "FAIL on validate URL port " << http->request->url.port() << " matches Host: default port " << http->request->url.getScheme().defaultPort());
+         hostHeaderVerifyFailed("URL port", "default port");
+     } else {
+         // Okay no problem.
+-        debugs(85, 3, HERE << "validate passed.");
++        debugs(85, 3, "validate passed.");
+         http->request->flags.hostVerified = true;
+         http->doCallouts();
+     }
+@@ -1130,35 +1130,25 @@ Ftp::Gateway::buildTitleUrl()
+         title_url.append("@");
+     }
+ 
+-    title_url.append(request->GetHost());
++    SBuf authority = request->url.authority(request->url.getScheme() != AnyP::PROTO_FTP);
+ 
+-    if (request->port != urlDefaultPort(AnyP::PROTO_FTP)) {
+-        title_url.append(":");
+-        title_url.append(xitoa(request->port));
+-    }
+-
+-    title_url.append (request->urlpath);
++    title_url.append(authority.rawContent(), authority.length());
++    title_url.append(request->urlpath);
+ 
+     base_href = "ftp://";
+ 
+     if (strcmp(user, "anonymous") != 0) {
+         base_href.append(rfc1738_escape_part(user));
+ 
+         if (password_url) {
+-            base_href.append (":");
++            base_href.append(":");
+             base_href.append(rfc1738_escape_part(password));
+         }
+ 
+         base_href.append("@");
+     }
+ 
+-    base_href.append(request->GetHost());
+-
+-    if (request->port != urlDefaultPort(AnyP::PROTO_FTP)) {
+-        base_href.append(":");
+-        base_href.append(xitoa(request->port));
+-    }
+-
++    base_href.append(authority.rawContent(), authority.length());
+     base_href.append(request->urlpath);
+     base_href.append("/");
+ }
+@@ -1176,7 +1166,7 @@ Ftp::Gateway::start()
+ 
+     checkUrlpath();
+     buildTitleUrl();
+-    debugs(9, 5, HERE << "FD " << ctrl.conn->fd << " : host=" << request->GetHost() <<
++    debugs(9, 5, HERE << "FD " << ctrl.conn->fd << " : host=" << request->url.host() <<
+            ", path=" << request->urlpath << ", user=" << user << ", passwd=" << password);
+     state = BEGIN;
+     Ftp::Client::start();
+@@ -1307,10 +1297,10 @@ Ftp::Gateway::ftpRealm()
+     /* This request is not fully authenticated */
+     if (!request) {
+         snprintf(realm, 8192, "FTP %s unknown", user);
+-    } else if (request->port == 21) {
+-        snprintf(realm, 8192, "FTP %s %s", user, request->GetHost());
++    } else if (request->url.port() == 21) {
++        snprintf(realm, 8192, "FTP %s %s", user, request->url.host());
+     } else {
+-        snprintf(realm, 8192, "FTP %s %s port %d", user, request->GetHost(), request->port);
++        snprintf(realm, 8192, "FTP %s %s port %d", user, request->url.host(), request->url.port());
+     }
+     return realm;
+ }
+@@ -1323,9 +1313,7 @@ ftpSendUser(Ftp::Gateway * ftpState)
+         return;
+ 
+     if (ftpState->proxy_host != NULL)
+-        snprintf(cbuf, CTRL_BUFLEN, "USER %s@%s\r\n",
+-                 ftpState->user,
+-                 ftpState->request->GetHost());
++        snprintf(cbuf, CTRL_BUFLEN, "USER %s@%s\r\n", ftpState->user, ftpState->request->url.host());
+     else
+         snprintf(cbuf, CTRL_BUFLEN, "USER %s\r\n", ftpState->user);
+ 
+@@ -877,7 +877,7 @@ ErrorState::Convert(char token, bool building_deny_info_url, bool allowRecursion
+             if (request->hier.host[0] != '\0') // if non-empty string.
+                 p = request->hier.host;
+             else
+-                p = request->GetHost();
++                p = request->url.host();
+         } else if (!building_deny_info_url)
+             p = "[unknown host]";
+         break;
+@@ -936,7 +936,7 @@ ErrorState::Convert(char token, bool building_deny_info_url, bool allowRecursion
+ 
+     case 'p':
+         if (request) {
+-            mb.appendf("%u", request->port);
++            mb.appendf("%u", request->url.port());
+         } else if (!building_deny_info_url) {
+             p = "[unknown port]";
+         }
+@@ -966,15 +966,15 @@ makeExternalAclKey(ACLFilledChecklist * ch, external_acl_data * acl_data)
+             break;
+ 
+         case Format::LFT_CLIENT_REQ_URLDOMAIN:
+-            str = request->GetHost();
++            str = request->url.host();
+             break;
+ 
+         case Format::LFT_CLIENT_REQ_URLSCHEME:
+             str = request->url.getScheme().c_str();
+             break;
+ 
+         case Format::LFT_CLIENT_REQ_URLPORT:
+-            snprintf(buf, sizeof(buf), "%d", request->port);
++            snprintf(buf, sizeof(buf), "%u", request->url.port());
+             str = buf;
+             break;
+ 
+@@ -956,14 +956,14 @@ Format::Format::assemble(MemBuf &mb, const AccessLogEntry::Pointer &al, int logS
+ 
+         case LFT_CLIENT_REQ_URLDOMAIN:
+             if (al->request) {
+-                out = al->request->GetHost();
++                out = al->request->url.host();
+                 quote = 1;
+             }
+             break;
+ 
+         case LFT_CLIENT_REQ_URLPORT:
+             if (al->request) {
+-                outint = al->request->port;
++                outint = al->request->url.port();
+                 doint = 1;
+             }
+             break;
+@@ -1030,14 +1030,14 @@ Format::Format::assemble(MemBuf &mb, const AccessLogEntry::Pointer &al, int logS
+ 
+         case LFT_SERVER_REQ_URLDOMAIN:
+             if (al->adapted_request) {
+-                out = al->adapted_request->GetHost();
++                out = al->adapted_request->url.host();
+                 quote = 1;
+             }
+             break;
+ 
+         case LFT_SERVER_REQ_URLPORT:
+             if (al->adapted_request) {
+-                outint = al->adapted_request->port;
++                outint = al->adapted_request->url.port();
+                 doint = 1;
+             }
+             break;
+@@ -830,7 +830,7 @@ gopherSendComplete(const Comm::ConnectionPointer &conn, char *buf, size_t size,
+         ErrorState *err;
+         err = new ErrorState(ERR_WRITE_ERROR, Http::scServiceUnavailable, gopherState->fwd->request);
+         err->xerrno = xerrno;
+-        err->port = gopherState->fwd->request->port;
++        err->port = gopherState->fwd->request->url.port();
+         err->url = xstrdup(entry->url());
+         gopherState->fwd->fail(err);
+         gopherState->serverConn->close();
+@@ -674,7 +674,7 @@ HttpStateData::checkDateSkew(HttpReply *reply)
+         int skew = abs((int)(reply->date - squid_curtime));
+ 
+         if (skew > 86400)
+-            debugs(11, 3, "" << request->GetHost() << "'s clock is skewed by " << skew << " seconds!");
++            debugs(11, 3, "" << request->url.host() << "'s clock is skewed by " << skew << " seconds!");
+     }
+ }
+ 
+@@ -1309,7 +1309,7 @@ HttpStateData::continueAfterParsingHeader()
+             const Http::StatusCode s = vrep->sline.status();
+             const AnyP::ProtocolVersion &v = vrep->sline.version;
+             if (s == Http::scInvalidHeader && v != Http::ProtocolVersion(0,9)) {
+-                debugs(11, DBG_IMPORTANT, "WARNING: HTTP: Invalid Response: Bad header encountered from " << entry->url() << " AKA " << request->GetHost() << request->urlpath.termedBuf() );
++                debugs(11, DBG_IMPORTANT, "WARNING: HTTP: Invalid Response: Bad header encountered from " << entry->url() << " AKA " << request->url.host() << request->urlpath.termedBuf());
+                 error = ERR_INVALID_RESP;
+             } else if (s == Http::scHeaderTooLarge) {
+                 fwd->dontRetry(true);
+@@ -1319,18 +1319,18 @@ HttpStateData::continueAfterParsingHeader()
+             }
+         } else {
+             // parsed headers but got no reply
+-            debugs(11, DBG_IMPORTANT, "WARNING: HTTP: Invalid Response: No reply at all for " << entry->url() << " AKA " << request->GetHost() << request->urlpath.termedBuf() );
++            debugs(11, DBG_IMPORTANT, "WARNING: HTTP: Invalid Response: No reply at all for " << entry->url() << " AKA " << request->url.host() << request->urlpath.termedBuf());
+             error = ERR_INVALID_RESP;
+         }
+     } else {
+         assert(eof);
+         if (inBuf.length()) {
+             error = ERR_INVALID_RESP;
+-            debugs(11, DBG_IMPORTANT, "WARNING: HTTP: Invalid Response: Headers did not parse at all for " << entry->url() << " AKA " << request->GetHost() << request->urlpath.termedBuf() );
++            debugs(11, DBG_IMPORTANT, "WARNING: HTTP: Invalid Response: Headers did not parse at all for " << entry->url() << " AKA " << request->url.host() << request->urlpath.termedBuf());
+         } else {
+             error = ERR_ZERO_SIZE_OBJECT;
+             debugs(11, (request->flags.accelerated?DBG_IMPORTANT:2), "WARNING: HTTP: Invalid Response: No object data received for " <<
+-                   entry->url() << " AKA " << request->GetHost() << request->urlpath.termedBuf() );
++                   entry->url() << " AKA " << request->url.host() << request->urlpath.termedBuf());
+         }
+     }
+ 
+@@ -1492,7 +1492,7 @@ HttpStateData::processReplyBody()
+                 request->clientConnectionManager->pinConnection(serverConnection, request, _peer,
+                         (request->flags.connectionAuth));
+             } else {
+-                fwd->pconnPush(serverConnection, request->GetHost());
++                fwd->pconnPush(serverConnection, request->url.host());
+             }
+ 
+             serverConnection = NULL;
+@@ -1864,13 +1864,9 @@ HttpStateData::httpBuildRequestHeader(HttpRequest * request,
+     if (!hdr_out->has(HDR_HOST)) {
+         if (request->peer_domain) {
+             hdr_out->putStr(HDR_HOST, request->peer_domain);
+-        } else if (request->port == urlDefaultPort(request->url.getScheme())) {
+-            /* use port# only if not default */
+-            hdr_out->putStr(HDR_HOST, request->GetHost());
+         } else {
+-            httpHeaderPutStrf(hdr_out, HDR_HOST, "%s:%d",
+-                              request->GetHost(),
+-                              (int) request->port);
++            SBuf authority = request->url.authority();
++            hdr_out->putStr(HDR_HOST, authority.c_str());
+         }
+     }
+ 
+@@ -2019,15 +2015,8 @@ copyOneHeaderFromClientsideRequestToUpstreamRequest(const HttpHeaderEntry *e, co
+         else if (request->flags.redirected && !Config.onoff.redir_rewrites_host)
+             hdr_out->addEntry(e->clone());
+         else {
+-            /* use port# only if not default */
+-
+-            if (request->port == urlDefaultPort(request->url.getScheme())) {
+-                hdr_out->putStr(HDR_HOST, request->GetHost());
+-            } else {
+-                httpHeaderPutStrf(hdr_out, HDR_HOST, "%s:%d",
+-                                  request->GetHost(),
+-                                  (int) request->port);
+-            }
++            SBuf authority = request->url.authority();
++            hdr_out->putStr(HDR_HOST, authority.c_str());
+         }
+ 
+         break;
+@@ -2264,18 +2253,17 @@ HttpStateData::sendRequest()
+ 
+     if (_peer) {
+         /*The old code here was
+-          if (neighborType(_peer, request) == PEER_SIBLING && ...
++          if (neighborType(_peer, request->url) == PEER_SIBLING && ...
+           which is equivalent to:
+-          if (neighborType(_peer, NULL) == PEER_SIBLING && ...
++          if (neighborType(_peer, URL()) == PEER_SIBLING && ...
+           or better:
+           if (((_peer->type == PEER_MULTICAST && p->options.mcast_siblings) ||
+                  _peer->type == PEER_SIBLINGS ) && _peer->options.allow_miss)
+                flags.only_if_cached = 1;
+ 
+            But I suppose it was a bug
+          */
+-        if (neighborType(_peer, request) == PEER_SIBLING &&
+-                !_peer->options.allow_miss)
++        if (neighborType(_peer, request->url) == PEER_SIBLING && !_peer->options.allow_miss)
+             flags.only_if_cached = true;
+ 
+         flags.front_end_https = _peer->front_end_https;
+@@ -1102,18 +1102,18 @@ netdbHostData(const char *host, int *samp, int *rtt, int *hops)
+ }
+ 
+ void
+-netdbUpdatePeer(HttpRequest * r, CachePeer * e, int irtt, int ihops)
++netdbUpdatePeer(const URL &url, CachePeer * e, int irtt, int ihops)
+ {
+ #if USE_ICMP
+     netdbEntry *n;
+     double rtt = (double) irtt;
+     double hops = (double) ihops;
+     net_db_peer *p;
+-    debugs(38, 3, "netdbUpdatePeer: '" << r->GetHost() << "', " << ihops << " hops, " << irtt << " rtt");
+-    n = netdbLookupHost(r->GetHost());
++    debugs(38, 3, url.host() << ", " << ihops << " hops, " << irtt << " rtt");
++    n = netdbLookupHost(url.host());
+ 
+     if (n == NULL) {
+-        debugs(38, 3, "netdbUpdatePeer: host '" << r->GetHost() << "' not found");
++        debugs(38, 3, "host " << url.host() << " not found");
+         return;
+     }
+ 
+@@ -1333,11 +1333,11 @@ netdbClosestParent(HttpRequest * request)
+     const ipcache_addrs *ia;
+     net_db_peer *h;
+     int i;
+-    n = netdbLookupHost(request->GetHost());
++    n = netdbLookupHost(request->url.host());
+ 
+     if (NULL == n) {
+         /* try IP addr */
+-        ia = ipcache_gethostbyname(request->GetHost(), 0);
++        ia = ipcache_gethostbyname(request->url.host(), 0);
+ 
+         if (NULL != ia)
+             n = netdbLookupAddr(ia->in_addrs[ia->cur]);
+@@ -1368,7 +1368,7 @@ netdbClosestParent(HttpRequest * request)
+         if (NULL == p)      /* not found */
+             continue;
+ 
+-        if (neighborType(p, request) != PEER_PARENT)
++        if (neighborType(p, request->url) != PEER_PARENT)
+             continue;
+ 
+         if (!peerHTTPOkay(p, request))  /* not allowed */
+@@ -10,15 +10,13 @@
+ #define ICMP_NET_DB_H
+ 
+ #include "hash.h"
++#include "ip/forward.h"
+ 
+ class CachePeer;
+ class HttpRequest;
+ class netdbEntry;
+ class StoreEntry;
+-namespace Ip
+-{
+-class Address;
+-};
++class URL;
+ 
+ // POD
+ class net_db_name
+@@ -67,7 +65,7 @@ void netdbDump(StoreEntry *);
+ void netdbFreeMemory(void);
+ int netdbHostHops(const char *host);
+ int netdbHostRtt(const char *host);
+-void netdbUpdatePeer(HttpRequest *, CachePeer * e, int rtt, int hops);
++void netdbUpdatePeer(const URL &, CachePeer * e, int rtt, int hops);
+ 
+ void netdbDeleteAddrNetwork(Ip::Address &addr);
+ void netdbBinaryExchange(StoreEntry *);
+@@ -159,8 +159,8 @@ ICP2State::created(StoreEntry *newEntry)
+     } else {
+ #if USE_ICMP
+         if (Config.onoff.test_reachability && rtt == 0) {
+-            if ((rtt = netdbHostRtt(request->GetHost())) == 0)
+-                netdbPingSite(request->GetHost());
++            if ((rtt = netdbHostRtt(request->url.host())) == 0)
++                netdbPingSite(request->url.host());
+         }
+ #endif /* USE_ICMP */
+ 
+@@ -470,8 +470,8 @@ doV2Query(int fd, Ip::Address &from, char *buf, icp_common_t header)
+     }
+ #if USE_ICMP
+     if (header.flags & ICP_FLAG_SRC_RTT) {
+-        rtt = netdbHostRtt(icp_request->GetHost());
+-        int hops = netdbHostHops(icp_request->GetHost());
++        rtt = netdbHostRtt(icp_request->url.host());
++        int hops = netdbHostHops(icp_request->url.host());
+         src_rtt = ((hops & 0xFFFF) << 16) | (rtt & 0xFFFF);
+ 
+         if (rtt)
+@@ -101,15 +101,16 @@ internalRemoteUri(const char *host, unsigned short port, const char *dir, const
+         strncat(lc_host, Config.appendDomain, SQUIDHOSTNAMELEN -
+                 strlen(lc_host) - 1);
+ 
+-    /* build uri in mb */
++    /* build URI */
++    URL tmp(AnyP::PROTO_HTTP);
++    tmp.host(lc_host);
++    if (port)
++        tmp.port(port);
++
+     static MemBuf mb;
+ 
+     mb.reset();
+-    mb.appendf("http://%s", lc_host);
+-
+-    /* append port if not default */
+-    if (port && port != urlDefaultPort(AnyP::PROTO_HTTP))
+-        mb.appendf(":%u", port);
++    mb.appendf("http://" SQUIDSBUFPH, SQUIDSBUFPRINT(tmp.authority()));
+ 
+     if (dir)
+         mb.append(dir, strlen(dir));
+@@ -110,13 +110,13 @@ whichPeer(const Ip::Address &from)
+ }
+ 
+ peer_t
+-neighborType(const CachePeer * p, const HttpRequest * request)
++neighborType(const CachePeer * p, const URL &url)
+ {
+ 
+     const NeighborTypeDomainList *d = NULL;
+ 
+     for (d = p->typelist; d; d = d->next) {
+-        if (0 == matchDomainName(request->GetHost(), d->domain))
++        if (0 == matchDomainName(url.host(), d->domain))
+             if (d->type != PEER_NONE)
+                 return d->type;
+     }
+@@ -138,11 +138,11 @@ peerAllowedToUse(const CachePeer * p, HttpRequest * request)
+ 
+     assert(request != NULL);
+ 
+-    if (neighborType(p, request) == PEER_SIBLING) {
++    if (neighborType(p, request->url) == PEER_SIBLING) {
+ #if PEER_MULTICAST_SIBLINGS
+         if (p->type == PEER_MULTICAST && p->options.mcast_siblings &&
+                 (request->flags.noCache || request->flags.refresh || request->flags.loopDetected || request->flags.needValidation))
+-            debugs(15, 2, "peerAllowedToUse(" << p->name << ", " << request->GetHost() << ") : multicast-siblings optimization match");
++            debugs(15, 2, "peerAllowedToUse(" << p->name << ", " << request->url.authority() << ") : multicast-siblings optimization match");
+ #endif
+         if (request->flags.noCache)
+             return false;
+@@ -159,7 +159,7 @@ peerAllowedToUse(const CachePeer * p, HttpRequest * request)
+ 
+     // CONNECT requests are proxy requests. Not to be forwarded to origin servers.
+     // Unless the destination port matches, in which case we MAY perform a 'DIRECT' to this CachePeer.
+-    if (p->options.originserver && request->method == Http::METHOD_CONNECT && request->port != p->in_addr.port())
++    if (p->options.originserver && request->method == Http::METHOD_CONNECT && request->url.port() != p->in_addr.port())
+         return false;
+ 
+     if (p->access == NULL)
+@@ -282,7 +282,7 @@ getFirstUpParent(HttpRequest * request)
+         if (!neighborUp(p))
+             continue;
+ 
+-        if (neighborType(p, request) != PEER_PARENT)
++        if (neighborType(p, request->url) != PEER_PARENT)
+             continue;
+ 
+         if (!peerHTTPOkay(p, request))
+@@ -305,7 +305,7 @@ getRoundRobinParent(HttpRequest * request)
+         if (!p->options.roundrobin)
+             continue;
+ 
+-        if (neighborType(p, request) != PEER_PARENT)
++        if (neighborType(p, request->url) != PEER_PARENT)
+             continue;
+ 
+         if (!peerHTTPOkay(p, request))
+@@ -345,7 +345,7 @@ getWeightedRoundRobinParent(HttpRequest * request)
+         if (!p->options.weighted_roundrobin)
+             continue;
+ 
+-        if (neighborType(p, request) != PEER_PARENT)
++        if (neighborType(p, request->url) != PEER_PARENT)
+             continue;
+ 
+         if (!peerHTTPOkay(p, request))
+@@ -362,7 +362,7 @@ getWeightedRoundRobinParent(HttpRequest * request)
+             if (!p->options.weighted_roundrobin)
+                 continue;
+ 
+-            if (neighborType(p, request) != PEER_PARENT)
++            if (neighborType(p, request->url) != PEER_PARENT)
+                 continue;
+ 
+             p->rr_count = 0;
+@@ -455,7 +455,7 @@ getDefaultParent(HttpRequest * request)
+     CachePeer *p = NULL;
+ 
+     for (p = Config.peers; p; p = p->next) {
+-        if (neighborType(p, request) != PEER_PARENT)
++        if (neighborType(p, request->url) != PEER_PARENT)
+             continue;
+ 
+         if (!p->options.default_parent)
+@@ -668,7 +668,7 @@ neighborsUdpPing(HttpRequest * request,
+         } else if (neighborUp(p)) {
+             /* its alive, expect a reply from it */
+ 
+-            if (neighborType(p, request) == PEER_PARENT) {
++            if (neighborType(p, request->url) == PEER_PARENT) {
+                 ++parent_exprep;
+                 parent_timeout += p->stats.rtt;
+             } else {
+@@ -1033,7 +1033,7 @@ neighborsUdpAck(const cache_key * key, icp_common_t * header, const Ip::Address
+     debugs(15, 3, "neighborsUdpAck: " << opcode_d << " for '" << storeKeyText(key) << "' from " << (p ? p->host : "source") << " ");
+ 
+     if (p) {
+-        ntype = neighborType(p, mem->request);
++        ntype = neighborType(p, mem->request->url);
+     }
+ 
+     if (ignoreMulticastReply(p, mem)) {
+@@ -1704,7 +1704,7 @@ neighborsHtcpReply(const cache_key * key, HtcpReplyData * htcp, const Ip::Addres
+     }
+ 
+     if (p) {
+-        ntype = neighborType(p, mem->request);
++        ntype = neighborType(p, mem->request->url);
+         neighborUpdateRtt(p, mem);
+     }
+ 
+@@ -19,6 +19,7 @@ class HttpRequest;
+ class HttpRequestMethod;
+ class CachePeer;
+ class StoreEntry;
++class URL;
+ 
+ CachePeer *getFirstPeer(void);
+ CachePeer *getFirstUpParent(HttpRequest *);
+@@ -52,7 +53,7 @@ void peerNoteDigestLookup(HttpRequest * request, CachePeer * p, lookup_t lookup)
+ void peerNoteDigestGone(CachePeer * p);
+ int neighborUp(const CachePeer * e);
+ const char *neighborTypeStr(const CachePeer * e);
+-peer_t neighborType(const CachePeer *, const HttpRequest *);
++peer_t neighborType(const CachePeer *, const URL &);
+ void peerConnectFailed(CachePeer *);
+ void peerConnectSucceded(CachePeer *);
+ void dump_peer_options(StoreEntry *, CachePeer *);
+@@ -253,7 +253,7 @@ peerSelectDnsPaths(ps_state *psstate)
+     // convert the list of FwdServer destinations into destinations IP addresses
+     if (fs && psstate->paths->size() < (unsigned int)Config.forward_max_tries) {
+         // send the next one off for DNS lookup.
+-        const char *host = fs->_peer ? fs->_peer->host : psstate->request->GetHost();
++        const char *host = fs->_peer ? fs->_peer->host : psstate->request->url.host();
+         debugs(44, 2, "Find IP destination for: " << psstate->url() << "' via " << host);
+         ipcache_nbgethostbyname(host, peerSelectDnsResults, psstate);
+         return;
+@@ -347,15 +347,12 @@ peerSelectDnsResults(const ipcache_addrs *ia, const Dns::LookupDetails &details,
+ 
+             // when IPv6 is disabled we cannot use it
+             if (!Ip::EnableIpv6 && p->remote.isIPv6()) {
+-                const char *host = (fs->_peer ? fs->_peer->host : psstate->request->GetHost());
++                const char *host = (fs->_peer ? fs->_peer->host : psstate->request->url.host());
+                 ipcacheMarkBadAddr(host, p->remote);
+                 continue;
+             }
+ 
+-            if (fs->_peer)
+-                p->remote.port(fs->_peer->http_port);
+-            else
+-                p->remote.port(psstate->request->port);
++            p->remote.port(fs->_peer ? fs->_peer->http_port : psstate->request->url.port());
+             p->peerType = fs->code;
+             p->setPeer(fs->_peer);
+ 
+@@ -364,7 +361,7 @@ peerSelectDnsResults(const ipcache_addrs *ia, const Dns::LookupDetails &details,
+             psstate->paths->push_back(p);
+         }
+     } else {
+-        debugs(44, 3, HERE << "Unknown host: " << (fs->_peer ? fs->_peer->host : psstate->request->GetHost()));
++        debugs(44, 3, "Unknown host: " << (fs->_peer ? fs->_peer->host : psstate->request->url.host()));
+         // discard any previous error.
+         delete psstate->lastError;
+         psstate->lastError = NULL;
+@@ -395,15 +392,14 @@ peerCheckNetdbDirect(ps_state * psstate)
+ 
+     /* base lookup on RTT and Hops if ICMP NetDB is enabled. */
+ 
+-    myrtt = netdbHostRtt(psstate->request->GetHost());
+-
+-    debugs(44, 3, "peerCheckNetdbDirect: MY RTT = " << myrtt << " msec");
+-    debugs(44, 3, "peerCheckNetdbDirect: minimum_direct_rtt = " << Config.minDirectRtt << " msec");
++    myrtt = netdbHostRtt(psstate->request->url.host());
++    debugs(44, 3, "MY RTT = " << myrtt << " msec");
++    debugs(44, 3, "minimum_direct_rtt = " << Config.minDirectRtt << " msec");
+ 
+     if (myrtt && myrtt <= Config.minDirectRtt)
+         return 1;
+ 
+-    myhops = netdbHostHops(psstate->request->GetHost());
++    myhops = netdbHostHops(psstate->request->url.host());
+ 
+     debugs(44, 3, "peerCheckNetdbDirect: MY hops = " << myhops);
+     debugs(44, 3, "peerCheckNetdbDirect: minimum_direct_hops = " << Config.minDirectHops);
+@@ -437,7 +433,7 @@ peerSelectFoo(ps_state * ps)
+ 
+     StoreEntry *entry = ps->entry;
+     HttpRequest *request = ps->request;
+-    debugs(44, 3, request->method << ' ' << request->GetHost());
++    debugs(44, 3, request->method << ' ' << request->url.host());
+ 
+     /** If we don't know whether DIRECT is permitted ... */
+     if (ps->direct == DIRECT_UNKNOWN) {
+@@ -574,7 +570,7 @@ peerGetSomeNeighbor(ps_state * ps)
+ 
+ #if USE_CACHE_DIGESTS
+     if ((p = neighborsDigestSelect(request))) {
+-        if (neighborType(p, request) == PEER_PARENT)
++        if (neighborType(p, request->url) == PEER_PARENT)
+             code = CD_PARENT_HIT;
+         else
+             code = CD_SIBLING_HIT;
+@@ -634,7 +630,7 @@ peerGetSomeNeighborReplies(ps_state * ps)
+ 
+     if (peerCheckNetdbDirect(ps)) {
+         code = CLOSEST_DIRECT;
+-        debugs(44, 3, "peerSelect: " << hier_code_str[code] << "/" << request->GetHost());
++        debugs(44, 3, hier_code_str[code] << "/" << request->url.host());
+         peerAddFwdServer(&ps->servers, NULL, code);
+         return;
+     }
+@@ -651,7 +647,7 @@ peerGetSomeNeighborReplies(ps_state * ps)
+         }
+     }
+     if (p && code != HIER_NONE) {
+-        debugs(44, 3, "peerSelect: " << hier_code_str[code] << "/" << p->host);
++        debugs(44, 3, hier_code_str[code] << "/" << p->host);
+         peerAddFwdServer(&ps->servers, p, code);
+     }
+ }
+@@ -681,7 +677,7 @@ peerGetSomeParent(ps_state * ps)
+     CachePeer *p;
+     HttpRequest *request = ps->request;
+     hier_code code = HIER_NONE;
+-    debugs(44, 3, request->method << ' ' << request->GetHost());
++    debugs(44, 3, request->method << ' ' << request->url.host());
+ 
+     if (ps->direct == DIRECT_YES)
+         return;
+@@ -724,7 +720,7 @@ peerGetAllParents(ps_state * ps)
+          * parents to a request so we have to dig some here..
+          */
+ 
+-        if (neighborType(p, request) != PEER_PARENT)
++        if (neighborType(p, request->url) != PEER_PARENT)
+             continue;
+ 
+         if (!peerHTTPOkay(p, request))
+@@ -786,7 +782,7 @@ peerIcpParentMiss(CachePeer * p, icp_common_t * header, ps_state * ps)
+             int hops = (header->pad >> 16) & 0xFFFF;
+ 
+             if (rtt > 0 && rtt < 0xFFFF)
+-                netdbUpdatePeer(ps->request, p, rtt, hops);
++                netdbUpdatePeer(ps->request->url, p, rtt, hops);
+ 
+             if (rtt && (ps->ping.p_rtt == 0 || rtt < ps->ping.p_rtt)) {
+                 ps->closest_parent_miss = p->in_addr;
+@@ -882,7 +878,7 @@ peerHtcpParentMiss(CachePeer * p, HtcpReplyData * htcp, ps_state * ps)
+         if (htcp->cto.rtt > 0) {
+             rtt = (int) htcp->cto.rtt * 1000;
+             int hops = (int) htcp->cto.hops * 1000;
+-            netdbUpdatePeer(ps->request, p, rtt, hops);
++            netdbUpdatePeer(ps->request->url, p, rtt, hops);
+ 
+             if (rtt && (ps->ping.p_rtt == 0 || rtt < ps->ping.p_rtt)) {
+                 ps->closest_parent_miss = p->in_addr;
+@@ -178,7 +178,7 @@ Ssl::PeerConnector::sslFinalized()
+         // Ssl::CertValidationRequest object used only to pass data to
+         // Ssl::CertValidationHelper::submit method.
+         validationRequest.ssl = ssl;
+-        validationRequest.domainName = request->GetHost();
++        validationRequest.domainName = request->url.host();
+         if (Ssl::CertErrors *errs = static_cast<Ssl::CertErrors *>(SSL_get_ex_data(ssl, ssl_ex_index_ssl_errors)))
+             // validationRequest disappears on return so no need to cbdataReference
+             validationRequest.errors = errs;
+@@ -294,7 +294,7 @@ Ssl::PeerConnector::sslCrtvdHandleReply(Ssl::CertValidationResponse const &valid
+         return;
+     }
+ 
+-    debugs(83,5, request->GetHost() << " cert validation result: " << validationResponse.resultCode);
++    debugs(83,5, request->url.host() << " cert validation result: " << validationResponse.resultCode);
+ 
+     if (validationResponse.resultCode == ::Helper::Error)
+         errs = sslCrtvdCheckForErrors(validationResponse, errDetails);
+@@ -650,7 +650,7 @@ Ssl::PeekingPeerConnector::initializeSsl()
+             // unless it was the CONNECT request with a user-typed address.
+             const bool isConnectRequest = !csd->port->flags.isIntercepted();
+             if (!request->flags.sslPeek || isConnectRequest)
+-                hostName = new SBuf(request->GetHost());
++                hostName = new SBuf(request->url.host());
+         }
+ 
+         if (hostName)
+@@ -679,7 +679,7 @@ Ssl::PeekingPeerConnector::initializeSsl()
+             // Use SNI TLS extension only when we connect directly
+             // to the origin server and we know the server host name.
+             const char *sniServer = hostName ? hostName->c_str() :
+-                                    (!request->GetHostIsNumeric() ? request->GetHost() : NULL);
++                                    (!request->url.hostIsNumeric() ? request->url.host() : NULL);
+             if (sniServer)
+                 Ssl::setClientSNI(ssl, sniServer);
+         }
+@@ -24,7 +24,7 @@ Ssl::ServerBump::ServerBump(HttpRequest *fakeRequest, StoreEntry *e, Ssl::BumpMo
+     sslErrors(NULL),
+     step(bumpStep1)
+ {
+-    debugs(33, 4, HERE << "will peek at " << request->GetHost() << ':' << request->port);
++    debugs(33, 4, "will peek at " << request->url.authority(true));
+     act.step1 = md;
+     act.step2 = act.step3 = Ssl::bumpNone;
+ 
+@@ -30,7 +30,7 @@ void netdbDump(StoreEntry *) STUB
+ void netdbFreeMemory(void) STUB
+ int netdbHostHops(const char *host) STUB_RETVAL(-1)
+ int netdbHostRtt(const char *host) STUB_RETVAL(-1)
+-void netdbUpdatePeer(HttpRequest *, CachePeer * e, int rtt, int hops) STUB
++void netdbUpdatePeer(const URL &, CachePeer * e, int rtt, int hops) STUB
+ void netdbDeleteAddrNetwork(Ip::Address &addr) STUB
+ void netdbBinaryExchange(StoreEntry *) STUB
+ void netdbExchangeStart(void *) STUB
+@@ -46,9 +46,9 @@ testHttpRequest::testCreateFromUrlAndMethod()
+     HttpRequest *aRequest = HttpRequest::CreateFromUrlAndMethod(url, Http::METHOD_GET);
+     expected_port = 90;
+     HttpRequest *nullRequest = NULL;
+-    CPPUNIT_ASSERT_EQUAL(expected_port, aRequest->port);
++    CPPUNIT_ASSERT_EQUAL(expected_port, aRequest->url.port());
+     CPPUNIT_ASSERT(aRequest->method == Http::METHOD_GET);
+-    CPPUNIT_ASSERT_EQUAL(String("foo"), String(aRequest->GetHost()));
++    CPPUNIT_ASSERT_EQUAL(String("foo"), String(aRequest->url.host()));
+     CPPUNIT_ASSERT_EQUAL(String("/bar"), aRequest->urlpath);
+     CPPUNIT_ASSERT_EQUAL(AnyP::PROTO_HTTP, static_cast<AnyP::ProtocolType>(aRequest->url.getScheme()));
+     CPPUNIT_ASSERT_EQUAL(String("http://foo:90/bar"), String(url));
+@@ -58,9 +58,9 @@ testHttpRequest::testCreateFromUrlAndMethod()
+     url = xstrdup("http://foo/bar");
+     aRequest = HttpRequest::CreateFromUrlAndMethod(url, Http::METHOD_PUT);
+     expected_port = 80;
+-    CPPUNIT_ASSERT_EQUAL(expected_port, aRequest->port);
++    CPPUNIT_ASSERT_EQUAL(expected_port, aRequest->url.port());
+     CPPUNIT_ASSERT(aRequest->method == Http::METHOD_PUT);
+-    CPPUNIT_ASSERT_EQUAL(String("foo"), String(aRequest->GetHost()));
++    CPPUNIT_ASSERT_EQUAL(String("foo"), String(aRequest->url.host()));
+     CPPUNIT_ASSERT_EQUAL(String("/bar"), aRequest->urlpath);
+     CPPUNIT_ASSERT_EQUAL(AnyP::PROTO_HTTP, static_cast<AnyP::ProtocolType>(aRequest->url.getScheme()));
+     CPPUNIT_ASSERT_EQUAL(String("http://foo/bar"), String(url));
+@@ -76,9 +76,9 @@ testHttpRequest::testCreateFromUrlAndMethod()
+     url = xstrdup("foo:45");
+     aRequest = HttpRequest::CreateFromUrlAndMethod(url, Http::METHOD_CONNECT);
+     expected_port = 45;
+-    CPPUNIT_ASSERT_EQUAL(expected_port, aRequest->port);
++    CPPUNIT_ASSERT_EQUAL(expected_port, aRequest->url.port());
+     CPPUNIT_ASSERT(aRequest->method == Http::METHOD_CONNECT);
+-    CPPUNIT_ASSERT_EQUAL(String("foo"), String(aRequest->GetHost()));
++    CPPUNIT_ASSERT_EQUAL(String("foo"), String(aRequest->url.host()));
+     CPPUNIT_ASSERT_EQUAL(String(""), aRequest->urlpath);
+     CPPUNIT_ASSERT_EQUAL(AnyP::PROTO_NONE, static_cast<AnyP::ProtocolType>(aRequest->url.getScheme()));
+     CPPUNIT_ASSERT_EQUAL(String("foo:45"), String(url));
+@@ -96,9 +96,9 @@ testHttpRequest::testCreateFromUrl()
+     char * url = xstrdup("http://foo:90/bar");
+     HttpRequest *aRequest = HttpRequest::CreateFromUrl(url);
+     expected_port = 90;
+-    CPPUNIT_ASSERT_EQUAL(expected_port, aRequest->port);
++    CPPUNIT_ASSERT_EQUAL(expected_port, aRequest->url.port());
+     CPPUNIT_ASSERT(aRequest->method == Http::METHOD_GET);
+-    CPPUNIT_ASSERT_EQUAL(String("foo"), String(aRequest->GetHost()));
++    CPPUNIT_ASSERT_EQUAL(String("foo"), String(aRequest->url.host()));
+     CPPUNIT_ASSERT_EQUAL(String("/bar"), aRequest->urlpath);
+     CPPUNIT_ASSERT_EQUAL(AnyP::PROTO_HTTP, static_cast<AnyP::ProtocolType>(aRequest->url.getScheme()));
+     CPPUNIT_ASSERT_EQUAL(String("http://foo:90/bar"), String(url));
+@@ -119,9 +119,9 @@ testHttpRequest::testIPv6HostColonBug()
+     url = xstrdup("http://[2000:800::45]/foo");
+     aRequest = HttpRequest::CreateFromUrlAndMethod(url, Http::METHOD_GET);
+     expected_port = 80;
+-    CPPUNIT_ASSERT_EQUAL(expected_port, aRequest->port);
++    CPPUNIT_ASSERT_EQUAL(expected_port, aRequest->url.port());
+     CPPUNIT_ASSERT(aRequest->method == Http::METHOD_GET);
+-    CPPUNIT_ASSERT_EQUAL(String("[2000:800::45]"), String(aRequest->GetHost()));
++    CPPUNIT_ASSERT_EQUAL(String("[2000:800::45]"), String(aRequest->url.host()));
+     CPPUNIT_ASSERT_EQUAL(String("/foo"), aRequest->urlpath);
+     CPPUNIT_ASSERT_EQUAL(AnyP::PROTO_HTTP, static_cast<AnyP::ProtocolType>(aRequest->url.getScheme()));
+     CPPUNIT_ASSERT_EQUAL(String("http://[2000:800::45]/foo"), String(url));
+@@ -131,9 +131,9 @@ testHttpRequest::testIPv6HostColonBug()
+     url = xstrdup("http://[2000:800::45]:90/foo");
+     aRequest = HttpRequest::CreateFromUrlAndMethod(url, Http::METHOD_GET);
+     expected_port = 90;
+-    CPPUNIT_ASSERT_EQUAL(expected_port, aRequest->port);
++    CPPUNIT_ASSERT_EQUAL(expected_port, aRequest->url.port());
+     CPPUNIT_ASSERT(aRequest->method == Http::METHOD_GET);
+-    CPPUNIT_ASSERT_EQUAL(String("[2000:800::45]"), String(aRequest->GetHost()));
++    CPPUNIT_ASSERT_EQUAL(String("[2000:800::45]"), String(aRequest->url.host()));
+     CPPUNIT_ASSERT_EQUAL(String("/foo"), aRequest->urlpath);
+     CPPUNIT_ASSERT_EQUAL(AnyP::PROTO_HTTP, static_cast<AnyP::ProtocolType>(aRequest->url.getScheme()));
+     CPPUNIT_ASSERT_EQUAL(String("http://[2000:800::45]:90/foo"), String(url));
+@@ -143,9 +143,9 @@ testHttpRequest::testIPv6HostColonBug()
+     url = xstrdup("http://2000:800::45/foo");
+     aRequest = HttpRequest::CreateFromUrlAndMethod(url, Http::METHOD_GET);
+     expected_port = 80;
+-    CPPUNIT_ASSERT_EQUAL(expected_port, aRequest->port);
++    CPPUNIT_ASSERT_EQUAL(expected_port, aRequest->url.port());
+     CPPUNIT_ASSERT(aRequest->method == Http::METHOD_GET);
+-    CPPUNIT_ASSERT_EQUAL(String("[2000:800::45]"), String(aRequest->GetHost()));
++    CPPUNIT_ASSERT_EQUAL(String("[2000:800::45]"), String(aRequest->url.host()));
+     CPPUNIT_ASSERT_EQUAL(String("/foo"), aRequest->urlpath);
+     CPPUNIT_ASSERT_EQUAL(AnyP::PROTO_HTTP, static_cast<AnyP::ProtocolType>(aRequest->url.getScheme()));
+     CPPUNIT_ASSERT_EQUAL(String("http://2000:800::45/foo"), String(url));
+@@ -10,6 +10,7 @@
+ 
+ #include <cppunit/TestAssert.h>
+ 
++#include "Debug.h"
+ #include "testURL.h"
+ #include "unitTestMain.h"
+ #include "URL.h"
+@@ -93,7 +93,7 @@ class TunnelStateData
+     Comm::ConnectionList serverDestinations;
+ 
+     const char * getHost() const {
+-        return (server.conn != NULL && server.conn->getPeer() ? server.conn->getPeer()->host : request->GetHost());
++        return (server.conn != NULL && server.conn->getPeer() ? server.conn->getPeer()->host : request->url.host());
+     };
+ 
+     /// Whether we are writing a CONNECT request to a peer.
+@@ -44,6 +44,22 @@ URL::Asterisk()
+     return star;
  }
  
 +void
-+StoreEntry::lengthWentBad(const char *reason)
++URL::host(const char *src)
 +{
-+    debugs(20, 3, "because " << reason << ": " << *this);
-+    EBIT_SET(flags, ENTRY_BAD_LENGTH);
-+    releaseRequest();
++    hostAddr_.setEmpty();
++    hostAddr_ = src;
++    if (hostAddr_.isAnyAddr()) {
++        xstrncpy(host_, src, sizeof(host_));
++        hostIsNumeric_ = false;
++    } else {
++        hostAddr_.toHostStr(host_, sizeof(host_));
++        debugs(23, 3, "given IP: " << hostAddr_);
++        hostIsNumeric_ = 1;
++    }
++    touch();
 +}
 +
  void
- StoreEntry::complete()
+ urlInitialize(void)
  {
-@@ -1107,10 +1115,8 @@ StoreEntry::complete()
+@@ -133,43 +149,6 @@ urlParseProtocol(const char *b, const char *e)
+     return AnyP::PROTO_NONE;
+ }
  
-     assert(mem_status == NOT_IN_MEMORY);
- 
--    if (!validLength()) {
--        EBIT_SET(flags, ENTRY_BAD_LENGTH);
--        releaseRequest();
+-int
+-urlDefaultPort(AnyP::ProtocolType p)
+-{
+-    switch (p) {
+-
+-    case AnyP::PROTO_HTTP:
+-        return 80;
+-
+-    case AnyP::PROTO_HTTPS:
+-        return 443;
+-
+-    case AnyP::PROTO_FTP:
+-        return 21;
+-
+-    case AnyP::PROTO_COAP:
+-    case AnyP::PROTO_COAPS:
+-        // coaps:// default is TBA as of draft-ietf-core-coap-08.
+-        // Assuming IANA policy of allocating same port for base and TLS protocol versions will occur.
+-        return 5683;
+-
+-    case AnyP::PROTO_GOPHER:
+-        return 70;
+-
+-    case AnyP::PROTO_WAIS:
+-        return 210;
+-
+-    case AnyP::PROTO_CACHE_OBJECT:
+-        return CACHE_HTTP_PORT;
+-
+-    case AnyP::PROTO_WHOIS:
+-        return 43;
+-
+-    default:
+-        return 0;
 -    }
-+    if (!EBIT_TEST(flags, ENTRY_BAD_LENGTH) && !validLength())
-+        lengthWentBad("!validLength() in complete()");
+-}
+-
+ /*
+  * Parse a URI/URL.
+  *
+@@ -224,7 +203,7 @@ urlParse(const HttpRequestMethod& method, char *url, HttpRequest *request)
+     } else if ((method == Http::METHOD_OPTIONS || method == Http::METHOD_TRACE) &&
+                URL::Asterisk().cmp(url) == 0) {
+         protocol = AnyP::PROTO_HTTP;
+-        port = urlDefaultPort(protocol);
++        port = AnyP::UriScheme(protocol).defaultPort();
+         return urlParseFinish(method, protocol, url, host, SBuf(), port, request);
+     } else if (!strncmp(url, "urn:", 4)) {
+         return urnParse(method, url, request);
+@@ -286,7 +265,7 @@ urlParse(const HttpRequestMethod& method, char *url, HttpRequest *request)
+         *dst = '\0';
  
- #if USE_CACHE_DIGESTS
-     if (mem_obj->request)
+         protocol = urlParseProtocol(proto);
+-        port = urlDefaultPort(protocol);
++        port = AnyP::UriScheme(protocol).defaultPort();
+ 
+         /* Is there any login information? (we should eventually parse it above) */
+         t = strrchr(host, '@');
+@@ -456,7 +435,7 @@ urlParseFinish(const HttpRequestMethod& method,
+ 
+     request->SetHost(host);
+     request->url.userInfo(login);
+-    request->port = (unsigned short) port;
++    request->url.port(port);
+     return request;
+ }
+ 
+@@ -473,10 +452,34 @@ urnParse(const HttpRequestMethod& method, char *urn, HttpRequest *request)
+     return new HttpRequest(method, AnyP::PROTO_URN, urn + 4);
+ }
+ 
++void
++URL::touch()
++{
++    authorityHttp_.clear();
++    authorityWithPort_.clear();
++}
++
++SBuf &
++URL::authority(bool requirePort) const
++{
++    if (authorityHttp_.isEmpty()) {
++
++        // both formats contain Host/IP
++        authorityWithPort_.append(host());
++        authorityHttp_ = authorityWithPort_;
++
++        // authorityForm_ only has :port if it is non-default
++        authorityWithPort_.appendf(":%u",port());
++        if (port() != getScheme().defaultPort())
++            authorityHttp_ = authorityWithPort_;
++    }
++
++    return requirePort ? authorityWithPort_ : authorityHttp_;
++}
++
+ const char *
+ urlCanonical(HttpRequest * request)
+ {
+-    LOCAL_ARRAY(char, portbuf, 32);
+     LOCAL_ARRAY(char, urlbuf, MAX_URL);
+ 
+     if (request->canonical)
+@@ -486,24 +489,21 @@ urlCanonical(HttpRequest * request)
+         snprintf(urlbuf, MAX_URL, "urn:" SQUIDSTRINGPH,
+                  SQUIDSTRINGPRINT(request->urlpath));
+     } else {
++        SBuf authorityForm;
+         switch (request->method.id()) {
+ 
+         case Http::METHOD_CONNECT:
+-            snprintf(urlbuf, MAX_URL, "%s:%d", request->GetHost(), request->port);
++            authorityForm = request->url.authority(true); // host:port
++            snprintf(urlbuf, MAX_URL, SQUIDSBUFPH, SQUIDSBUFPRINT(authorityForm));
+             break;
+ 
+         default: {
+-            portbuf[0] = '\0';
+-
+-            if (request->port != urlDefaultPort(request->url.getScheme()))
+-                snprintf(portbuf, 32, ":%d", request->port);
+-
+-            snprintf(urlbuf, MAX_URL, "%s://" SQUIDSBUFPH "%s%s%s" SQUIDSTRINGPH,
++            authorityForm = request->url.authority(); // host[:port]
++            snprintf(urlbuf, MAX_URL, "%s://" SQUIDSBUFPH "%s" SQUIDSBUFPH SQUIDSTRINGPH,
+                      request->url.getScheme().c_str(),
+                      SQUIDSBUFPRINT(request->url.userInfo()),
+                      !request->url.userInfo().isEmpty() ? "@" : "",
+-                     request->GetHost(),
+-                     portbuf,
++                     SQUIDSBUFPRINT(authorityForm),
+                      SQUIDSTRINGPRINT(request->urlpath));
+         }
+         }
+@@ -520,31 +520,27 @@ char *
+ urlCanonicalClean(const HttpRequest * request)
+ {
+     LOCAL_ARRAY(char, buf, MAX_URL);
+-    LOCAL_ARRAY(char, portbuf, 32);
+     char *t;
+ 
+     if (request->url.getScheme() == AnyP::PROTO_URN) {
+         snprintf(buf, MAX_URL, "urn:" SQUIDSTRINGPH,
+                  SQUIDSTRINGPRINT(request->urlpath));
+     } else {
++        SBuf authorityForm;
+         switch (request->method.id()) {
+ 
+         case Http::METHOD_CONNECT:
+-            snprintf(buf, MAX_URL, "%s:%d", request->GetHost(), request->port);
++            authorityForm = request->url.authority(true); // host:port
++            snprintf(buf, MAX_URL, SQUIDSBUFPH, SQUIDSBUFPRINT(authorityForm));
+             break;
+ 
+         default: {
+-            portbuf[0] = '\0';
+-
+-            if (request->port != urlDefaultPort(request->url.getScheme()))
+-                snprintf(portbuf, 32, ":%d", request->port);
+-
+-            snprintf(buf, MAX_URL, "%s://" SQUIDSBUFPH "%s%s%s" SQUIDSTRINGPH,
++            authorityForm = request->url.authority(); // host[:port]
++            snprintf(buf, MAX_URL, "%s://" SQUIDSBUFPH "%s" SQUIDSBUFPH SQUIDSTRINGPH,
+                      request->url.getScheme().c_str(),
+                      SQUIDSBUFPRINT(request->url.userInfo()),
+-                     (request->url.userInfo().isEmpty() ? "" : "@"),
+-                     request->GetHost(),
+-                     portbuf,
++                     !request->url.userInfo().isEmpty() ? "@" : "",
++                     SQUIDSBUFPRINT(authorityForm),
+                      SQUIDSTRINGPRINT(request->urlpath));
+ 
+             // strip arguments AFTER a question-mark
+@@ -573,8 +569,8 @@ urlCanonicalFakeHttps(const HttpRequest * request)
+     LOCAL_ARRAY(char, buf, MAX_URL);
+ 
+     // method CONNECT and port HTTPS
+-    if (request->method == Http::METHOD_CONNECT && request->port == 443) {
+-        snprintf(buf, MAX_URL, "https://%s/*", request->GetHost());
++    if (request->method == Http::METHOD_CONNECT && request->url.port() == 443) {
++        snprintf(buf, MAX_URL, "https://%s/*", request->url.host());
+         return buf;
+     }
+ 
+@@ -637,24 +633,12 @@ urlMakeAbsolute(const HttpRequest * req, const char *relUrl)
+         return (urlbuf);
+     }
+ 
+-    size_t urllen;
+-
+-    if (req->port != urlDefaultPort(req->url.getScheme())) {
+-        urllen = snprintf(urlbuf, MAX_URL, "%s://" SQUIDSBUFPH "%s%s:%d",
+-                          req->url.getScheme().c_str(),
+-                          SQUIDSBUFPRINT(req->url.userInfo()),
+-                          !req->url.userInfo().isEmpty() ? "@" : "",
+-                          req->GetHost(),
+-                          req->port
+-                         );
+-    } else {
+-        urllen = snprintf(urlbuf, MAX_URL, "%s://" SQUIDSBUFPH "%s%s",
+-                          req->url.getScheme().c_str(),
+-                          SQUIDSBUFPRINT(req->url.userInfo()),
+-                          !req->url.userInfo().isEmpty() ? "@" : "",
+-                          req->GetHost()
+-                         );
+-    }
++    SBuf authorityForm = req->url.authority(); // host[:port]
++    size_t urllen = snprintf(urlbuf, MAX_URL, "%s://" SQUIDSBUFPH "%s" SQUIDSBUFPH,
++                             req->url.getScheme().c_str(),
++                             SQUIDSBUFPRINT(req->url.userInfo()),
++                             !req->url.userInfo().isEmpty() ? "@" : "",
++                             SQUIDSBUFPRINT(authorityForm));
+ 
+     if (relUrl[0] == '/') {
+         strncpy(&urlbuf[urllen], relUrl, MAX_URL - urllen - 1);

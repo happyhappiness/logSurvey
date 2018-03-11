@@ -1,0 +1,3475 @@
+@@ -14,7 +14,7 @@
+ @SET_MAKE@
+ 
+ #
+-# $Id: Makefile.in,v 1.24 2002/09/02 00:19:04 hno Exp $
++# $Id: Makefile.in,v 1.25 2002/09/15 05:41:26 robertc Exp $
+ #
+ 
+ SHELL = @SHELL@
+@@ -33,3 +33,10 @@ SGI - http://www.sgi.com/
+ 
+ 	SGI has provided hardware donations for Squid developers.
+ 
++Zope Corporation - http://www.zope.com/
++
++	Zope Corporation funded the development of the ESI protocol
++	(http://www.esi.org) in Squid to provide greater cachability
++	of dynamic and personalized pages by caching common page
++	components. Zope engaged one of the core Squid developers
++	for the project.
+@@ -16,7 +16,7 @@
+ #
+ #  Makefile for the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.9 2002/09/02 00:19:30 hno Exp $
++#  $Id: Makefile.in,v 1.10 2002/09/15 05:41:27 robertc Exp $
+ #
+ #  Uncomment and customize the following to suit your needs:
+ #
+@@ -2,7 +2,7 @@
+ <article>
+ <title>Squid Programmers Guide</title>
+ <author>Squid Developers</author>
+-<date>$Id: prog-guide.sgml,v 1.51 2002/08/09 10:57:41 robertc Exp $</date>
++<date>$Id: prog-guide.sgml,v 1.52 2002/09/15 05:41:27 robertc Exp $</date>
+ 
+ <abstract>
+ Squid is a WWW Cache application developed by the National Laboratory
+@@ -91,19 +91,41 @@ or improve it.
+ 	<P>
+ Squid consists of the following major components
+ 
+-<sect1>Client Side
++<sect1>Client Side Socket
+ 
+ 	<P>
+ 	Here new client connections are accepted, parsed, and
+-	processed.  This is where we determine if the request is
+-	a cache HIT, REFRESH, MISS, etc.  With HTTP/1.1 we may have
+-	multiple requests from a single TCP connection.  Per-connection
+-	state information is held in a data structure called
+-	<em/ConnStateData/.  Per-request state information is stored
+-	in the <em/clientHttpRequest/ structure.
++	reply data sent. Per-connection state information is held
++	in a data structure called <em/ConnStateData/.  Per-request 
++	state information is stored in the <em/clientSocketContext/
++	structure. With HTTP/1.1 we may have multiple requests from
++	a single TCP connection.
++
++<sect1>Client Side Request
++	<P>
++	This is where requests are processed. We determine if the
++	request is to be redirected, if it passes access lists,
++	and setup the initial client stream for internal requests.
++	Temporary state for this processing is held in a 
++	<em/clientRequestContext/ struct.
++	
++<sect1>Client Side Reply	
++	<P>
++	This is where we determine if the request is cache HIT, 
++	REFRESH, MISS, etc. This involves querying the store 
++	(possibly multiple times) to work through Vary lists and
++	the list. Per-request state information is stored
++	in the <em/clientReplyContext/ structure.
+ 
+-<sect1>Server Side
++<sect1>Client Streams
++	<P>
++	These routines implement a unidirectional, non-blocking,
++	pull pipeline. They allow code to be inserted into the 
++	reply logic on an as-needed basis. For instance, 
++	transfer-encoding logic is only needed when sending a
++	HTTP/1.1 reply.
+ 
++<sect1>Server Side
+ 	<P>
+ 	These routines are responsible for forwarding cache misses
+ 	to other servers, depending on the protocol.  Cache misses
+@@ -479,20 +501,25 @@ Squid consists of the following major components
+ 	<P>
+ 	<enum>
+ 	<item>
+-	A client connection is accepted by the <em/client-side/.
+-	The HTTP request is parsed.
++	A client connection is accepted by the <em/client-side socket
++	support/ and parsed, or is directly created via
++	<em/clientBeginRequest/.
+ 
+ 	<item>
+-	The access controls are checked.  The client-side builds
++	The access controls are checked.  The client-side-request builds
+ 	an ACL state data structure and registers a callback function
+ 	for notification when access control checking is completed.
+ 
+ 	<item>
+-	After the access controls have been verified, the client-side
+-	looks for the requested object in the cache.  If is a cache
+-	hit, then the client-side registers its interest in the
+-	<em/StoreEntry/.  Otherwise, Squid needs to forward the
+-	request, perhaps with an If-Modified-Since header.
++	After the access controls have been verified, the request
++	may be redirected. 
++	
++	<item>The client-side-request is forwarded up the client stream
++	to <em/GetMoreData/ which looks for the requested object in the 
++	cache, and or Vary: versions of the same. If is a cache hit, 
++	then the client-side registers its interest in the 
++	<em/StoreEntry/. Otherwise, Squid needs to forward the request,
++	perhaps with an If-Modified-Since header.
+ 
+ 	<item>
+ 	The request-forwarding process begins with <tt/protoDispatch/.
+@@ -679,7 +706,137 @@ Squid consists of the following major components
+ 	descriptors which have been idle for too long.  They are
+ 	further discussed in a following chapter.
+ 
+-<!-- %%%% Chapter : CLIENT REQUEST PROCESSING %%%% -->
++<!-- %%%% Chapter : CLIENT STREAMS %%%% -->
++<sect>Client Streams
++<sect1>Introduction
++	<P>A clientStream is a uni-directional loosely coupled pipe. Each node
++consists of four methods - read, callback, detach, and status, along with the
++stream housekeeping variables (a dlink node and pointer to the head of
++the list), context data for the node, and read request parameters -
++readbuf, readlen and readoff (in the body).
++<P>clientStream is the basic unit for scheduling, and the clientStreamRead
++and clientStreamCallback calls allow for deferred scheduled activity if desired.
++<P>Theory on stream operation:
++<enum>
++<item>Something creates a pipeline. At a minimum it needs a head with a
++status method and a read method, and a tail with a callback method and a
++valid initial read request.
++<item>Other nodes may be added into the pipeline.
++<item>The tail-1th node's read method is called.
++<item>for each node going up the pipeline, the node either:
++<enum>
++<item>satisfies the read request, or
++<item>inserts a new node above it and calls clientStreamRead, or
++<item>calls clientStreamRead
++</enum>
++<P>There is no requirement for the Read parameters from different
++nodes to have any correspondence, as long as the callbacks provided are
++correct.
++<item>The first node that satisfies the read request MUST generate an
++httpReply to be passed down the pipeline. Body data MAY be provided.
++<item>On the first callback a node MAY insert further downstream nodes in
++the pipeline, but MAY NOT do so thereafter.
++<item>the callbacks progress down the pipeline until a node makes further
++reads instead of satisfying the callback (go to 4) or the end of the
++pipe line is reached, where a new read sequence may be scheduled.
++</enum>
++<sect1>Implementation notes
++<P>ClientStreams have been implemented for the client side reply logic,
++starting with either a client socket (tail of the list is
++clientSocketRecipient) or a custom handler for in-squid requests, and
++with the pipeline HEAD being clientGetMoreData, which uses
++clientSendMoreData to send data down the pipeline.
++<P>client POST bodies do not use a pipeline currently, they use the
++previous code to send the data. This is a TODO when time permits.
++
++<sect1>Whats in a node
++<P>Each node must have: 
++<itemize>
++<item>read method - to allow loose coupling in the pipeline. (The reader may
++therefore change if the pipeline is altered, even mid-flow).
++<item>callback method - likewise.
++<item>status method - likewise.
++<item>detach method - used to ensure all resources are cleaned up properly.
++<item>dlink head pointer - to allow list inserts and deletes from within a
++node.
++<item>context data - to allow the called back nodes to maintain their
++private information.
++<item>read request parameters - For two reasons:
++<enum>
++<item>To allow a node to determine the requested data offset, length and
++target buffer dynamically. Again, this is to promote loose coupling.
++<item>Because of the callback nature of squid, every node would have to
++keep these parameters in their context anyway, so this reduces
++programmer overhead.
++</enum>
++</itemize>
++
++<sect1>Method details
++<P>The first parameter is always the 'this' reference for the client
++stream - a clientStreamNode *.
++<sect2>Read
++<P>Parameters:
++<itemize>
++<item>clientHttpRequest * - superset of request data, being winnowed down
++over time. MUST NOT be NULL.
++<item>offset, length, buffer - what, how much and where.
++</itemize>
++<P>Side effects:
++<P>Triggers a read of data that satisfies the httpClientRequest 
++metainformation and (if appropriate) the offset,length and buffer
++parameters.
++<sect2>Callback
++<P>Parameters:
++<itemize>
++<item>clientHttpRequest * - superset of request data, being winnowed down
++over time. MUST NOT be NULL.
++<item>httpReply * - not NULL on the first call back only. Ownership is
++passed down the pipeline. Each node may alter the reply if appropriate.
++<item>buffer, length - where and how much.
++</itemize>
++<P>Side effects:
++<P>Return data to the next node in the stream. The data may be returned immediately,
++or may be delayed for a later scheduling cycle.
++<sect2>Detach
++<P>Parameters:
++<itemize>
++<item>clienthttpRequest * - MUST NOT be NULL.
++</itemize>
++<P>Side effects:
++<itemize>
++<item>Removes this node from a clientStream. The stream infrastructure handles
++the removal. This node MUST have cleaned up all context data, UNLESS scheduled
++callbacks will take care of that.
++<item>Informs the prev node in the list of this nodes detachment.
++</itemize>
++<sect2>Status
++<P>Parameters:
++<itemize>
++<item>clienthttpRequest * - MUST NOT be NULL.
++</itemize>
++<P>Side effects:
++<P>Allows nodes to query the upstream nodes for :
++<itemize>
++<item>stream ABORTS - request cancelled for some reason. upstream will not
++accept further reads().
++<item>stream COMPLETION - upstream has completed and will not accept further
++reads().
++<item>stream UNPLANNED COMPLETION - upstream has completed, but not at a
++pre-planned location (used for keepalive checking), and will not accept
++further reads().
++<item>stream NONE - no special status, further reads permitted.
++</itemize>
++
++<sect2>Abort
++<P>Parameters:
++<itemize>
++<item>clienthttpRequest * - MUST NOT be NULL.
++</itemize>
++<P>Side effects:
++<P>Detachs the tail of the stream. CURRENTLY DOES NOT clean up the tail node data - 
++this must be done separately. Thus Abort may ONLY be called by the tail node.
++
++<!-- %%%% Chapter : CLIENT REQUEST PROCESSING  %%%% -->
+ <sect>Processing Client Requests
+ 
+ 	<P>
+@@ -88,3 +88,6 @@ section 81    Cache Store
+ section 82    External ACL
+ section 83    SSL accelerator support
+ section 84    Helper process maintenance
++section 85    Client side request management - after parsing, before caching
++section 87    client side stream management
++section 88    Client side reply management - from store to stream
+@@ -14,7 +14,7 @@
+ @SET_MAKE@
+ 
+ #
+-# $Id: Makefile.in,v 1.24 2002/09/02 00:19:37 hno Exp $
++# $Id: Makefile.in,v 1.25 2002/09/15 05:41:29 robertc Exp $
+ #
+ 
+ SHELL = @SHELL@
+@@ -16,7 +16,7 @@
+ #
+ #  Makefile for the Squid LDAP authentication helper
+ #
+-#  $Id: Makefile.in,v 1.18 2002/09/02 00:20:04 hno Exp $
++#  $Id: Makefile.in,v 1.19 2002/09/15 05:41:30 robertc Exp $
+ #
+ #  Uncomment and customize the following to suit your needs:
+ #
+@@ -16,7 +16,7 @@
+ #
+ #  Makefile for the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.21 2002/09/02 00:20:08 hno Exp $
++#  $Id: Makefile.in,v 1.22 2002/09/15 05:41:31 robertc Exp $
+ #
+ #  Uncomment and customize the following to suit your needs:
+ #
+@@ -15,7 +15,7 @@
+ 
+ #  Makefile for storage modules in the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.16 2002/09/02 00:19:46 hno Exp $
++#  $Id: Makefile.in,v 1.17 2002/09/15 05:41:30 robertc Exp $
+ #
+ 
+ SHELL = @SHELL@
+@@ -16,7 +16,7 @@
+ #
+ #  Makefile for the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.16 2002/09/02 00:20:21 hno Exp $
++#  $Id: Makefile.in,v 1.17 2002/09/15 05:41:32 robertc Exp $
+ #
+ #  Uncomment and customize the following to suit your needs:
+ #
+@@ -16,7 +16,7 @@
+ #
+ #  Makefile for the Squid PAM authentication helper
+ #
+-#  $Id: Makefile.in,v 1.17 2002/09/02 00:20:43 hno Exp $
++#  $Id: Makefile.in,v 1.18 2002/09/15 05:41:34 robertc Exp $
+ #
+ #  Uncomment and customize the following to suit your needs:
+ #
+@@ -16,7 +16,7 @@
+ #
+ #  Makefile for the Squid SASL authentication helper
+ #
+-#  $Id: Makefile.in,v 1.14 2002/09/02 00:20:59 hno Exp $
++#  $Id: Makefile.in,v 1.15 2002/09/15 05:41:35 robertc Exp $
+ #
+ #  Uncomment and customize the following to suit your needs:
+ #
+@@ -16,7 +16,7 @@
+ #
+ #  Makefile for the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.17 2002/09/02 00:21:17 hno Exp $
++#  $Id: Makefile.in,v 1.18 2002/09/15 05:41:36 robertc Exp $
+ #
+ #  Uncomment and customize the following to suit your needs:
+ #
+@@ -16,7 +16,7 @@
+ #
+ #  Makefile for the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.18 2002/09/02 00:21:19 hno Exp $
++#  $Id: Makefile.in,v 1.19 2002/09/15 05:41:37 robertc Exp $
+ #
+ #
+ 
+@@ -16,7 +16,7 @@
+ #
+ #  Makefile for the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.16 2002/09/02 00:21:39 hno Exp $
++#  $Id: Makefile.in,v 1.17 2002/09/15 05:41:39 robertc Exp $
+ #
+ #  Uncomment and customize the following to suit your needs:
+ #
+@@ -16,7 +16,7 @@
+ #
+ #  Makefile for the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.14 2002/09/02 00:21:41 hno Exp $
++#  $Id: Makefile.in,v 1.15 2002/09/15 05:41:40 robertc Exp $
+ #
+ #  Uncomment and customize the following to suit your needs:
+ #
+@@ -16,7 +16,7 @@
+ #
+ #  Makefile for the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.8 2002/09/02 00:21:43 hno Exp $
++#  $Id: Makefile.in,v 1.9 2002/09/15 05:41:41 robertc Exp $
+ #
+ 
+ SHELL = @SHELL@
+@@ -15,7 +15,7 @@
+ 
+ #  Makefile for digest auth helpers in the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.13 2002/09/02 00:21:47 hno Exp $
++#  $Id: Makefile.in,v 1.14 2002/09/15 05:41:42 robertc Exp $
+ #
+ 
+ SHELL = @SHELL@
+@@ -16,7 +16,7 @@
+ #
+ #  Makefile for the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.15 2002/09/02 00:21:54 hno Exp $
++#  $Id: Makefile.in,v 1.16 2002/09/15 05:41:42 robertc Exp $
+ #
+ #  Uncomment and customize the following to suit your needs:
+ #
+@@ -15,7 +15,7 @@
+ 
+ #  Makefile for storage modules in the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.3 2002/09/02 00:22:07 hno Exp $
++#  $Id: Makefile.in,v 1.4 2002/09/15 05:41:43 robertc Exp $
+ #
+ 
+ SHELL = @SHELL@
+@@ -16,7 +16,7 @@
+ #
+ #  Makefile for the ip_user external_acl helper by Rodrigo Campos
+ #
+-#  $Id: Makefile.in,v 1.3 2002/09/02 00:22:07 hno Exp $
++#  $Id: Makefile.in,v 1.4 2002/09/15 05:41:44 robertc Exp $
+ #
+ #  Uncomment and customize the following to suit your needs:
+ #
+@@ -16,7 +16,7 @@
+ #
+ #  Makefile for the Squid LDAP authentication helper
+ #
+-#  $Id: Makefile.in,v 1.3 2002/09/07 23:05:35 hno Exp $
++#  $Id: Makefile.in,v 1.4 2002/09/15 05:41:45 robertc Exp $
+ #
+ #  Uncomment and customize the following to suit your needs:
+ #
+@@ -16,7 +16,7 @@
+ #
+ #  Makefile for the Squid LDAP authentication helper
+ #
+-#  $Id: Makefile.in,v 1.3 2002/09/02 00:22:28 hno Exp $
++#  $Id: Makefile.in,v 1.4 2002/09/15 05:41:45 robertc Exp $
+ #
+ #  Uncomment and customize the following to suit your needs:
+ #
+@@ -16,7 +16,7 @@
+ #
+ #  Makefile for the Squid LDAP authentication helper
+ #
+-#  $Id: Makefile.in,v 1.2 2002/09/02 00:22:30 hno Exp $
++#  $Id: Makefile.in,v 1.3 2002/09/15 05:41:46 robertc Exp $
+ #
+ #  Uncomment and customize the following to suit your needs:
+ #
+@@ -16,7 +16,7 @@
+ #
+ #  Makefile for the wb_group external_acl helper
+ #
+-#  $Id: Makefile.in,v 1.3 2002/09/11 00:10:45 hno Exp $
++#  $Id: Makefile.in,v 1.4 2002/09/15 05:41:47 robertc Exp $
+ #
+ 
+ SHELL = @SHELL@
+@@ -15,7 +15,7 @@
+ 
+ #  Makefile for storage modules in the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.16 2002/09/02 00:22:44 hno Exp $
++#  $Id: Makefile.in,v 1.17 2002/09/15 05:41:48 robertc Exp $
+ #
+ 
+ SHELL = @SHELL@
+@@ -16,7 +16,7 @@
+ #
+ #  Makefile for the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.16 2002/09/02 00:22:49 hno Exp $
++#  $Id: Makefile.in,v 1.17 2002/09/15 05:41:49 robertc Exp $
+ #
+ 
+ SHELL = @SHELL@
+@@ -16,7 +16,7 @@
+ #
+ #  Makefile for the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.15 2002/09/02 00:23:02 hno Exp $
++#  $Id: Makefile.in,v 1.16 2002/09/15 05:41:50 robertc Exp $
+ #
+ #  Uncomment and customize the following to suit your needs:
+ #
+@@ -16,7 +16,7 @@
+ #
+ #  Makefile for the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.17 2002/09/02 00:23:08 hno Exp $
++#  $Id: Makefile.in,v 1.18 2002/09/15 05:41:51 robertc Exp $
+ #
+ #  Uncomment and customize the following to suit your needs:
+ #
+@@ -16,7 +16,7 @@
+ #
+ #  Makefile for the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.8 2002/09/02 00:23:13 hno Exp $
++#  $Id: Makefile.in,v 1.9 2002/09/15 05:41:53 robertc Exp $
+ #
+ 
+ SHELL = @SHELL@
+@@ -13,7 +13,7 @@
+ 
+ @SET_MAKE@
+ 
+-# $Id: Makefile.in,v 1.27 2002/09/02 00:23:21 hno Exp $
++# $Id: Makefile.in,v 1.28 2002/09/15 05:41:54 robertc Exp $
+ #
+ 
+ SHELL = @SHELL@
+@@ -14,7 +14,7 @@
+ @SET_MAKE@
+ 
+ #
+-#  $Id: Makefile.in,v 1.63 2002/09/02 00:23:41 hno Exp $
++#  $Id: Makefile.in,v 1.64 2002/09/15 05:41:55 robertc Exp $
+ #
+ 
+ SHELL = @SHELL@
+@@ -1,7 +1,7 @@
+ #
+ #  Makefile for the Squid Object Cache server
+ #
+-#  $Id: Makefile.am,v 1.28 2002/09/01 15:13:08 hno Exp $
++#  $Id: Makefile.am,v 1.29 2002/09/15 05:41:56 robertc Exp $
+ #
+ #  Uncomment and customize the following to suit your needs:
+ #
+@@ -114,6 +114,9 @@ squid_SOURCES = \
+ 	cbdata.c \
+ 	client_db.c \
+ 	client_side.c \
++	client_side_reply.c \
++	client_side_request.c \
++	clientStream.c \
+ 	comm.c \
+ 	comm_select.c \
+ 	comm_poll.c \
+@@ -16,7 +16,7 @@
+ #
+ #  Makefile for the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.240 2002/09/02 00:24:13 hno Exp $
++#  $Id: Makefile.in,v 1.241 2002/09/15 05:41:56 robertc Exp $
+ #
+ #  Uncomment and customize the following to suit your needs:
+ #
+@@ -214,6 +214,9 @@ squid_SOURCES = \
+ 	cbdata.c \
+ 	client_db.c \
+ 	client_side.c \
++	client_side_reply.c \
++	client_side_request.c \
++	clientStream.c \
+ 	comm.c \
+ 	comm_select.c \
+ 	comm_poll.c \
+@@ -462,29 +465,30 @@ pinger_LDFLAGS =
+ am_squid_OBJECTS = access_log.$(OBJEXT) acl.$(OBJEXT) asn.$(OBJEXT) \
+ 	authenticate.$(OBJEXT) cache_cf.$(OBJEXT) CacheDigest.$(OBJEXT) \
+ 	cache_manager.$(OBJEXT) carp.$(OBJEXT) cbdata.$(OBJEXT) \
+-	client_db.$(OBJEXT) client_side.$(OBJEXT) comm.$(OBJEXT) \
+-	comm_select.$(OBJEXT) comm_poll.$(OBJEXT) comm_kqueue.$(OBJEXT) \
+-	debug.$(OBJEXT) $(am__objects_3) disk.$(OBJEXT) \
+-	$(am__objects_4) errorpage.$(OBJEXT) ETag.$(OBJEXT) \
+-	event.$(OBJEXT) external_acl.$(OBJEXT) fd.$(OBJEXT) \
+-	filemap.$(OBJEXT) forward.$(OBJEXT) fqdncache.$(OBJEXT) \
+-	ftp.$(OBJEXT) gopher.$(OBJEXT) helper.$(OBJEXT) \
+-	$(am__objects_5) http.$(OBJEXT) HttpStatusLine.$(OBJEXT) \
+-	HttpHdrCc.$(OBJEXT) HttpHdrRange.$(OBJEXT) \
+-	HttpHdrContRange.$(OBJEXT) HttpHeader.$(OBJEXT) \
+-	HttpHeaderTools.$(OBJEXT) HttpBody.$(OBJEXT) HttpMsg.$(OBJEXT) \
+-	HttpReply.$(OBJEXT) HttpRequest.$(OBJEXT) icmp.$(OBJEXT) \
+-	icp_v2.$(OBJEXT) icp_v3.$(OBJEXT) ident.$(OBJEXT) \
+-	internal.$(OBJEXT) ipc.$(OBJEXT) ipcache.$(OBJEXT) \
+-	$(am__objects_6) logfile.$(OBJEXT) main.$(OBJEXT) mem.$(OBJEXT) \
+-	MemBuf.$(OBJEXT) mime.$(OBJEXT) multicast.$(OBJEXT) \
+-	neighbors.$(OBJEXT) net_db.$(OBJEXT) Packer.$(OBJEXT) \
+-	pconn.$(OBJEXT) peer_digest.$(OBJEXT) peer_select.$(OBJEXT) \
+-	redirect.$(OBJEXT) referer.$(OBJEXT) refresh.$(OBJEXT) \
+-	send-announce.$(OBJEXT) $(am__objects_7) ssl.$(OBJEXT) \
+-	$(am__objects_8) stat.$(OBJEXT) StatHist.$(OBJEXT) \
+-	String.$(OBJEXT) stmem.$(OBJEXT) store.$(OBJEXT) \
+-	store_io.$(OBJEXT) store_client.$(OBJEXT) \
++	client_db.$(OBJEXT) client_side.$(OBJEXT) \
++	client_side_reply.$(OBJEXT) client_side_request.$(OBJEXT) \
++	clientStream.$(OBJEXT) comm.$(OBJEXT) comm_select.$(OBJEXT) \
++	comm_poll.$(OBJEXT) comm_kqueue.$(OBJEXT) debug.$(OBJEXT) \
++	$(am__objects_3) disk.$(OBJEXT) $(am__objects_4) \
++	errorpage.$(OBJEXT) ETag.$(OBJEXT) event.$(OBJEXT) \
++	external_acl.$(OBJEXT) fd.$(OBJEXT) filemap.$(OBJEXT) \
++	forward.$(OBJEXT) fqdncache.$(OBJEXT) ftp.$(OBJEXT) \
++	gopher.$(OBJEXT) helper.$(OBJEXT) $(am__objects_5) \
++	http.$(OBJEXT) HttpStatusLine.$(OBJEXT) HttpHdrCc.$(OBJEXT) \
++	HttpHdrRange.$(OBJEXT) HttpHdrContRange.$(OBJEXT) \
++	HttpHeader.$(OBJEXT) HttpHeaderTools.$(OBJEXT) \
++	HttpBody.$(OBJEXT) HttpMsg.$(OBJEXT) HttpReply.$(OBJEXT) \
++	HttpRequest.$(OBJEXT) icmp.$(OBJEXT) icp_v2.$(OBJEXT) \
++	icp_v3.$(OBJEXT) ident.$(OBJEXT) internal.$(OBJEXT) \
++	ipc.$(OBJEXT) ipcache.$(OBJEXT) $(am__objects_6) \
++	logfile.$(OBJEXT) main.$(OBJEXT) mem.$(OBJEXT) MemBuf.$(OBJEXT) \
++	mime.$(OBJEXT) multicast.$(OBJEXT) neighbors.$(OBJEXT) \
++	net_db.$(OBJEXT) Packer.$(OBJEXT) pconn.$(OBJEXT) \
++	peer_digest.$(OBJEXT) peer_select.$(OBJEXT) redirect.$(OBJEXT) \
++	referer.$(OBJEXT) refresh.$(OBJEXT) send-announce.$(OBJEXT) \
++	$(am__objects_7) ssl.$(OBJEXT) $(am__objects_8) stat.$(OBJEXT) \
++	StatHist.$(OBJEXT) String.$(OBJEXT) stmem.$(OBJEXT) \
++	store.$(OBJEXT) store_io.$(OBJEXT) store_client.$(OBJEXT) \
+ 	store_digest.$(OBJEXT) store_dir.$(OBJEXT) \
+ 	store_key_md5.$(OBJEXT) store_log.$(OBJEXT) \
+ 	store_rebuild.$(OBJEXT) store_swapin.$(OBJEXT) \
+@@ -526,8 +530,10 @@ depcomp = $(SHELL) $(top_srcdir)/cfgaux/depcomp
+ @AMDEP_TRUE@	$(DEPDIR)/cache_cf.Po $(DEPDIR)/cache_manager.Po \
+ @AMDEP_TRUE@	$(DEPDIR)/cachemgr.Po $(DEPDIR)/carp.Po \
+ @AMDEP_TRUE@	$(DEPDIR)/cbdata.Po $(DEPDIR)/cf_gen.Po \
+-@AMDEP_TRUE@	$(DEPDIR)/client.Po $(DEPDIR)/client_db.Po \
+-@AMDEP_TRUE@	$(DEPDIR)/client_side.Po $(DEPDIR)/comm.Po \
++@AMDEP_TRUE@	$(DEPDIR)/client.Po $(DEPDIR)/clientStream.Po \
++@AMDEP_TRUE@	$(DEPDIR)/client_db.Po $(DEPDIR)/client_side.Po \
++@AMDEP_TRUE@	$(DEPDIR)/client_side_reply.Po \
++@AMDEP_TRUE@	$(DEPDIR)/client_side_request.Po $(DEPDIR)/comm.Po \
+ @AMDEP_TRUE@	$(DEPDIR)/comm_kqueue.Po $(DEPDIR)/comm_poll.Po \
+ @AMDEP_TRUE@	$(DEPDIR)/comm_select.Po $(DEPDIR)/debug.Po \
+ @AMDEP_TRUE@	$(DEPDIR)/delay_pools.Po $(DEPDIR)/disk.Po \
+@@ -728,8 +734,11 @@ distclean-compile:
+ @AMDEP_TRUE@@am__include@ @am__quote@$(DEPDIR)/cbdata.Po@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@$(DEPDIR)/cf_gen.Po@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@$(DEPDIR)/client.Po@am__quote@
++@AMDEP_TRUE@@am__include@ @am__quote@$(DEPDIR)/clientStream.Po@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@$(DEPDIR)/client_db.Po@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@$(DEPDIR)/client_side.Po@am__quote@
++@AMDEP_TRUE@@am__include@ @am__quote@$(DEPDIR)/client_side_reply.Po@am__quote@
++@AMDEP_TRUE@@am__include@ @am__quote@$(DEPDIR)/client_side_request.Po@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@$(DEPDIR)/comm.Po@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@$(DEPDIR)/comm_kqueue.Po@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@$(DEPDIR)/comm_poll.Po@am__quote@
+@@ -15,7 +15,7 @@
+ 
+ #  Makefile for authentication modules in the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.12 2002/09/02 00:24:21 hno Exp $
++#  $Id: Makefile.in,v 1.13 2002/09/15 05:41:59 robertc Exp $
+ #
+ 
+ SHELL = @SHELL@
+@@ -0,0 +1,278 @@
++
++/*
++ * $Id: clientStream.cc,v 1.1 2002/09/15 05:41:56 robertc Exp $
++ *
++ * DEBUG: section 87    Client-side Stream routines.
++ * AUTHOR: Robert Collins
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sources; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ */
++
++/*
++ * A client Stream is a uni directional pipe, with the usual non-blocking
++ * asynchronous approach present elsewhere in squid.
++ *
++ * Each pipe node has a data push function, and a data request function.
++ * This limits flexability - the data flow is no longer assembled at each
++ * step. 
++ *
++ * An alternative approach is to pass each node in the pipe the call-
++ * back to use on each IO call. This allows the callbacks to be changed 
++ * very easily by a participating node, but requires more maintenance 
++ * in each node (store the call  back to the msot recent IO request in 
++ * the nodes context.) Such an approach also prevents dynamically 
++ * changing the pipeline from outside without an additional interface
++ * method to extract the callback and context from the next node.
++ *
++ * One important characteristic of the stream is that the readfunc
++ * on the terminating node, and the callback on the first node
++ * will be NULL, and never used.
++ */
++
++#include "squid.h"
++
++CBDATA_TYPE(clientStreamNode);
++
++/*
++ * TODO: rather than each node undeleting the next, have a clientStreamDelete
++ * that walks the list
++ */
++
++/*
++ * clientStream quick notes:
++ *
++ * Each node including the HEAD of the clientStream has a cbdataReference
++ * held by the stream. Freeing the stream then removes that reference
++ * and cbdataFrees every node.
++ * Any node with other References, and all nodes downstream will only 
++ * free when those references are released.
++ * Stream nodes MAY hold references to the data member of the node. 
++ *
++ * Specifically - on creation no reference is made. 
++ * If you pass a data variable to a node, give it an initial reference.
++ * If the data member is non-null on FREE, cbdataFree WILL be called.
++ * This you must never call cbdataFree on your own context without
++ * explicitly setting the stream node data member to NULL and
++ * cbdataReferenceDone'ing it.
++ *
++ * No data member may hold a reference to it's stream node.
++ * The stream guarantees that DETACH will be called before
++ * freeing the node, alowing data members to cleanup.
++ * 
++ * If a node's data holds a reference to something that needs to
++ * free the stream a circular reference list will occur.
++ * This results no data being freed until that reference is removed.
++ * One way to accomplish this is to explicitly remove the
++ * data from your own node before freeing the stream.
++ *
++ * (i.e. 
++ * mycontext = this->data;
++ * cbdataReferenceDone (mycontext);
++ * clientStreamFreeLinst (this->head);
++ * cbdataFree (mycontext);
++ * return;
++ */
++
++/* Local functions */
++static FREE clientStreamFree;
++
++clientStreamNode *
++clientStreamNew(CSR * readfunc, CSCB * callback, CSD * detach, CSS * status,
++    void *data)
++{
++    clientStreamNode *temp;
++    CBDATA_INIT_TYPE_FREECB(clientStreamNode, clientStreamFree);
++    temp = cbdataAlloc(clientStreamNode);
++    temp->readfunc = readfunc;
++    temp->callback = callback;
++    temp->detach = detach;
++    temp->status = status;
++    temp->data = data;
++    return temp;
++}
++
++/*
++ * Initialise a client Stream.
++ * list is the stream
++ * func is the read function for the head
++ * callback is the callback for the tail
++ * tailbuf and taillen are the initial buffer and length for the tail.
++ */
++void
++clientStreamInit(dlink_list * list, CSR * func, CSD * rdetach, CSS * readstatus,
++    void *readdata, CSCB * callback, CSD * cdetach, void *callbackdata,
++    char *tailbuf, size_t taillen)
++{
++    clientStreamNode *temp = clientStreamNew(func, NULL, rdetach, readstatus,
++	readdata);
++    dlinkAdd(temp, &temp->node, list);
++    cbdataReference(temp);
++    temp->head = list;
++    clientStreamInsertHead(list, NULL, callback, cdetach, NULL, callbackdata);
++    temp = list->tail->data;
++    temp->readbuf = tailbuf;
++    temp->readlen = taillen;
++}
++
++/*
++ * Doesn't actually insert at head. Instead it inserts one *after*
++ * head. This is because HEAD is a special node, as is tail
++ * This function is not suitable for inserting the real HEAD.
++ * TODO: should we always initalise the buffers and length, to 
++ * allow safe insertion of elements in the downstream cycle?
++ */
++void
++clientStreamInsertHead(dlink_list * list, CSR * func, CSCB * callback,
++    CSD * detach, CSS * status, void *data)
++{
++    clientStreamNode *temp;
++
++    /* test preconditions */
++    assert(list != NULL);
++    assert(list->head);
++    temp = clientStreamNew(func, callback, detach, status, data);
++    temp->head = list;
++    debug(87,
++	3)
++	("clientStreamInsertHead: Inserted node %p with data %p after head\n",
++	temp, data);
++    dlinkAddAfter(temp, &temp->node, list->head, list);
++    cbdataReference(temp);
++}
++
++/*
++ * Callback the next node the in chain with it's requested data
++ */
++void
++clientStreamCallback(clientStreamNode * this, clientHttpRequest * http,
++    HttpReply * rep, const char *body_data, ssize_t body_size)
++{
++    clientStreamNode *next;
++    assert(this && http && this->node.next);
++    next = this->node.next->data;
++
++    debug(87,
++	3) ("clientStreamCallback: Calling %p with cbdata %p from node %p\n",
++	next->callback, next->data, this);
++    next->callback(next, http, rep, body_data, body_size);
++}
++
++/*
++ * Call the previous node in the chain to read some data
++ */
++void
++clientStreamRead(clientStreamNode * this, clientHttpRequest * http,
++    off_t readoff, size_t readlen, char *readbuf)
++{
++    /* place the parameters on the 'stack' */
++    clientStreamNode *prev;
++    assert(this && http && this->node.prev);
++    prev = this->node.prev->data;
++
++    debug(87, 3) ("clientStreamRead: Calling %p with cbdata %p from node %p\n",
++	prev->readfunc, prev->data, this);
++    this->readoff = readoff;
++    this->readlen = readlen;
++    this->readbuf = readbuf;
++    prev->readfunc(prev, http);
++}
++
++/*
++ * Detach from the stream - only allowed for terminal members
++ */
++void
++clientStreamDetach(clientStreamNode * this, clientHttpRequest * http)
++{
++    clientStreamNode *prev = NULL;
++    clientStreamNode *temp = this;
++
++    if (this->node.prev) {
++	prev = this->node.prev->data;
++    }
++    assert(this->node.next == NULL);
++    debug(87, 3) ("clientStreamDetach: Detaching node %p\n", this);
++    /* And clean up this node */
++    /* ESI TODO: push refcount class through to head */
++    cbdataReferenceDone(temp);
++    cbdataFree(this);
++    /* and tell the prev that the detach has occured */
++    /*
++     * We do it in this order so that the detaching node is always
++     * at the end of the list
++     */
++    if (prev) {
++	debug(87, 3) ("clientStreamDetach: Calling %p with cbdata %p\n",
++	    prev->detach, prev->data);
++	prev->detach(prev, http);
++    }
++}
++
++/*
++ * Abort the stream - detach every node in the pipeline.
++ */
++void
++clientStreamAbort(clientStreamNode * this, clientHttpRequest * http)
++{
++    dlink_list *list;
++
++    assert(this != NULL);
++    assert(http != NULL);
++    list = this->head;
++    debug(87, 3) ("clientStreamAbort: Aborting stream with tail %p\n",
++	list->tail);
++    if (list->tail) {
++	clientStreamDetach(list->tail->data, http);
++    }
++}
++
++/*
++ * Call the upstream node to find it's status 
++ */
++clientStream_status_t
++clientStreamStatus(clientStreamNode * this, clientHttpRequest * http)
++{
++    clientStreamNode *prev;
++    assert(this && http && this->node.prev);
++    prev = this->node.prev->data;
++    return prev->status(prev, http);
++}
++
++/* Local function bodies */
++void
++clientStreamFree(void *foo)
++{
++    clientStreamNode *this = foo;
++
++    debug(87, 3) ("Freeing clientStreamNode %p\n", this);
++    if (this->data) {
++	cbdataFree(this->data);
++    }
++    if (this->node.next || this->node.prev) {
++	dlinkDelete(&this->node, this->head);
++    }
++}
+@@ -0,0 +1,1591 @@
++
++/*
++ * $Id: client_side_reply.cc,v 1.1 2002/09/15 05:41:56 robertc Exp $
++ *
++ * DEBUG: section 88    Client-side Reply Routines
++ * AUTHOR: Robert Collins (Originally Duane Wessels in client_side.c)
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sources; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ */
++
++#include "squid.h"
++
++typedef struct _clientReplyContext {
++    clientHttpRequest *http;
++    int headers_sz;
++    store_client *sc;		/* The store_client we're using */
++    store_client *old_sc;	/* ... for entry to be validated */
++    int old_reqofs;		/* ... for the buffer */
++    int old_reqsize;		/* ... again, for the buffer */
++    size_t reqsize;
++    off_t reqofs;
++    char tempbuf[HTTP_REQBUF_SZ];	/* a temporary buffer if we need working storage */
++#if USE_CACHE_DIGESTS
++    const char *lookup_type;	/* temporary hack: storeGet() result: HIT/MISS/NONE */
++#endif
++    struct {
++	int storelogiccomplete:1;
++	int complete:1;		/* we have read all we can from upstream */
++    } flags;
++    clientStreamNode *ourNode;	/* This will go away if/when this file gets refactored some more */
++} clientReplyContext;
++
++CBDATA_TYPE(clientReplyContext);
++
++static const char *const crlf = "\r\n";
++
++/* Local functions */
++static int clientGotNotEnough(clientHttpRequest const *);
++static int clientReplyBodyTooLarge(HttpReply *, ssize_t);
++static int clientOnlyIfCached(clientHttpRequest * http);
++static void clientProcessExpired(clientReplyContext *);
++static void clientProcessMiss(clientReplyContext *);
++static STCB clientCacheHit;
++static void clientProcessOnlyIfCachedMiss(clientReplyContext *);
++static int clientGetsOldEntry(StoreEntry * new, StoreEntry * old,
++    request_t * request);
++static STCB clientHandleIMSReply;
++static int modifiedSince(StoreEntry *, request_t *);
++static log_type clientIdentifyStoreObject(clientHttpRequest * http);
++static void clientPurgeRequest(clientReplyContext *);
++static void clientTraceReply(clientStreamNode *, clientReplyContext *);
++static StoreEntry *clientCreateStoreEntry(clientReplyContext *, method_t,
++    request_flags);
++static STCB clientSendMoreData;
++static void clientRemoveStoreReference(clientReplyContext *, store_client **,
++    StoreEntry **);
++static void clientReplyContextSaveState(clientReplyContext *,
++    clientHttpRequest *);
++static void clientReplyContextRestoreState(clientReplyContext *,
++    clientHttpRequest *);
++extern CSS clientReplyStatus;
++extern ErrorState *clientBuildError(err_type, http_status, char const *,
++    struct in_addr *, request_t *);
++
++/* The clientReply clean interface */
++/* privates */
++static FREE clientReplyFree;
++
++void
++clientReplyFree(void *data)
++{
++    clientReplyContext *this = data;
++    clientRemoveStoreReference(this, &this->sc, &this->http->entry);
++    /* old_entry might still be set if we didn't yet get the reply
++     * code in clientHandleIMSReply() */
++    clientRemoveStoreReference(this, &this->old_sc, &this->http->old_entry);
++    cbdataReferenceDone(this->http);
++}
++
++void *
++clientReplyNewContext(clientHttpRequest * clientContext)
++{
++    clientReplyContext *context;
++    CBDATA_INIT_TYPE_FREECB(clientReplyContext, clientReplyFree);
++    context = cbdataAlloc(clientReplyContext);
++    context->http = cbdataReference(clientContext);
++    return context;
++}
++
++/* create an error in the store awaiting the client side to read it. */
++void
++clientSetReplyToError(void *data,
++    err_type err, http_status status, method_t method, char const *uri,
++    struct in_addr *addr, request_t * failedrequest, char *unparsedrequest,
++    auth_user_request_t * auth_user_request)
++{
++    clientReplyContext *context = data;
++    ErrorState *errstate =
++    clientBuildError(err, status, uri, addr, failedrequest);
++    if (unparsedrequest)
++	errstate->request_hdrs = xstrdup(unparsedrequest);
++
++    if (status == HTTP_NOT_IMPLEMENTED && context->http->request)
++	/* prevent confusion over whether we default to persistent or not */
++	context->http->request->flags.proxy_keepalive = 0;
++    context->http->al.http.code = errstate->http_status;
++
++    context->http->entry =
++	clientCreateStoreEntry(context, method, null_request_flags);
++    if (auth_user_request) {
++	errstate->auth_user_request = auth_user_request;
++	authenticateAuthUserRequestLock(errstate->auth_user_request);
++    }
++    assert(errstate->callback_data == NULL);
++    errorAppendEntry(context->http->entry, errstate);
++    /* Now the caller reads to get this */
++}
++
++void
++clientRemoveStoreReference(clientReplyContext * context, store_client ** scp,
++    StoreEntry ** ep)
++{
++    StoreEntry *e;
++    store_client *sc = *scp;
++    if ((e = *ep) != NULL) {
++	*ep = NULL;
++	storeUnregister(sc, e, context);
++	*scp = NULL;
++	storeUnlockObject(e);
++    }
++}
++
++void
++clientReplyContextSaveState(clientReplyContext * this, clientHttpRequest * http)
++{
++    assert(this->old_sc == NULL);
++    debug(88, 1) ("clientReplyContextSaveState: saving store context\n");
++    http->old_entry = http->entry;
++    this->old_sc = this->sc;
++    this->old_reqsize = this->reqsize;
++    this->old_reqofs = this->reqofs;
++    /* Prevent accessing the now saved entries */
++    http->entry = NULL;
++    this->sc = NULL;
++    this->reqsize = 0;
++    this->reqofs = 0;
++}
++
++void
++clientReplyContextRestoreState(clientReplyContext * this,
++    clientHttpRequest * http)
++{
++    assert(this->old_sc != NULL);
++    debug(88, 1) ("clientReplyContextRestoreState: Restoring store context\n");
++    http->entry = http->old_entry;
++    this->sc = this->old_sc;
++    this->reqsize = this->old_reqsize;
++    this->reqofs = this->old_reqofs;
++    /* Prevent accessed the old saved entries */
++    http->old_entry = NULL;
++    this->old_sc = NULL;
++    this->old_reqsize = 0;
++    this->old_reqofs = 0;
++}
++
++
++/* there is an expired entry in the store.
++ * setup a temporary buffer area and perform an IMS to the origin
++ */
++static void
++clientProcessExpired(clientReplyContext * context)
++{
++    clientHttpRequest *http = context->http;
++    char *url = http->uri;
++    StoreEntry *entry = NULL;
++    debug(88, 3) ("clientProcessExpired: '%s'\n", http->uri);
++    assert(http->entry->lastmod >= 0);
++    /*
++     * check if we are allowed to contact other servers
++     * @?@: Instead of a 504 (Gateway Timeout) reply, we may want to return 
++     *      a stale entry *if* it matches client requirements
++     */
++    if (clientOnlyIfCached(http)) {
++	clientProcessOnlyIfCachedMiss(context);
++	return;
++    }
++    http->request->flags.refresh = 1;
++#if STORE_CLIENT_LIST_DEBUG
++    /*
++     * Assert that 'http' is already a client of old_entry.  If 
++     * it is not, then the beginning of the object data might get
++     * freed from memory before we need to access it.
++     */
++    assert(http->sc->owner == context);
++#endif
++    /* Prepare to make a new temporary request */
++    clientReplyContextSaveState(context, http);
++    entry = storeCreateEntry(url,
++	http->log_uri, http->request->flags, http->request->method);
++    /* NOTE, don't call storeLockObject(), storeCreateEntry() does it */
++    context->sc = storeClientListAdd(entry, context);
++#if DELAY_POOLS
++    /* delay_id is already set on original store client */
++    delaySetStoreClient(context->sc, delayClient(http));
++#endif
++    http->request->lastmod = http->old_entry->lastmod;
++    debug(88, 5) ("clientProcessExpired: lastmod %ld\n",
++	(long int) entry->lastmod);
++    http->entry = entry;
++    http->out.offset = 0;	/* FIXME Not needed - we have not written anything anyway */
++    fwdStart(http->conn ? http->conn->fd : -1, http->entry, http->request);
++    /* Register with storage manager to receive updates when data comes in. */
++    if (EBIT_TEST(entry->flags, ENTRY_ABORTED))
++	debug(88, 0) ("clientProcessExpired: found ENTRY_ABORTED object\n");
++    /* start counting the length from 0 */
++    storeClientCopy(context->sc, entry,
++	0, HTTP_REQBUF_SZ, context->tempbuf, clientHandleIMSReply, context);
++}
++
++int
++modifiedSince(StoreEntry * entry, request_t * request)
++{
++    int object_length;
++    MemObject *mem = entry->mem_obj;
++    time_t mod_time = entry->lastmod;
++    debug(88, 3) ("modifiedSince: '%s'\n", storeUrl(entry));
++    if (mod_time < 0)
++	mod_time = entry->timestamp;
++    debug(88, 3) ("modifiedSince: mod_time = %ld\n", (long int) mod_time);
++    if (mod_time < 0)
++	return 1;
++    /* Find size of the object */
++    object_length = mem->reply->content_length;
++    if (object_length < 0)
++	object_length = contentLen(entry);
++    if (mod_time > request->ims) {
++	debug(88, 3) ("--> YES: entry newer than client\n");
++	return 1;
++    } else if (mod_time < request->ims) {
++	debug(88, 3) ("-->  NO: entry older than client\n");
++	return 0;
++    } else if (request->imslen < 0) {
++	debug(88, 3) ("-->  NO: same LMT, no client length\n");
++	return 0;
++    } else if (request->imslen == object_length) {
++	debug(88, 3) ("-->  NO: same LMT, same length\n");
++	return 0;
++    } else {
++	debug(88, 3) ("--> YES: same LMT, different length\n");
++	return 1;
++    }
++}
++
++static int
++clientGetsOldEntry(StoreEntry * new_entry, StoreEntry * old_entry,
++    request_t * request)
++{
++    const http_status status = new_entry->mem_obj->reply->sline.status;
++    if (0 == status) {
++	debug(88, 5) ("clientGetsOldEntry: YES, broken HTTP reply\n");
++	return 1;
++    }
++    /* If the reply is a failure then send the old object as a last
++     * resort */
++    if (status >= 500 && status < 600) {
++	debug(88, 3) ("clientGetsOldEntry: YES, failure reply=%d\n", status);
++	return 1;
++    }
++    /* If the reply is anything but "Not Modified" then
++     * we must forward it to the client */
++    if (HTTP_NOT_MODIFIED != status) {
++	debug(88, 5) ("clientGetsOldEntry: NO, reply=%d\n", status);
++	return 0;
++    }
++    /* If the client did not send IMS in the request, then it
++     * must get the old object, not this "Not Modified" reply */
++    if (!request->flags.ims) {
++	debug(88, 5) ("clientGetsOldEntry: YES, no client IMS\n");
++	return 1;
++    }
++    /* If the client IMS time is prior to the entry LASTMOD time we
++     * need to send the old object */
++    if (modifiedSince(old_entry, request)) {
++	debug(88, 5) ("clientGetsOldEntry: YES, modified since %ld\n",
++	    (long int) request->ims);
++	return 1;
++    }
++    debug(88, 5) ("clientGetsOldEntry: NO, new one is fine\n");
++    return 0;
++}
++
++void
++clientHandleIMSReply(void *data, char *buf, ssize_t size)
++{
++    clientReplyContext *context = data;
++    clientHttpRequest *http = context->http;
++    StoreEntry *entry = http->entry;
++    MemObject *mem;
++    const char *url = storeUrl(entry);
++    int unlink_request = 0;
++    StoreEntry *oldentry;
++    http_status status;
++    debug(88, 3) ("clientHandleIMSReply: %s, %ld bytes\n", url,
++	(long int) size);
++    if (entry == NULL) {
++	return;
++    }
++    if (size < 0 && !EBIT_TEST(entry->flags, ENTRY_ABORTED)) {
++	return;
++    }
++    /* update size of the request */
++    context->reqsize = size + context->reqofs;
++    context->reqofs = context->reqsize;
++    mem = entry->mem_obj;
++    status = mem->reply->sline.status;
++    if (EBIT_TEST(entry->flags, ENTRY_ABORTED)) {
++	debug(88, 3) ("clientHandleIMSReply: ABORTED '%s'\n", url);
++	/* We have an existing entry, but failed to validate it */
++	/* Its okay to send the old one anyway */
++	http->log_type = LOG_TCP_REFRESH_FAIL_HIT;
++	clientRemoveStoreReference(context, &context->sc, &entry);
++	/* Get the old request back */
++	clientReplyContextRestoreState(context, http);
++	entry = http->entry;
++    } else if (STORE_PENDING == entry->store_status && 0 == status) {
++	/* more headers needed to decide */
++	debug(88, 3) ("clientHandleIMSReply: Incomplete headers for '%s'\n",
++	    url);
++	if (size + context->reqofs >= HTTP_REQBUF_SZ) {
++	    /* will not get any bigger than that */
++	    debug(88,
++		3)
++		("clientHandleIMSReply: Reply is too large '%s', using old entry\n",
++		url);
++	    /* use old entry, this repeats the code abovez */
++	    http->log_type = LOG_TCP_REFRESH_FAIL_HIT;
++	    clientRemoveStoreReference(context, &context->sc, &entry);
++	    entry = http->entry = http->old_entry;
++	    /* Get the old request back */
++	    clientReplyContextRestoreState(context, http);
++	    entry = http->entry;
++	    /* continue */
++	} else {
++	    storeClientCopy(context->sc, entry,
++		context->reqofs,
++		HTTP_REQBUF_SZ - context->reqofs,
++		context->tempbuf + context->reqofs,
++		clientHandleIMSReply, context);
++	    return;
++	}
++    } else if (clientGetsOldEntry(entry, http->old_entry, http->request)) {
++	/* We initiated the IMS request, the client is not expecting
++	 * 304, so put the good one back.  First, make sure the old entry
++	 * headers have been loaded from disk. */
++	clientStreamNode *next = context->http->client_stream.head->next->data;
++	oldentry = http->old_entry;
++	http->log_type = LOG_TCP_REFRESH_HIT;
++	if (oldentry->mem_obj->request == NULL) {
++	    oldentry->mem_obj->request = requestLink(mem->request);
++	    unlink_request = 1;
++	}
++	/* Don't memcpy() the whole reply structure here.  For example,
++	 * www.thegist.com (Netscape/1.13) returns a content-length for
++	 * 304's which seems to be the length of the 304 HEADERS!!! and
++	 * not the body they refer to.  */
++	httpReplyUpdateOnNotModified(oldentry->mem_obj->reply, mem->reply);
++	storeTimestampsSet(oldentry);
++	clientRemoveStoreReference(context, &context->sc, &entry);
++	oldentry->timestamp = squid_curtime;
++	if (unlink_request) {
++	    requestUnlink(oldentry->mem_obj->request);
++	    oldentry->mem_obj->request = NULL;
++	}
++	/* Get the old request back */
++	clientReplyContextRestoreState(context, http);
++	entry = http->entry;
++	/* here the data to send is in the next nodes buffers already */
++	assert(!EBIT_TEST(entry->flags, ENTRY_ABORTED));
++	clientSendMoreData(context, next->readbuf, context->reqsize);
++    } else {
++	/* the client can handle this reply, whatever it is */
++	http->log_type = LOG_TCP_REFRESH_MISS;
++	if (HTTP_NOT_MODIFIED == mem->reply->sline.status) {
++	    httpReplyUpdateOnNotModified(http->old_entry->mem_obj->reply,
++		mem->reply);
++	    storeTimestampsSet(http->old_entry);
++	    http->log_type = LOG_TCP_REFRESH_HIT;
++	}
++	clientRemoveStoreReference(context, &context->old_sc, &http->old_entry);
++	/* here the data to send is the data we just recieved */
++	context->old_reqofs = 0;
++	context->old_reqsize = 0;
++	assert(!EBIT_TEST(entry->flags, ENTRY_ABORTED));
++	/* TODO: provide SendMoreData with the ready parsed reply */
++	clientSendMoreData(context, context->tempbuf, context->reqsize);
++    }
++}
++
++CSR clientGetMoreData;
++CSD clientReplyDetach;
++
++/*
++ * clientCacheHit should only be called until the HTTP reply headers
++ * have been parsed.  Normally this should be a single call, but
++ * it might take more than one.  As soon as we have the headers,
++ * we hand off to clientSendMoreData, clientProcessExpired, or
++ * clientProcessMiss.
++ */
++void
++clientCacheHit(void *data, char *buf, ssize_t size)
++{
++    clientReplyContext *context = data;
++    clientHttpRequest *http = context->http;
++    StoreEntry *e = http->entry;
++    MemObject *mem;
++    request_t *r = http->request;
++    debug(88, 3) ("clientCacheHit: %s, %d bytes\n", http->uri, (int) size);
++    if (http->entry == NULL) {
++	debug(88, 3) ("clientCacheHit: request aborted\n");
++	return;
++    } else if (size < 0) {
++	/* swap in failure */
++	debug(88, 3) ("clientCacheHit: swapin failure for %s\n", http->uri);
++	http->log_type = LOG_TCP_SWAPFAIL_MISS;
++	clientRemoveStoreReference(context, &context->sc, &http->entry);
++	clientProcessMiss(context);
++	return;
++    }
++    assert(size > 0);
++    mem = e->mem_obj;
++    assert(!EBIT_TEST(e->flags, ENTRY_ABORTED));
++    /* update size of the request */
++    context->reqsize = size + context->reqofs;
++    if (mem->reply->sline.status == 0) {
++	/*
++	 * we don't have full reply headers yet; either wait for more or
++	 * punt to clientProcessMiss.
++	 */
++	if (e->mem_status == IN_MEMORY || e->store_status == STORE_OK) {
++	    clientProcessMiss(context);
++	} else if (size + context->reqofs >= HTTP_REQBUF_SZ
++	    && http->out.offset == 0) {
++	    clientProcessMiss(context);
++	} else {
++	    clientStreamNode *next;
++	    debug(88, 3) ("clientCacheHit: waiting for HTTP reply headers\n");
++	    context->reqofs += size;
++	    assert(context->reqofs <= HTTP_REQBUF_SZ);
++	    /* get the next users' buffer */
++	    next = context->http->client_stream.head->next->data;
++	    storeClientCopy(context->sc, e,
++		http->out.offset + context->reqofs,
++		HTTP_REQBUF_SZ,
++		next->readbuf + context->reqofs, clientCacheHit, context);
++	}
++	return;
++    }
++    /*
++     * Got the headers, now grok them
++     */
++    assert(http->log_type == LOG_TCP_HIT);
++    switch (varyEvaluateMatch(e, r)) {
++    case VARY_NONE:
++	/* No variance detected. Continue as normal */
++	break;
++    case VARY_MATCH:
++	/* This is the correct entity for this request. Continue */
++	debug(88, 2) ("clientProcessHit: Vary MATCH!\n");
++	break;
++    case VARY_OTHER:
++	/* This is not the correct entity for this request. We need
++	 * to requery the cache.
++	 */
++	clientRemoveStoreReference(context, &context->sc, &http->entry);
++	e = NULL;
++	/* Note: varyEvalyateMatch updates the request with vary information
++	 * so we only get here once. (it also takes care of cancelling loops)
++	 */
++	debug(88, 2) ("clientProcessHit: Vary detected!\n");
++	clientGetMoreData(context->ourNode, http);
++	return;
++    case VARY_CANCEL:
++	/* varyEvaluateMatch found a object loop. Process as miss */
++	debug(88, 1) ("clientProcessHit: Vary object loop!\n");
++	clientProcessMiss(context);
++	return;
++    }
++    if (r->method == METHOD_PURGE) {
++	clientRemoveStoreReference(context, &context->sc, &http->entry);
++	e = NULL;
++	clientPurgeRequest(context);
++	return;
++    }
++    if (storeCheckNegativeHit(e)) {
++	http->log_type = LOG_TCP_NEGATIVE_HIT;
++	clientSendMoreData(context, buf, size);
++    } else if (r->method == METHOD_HEAD) {
++	/*
++	 * RFC 2068 seems to indicate there is no "conditional HEAD"
++	 * request.  We cannot validate a cached object for a HEAD
++	 * request, nor can we return 304.
++	 */
++	if (e->mem_status == IN_MEMORY)
++	    http->log_type = LOG_TCP_MEM_HIT;
++	clientSendMoreData(context, buf, size);
++    } else if (refreshCheckHTTP(e, r) && !http->flags.internal) {
++	debug(88, 5) ("clientCacheHit: in refreshCheck() block\n");
++	/*
++	 * We hold a stale copy; it needs to be validated
++	 */
++	/*
++	 * The 'need_validation' flag is used to prevent forwarding
++	 * loops between siblings.  If our copy of the object is stale,
++	 * then we should probably only use parents for the validation
++	 * request.  Otherwise two siblings could generate a loop if
++	 * both have a stale version of the object.
++	 */
++	r->flags.need_validation = 1;
++	if (e->lastmod < 0) {
++	    /*
++	     * Previous reply didn't have a Last-Modified header,
++	     * we cannot revalidate it.
++	     */
++	    http->log_type = LOG_TCP_MISS;
++	    clientProcessMiss(context);
++	} else if (r->flags.nocache) {
++	    /*
++	     * This did not match a refresh pattern that overrides no-cache
++	     * we should honour the client no-cache header.
++	     */
++	    http->log_type = LOG_TCP_CLIENT_REFRESH_MISS;
++	    clientProcessMiss(context);
++	} else if (r->protocol == PROTO_HTTP) {
++	    /*
++	     * Object needs to be revalidated
++	     * XXX This could apply to FTP as well, if Last-Modified is known.
++	     */
++	    http->log_type = LOG_TCP_REFRESH_MISS;
++	    clientProcessExpired(context);
++	} else {
++	    /*
++	     * We don't know how to re-validate other protocols. Handle
++	     * them as if the object has expired.
++	     */
++	    http->log_type = LOG_TCP_MISS;
++	    clientProcessMiss(context);
++	}
++    } else if (r->flags.ims) {
++	/*
++	 * Handle If-Modified-Since requests from the client
++	 */
++	if (mem->reply->sline.status != HTTP_OK) {
++	    debug(88, 4) ("clientCacheHit: Reply code %d != 200\n",
++		mem->reply->sline.status);
++	    http->log_type = LOG_TCP_MISS;
++	    clientProcessMiss(context);
++	} else if (modifiedSince(e, http->request)) {
++	    http->log_type = LOG_TCP_IMS_HIT;
++	    clientSendMoreData(context, buf, size);
++	} else {
++	    clientStreamNode *next;
++	    time_t timestamp = e->timestamp;
++	    MemBuf mb = httpPacked304Reply(e->mem_obj->reply);
++	    http->log_type = LOG_TCP_IMS_HIT;
++	    clientRemoveStoreReference(context, &context->sc, &http->entry);
++	    http->entry = e =
++		clientCreateStoreEntry(context, http->request->method,
++		null_request_flags);
++	    /*
++	     * Copy timestamp from the original entry so the 304
++	     * reply has a meaningful Age: header.
++	     */
++	    e->timestamp = timestamp;
++	    httpReplyParse(e->mem_obj->reply, mb.buf, mb.size);
++	    storeAppend(e, mb.buf, mb.size);
++	    memBufClean(&mb);
++	    storeComplete(e);
++	    /* TODO: why put this in the store and then serialise it and then parse it again.
++	     * Simply mark the request complete in our context and
++	     * write the reply struct to the client side
++	     */
++	    /* now write this back to the requester */
++
++	    /* get the next chain members buffer */
++	    next = http->client_stream.head->next->data;
++	    storeClientCopy(context->sc, e, next->readoff, next->readlen,
++		next->readbuf, clientSendMoreData, context);
++	}
++    } else {
++	/*
++	 * plain ol' cache hit
++	 */
++	if (e->mem_status == IN_MEMORY)
++	    http->log_type = LOG_TCP_MEM_HIT;
++	else if (Config.onoff.offline)
++	    http->log_type = LOG_TCP_OFFLINE_HIT;
++	clientSendMoreData(context, buf, size);
++    }
++}
++
++/*
++ * Prepare to fetch the object as it's a cache miss of some kind.
++ */
++void
++clientProcessMiss(clientReplyContext * context)
++{
++    clientHttpRequest *http = context->http;
++    char *url = http->uri;
++    request_t *r = http->request;
++    ErrorState *err = NULL;
++    debug(88, 4) ("clientProcessMiss: '%s %s'\n",
++	RequestMethodStr[r->method], url);
++    /*
++     * We might have a left-over StoreEntry from a failed cache hit
++     * or IMS request.
++     */
++    if (http->entry) {
++	if (EBIT_TEST(http->entry->flags, ENTRY_SPECIAL)) {
++	    debug(88, 0) ("clientProcessMiss: miss on a special object (%s).\n",
++		url);
++	    debug(88, 0) ("\tlog_type = %s\n", log_tags[http->log_type]);
++	    storeEntryDump(http->entry, 1);
++	}
++	clientRemoveStoreReference(context, &context->sc, &http->entry);
++    }
++    if (r->method == METHOD_PURGE) {
++	clientPurgeRequest(context);
++	return;
++    }
++    if (clientOnlyIfCached(http)) {
++	clientProcessOnlyIfCachedMiss(context);
++	return;
++    }
++    /*
++     * Deny loops when running in accelerator/transproxy mode.
++     */
++    if (http->flags.accel && r->flags.loopdetect) {
++	clientStreamNode *next;
++	http->al.http.code = HTTP_FORBIDDEN;
++	err =
++	    clientBuildError(ERR_ACCESS_DENIED, HTTP_FORBIDDEN, NULL,
++	    &http->conn->peer.sin_addr, http->request);
++	http->entry =
++	    clientCreateStoreEntry(context, r->method, null_request_flags);
++	errorAppendEntry(http->entry, err);
++	/* and trigger a read of the resulting object */
++	next = http->client_stream.head->next->data;
++	storeClientCopy(context->sc, http->entry, next->readoff, next->readlen,
++	    next->readbuf, clientSendMoreData, context);
++	return;
++    } else {
++	clientStreamNode *next;
++	assert(http->out.offset == 0);
++	http->entry = clientCreateStoreEntry(context, r->method, r->flags);
++	/* And trigger a read of the resultant object */
++	next = http->client_stream.head->next->data;
++	storeClientCopy(context->sc, http->entry, next->readoff, next->readlen,
++	    next->readbuf, clientSendMoreData, context);
++	if (http->redirect.status) {
++	    HttpReply *rep = httpReplyCreate();
++#if LOG_TCP_REDIRECTS
++	    http->log_type = LOG_TCP_REDIRECT;
++#endif
++	    storeReleaseRequest(http->entry);
++	    httpRedirectReply(rep, http->redirect.status,
++		http->redirect.location);
++	    httpReplySwapOut(rep, http->entry);
++	    httpReplyDestroy(rep);
++	    storeComplete(http->entry);
++	    return;
++	}
++	if (http->flags.internal)
++	    r->protocol = PROTO_INTERNAL;
++	fwdStart(http->conn ? http->conn->fd : -1, http->entry, r);
++    }
++}
++
++/*
++ * client issued a request with an only-if-cached cache-control directive;
++ * we did not find a cached object that can be returned without
++ *     contacting other servers;
++ * respond with a 504 (Gateway Timeout) as suggested in [RFC 2068]
++ */
++static void
++clientProcessOnlyIfCachedMiss(clientReplyContext * context)
++{
++    clientHttpRequest *http = context->http;
++    char *url = http->uri;
++    request_t *r = http->request;
++    ErrorState *err = NULL;
++    clientStreamNode *next;
++    debug(88, 4) ("clientProcessOnlyIfCachedMiss: '%s %s'\n",
++	RequestMethodStr[r->method], url);
++    http->al.http.code = HTTP_GATEWAY_TIMEOUT;
++    err = clientBuildError(ERR_ONLY_IF_CACHED_MISS, HTTP_GATEWAY_TIMEOUT, NULL,
++	&http->conn->peer.sin_addr, http->request);
++    clientRemoveStoreReference(context, &context->sc, &http->entry);
++    http->entry =
++	clientCreateStoreEntry(context, r->method, null_request_flags);
++    /* And trigger a read of the resultant object */
++    next = http->client_stream.head->next->data;
++    storeClientCopy(context->sc, http->entry, next->readoff, next->readlen,
++	next->readbuf, clientSendMoreData, context);
++    errorAppendEntry(http->entry, err);
++}
++
++void
++clientPurgeRequest(clientReplyContext * context)
++{
++    clientHttpRequest *http = context->http;
++    StoreEntry *entry;
++    ErrorState *err = NULL;
++    HttpReply *r;
++    http_status status = HTTP_NOT_FOUND;
++    clientStreamNode *next;
++    http_version_t version;
++    debug(88, 3) ("Config2.onoff.enable_purge = %d\n",
++	Config2.onoff.enable_purge);
++    next = http->client_stream.head->next->data;
++    if (!Config2.onoff.enable_purge) {
++	http->log_type = LOG_TCP_DENIED;
++	err =
++	    clientBuildError(ERR_ACCESS_DENIED, HTTP_FORBIDDEN, NULL,
++	    &http->conn->peer.sin_addr, http->request);
++	http->entry =
++	    clientCreateStoreEntry(context, http->request->method,
++	    null_request_flags);
++	/* And trigger a read of the resultant object */
++	storeClientCopy(context->sc, http->entry, next->readoff, next->readlen,
++	    next->readbuf, clientSendMoreData, context);
++	errorAppendEntry(http->entry, err);
++	return;
++    }
++    /* Release both IP cache */
++    ipcacheInvalidate(http->request->host);
++
++    /* RC FIXME: This doesn't make sense - we should only ever be here on PURGE
++     * requests!
++     */
++    if (!http->flags.purging) {
++	/* Try to find a base entry */
++	http->flags.purging = 1;
++	entry = storeGetPublicByRequestMethod(http->request, METHOD_GET);
++	if (!entry)
++	    entry = storeGetPublicByRequestMethod(http->request, METHOD_HEAD);
++	if (entry) {
++	    /* Swap in the metadata */
++	    http->entry = entry;
++	    storeLockObject(http->entry);
++	    storeCreateMemObject(http->entry, http->uri, http->log_uri);
++	    http->entry->mem_obj->method = http->request->method;
++	    context->sc = storeClientListAdd(http->entry, context);
++	    http->log_type = LOG_TCP_HIT;
++	    context->reqofs = 0;
++	    storeClientCopy(context->sc, http->entry,
++		http->out.offset,
++		next->readlen, next->readbuf, clientCacheHit, context);
++	    return;
++	}
++    }
++    http->log_type = LOG_TCP_MISS;
++    /* Release the cached URI */
++    entry = storeGetPublicByRequestMethod(http->request, METHOD_GET);
++    if (entry) {
++	debug(88, 4) ("clientPurgeRequest: GET '%s'\n", storeUrl(entry));
++	storeRelease(entry);
++	status = HTTP_OK;
++    }
++    entry = storeGetPublicByRequestMethod(http->request, METHOD_HEAD);
++    if (entry) {
++	debug(88, 4) ("clientPurgeRequest: HEAD '%s'\n", storeUrl(entry));
++	storeRelease(entry);
++	status = HTTP_OK;
++    }
++    /* And for Vary, release the base URI if none of the headers was included in the request */
++    if (http->request->vary_headers
++	&& !strstr(http->request->vary_headers, "=")) {
++	entry = storeGetPublic(urlCanonical(http->request), METHOD_GET);
++	if (entry) {
++	    debug(88, 4) ("clientPurgeRequest: Vary GET '%s'\n",
++		storeUrl(entry));
++	    storeRelease(entry);
++	    status = HTTP_OK;
++	}
++	entry = storeGetPublic(urlCanonical(http->request), METHOD_HEAD);
++	if (entry) {
++	    debug(88, 4) ("clientPurgeRequest: Vary HEAD '%s'\n",
++		storeUrl(entry));
++	    storeRelease(entry);
++	    status = HTTP_OK;
++	}
++    }
++    /*
++     * Make a new entry to hold the reply to be written
++     * to the client.
++     */
++    http->entry =
++	clientCreateStoreEntry(context, http->request->method,
++	null_request_flags);
++    /* And trigger a read of the resultant object */
++    storeClientCopy(context->sc, http->entry, next->readoff, next->readlen,
++	next->readbuf, clientSendMoreData, context);
++    httpReplyReset(r = http->entry->mem_obj->reply);
++    httpBuildVersion(&version, 1, 0);
++    httpReplySetHeaders(r, version, status, NULL, NULL, 0, 0, -1);
++    httpReplySwapOut(r, http->entry);
++    storeComplete(http->entry);
++}
++
++void
++clientTraceReply(clientStreamNode * node, clientReplyContext * context)
++{
++    HttpReply *rep;
++    http_version_t version;
++    clientStreamNode *next = node->node.next->data;
++    assert(context->http->request->max_forwards == 0);
++    context->http->entry =
++	clientCreateStoreEntry(context, context->http->request->method,
++	null_request_flags);
++    storeClientCopy(context->sc, context->http->entry,
++	next->readoff + context->headers_sz, next->readlen, next->readbuf,
++	clientSendMoreData, context);
++    storeReleaseRequest(context->http->entry);
++    storeBuffer(context->http->entry);
++    rep = httpReplyCreate();
++    httpBuildVersion(&version, 1, 0);
++    httpReplySetHeaders(rep, version, HTTP_OK, NULL, "text/plain",
++	httpRequestPrefixLen(context->http->request), 0, squid_curtime);
++    httpReplySwapOut(rep, context->http->entry);
++    httpReplyDestroy(rep);
++    httpRequestSwapOut(context->http->request, context->http->entry);
++    storeComplete(context->http->entry);
++}
++
++#define SENDING_BODY 0
++#define SENDING_HDRSONLY 1
++int
++clientCheckTransferDone(clientHttpRequest const *http)
++{
++    int sending = SENDING_BODY;
++    StoreEntry *entry = http->entry;
++    MemObject *mem;
++    http_reply *reply;
++    int sendlen;
++    if (entry == NULL)
++	return 0;
++    /*  
++     * For now, 'done_copying' is used for special cases like
++     * Range and HEAD requests.
++     */
++    if (http->flags.done_copying)
++	return 1;
++    /*
++     * Handle STORE_OK objects.
++     * objectLen(entry) will be set proprely.
++     * RC: Does objectLen(entry) include the Headers? 
++     */
++    if (entry->store_status == STORE_OK) {
++	if (http->out.offset >= objectLen(entry))
++	    return 1;
++	else
++	    return 0;
++    }
++    /*
++     * Now, handle STORE_PENDING objects
++     */
++    mem = entry->mem_obj;
++    assert(mem != NULL);
++    assert(http->request != NULL);
++    reply = mem->reply;
++    if (reply->hdr_sz == 0)
++	return 0;		/* haven't found end of headers yet */
++    else if (reply->sline.status == HTTP_OK)
++	sending = SENDING_BODY;
++    else if (reply->sline.status == HTTP_NO_CONTENT)
++	sending = SENDING_HDRSONLY;
++    else if (reply->sline.status == HTTP_NOT_MODIFIED)
++	sending = SENDING_HDRSONLY;
++    else if (reply->sline.status < HTTP_OK)
++	sending = SENDING_HDRSONLY;
++    else if (http->request->method == METHOD_HEAD)
++	sending = SENDING_HDRSONLY;
++    else
++	sending = SENDING_BODY;
++    /*
++     * Figure out how much data we are supposed to send.
++     * If we are sending a body and we don't have a content-length,
++     * then we must wait for the object to become STORE_OK.
++     */
++    if (sending == SENDING_HDRSONLY)
++	sendlen = reply->hdr_sz;
++    else if (reply->content_length < 0)
++	return 0;
++    else
++	sendlen = reply->content_length + reply->hdr_sz;
++    /*
++     * Now that we have the expected length, did we send it all?
++     */
++    if (http->out.offset < sendlen)
++	return 0;
++    else
++	return 1;
++}
++
++
++
++int
++clientGotNotEnough(clientHttpRequest const *http)
++{
++    int cl =
++    httpReplyBodySize(http->request->method, http->entry->mem_obj->reply);
++    int hs = http->entry->mem_obj->reply->hdr_sz;
++    assert(cl >= 0);
++    if (http->out.offset < cl + hs)
++	return 1;
++    return 0;
++}
++
++
++/* A write has completed, what is the next status based on the
++ * canonical request data?
++ * 1 something is wrong
++ * 0 nothing is wrong.
++ *
++ */
++int
++clientHttpRequestStatus(int fd, clientHttpRequest const *http)
++{
++#if SIZEOF_SIZE_T == 4
++    if (http->out.size > 0x7FFF0000) {
++	debug(88, 1) ("WARNING: closing FD %d to prevent counter overflow\n",
++	    fd);
++	debug(88, 1) ("\tclient %s\n",
++	    inet_ntoa(http->conn ? http->conn->peer.sin_addr : no_addr));
++	debug(88, 1) ("\treceived %d bytes\n", (int) http->out.size);
++	debug(88, 1) ("\tURI %s\n", http->log_uri);
++	return 1;
++    }
++#endif
++#if SIZEOF_OFF_T == 4
++    if (http->out.offset > 0x7FFF0000) {
++	debug(88, 1) ("WARNING: closing FD %d to prevent counter overflow\n",
++	    fd);
++	debug(88, 1) ("\tclient %s\n",
++	    inet_ntoa(http->conn ? http->conn->peer.sin_addr : no_addr));
++	debug(88, 1) ("\treceived %d bytes (offset %d)\n", (int) http->out.size,
++	    (int) http->out.offset);
++	debug(88, 1) ("\tURI %s\n", http->log_uri);
++	return 1;
++    }
++#endif
++    return 0;
++}
++
++/* Preconditions: 
++ * *http is a valid structure.
++ * fd is either -1, or an open fd.
++ *
++ * TODO: enumify this
++ *
++ * This function is used by any http request sink, to determine the status
++ * of the object.
++ */
++clientStream_status_t
++clientReplyStatus(clientStreamNode * this, clientHttpRequest * http)
++{
++    clientReplyContext *context = this->data;
++    int done;
++    /* Here because lower nodes don't need it */
++    if (http->entry == NULL)
++	return STREAM_FAILED;	/* yuck, but what can we do? */
++    if (EBIT_TEST(http->entry->flags, ENTRY_ABORTED))
++	/* TODO: Could upstream read errors (retsize < 0) be
++	 * lost, and result in undersize requests being considered
++	 * complete. Should we tcp reset such connections ?
++	 */
++	return STREAM_FAILED;
++    if ((done = clientCheckTransferDone(http)) != 0 || context->flags.complete) {
++	debug(88, 5) ("clientReplyStatus: transfer is DONE\n");
++	/* Ok we're finished, but how? */
++	if (httpReplyBodySize(http->request->method,
++		http->entry->mem_obj->reply) < 0) {
++	    debug(88, 5) ("clientWriteComplete: closing, content_length < 0\n");
++	    return STREAM_FAILED;
++	} else if (!done) {
++	    debug(88, 5) ("clientWriteComplete: closing, !done, but read 0 bytes\n");
++	    return STREAM_FAILED;
++	} else if (clientGotNotEnough(http)) {
++	    debug(88, 5) ("clientWriteComplete: client didn't get all it expected\n");
++	    return STREAM_UNPLANNED_COMPLETE;
++	} else if (http->request->flags.proxy_keepalive) {
++	    return STREAM_COMPLETE;
++	}
++	return STREAM_UNPLANNED_COMPLETE;
++
++    }
++    if (clientReplyBodyTooLarge(http->entry->mem_obj->reply, http->out.offset))
++	return STREAM_FAILED;
++    return STREAM_NONE;
++}
++
++/* Responses with no body will not have a content-type header, 
++ * which breaks the rep_mime_type acl, which
++ * coincidentally, is the most common acl for reply access lists.
++ * A better long term fix for this is to allow acl matchs on the various
++ * status codes, and then supply a default ruleset that puts these 
++ * codes before any user defines access entries. That way the user 
++ * can choose to block these responses where appropriate, but won't get
++ * mysterious breakages.
++ */
++static int
++clientAlwaysAllowResponse(http_status sline)
++{
++    switch (sline) {
++    case HTTP_CONTINUE:
++    case HTTP_SWITCHING_PROTOCOLS:
++    case HTTP_PROCESSING:
++    case HTTP_NO_CONTENT:
++    case HTTP_NOT_MODIFIED:
++	return 1;
++	/* unreached */
++	break;
++    default:
++	return 0;
++    }
++}
++
++/*
++ * filters out unwanted entries from original reply header
++ * adds extra entries if we have more info than origin server
++ * adds Squid specific entries
++ */
++static void
++clientBuildReplyHeader(clientHttpRequest * http, HttpReply * rep)
++{
++    HttpHeader *hdr = &rep->header;
++    int is_hit = isTcpHit(http->log_type);
++    request_t *request = http->request;
++#if DONT_FILTER_THESE
++    /* but you might want to if you run Squid as an HTTP accelerator */
++    /* httpHeaderDelById(hdr, HDR_ACCEPT_RANGES); */
++    httpHeaderDelById(hdr, HDR_ETAG);
++#endif
++    httpHeaderDelById(hdr, HDR_PROXY_CONNECTION);
++    /* here: Keep-Alive is a field-name, not a connection directive! */
++    httpHeaderDelByName(hdr, "Keep-Alive");
++    /* remove Set-Cookie if a hit */
++    if (is_hit)
++	httpHeaderDelById(hdr, HDR_SET_COOKIE);
++    /* handle Connection header */
++    if (httpHeaderHas(hdr, HDR_CONNECTION)) {
++	/* anything that matches Connection list member will be deleted */
++	String strConnection = httpHeaderGetList(hdr, HDR_CONNECTION);
++	const HttpHeaderEntry *e;
++	HttpHeaderPos pos = HttpHeaderInitPos;
++	/*
++	 * think: on-average-best nesting of the two loops (hdrEntry
++	 * and strListItem) @?@
++	 */
++	/*
++	 * maybe we should delete standard stuff ("keep-alive","close")
++	 * from strConnection first?
++	 */
++	while ((e = httpHeaderGetEntry(hdr, &pos))) {
++	    if (strListIsMember(&strConnection, strBuf(e->name), ','))
++		httpHeaderDelAt(hdr, pos);
++	}
++	httpHeaderDelById(hdr, HDR_CONNECTION);
++	stringClean(&strConnection);
++    }
++    /*
++     * Add a estimated Age header on cache hits.
++     */
++    if (is_hit) {
++	/*
++	 * Remove any existing Age header sent by upstream caches
++	 * (note that the existing header is passed along unmodified
++	 * on cache misses)
++	 */
++	httpHeaderDelById(hdr, HDR_AGE);
++	/*
++	 * This adds the calculated object age. Note that the details of the
++	 * age calculation is performed by adjusting the timestamp in
++	 * storeTimestampsSet(), not here.
++	 *
++	 * BROWSER WORKAROUND: IE sometimes hangs when receiving a 0 Age
++	 * header, so don't use it unless there is a age to report. Please
++	 * note that Age is only used to make a conservative estimation of
++	 * the objects age, so a Age: 0 header does not add any useful
++	 * information to the reply in any case.
++	 */
++	if (NULL == http->entry)
++	    (void) 0;
++	else if (http->entry->timestamp < 0)
++	    (void) 0;
++	else if (http->entry->timestamp < squid_curtime)
++	    httpHeaderPutInt(hdr, HDR_AGE,
++		squid_curtime - http->entry->timestamp);
++    }
++    /* Handle authentication headers */
++    if (request->auth_user_request)
++	authenticateFixHeader(rep, request->auth_user_request, request,
++	    http->flags.accel, 0);
++    /* Append X-Cache */
++    httpHeaderPutStrf(hdr, HDR_X_CACHE, "%s from %s",
++	is_hit ? "HIT" : "MISS", getMyHostname());
++#if USE_CACHE_DIGESTS
++    /* Append X-Cache-Lookup: -- temporary hack, to be removed @?@ @?@ */
++    httpHeaderPutStrf(hdr, HDR_X_CACHE_LOOKUP, "%s from %s:%d",
++	context->lookup_type ? context->lookup_type : "NONE",
++	getMyHostname(), getMyPort());
++#endif
++    if (httpReplyBodySize(request->method, rep) < 0) {
++	debug(88,
++	    3)
++	    ("clientBuildReplyHeader: can't keep-alive, unknown body size\n");
++	request->flags.proxy_keepalive = 0;
++    }
++    /* Signal keep-alive if needed */
++    httpHeaderPutStr(hdr,
++	http->flags.accel ? HDR_CONNECTION : HDR_PROXY_CONNECTION,
++	request->flags.proxy_keepalive ? "keep-alive" : "close");
++#if ADD_X_REQUEST_URI
++    /*
++     * Knowing the URI of the request is useful when debugging persistent
++     * connections in a client; we cannot guarantee the order of http headers,
++     * but X-Request-URI is likely to be the very last header to ease use from a
++     * debugger [hdr->entries.count-1].
++     */
++    httpHeaderPutStr(hdr, HDR_X_REQUEST_URI,
++	http->entry->mem_obj->url ? http->entry->mem_obj->url : http->uri);
++#endif
++    httpHdrMangleList(hdr, request);
++}
++
++
++static HttpReply *
++clientBuildReply(clientHttpRequest * http, const char *buf, size_t size)
++{
++    HttpReply *rep = httpReplyCreate();
++    size_t k = headersEnd(buf, size);
++    if (k && httpReplyParse(rep, buf, k)) {
++	/* enforce 1.0 reply version */
++	httpBuildVersion(&rep->sline.version, 1, 0);
++	/* do header conversions */
++	clientBuildReplyHeader(http, rep);
++    } else {
++	/* parsing failure, get rid of the invalid reply */
++	httpReplyDestroy(rep);
++	rep = NULL;
++    }
++    return rep;
++}
++
++static log_type
++clientIdentifyStoreObject(clientHttpRequest * http)
++{
++    request_t *r = http->request;
++    StoreEntry *e;
++    if (r->flags.cachable || r->flags.internal)
++	e = http->entry = storeGetPublicByRequest(r);
++    else
++	e = http->entry = NULL;
++    /* Release negatively cached IP-cache entries on reload */
++    if (r->flags.nocache)
++	ipcacheInvalidate(r->host);
++#if HTTP_VIOLATIONS
++    else if (r->flags.nocache_hack)
++	ipcacheInvalidate(r->host);
++#endif
++#if USE_CACHE_DIGESTS
++    context->lookup_type = e ? "HIT" : "MISS";
++#endif
++    if (NULL == e) {
++	/* this object isn't in the cache */
++	debug(85, 3) ("clientProcessRequest2: storeGet() MISS\n");
++	return LOG_TCP_MISS;
++    }
++    if (Config.onoff.offline) {
++	debug(85, 3) ("clientProcessRequest2: offline HIT\n");
++	http->entry = e;
++	return LOG_TCP_HIT;
++    }
++    if (http->redirect.status) {
++	/* force this to be a miss */
++	http->entry = NULL;
++	return LOG_TCP_MISS;
++    }
++    if (!storeEntryValidToSend(e)) {
++	debug(85, 3) ("clientProcessRequest2: !storeEntryValidToSend MISS\n");
++	http->entry = NULL;
++	return LOG_TCP_MISS;
++    }
++    if (EBIT_TEST(e->flags, ENTRY_SPECIAL)) {
++	/* Special entries are always hits, no matter what the client says */
++	debug(85, 3) ("clientProcessRequest2: ENTRY_SPECIAL HIT\n");
++	http->entry = e;
++	return LOG_TCP_HIT;
++    }
++#if HTTP_VIOLATIONS
++    if (e->store_status == STORE_PENDING) {
++	if (r->flags.nocache || r->flags.nocache_hack) {
++	    debug(85, 3) ("Clearing no-cache for STORE_PENDING request\n\t%s\n",
++		storeUrl(e));
++	    r->flags.nocache = 0;
++	    r->flags.nocache_hack = 0;
++	}
++    }
++#endif
++    if (r->flags.nocache) {
++	debug(85, 3) ("clientProcessRequest2: no-cache REFRESH MISS\n");
++	http->entry = NULL;
++	return LOG_TCP_CLIENT_REFRESH_MISS;
++    }
++    /* We don't cache any range requests (for now!) -- adrian */
++    if (r->flags.range) {
++	http->entry = NULL;
++	return LOG_TCP_MISS;
++    }
++    debug(85, 3) ("clientProcessRequest2: default HIT\n");
++    http->entry = e;
++    return LOG_TCP_HIT;
++}
++
++/* Request more data from the store for the client Stream
++ * This is *the* entry point to this module.
++ *
++ * Preconditions:
++ * This is the head of the list.
++ * There is at least one more node.
++ * data context is not null
++ */
++void
++clientGetMoreData(clientStreamNode * this, clientHttpRequest * http)
++{
++    clientStreamNode *next;
++    clientReplyContext *context;
++    /* Test preconditions */
++    assert(this != NULL);
++    assert(cbdataReferenceValid(this));
++    assert(this->data != NULL);
++    assert(this->node.prev == NULL);
++    assert(this->node.next != NULL);
++    context = this->data;
++    assert(context->http == http);
++
++    next = this->node.next->data;
++    if (!context->ourNode)
++	context->ourNode = this;	/* no cbdatareference, this is only used once, and safely */
++    if (context->flags.storelogiccomplete) {
++	storeClientCopy(context->sc, http->entry,
++	    next->readoff + context->headers_sz, next->readlen, next->readbuf,
++	    clientSendMoreData, context);
++	return;
++    }
++    if (context->http->request->method == METHOD_PURGE) {
++	clientPurgeRequest(context);
++	return;
++    }
++    if (context->http->request->method == METHOD_TRACE) {
++	if (context->http->request->max_forwards == 0) {
++	    clientTraceReply(this, context);
++	    return;
++	}
++	/* continue forwarding, not finished yet. */
++	http->log_type = LOG_TCP_MISS;
++    } else
++	http->log_type = clientIdentifyStoreObject(http);
++    /* We still have to do store logic processing - vary, cache hit etc */
++    if (context->http->entry != NULL) {
++	/* someone found the object in the cache for us */
++	storeLockObject(context->http->entry);
++	if (context->http->entry->mem_obj == NULL) {
++	    /*
++	     * This if-block exists because we don't want to clobber
++	     * a preexiting mem_obj->method value if the mem_obj
++	     * already exists.  For example, when a HEAD request
++	     * is a cache hit for a GET response, we want to keep
++	     * the method as GET.
++	     */
++	    storeCreateMemObject(context->http->entry, context->http->uri,
++		context->http->log_uri);
++	    context->http->entry->mem_obj->method =
++		context->http->request->method;
++	}
++	context->sc = storeClientListAdd(context->http->entry, context);
++#if DELAY_POOLS
++	delaySetStoreClient(context->http->sc, delayClient(context->http));
++#endif
++	assert(context->http->log_type == LOG_TCP_HIT);
++	context->reqofs = 0;
++	assert(http->out.offset == http->out.size && http->out.offset == 0);
++	storeClientCopy(context->sc, http->entry,
++	    context->reqofs,
++	    next->readlen, next->readbuf, clientCacheHit, context);
++    } else {
++	/* MISS CASE, http->log_type is already set! */
++	clientProcessMiss(context);
++    }
++}
++
++/* the next node has removed itself from the stream. */
++void
++clientReplyDetach(clientStreamNode * node, clientHttpRequest * http)
++{
++    /* detach from the stream */
++    /* NB: This cbdataFrees our context,
++     * so the clientSendMoreData callback (if any)
++     * pending in the store will not trigger
++     */
++    clientStreamDetach(node, http);
++}
++
++/*
++ * accepts chunk of a http message in buf, parses prefix, filters headers and
++ * such, writes processed message to the message recipient
++ */
++void
++clientSendMoreData(void *data, char *retbuf, ssize_t retsize)
++{
++    clientReplyContext *context = data;
++    clientHttpRequest *http = context->http;
++    clientStreamNode *next = http->client_stream.head->next->data;
++    StoreEntry *entry = http->entry;
++    ConnStateData *conn = http->conn;
++    int fd = conn ? conn->fd : -1;
++    HttpReply *rep = NULL;
++    char *buf = next->readbuf;
++    const char *body_buf = buf;
++    ssize_t size = context->reqofs + retsize;
++    ssize_t body_size = size;
++
++    if (buf != retbuf) {
++	/* we've got to copy some data */
++	assert(retsize <= next->readlen);
++	xmemcpy(buf, retbuf, retsize);
++	body_buf = buf;
++    }
++    /* We've got the final data to start pushing... */
++    context->flags.storelogiccomplete = 1;
++
++    debug(88, 5) ("clientSendMoreData: %s, %d bytes (%d new bytes)\n",
++	http->uri, (int) size, retsize);
++    assert(size <= HTTP_REQBUF_SZ);
++    assert(http->request != NULL);
++    /* ESI TODO: remove this assert once everything is stable */
++    assert(http->client_stream.head->data
++	&& cbdataReferenceValid(http->client_stream.head->data));
++    dlinkDelete(&http->active, &ClientActiveRequests);
++    dlinkAdd(http, &http->active, &ClientActiveRequests);
++    debug(88, 5) ("clientSendMoreData: FD %d '%s', out.offset=%ld \n",
++	fd, storeUrl(entry), (long int) http->out.offset);
++    /* update size of the request */
++    context->reqsize = size;
++    if (http->request->flags.reset_tcp) {
++	/* yuck. FIXME: move to client_side.c */
++	if (fd != -1)
++	    comm_reset_close(fd);
++	return;
++    } else if (			/* aborted request */
++	    (entry && EBIT_TEST(entry->flags, ENTRY_ABORTED)) ||
++	/* Upstream read error */ (retsize < 0) ||
++	/* Upstream EOF */ (body_size == 0)) {
++	/* call clientWriteComplete so the client socket gets closed */
++	/* We call into the stream, because we don't know that there is a
++	 * client socket!
++	 */
++	context->flags.complete = 1;
++	clientStreamCallback(http->client_stream.head->data, http, NULL, NULL,
++	    0);
++	/* clientWriteComplete(fd, NULL, 0, COMM_OK, http); */
++	return;
++    }
++    /* FIXME: Adrian says this is a dodgy artifact from the rearrangement of
++     * HEAD and may not be true for pipelining.
++     * */
++    if (http->out.offset != 0) {
++	if (retsize == 0)
++	    context->flags.complete = 1;
++	clientStreamCallback(http->client_stream.head->data, http, NULL, buf,
++	    size);
++	return;
++    }
++    /* handle headers */
++    if (Config.onoff.log_mime_hdrs) {
++	size_t k;
++	if ((k = headersEnd(buf, size))) {
++	    safe_free(http->al.headers.reply);
++	    http->al.headers.reply = xcalloc(k + 1, 1);
++	    xstrncpy(http->al.headers.reply, buf, k);
++	}
++    }
++    rep = clientBuildReply(http, buf, size);
++    if (rep) {
++	aclCheck_t *ch;
++	int rv;
++	httpReplyBodyBuildSize(http->request, rep, &Config.ReplyBodySize);
++	if (clientReplyBodyTooLarge(rep, rep->content_length)) {
++	    ErrorState *err =
++	    clientBuildError(ERR_TOO_BIG, HTTP_FORBIDDEN, NULL,
++		http->conn ? &http->conn->peer.sin_addr : &no_addr,
++		http->request);
++	    clientStreamNode *next;
++	    clientRemoveStoreReference(context, &context->sc, &http->entry);
++	    http->entry = clientCreateStoreEntry(context, http->request->method,
++		null_request_flags);
++	    /* And trigger a read of the resultant object */
++	    next = http->client_stream.head->next->data;
++	    storeClientCopy(context->sc, http->entry, next->readoff,
++		next->readlen, next->readbuf, clientSendMoreData, context);
++	    errorAppendEntry(http->entry, err);
++	    httpReplyDestroy(rep);
++	    return;
++	}
++	context->headers_sz = rep->hdr_sz;
++	body_size = size - rep->hdr_sz;
++	assert(body_size >= 0);
++	body_buf = buf + rep->hdr_sz;
++	debug(88,
++	    3)
++	    ("clientSendMoreData: Appending %d bytes after %d bytes of headers\n",
++	    (int) body_size, rep->hdr_sz);
++	ch = aclChecklistCreate(Config.accessList.reply, http->request, NULL);
++	ch->reply = rep;
++	rv = aclCheckFast(Config.accessList.reply, ch);
++	aclChecklistFree(ch);
++	ch = NULL;
++	debug(88, 2) ("The reply for %s %s is %s, because it matched '%s'\n",
++	    RequestMethodStr[http->request->method], http->uri,
++	    rv ? "ALLOWED" : "DENIED",
++	    AclMatchedName ? AclMatchedName : "NO ACL's");
++	if (!rv && rep->sline.status != HTTP_FORBIDDEN
++	    && !clientAlwaysAllowResponse(rep->sline.status)) {
++	    /* the if above is slightly broken, but there is no way
++	     * to tell if this is a squid generated error page, or one from
++	     *  upstream at this point. */
++	    ErrorState *err;
++	    clientStreamNode *next;
++	    err =
++		clientBuildError(ERR_ACCESS_DENIED, HTTP_FORBIDDEN, NULL,
++		http->conn ? &http->conn->peer.sin_addr : &no_addr,
++		http->request);
++	    clientRemoveStoreReference(context, &context->sc, &http->entry);
++	    http->entry = clientCreateStoreEntry(context, http->request->method,
++		null_request_flags);
++	    /* And trigger a read of the resultant object */
++	    next = http->client_stream.head->next->data;
++	    storeClientCopy(context->sc, http->entry, next->readoff,
++		next->readlen, next->readbuf, clientSendMoreData, context);
++	    errorAppendEntry(http->entry, err);
++	    httpReplyDestroy(rep);
++	    return;
++	}
++    } else if (size < HTTP_REQBUF_SZ && entry->store_status == STORE_PENDING) {
++	/* wait for more to arrive */
++	context->reqofs += retsize;
++	assert(context->reqofs <= HTTP_REQBUF_SZ);
++	/* TODO: copy into the supplied buffer */
++	storeClientCopy(context->sc, entry,
++	    context->reqofs,
++	    next->readlen - context->reqofs,
++	    next->readbuf + context->reqofs, clientSendMoreData, context);
++	return;
++    }
++    if (http->request->method == METHOD_HEAD) {
++	if (rep) {
++	    /* do not forward body for HEAD replies */
++	    /* ESI TODO: Can ESI affect headers on the master document */
++	    body_size = 0;
++	    http->flags.done_copying = 1;
++	    context->flags.complete = 1;
++	} else {
++	    /*
++	     * If we are here, then store_status == STORE_OK and it
++	     * seems we have a HEAD repsponse which is missing the
++	     * empty end-of-headers line (home.mira.net, phttpd/0.99.72
++	     * does this).  Because clientBuildReply() fails we just
++	     * call this reply a body, set the done_copying flag and
++	     * continue...
++	     */
++	    http->flags.done_copying = 1;
++	    context->flags.complete = 1;
++	}
++    }
++    assert(rep || (body_buf && body_size));
++    /* TODO: move the data in the buffer back by the request header size */
++    clientStreamCallback(http->client_stream.head->data, http, rep, body_buf,
++	body_size);
++}
++
++int
++clientReplyBodyTooLarge(HttpReply * rep, ssize_t clen)
++{
++    if (0 == rep->maxBodySize)
++	return 0;		/* disabled */
++    if (clen < 0)
++	return 0;		/* unknown */
++    if (clen > rep->maxBodySize)
++	return 1;		/* too large */
++    return 0;
++}
++
++/*
++ * returns true if client specified that the object must come from the cache
++ * without contacting origin server
++ */
++static int
++clientOnlyIfCached(clientHttpRequest * http)
++{
++    const request_t *r = http->request;
++    assert(r);
++    return r->cache_control &&
++	EBIT_TEST(r->cache_control->mask, CC_ONLY_IF_CACHED);
++}
++
++/* Using this breaks the client layering just a little!
++ */
++StoreEntry *
++clientCreateStoreEntry(clientReplyContext * context, method_t m,
++    request_flags flags)
++{
++    clientHttpRequest *h = context->http;
++    StoreEntry *e;
++    assert(h != NULL);
++    /*
++     * For erroneous requests, we might not have a h->request,
++     * so make a fake one.
++     */
++    if (h->request == NULL)
++	h->request = requestLink(requestCreate(m, PROTO_NONE, null_string));
++    e = storeCreateEntry(h->uri, h->log_uri, flags, m);
++    context->sc = storeClientListAdd(e, context);
++#if DELAY_POOLS
++    delaySetStoreClient(context->sc, delayClient(h));
++#endif
++    context->reqofs = 0;
++    context->reqsize = 0;
++    /* I don't think this is actually needed! -- adrian */
++    /* h->reqbuf = h->norm_reqbuf; */
++//    assert(h->reqbuf == h->norm_reqbuf);
++    /* The next line is illegal because we don't know if the client stream
++     * buffers have been set up 
++     */
++//    storeClientCopy(h->sc, e, 0, HTTP_REQBUF_SZ, h->reqbuf,
++    //        clientSendMoreData, context);
++    /* So, we mark the store logic as complete */
++    context->flags.storelogiccomplete = 1;
++    /* and get the caller to request a read, from whereever they are */
++    /* NOTE: after ANY data flows down the pipe, even one step, 
++     * this function CAN NOT be used to manage errors 
++     */
++    return e;
++}
++
++ErrorState *
++clientBuildError(err_type page_id, http_status status, char const *url,
++    struct in_addr * src_addr, request_t * request)
++{
++    ErrorState *err = errorCon(page_id, status);
++    err->src_addr = *src_addr;
++    if (url)
++	err->url = xstrdup(url);
++    if (request)
++	err->request = requestLink(request);
++    return err;
++}
+@@ -0,0 +1,598 @@
++
++/*
++ * $Id: client_side_request.cc,v 1.1 2002/09/15 05:41:57 robertc Exp $
++ *
++ * DEBUG: section 85    Client-side Request Routines
++ * AUTHOR: Robert Collins (Originally Duane Wessels in client_side.c)
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sources; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ */
++
++
++/* General logic of request processing:
++ *
++ * We run a series of tests to determine if access will be permitted,
++ * and to do any redirection. Then we call into the result clientStream
++ * to retrieve data. From that point on it's up to reply management.
++ */
++
++#include "squid.h"
++
++#if LINGERING_CLOSE
++#define comm_close comm_lingering_close
++#endif
++
++static const char *const crlf = "\r\n";
++
++typedef struct _clientRequestContext {
++    aclCheck_t *acl_checklist;	/* need ptr back so we can unreg if needed */
++    int redirect_state;
++    clientHttpRequest *http;
++} clientRequestContext;
++
++CBDATA_TYPE(clientRequestContext);
++
++/* Local functions */
++/* clientRequestContext */
++clientRequestContext *clientRequestContextNew(clientHttpRequest *);
++FREE clientRequestContextFree;
++/* other */
++static int checkAccelOnly(clientHttpRequest *);
++static void clientAccessCheckDone(int, void *);
++/*static */ aclCheck_t *clientAclChecklistCreate(const acl_access * acl,
++    const clientHttpRequest * http);
++static int clientCachable(clientHttpRequest * http);
++static int clientHierarchical(clientHttpRequest * http);
++static void clientInterpretRequestHeaders(clientHttpRequest * http);
++static RH clientRedirectDone;
++static void clientCheckNoCache(clientRequestContext * context);
++static void clientCheckNoCacheDone(int answer, void *data);
++void clientProcessRequest(clientHttpRequest *);
++extern CSR clientGetMoreData;
++extern CSS clientReplyStatus;
++extern CSD clientReplyDetach;
++
++void
++clientRequestContextFree(void *data)
++{
++    clientRequestContext *context = data;
++    cbdataReferenceDone(context->http);
++    if (context->acl_checklist)
++	aclChecklistFree(context->acl_checklist);
++}
++
++clientRequestContext *
++clientRequestContextNew(clientHttpRequest * http)
++{
++    clientRequestContext *rv;
++    assert(http != NULL);
++    CBDATA_INIT_TYPE_FREECB(clientRequestContext, clientRequestContextFree);
++    rv = cbdataAlloc(clientRequestContext);
++    rv->http = cbdataReference(http);
++    return rv;
++}
++
++/* Create a request and kick it off */
++/* TODO: Pass in the buffers to be used in the inital Read request,
++ * as they are determined by the user
++ */
++int				/* returns nonzero on failure */
++clientBeginRequest(method_t method, char const *url, CSCB * streamcallback,
++    CSD * streamdetach, void *streamdata, HttpHeader const *header,
++    char *tailbuf, size_t taillen)
++{
++    size_t url_sz;
++    http_version_t http_ver =
++    {1, 0};
++    clientHttpRequest *http = cbdataAlloc(clientHttpRequest);
++    request_t *request;
++    http->http_ver = http_ver;
++    http->conn = NULL;
++    http->start = current_time;
++    /* this is only used to adjust the connection offset in client_side.c */
++    http->req_sz = 0;
++    /* client stream setup */
++    clientStreamInit(&http->client_stream, clientGetMoreData, clientReplyDetach,
++	clientReplyStatus, clientReplyNewContext(http), streamcallback,
++	streamdetach, streamdata, tailbuf, taillen);
++    /* make it visible in the 'current acctive requests list' */
++    dlinkAdd(http, &http->active, &ClientActiveRequests);
++    /* Set flags */
++    http->flags.accel = 1;	/* internal requests only makes sense in an 
++				 * accelerator today. TODO: accept flags ? */
++    /* allow size for url rewriting */
++    url_sz = strlen(url) + Config.appendDomainLen + 5;
++    http->uri = xcalloc(url_sz, 1);
++    strcpy(http->uri, url);
++
++    if ((request = urlParse(method, http->uri)) == NULL) {
++	debug(85, 5) ("Invalid URL: %s\n", http->uri);
++	return -1;
++    }
++    /* now update the headers in request with our supplied headers. 
++     * urLParse should return a blank header set, but we use Update to be sure
++     * of correctness.
++     */
++    if (header)
++	httpHeaderUpdate(&request->header, header, NULL);
++    http->log_uri = xstrdup(urlCanonicalClean(request));
++    /* http struct now ready */
++
++    /* build new header list *?
++     * TODO
++     */
++    request->flags.accelerated = http->flags.accel;
++    request->flags.internalclient = 1;	/* this is an internally created request, not subject
++					 * to acceleration target overrides
++					 */
++    /* FIXME? Do we want to detect and handle internal requests of internal
++     * objects ? */
++
++    /* Internally created requests cannot have bodies today */
++    request->content_length = 0;
++    request->client_addr = no_addr;
++    request->my_addr = no_addr;	/* undefined for internal requests */
++    request->my_port = 0;
++    request->http_ver = http_ver;
++    http->request = requestLink(request);
++
++    /* optional - skip the access check ? */
++    clientAccessCheck(http);
++    return 0;
++}
++
++static int
++checkAccelOnly(clientHttpRequest * http)
++{
++    /* return TRUE if someone makes a proxy request to us and
++     * we are in httpd-accel only mode */
++    if (!Config2.Accel.on)
++	return 0;
++    if (Config.onoff.accel_with_proxy)
++	return 0;
++    if (http->request->protocol == PROTO_CACHEOBJ)
++	return 0;
++    if (http->flags.accel)
++	return 0;
++    if (http->request->method == METHOD_PURGE)
++	return 0;
++    return 1;
++}
++
++aclCheck_t *
++clientAclChecklistCreate(const acl_access * acl, const clientHttpRequest * http)
++{
++    aclCheck_t *ch;
++    ConnStateData *conn = http->conn;
++    ch = aclChecklistCreate(acl, http->request, conn ? conn->rfc931 : dash_str);
++
++    /*
++     * hack for ident ACL. It needs to get full addresses, and a
++     * place to store the ident result on persistent connections...
++     */
++    /* connection oriented auth also needs these two lines for it's operation. */
++    /* Internal requests do not have a connection reference, because:
++     * A) their byte count may be transformed before being applied to an outbound
++     * connection
++     * B) they are internal - any limiting on them should be done on the server end.
++     */
++    if (conn)
++	ch->conn = cbdataReference(conn);	/* unreferenced in acl.c */
++
++    return ch;
++}
++
++/* This is the entry point for external users of the client_side routines */
++void
++clientAccessCheck(void *data)
++{
++    clientHttpRequest *http = data;
++    clientRequestContext *context = clientRequestContextNew(http);
++    if (checkAccelOnly(http)) {
++	/* deny proxy requests in accel_only mode */
++	debug(85,
++	    1) ("clientAccessCheck: proxy request denied in accel_only mode\n");
++	clientAccessCheckDone(ACCESS_DENIED, context);
++	return;
++    }
++    context->acl_checklist =
++	clientAclChecklistCreate(Config.accessList.http, http);
++    aclNBCheck(context->acl_checklist, clientAccessCheckDone, context);
++}
++
++void
++clientAccessCheckDone(int answer, void *data)
++{
++    clientRequestContext *context = data;
++    clientHttpRequest *http = context->http;
++    err_type page_id;
++    http_status status;
++    char *proxy_auth_msg = NULL;
++    debug(85, 2) ("The request %s %s is %s, because it matched '%s'\n",
++	RequestMethodStr[http->request->method], http->uri,
++	answer == ACCESS_ALLOWED ? "ALLOWED" : "DENIED",
++	AclMatchedName ? AclMatchedName : "NO ACL's");
++    proxy_auth_msg = authenticateAuthUserRequestMessage((http->conn
++	    && http->conn->auth_user_request) ? http->conn->
++	auth_user_request : http->request->auth_user_request);
++    context->acl_checklist = NULL;
++    if (answer == ACCESS_ALLOWED) {
++	safe_free(http->uri);
++	http->uri = xstrdup(urlCanonical(http->request));
++	assert(context->redirect_state == REDIRECT_NONE);
++	context->redirect_state = REDIRECT_PENDING;
++	redirectStart(http, clientRedirectDone, context);
++    } else {
++	/* Send an error */
++	clientStreamNode *node = http->client_stream.tail->prev->data;
++	cbdataFree(context);
++	debug(85, 5) ("Access Denied: %s\n", http->uri);
++	debug(85, 5) ("AclMatchedName = %s\n",
++	    AclMatchedName ? AclMatchedName : "<null>");
++	debug(85, 5) ("Proxy Auth Message = %s\n",
++	    proxy_auth_msg ? proxy_auth_msg : "<null>");
++	/*
++	 * NOTE: get page_id here, based on AclMatchedName because
++	 * if USE_DELAY_POOLS is enabled, then AclMatchedName gets
++	 * clobbered in the clientCreateStoreEntry() call
++	 * just below.  Pedro Ribeiro <pribeiro@isel.pt>
++	 */
++	page_id = aclGetDenyInfoPage(&Config.denyInfoList, AclMatchedName);
++	http->log_type = LOG_TCP_DENIED;
++	if (answer == ACCESS_REQ_PROXY_AUTH || aclIsProxyAuth(AclMatchedName)) {
++	    if (!http->flags.accel) {
++		/* Proxy authorisation needed */
++		status = HTTP_PROXY_AUTHENTICATION_REQUIRED;
++	    } else {
++		/* WWW authorisation needed */
++		status = HTTP_UNAUTHORIZED;
++	    }
++	    if (page_id == ERR_NONE)
++		page_id = ERR_CACHE_ACCESS_DENIED;
++	} else {
++	    status = HTTP_FORBIDDEN;
++	    if (page_id == ERR_NONE)
++		page_id = ERR_ACCESS_DENIED;
++	}
++	clientSetReplyToError(node->data, page_id, status,
++	    http->request->method, NULL,
++	    http->conn ? &http->conn->peer.sin_addr : &no_addr, http->request,
++	    NULL, http->conn
++	    && http->conn->auth_user_request ? http->conn->
++	    auth_user_request : http->request->auth_user_request);
++	node = http->client_stream.tail->data;
++	clientStreamRead(node, http, node->readoff, node->readlen,
++	    node->readbuf);
++    }
++}
++
++static int
++clientCachable(clientHttpRequest * http)
++{
++    request_t *req = http->request;
++    method_t method = req->method;
++    if (req->protocol == PROTO_HTTP)
++	return httpCachable(method);
++    /* FTP is always cachable */
++    if (req->protocol == PROTO_WAIS)
++	return 0;
++    /* The below looks questionable: what non HTTP 
++     * protocols use connect, trace, put and post?
++     * RC
++     */
++    if (method == METHOD_CONNECT)
++	return 0;
++    if (method == METHOD_TRACE)
++	return 0;
++    if (method == METHOD_PUT)
++	return 0;
++    if (method == METHOD_POST)
++	return 0;		/* XXX POST may be cached sometimes.. ignored for now */
++    if (req->protocol == PROTO_GOPHER)
++	return gopherCachable(req);
++    if (req->protocol == PROTO_CACHEOBJ)
++	return 0;
++    return 1;
++}
++
++static int
++clientHierarchical(clientHttpRequest * http)
++{
++    const char *url = http->uri;
++    request_t *request = http->request;
++    method_t method = request->method;
++    const wordlist *p = NULL;
++
++    /* IMS needs a private key, so we can use the hierarchy for IMS only
++     * if our neighbors support private keys */
++    if (request->flags.ims && !neighbors_do_private_keys)
++	return 0;
++    /* This is incorrect: authenticating requests
++     * can be sent via a hierarchy (they can even
++     * be cached if the correct headers are set on
++     * the reply
++     */
++    if (request->flags.auth)
++	return 0;
++    if (method == METHOD_TRACE)
++	return 1;
++    if (method != METHOD_GET)
++	return 0;
++    /* scan hierarchy_stoplist */
++    for (p = Config.hierarchy_stoplist; p; p = p->next)
++	if (strstr(url, p->key))
++	    return 0;
++    if (request->flags.loopdetect)
++	return 0;
++    if (request->protocol == PROTO_HTTP)
++	return httpCachable(method);
++    if (request->protocol == PROTO_GOPHER)
++	return gopherCachable(request);
++    if (request->protocol == PROTO_WAIS)
++	return 0;
++    if (request->protocol == PROTO_CACHEOBJ)
++	return 0;
++    return 1;
++}
++
++
++static void
++clientInterpretRequestHeaders(clientHttpRequest * http)
++{
++    request_t *request = http->request;
++    const HttpHeader *req_hdr = &request->header;
++    int no_cache = 0;
++#if !defined(ESI) || defined(USE_USERAGENT_LOG) || defined(USE_REFERER_LOG)
++    const char *str;
++#endif
++    request->imslen = -1;
++    request->ims = httpHeaderGetTime(req_hdr, HDR_IF_MODIFIED_SINCE);
++    if (request->ims > 0)
++	request->flags.ims = 1;
++#if ESI
++    /* We ignore Cache-Control as per the Edge Architecture
++     * Section 3. See www.esi.org for more information.
++     */
++#else
++    if (httpHeaderHas(req_hdr, HDR_PRAGMA)) {
++	String s = httpHeaderGetList(req_hdr, HDR_PRAGMA);
++	if (strListIsMember(&s, "no-cache", ','))
++	    no_cache++;
++	stringClean(&s);
++    }
++    request->cache_control = httpHeaderGetCc(req_hdr);
++    if (request->cache_control)
++	if (EBIT_TEST(request->cache_control->mask, CC_NO_CACHE))
++	    no_cache++;
++    /* Work around for supporting the Reload button in IE browsers
++     * when Squid is used as an accelerator or transparent proxy,
++     * by turning accelerated IMS request to no-cache requests.
++     * Now knows about IE 5.5 fix (is actually only fixed in SP1, 
++     * but we can't tell whether we are talking to SP1 or not so 
++     * all 5.5 versions are treated 'normally').
++     */
++    if (Config.onoff.ie_refresh) {
++	if (http->flags.accel && request->flags.ims) {
++	    if ((str = httpHeaderGetStr(req_hdr, HDR_USER_AGENT))) {
++		if (strstr(str, "MSIE 5.01") != NULL)
++		    no_cache++;
++		else if (strstr(str, "MSIE 5.0") != NULL)
++		    no_cache++;
++		else if (strstr(str, "MSIE 4.") != NULL)
++		    no_cache++;
++		else if (strstr(str, "MSIE 3.") != NULL)
++		    no_cache++;
++	    }
++	}
++    }
++#endif
++    if (no_cache) {
++#if HTTP_VIOLATIONS
++	if (Config.onoff.reload_into_ims)
++	    request->flags.nocache_hack = 1;
++	else if (refresh_nocache_hack)
++	    request->flags.nocache_hack = 1;
++	else
++#endif
++	    request->flags.nocache = 1;
++    }
++    /* ignore range header in non-GETs */
++    if (request->method == METHOD_GET) {
++	/*
++	 * Since we're not doing ranges atm, just set the flag if
++	 * the header exists, and then free the range header info
++	 * -- adrian
++	 */
++	request->range = httpHeaderGetRange(req_hdr);
++	if (request->range) {
++	    request->flags.range = 1;
++	    httpHdrRangeDestroy(request->range);
++	    request->range = NULL;
++	}
++    }
++    if (httpHeaderHas(req_hdr, HDR_AUTHORIZATION))
++	request->flags.auth = 1;
++    if (request->login[0] != '\0')
++	request->flags.auth = 1;
++    if (httpHeaderHas(req_hdr, HDR_VIA)) {
++	String s = httpHeaderGetList(req_hdr, HDR_VIA);
++	/*
++	 * ThisCache cannot be a member of Via header, "1.0 ThisCache" can.
++	 * Note ThisCache2 has a space prepended to the hostname so we don't
++	 * accidentally match super-domains.
++	 */
++	if (strListIsSubstr(&s, ThisCache2, ',')) {
++	    debugObj(33, 1, "WARNING: Forwarding loop detected for:\n",
++		request, (ObjPackMethod) & httpRequestPack);
++	    request->flags.loopdetect = 1;
++	}
++#if FORW_VIA_DB
++	fvdbCountVia(strBuf(s));
++#endif
++	stringClean(&s);
++    }
++#if USE_USERAGENT_LOG
++    if ((str = httpHeaderGetStr(req_hdr, HDR_USER_AGENT)))
++	logUserAgent(fqdnFromAddr(http->conn ? http->conn->log_addr.
++		sin_addr : &noaddr), str);
++#endif
++#if USE_REFERER_LOG
++    if ((str = httpHeaderGetStr(req_hdr, HDR_REFERER)))
++	logReferer(fqdnFromAddr(http->conn ? http->conn->log_addr.
++		sin_addr : &noaddr), str, http->log_uri);
++#endif
++#if FORW_VIA_DB
++    if (httpHeaderHas(req_hdr, HDR_X_FORWARDED_FOR)) {
++	String s = httpHeaderGetList(req_hdr, HDR_X_FORWARDED_FOR);
++	fvdbCountForw(strBuf(s));
++	stringClean(&s);
++    }
++#endif
++    if (request->method == METHOD_TRACE) {
++	request->max_forwards = httpHeaderGetInt(req_hdr, HDR_MAX_FORWARDS);
++    }
++    if (clientCachable(http))
++	request->flags.cachable = 1;
++    if (clientHierarchical(http))
++	request->flags.hierarchical = 1;
++    debug(85, 5) ("clientInterpretRequestHeaders: REQ_NOCACHE = %s\n",
++	request->flags.nocache ? "SET" : "NOT SET");
++    debug(85, 5) ("clientInterpretRequestHeaders: REQ_CACHABLE = %s\n",
++	request->flags.cachable ? "SET" : "NOT SET");
++    debug(85, 5) ("clientInterpretRequestHeaders: REQ_HIERARCHICAL = %s\n",
++	request->flags.hierarchical ? "SET" : "NOT SET");
++}
++
++void
++clientRedirectDone(void *data, char *result)
++{
++    clientRequestContext *context = data;
++    clientHttpRequest *http = context->http;
++    request_t *new_request = NULL;
++    request_t *old_request = http->request;
++    debug(85, 5) ("clientRedirectDone: '%s' result=%s\n", http->uri,
++	result ? result : "NULL");
++    assert(context->redirect_state == REDIRECT_PENDING);
++    context->redirect_state = REDIRECT_DONE;
++    if (result) {
++	http_status status = (http_status) atoi(result);
++	if (status == HTTP_MOVED_PERMANENTLY
++	    || status == HTTP_MOVED_TEMPORARILY) {
++	    char *t = result;
++	    if ((t = strchr(result, ':')) != NULL) {
++		http->redirect.status = status;
++		http->redirect.location = xstrdup(t + 1);
++	    } else {
++		debug(85, 1) ("clientRedirectDone: bad input: %s\n", result);
++	    }
++	}
++	if (strcmp(result, http->uri))
++	    new_request = urlParse(old_request->method, result);
++    }
++    if (new_request) {
++	safe_free(http->uri);
++	http->uri = xstrdup(urlCanonical(new_request));
++	new_request->http_ver = old_request->http_ver;
++	httpHeaderAppend(&new_request->header, &old_request->header);
++	new_request->client_addr = old_request->client_addr;
++	new_request->my_addr = old_request->my_addr;
++	new_request->my_port = old_request->my_port;
++	new_request->flags.redirected = 1;
++	if (old_request->auth_user_request) {
++	    new_request->auth_user_request = old_request->auth_user_request;
++	    authenticateAuthUserRequestLock(new_request->auth_user_request);
++	}
++	if (old_request->body_connection) {
++	    new_request->body_connection = old_request->body_connection;
++	    old_request->body_connection = NULL;
++	}
++	new_request->content_length = old_request->content_length;
++	new_request->flags.proxy_keepalive = old_request->flags.proxy_keepalive;
++	requestUnlink(old_request);
++	http->request = requestLink(new_request);
++    }
++    clientInterpretRequestHeaders(http);
++#if HEADERS_LOG
++    headersLog(0, 1, request->method, request);
++#endif
++    /* FIXME PIPELINE: This is innacurate during pipelining */
++    if (http->conn)
++	fd_note(http->conn->fd, http->uri);
++    clientCheckNoCache(context);
++}
++
++void
++clientCheckNoCache(clientRequestContext * context)
++{
++    clientHttpRequest *http = context->http;
++    if (Config.accessList.noCache && http->request->flags.cachable) {
++	context->acl_checklist =
++	    clientAclChecklistCreate(Config.accessList.noCache, http);
++	aclNBCheck(context->acl_checklist, clientCheckNoCacheDone, context);
++    } else {
++	clientCheckNoCacheDone(http->request->flags.cachable, context);
++    }
++}
++
++void
++clientCheckNoCacheDone(int answer, void *data)
++{
++    clientRequestContext *context = data;
++    clientHttpRequest *http = context->http;
++    http->request->flags.cachable = answer;
++    context->acl_checklist = NULL;
++    cbdataFree(context);
++    clientProcessRequest(http);
++}
++
++/* Identify requests that do not go through the store and client side
++ * stream and forward them to the appropriate location.
++ * All other requests, request them.
++ */
++void
++clientProcessRequest(clientHttpRequest * http)
++{
++    request_t *r = http->request;
++    clientStreamNode *node;
++    debug(85, 4) ("clientProcessRequest: %s '%s'\n",
++	RequestMethodStr[r->method], http->uri);
++    if (r->method == METHOD_CONNECT) {
++	http->log_type = LOG_TCP_MISS;
++	sslStart(http, &http->out.size, &http->al.http.code);
++	return;
++    } else {
++	http->log_type = LOG_TAG_NONE;
++    }
++    debug(85, 4) ("clientProcessRequest: %s for '%s'\n",
++	log_tags[http->log_type], http->uri);
++    /* no one should have touched this */
++    assert(http->out.offset == 0);
++    /* Use the Stream Luke */
++    node = http->client_stream.tail->data;
++    clientStreamRead(node, http, node->readoff, node->readlen, node->readbuf);
++}
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: enums.h,v 1.211 2002/07/21 11:54:02 hno Exp $
++ * $Id: enums.h,v 1.212 2002/09/15 05:41:57 robertc Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -513,6 +513,23 @@ enum {
+ #endif
+ };
+ 
++/*
++ * These are for client Streams. Each node in the stream can be queried for
++ * its status
++ */
++typedef enum {
++    STREAM_NONE,		/* No particular status */
++    STREAM_COMPLETE,		/* All data has been flushed, no more reads allowed */
++    STREAM_UNPLANNED_COMPLETE,	/* an unpredicted end has occured, no more
++				 * reads occured, but no need to tell 
++				 * downstream that an error occured
++				 */
++    STREAM_FAILED		/* An error has occured in this node or an above one,
++				 * and the node is not generating an error body / it's 
++				 * midstream
++				 */
++} clientStream_status_t;
++
+ typedef enum {
+     ACCESS_DENIED,
+     ACCESS_ALLOWED,
+@@ -15,7 +15,7 @@
+ 
+ #  Makefile for storage modules in the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.15 2002/09/02 00:25:10 hno Exp $
++#  $Id: Makefile.in,v 1.16 2002/09/15 05:42:00 robertc Exp $
+ #
+ 
+ SHELL = @SHELL@
+@@ -16,7 +16,7 @@
+ #
+ #  Makefile for the DISKD storage driver for the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.12 2002/09/02 00:25:23 hno Exp $
++#  $Id: Makefile.in,v 1.13 2002/09/15 05:42:01 robertc Exp $
+ #
+ 
+ SHELL = @SHELL@
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: mem.cc,v 1.66 2002/07/20 23:51:03 hno Exp $
++ * $Id: mem.cc,v 1.67 2002/09/15 05:41:57 robertc Exp $
+  *
+  * DEBUG: section 13    High Level Memory Pool Management
+  * AUTHOR: Harvest Derived
+@@ -263,6 +263,7 @@ void *
+ memReallocBuf(void *oldbuf, size_t net_size, size_t * gross_size)
+ {
+     /* XXX This can be optimized on very large buffers to use realloc() */
++    /* TODO: if the existing gross size is >= new gross size, do nothing */
+     int new_gross_size;
+     void *newbuf = memAllocBuf(net_size, &new_gross_size);
+     if (oldbuf) {
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: protos.h,v 1.444 2002/09/07 15:12:56 hno Exp $
++ * $Id: protos.h,v 1.445 2002/09/15 05:41:57 robertc Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -125,6 +125,8 @@ extern int cbdataInternalReferenceDoneValid(void **p, void **tp);
+ extern int cbdataReferenceValid(const void *p);
+ extern cbdata_type cbdataInternalAddType(cbdata_type type, const char *label, int size, FREE * free_func);
+ 
++/* client_side.c - FD related client side routines */
++
+ extern void clientdbInit(void);
+ extern void clientdbUpdate(struct in_addr, log_type, protocol_t, size_t);
+ extern int clientdbCutoffDenied(struct in_addr);
+@@ -133,17 +135,32 @@ extern void clientdbFreeMemory(void);
+ extern int clientdbEstablished(struct in_addr, int);
+ 
+ extern void clientAccessCheck(void *);
+-extern void clientAccessCheckDone(int, void *);
+-extern int modifiedSince(StoreEntry *, request_t *);
+ extern char *clientConstructTraceEcho(clientHttpRequest *);
+-extern void clientPurgeRequest(clientHttpRequest *);
+-extern int checkNegativeHit(StoreEntry *);
+ extern void clientOpenListenSockets(void);
+ extern void clientHttpConnectionsClose(void);
+-extern StoreEntry *clientCreateStoreEntry(clientHttpRequest *, method_t, request_flags);
+ extern int isTcpHit(log_type);
+ extern void clientReadBody(request_t * req, char *buf, size_t size, CBCB * callback, void *data);
+ extern int clientAbortBody(request_t * req);
++extern void httpRequestFree(void *);
++
++/* client_side_request.c - client side request related routines (pure logic) */
++extern int clientBeginRequest(method_t, char const *, CSCB *, CSD *, void *, HttpHeader const *, char *, size_t);
++
++/* client_side_reply.c - client side reply related routines (pure logic, no comms) */
++extern int clientCheckTransferDone(clientHttpRequest const *);
++extern void *clientReplyNewContext(clientHttpRequest *);
++extern int clientHttpRequestStatus(int fd, clientHttpRequest const *http);
++extern void clientSetReplyToError(void *, err_type, http_status, method_t, char const *, struct in_addr *, request_t *, char *, auth_user_request_t * auth_user_request);
++
++/* clientStream.c */
++extern void clientStreamInit(dlink_list *, CSR *, CSD *, CSS *, void *, CSCB *, CSD *, void *, char *, size_t);
++extern void clientStreamInsertHead(dlink_list *, CSR *, CSCB *, CSD *, CSS *, void *);
++extern clientStreamNode *clientStreamNew(CSR *, CSCB *, CSD *, CSS *, void *);
++extern void clientStreamCallback(clientStreamNode *, clientHttpRequest *, HttpReply *, const char *, ssize_t);
++extern void clientStreamRead(clientStreamNode *, clientHttpRequest *, off_t, size_t, char *);
++extern void clientStreamDetach(clientStreamNode *, clientHttpRequest *);
++extern void clientStreamAbort(clientStreamNode *, clientHttpRequest *);
++extern clientStream_status_t clientStreamStatus(clientStreamNode *, clientHttpRequest *);
+ 
+ extern int commSetNonBlocking(int fd);
+ extern int commUnsetNonBlocking(int fd);
+@@ -899,6 +916,7 @@ extern EVH storeMaintainSwapSpace;
+ extern void storeExpireNow(StoreEntry *);
+ extern void storeReleaseRequest(StoreEntry *);
+ extern void storeConfigure(void);
++extern int storeCheckNegativeHit(StoreEntry *);
+ extern void storeNegativeCache(StoreEntry *);
+ extern void storeFreeMemory(void);
+ extern int expiresMoreThan(time_t, time_t);
+@@ -1144,6 +1162,7 @@ extern void asnFreeMemory(void);
+ 
+ /* tools.c */
+ extern void dlinkAdd(void *data, dlink_node *, dlink_list *);
++extern void dlinkAddAfter(void *, dlink_node *, dlink_node *, dlink_list *);
+ extern void dlinkAddTail(void *data, dlink_node *, dlink_list *);
+ extern void dlinkDelete(dlink_node * m, dlink_list * list);
+ extern void dlinkNodeDelete(dlink_node * m);
+@@ -15,7 +15,7 @@
+ 
+ #  Makefile for storage modules in the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.14 2002/09/02 00:26:28 hno Exp $
++#  $Id: Makefile.in,v 1.15 2002/09/15 05:42:02 robertc Exp $
+ #
+ 
+ SHELL = @SHELL@
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: stmem.cc,v 1.70 2001/10/24 08:19:08 hno Exp $
++ * $Id: stmem.cc,v 1.71 2002/09/15 05:41:57 robertc Exp $
+  *
+  * DEBUG: section 19    Store Memory Primitives
+  * AUTHOR: Harvest Derived
+@@ -133,9 +133,10 @@ stmemCopy(const mem_hdr * mem, off_t offset, char *buf, size_t size)
+     char *ptr_to_buf = NULL;
+     int bytes_from_this_packet = 0;
+     int bytes_into_this_packet = 0;
+-    debug(19, 6) ("memCopy: offset %ld: size %d\n", (long int) offset, (int) size);
++    debug(19, 6) ("memCopy: offset %ld: size %u\n", (long int) offset, size);
+     if (p == NULL)
+ 	return 0;
++    /* RC: the next assert is useless */
+     assert(size > 0);
+     /* Seek our way into store */
+     while ((t_off + p->len) < offset) {
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: store.cc,v 1.545 2002/08/15 18:11:48 hno Exp $
++ * $Id: store.cc,v 1.546 2002/09/15 05:41:57 robertc Exp $
+  *
+  * DEBUG: section 20    Storage Manager
+  * AUTHOR: Harvest Derived
+@@ -1039,6 +1039,18 @@ storeKeepInMemory(const StoreEntry * e)
+     return mem->inmem_lo == 0;
+ }
+ 
++int
++storeCheckNegativeHit(StoreEntry * e)
++{
++    if (!EBIT_TEST(e->flags, ENTRY_NEGCACHED))
++	return 0;
++    if (e->expires <= squid_curtime)
++	return 0;
++    if (e->store_status != STORE_OK)
++	return 0;
++    return 1;
++}
++
+ void
+ storeNegativeCache(StoreEntry * e)
+ {
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: store_client.cc,v 1.111 2002/04/21 21:52:47 hno Exp $
++ * $Id: store_client.cc,v 1.112 2002/09/15 05:41:57 robertc Exp $
+  *
+  * DEBUG: section 20    Storage Manager Client-Side Interface
+  * AUTHOR: Duane Wessels
+@@ -491,10 +491,15 @@ storeClientCopyPending(store_client * sc, StoreEntry * e, void *data)
+ {
+ #if STORE_CLIENT_LIST_DEBUG
+     assert(sc == storeClientListSearch(e->mem_obj, data));
++#endif
++#ifndef SILLY_CODE
++    assert(sc);
+ #endif
+     assert(sc->entry == e);
++#if SILLY_CODE
+     if (sc == NULL)
+ 	return 0;
++#endif
+     if (sc->callback == NULL)
+ 	return 0;
+     return 1;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: structs.h,v 1.428 2002/09/10 09:54:53 hno Exp $
++ * $Id: structs.h,v 1.429 2002/09/15 05:41:57 robertc Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -1048,13 +1048,22 @@ struct _AccessLogEntry {
+     HierarchyLogEntry hier;
+ };
+ 
++struct _clientStreamNode {
++    dlink_node node;
++    dlink_list *head;		/* sucks I know, but hey, the interface is limited */
++    CSR *readfunc;
++    CSCB *callback;
++    CSD *detach;		/* tell this node the next one downstream wants no more data */
++    CSS *status;
++    void *data;			/* Context for the node */
++    char *readbuf;		/* where *this* node wants its data returned; */
++    size_t readlen;		/* how much data *this* node can handle */
++    off_t readoff;		/* where *this* node wants it's data read from in the stream */
++};
++
+ struct _clientHttpRequest {
+     ConnStateData *conn;
+     request_t *request;		/* Parsed URL ... */
+-    store_client *sc;		/* The store_client we're using */
+-    store_client *old_sc;	/* ... for entry to be validated */
+-    int old_reqofs;		/* ... for the buffer */
+-    int old_reqsize;		/* ... again, for the buffer */
+     char *uri;
+     char *log_uri;
+     struct {
+@@ -1066,14 +1075,8 @@ struct _clientHttpRequest {
+     StoreEntry *entry;
+     StoreEntry *old_entry;
+     log_type log_type;
+-#if USE_CACHE_DIGESTS
+-    const char *lookup_type;	/* temporary hack: storeGet() result: HIT/MISS/NONE */
+-#endif
+     struct timeval start;
+     http_version_t http_ver;
+-    int redirect_state;
+-    aclCheck_t *acl_checklist;	/* need ptr back so we can unreg if needed */
+-    clientHttpRequest *next;
+     AccessLogEntry al;
+     struct {
+ 	unsigned int accel:1;
+@@ -1086,11 +1089,7 @@ struct _clientHttpRequest {
+ 	char *location;
+     } redirect;
+     dlink_node active;
+-    char norm_reqbuf[HTTP_REQBUF_SZ];	/* For 'normal requests' */
+-    char ims_reqbuf[HTTP_REQBUF_SZ];	/* For 'ims' requests */
+-    char *reqbuf;
+-    int reqofs;
+-    int reqsize;
++    dlink_list client_stream;
+ };
+ 
+ struct _ConnStateData {
+@@ -1113,7 +1112,7 @@ struct _ConnStateData {
+     /* note this is ONLY connection based because NTLM is against HTTP spec */
+     /* the user details for connection based authentication */
+     auth_user_request_t *auth_user_request;
+-    clientHttpRequest *chr;
++    void *currentobject;	/* used by the owner of the connection. Opaque otherwise */
+     struct sockaddr_in peer;
+     struct sockaddr_in me;
+     struct in_addr log_addr;
+@@ -1623,6 +1622,7 @@ struct _request_flags {
+ #endif
+     unsigned int accelerated:1;
+     unsigned int internal:1;
++    unsigned int internalclient:1;
+     unsigned int body_sent:1;
+     unsigned int reset_tcp:1;
+ };
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: tools.cc,v 1.223 2002/09/07 15:12:56 hno Exp $
++ * $Id: tools.cc,v 1.224 2002/09/15 05:41:57 robertc Exp $
+  *
+  * DEBUG: section 21    Misc Functions
+  * AUTHOR: Harvest Derived
+@@ -806,6 +806,21 @@ dlinkAdd(void *data, dlink_node * m, dlink_list * list)
+ 	list->tail = m;
+ }
+ 
++void
++dlinkAddAfter(void *data, dlink_node * m, dlink_node * n, dlink_list * list)
++{
++    m->data = data;
++    m->prev = n;
++    m->next = n->next;
++    if (n->next)
++	n->next->prev = m;
++    else {
++	assert(list->tail == n);
++	list->tail = m;
++    }
++    n->next = m;
++}
++
+ void
+ dlinkAddTail(void *data, dlink_node * m, dlink_list * list)
+ {
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: typedefs.h,v 1.134 2002/06/23 13:32:25 hno Exp $
++ * $Id: typedefs.h,v 1.135 2002/09/15 05:41:57 robertc Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -97,6 +97,8 @@ typedef struct _HttpHdrCc HttpHdrCc;
+ typedef struct _HttpHdrRangeSpec HttpHdrRangeSpec;
+ typedef struct _HttpHdrRange HttpHdrRange;
+ typedef struct _HttpHdrRangeIter HttpHdrRangeIter;
++typedef struct _HttpHdrSc HttpHdrSc;
++typedef struct _HttpHdrScTarget HttpHdrScTarget;
+ typedef struct _HttpHdrContRange HttpHdrContRange;
+ typedef struct _TimeOrTag TimeOrTag;
+ typedef struct _HttpHeaderEntry HttpHeaderEntry;
+@@ -106,6 +108,7 @@ typedef struct _HttpBody HttpBody;
+ typedef struct _HttpReply HttpReply;
+ typedef struct _HttpStateData HttpStateData;
+ typedef struct _icpUdpData icpUdpData;
++typedef struct _clientStreamNode clientStreamNode;
+ typedef struct _clientHttpRequest clientHttpRequest;
+ typedef struct _ConnStateData ConnStateData;
+ typedef struct _ConnCloseHelperData ConnCloseHelperData;
+@@ -197,6 +200,15 @@ typedef struct _delaySpecSet delaySpecSet;
+ typedef struct _delaySpec delaySpec;
+ #endif
+ 
++/* client_side.c callbacks and callforwards */
++/* client stream read callback */
++typedef void CSCB(clientStreamNode *, clientHttpRequest *, HttpReply *, const char *, ssize_t);
++/* client stream read */
++typedef void CSR(clientStreamNode *, clientHttpRequest *);
++/* client stream detach */
++typedef void CSD(clientStreamNode *, clientHttpRequest *);
++typedef clientStream_status_t CSS(clientStreamNode *, clientHttpRequest *);
++
+ typedef void CWCB(int fd, char *, size_t size, int flag, void *data);
+ typedef void CNCB(int fd, int status, void *);
+ 

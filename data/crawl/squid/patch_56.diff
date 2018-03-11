@@ -1,827 +1,155 @@
-@@ -238,6 +238,22 @@ HttpHeader::append(const HttpHeader * src)
+@@ -946,10 +946,6 @@ configDoConfigure(void)
+         }
      }
+ #endif
+-
+-    if (Config.readAheadGap <= 0) {
+-        fatalf("read_ahead_gap must be greater than 0 bytes");
+-    }
  }
  
-+/// check whether the fresh header has any new/changed updatable fields
-+bool
-+HttpHeader::needUpdate(HttpHeader const *fresh) const
-+{
-+    for (const auto e: fresh->entries) {
-+        if (skipUpdateHeader(e->id))
-+            continue;
-+        String value;
-+        const char *name = e->name.termedBuf();
-+        if (!getByNameIfPresent(name, strlen(name), value) ||
-+                (value != fresh->getByName(name)))
-+            return true;
-+    }
-+    return false;
-+}
-+
- void
- HttpHeader::updateWarnings()
- {
-@@ -258,16 +274,22 @@ HttpHeader::skipUpdateHeader(const Http::HdrType id) const
-     return id == Http::HdrType::WARNING;
- }
- 
--void
-+bool
- HttpHeader::update(HttpHeader const *fresh)
- {
--    const HttpHeaderEntry *e;
--    HttpHeaderPos pos = HttpHeaderInitPos;
-     assert(fresh);
-     assert(this != fresh);
- 
-+    // Optimization: Finding whether a header field changed is expensive
-+    // and probably not worth it except for collapsed revalidation needs.
-+    if (Config.onoff.collapsed_forwarding && !needUpdate(fresh))
-+        return false;
-+
-     updateWarnings();
- 
-+    const HttpHeaderEntry *e;
-+    HttpHeaderPos pos = HttpHeaderInitPos;
-+
-     while ((e = fresh->getEntry(&pos))) {
-         /* deny bad guys (ok to check for Http::HdrType::OTHER) here */
- 
-@@ -291,6 +313,7 @@ HttpHeader::update(HttpHeader const *fresh)
- 
-         addEntry(e->clone());
-     }
-+    return true;
- }
- 
- int
-@@ -81,7 +81,7 @@ class HttpHeader
-     /* Interface functions */
-     void clean();
-     void append(const HttpHeader * src);
--    void update(HttpHeader const *fresh);
-+    bool update(HttpHeader const *fresh);
-     void compact();
-     int parse(const char *header_start, size_t len);
-     void packInto(Packable * p, bool mask_sensitive_info=false) const;
-@@ -145,6 +145,7 @@ class HttpHeader
- protected:
-     /** \deprecated Public access replaced by removeHopByHopEntries() */
-     void removeConnectionHeaderEntries();
-+    bool needUpdate(const HttpHeader *fresh) const;
-     bool skipUpdateHeader(const Http::HdrType id) const;
-     void updateWarnings();
- 
-@@ -235,19 +235,23 @@ HttpReply::validatorsMatch(HttpReply const * otherRep) const
-     return 1;
- }
- 
--void
-+bool
- HttpReply::updateOnNotModified(HttpReply const * freshRep)
- {
-     assert(freshRep);
- 
-+    /* update raw headers */
-+    if (!header.update(&freshRep->header))
-+        return false;
-+
-     /* clean cache */
-     hdrCacheClean();
--    /* update raw headers */
--    header.update(&freshRep->header);
- 
-     header.compact();
-     /* init cache */
-     hdrCacheInit();
-+
-+    return true;
- }
- 
- /* internal routines */
-@@ -72,7 +72,7 @@ class HttpReply: public HttpMsg
- 
-     virtual bool inheritProperties(const HttpMsg *aMsg);
- 
--    void updateOnNotModified(HttpReply const *other);
-+    bool updateOnNotModified(HttpReply const *other);
- 
-     /** set commonly used info with one call */
-     void setHeaders(Http::StatusCode status,
-@@ -63,6 +63,7 @@ class MemStore: public Store::Controlled, public Ipc::StoreMapCleaner
-     virtual bool updateCollapsed(StoreEntry &e) override;
-     virtual void markForUnlink(StoreEntry &) override;
-     virtual void unlink(StoreEntry &e) override;
-+    virtual bool smpAware() const override { return true; }
- 
-     static int64_t EntryLimit();
- 
-@@ -82,9 +82,13 @@ class StoreEntry : public hash_link, public Packable
-     void swapOutDecision(const MemObject::SwapOut::Decision &decision);
- 
-     void abort();
--    void makePublic();
-+    void makePublic(const KeyScope keyScope = ksDefault);
-     void makePrivate();
--    void setPublicKey();
-+    void setPublicKey(const KeyScope keyScope = ksDefault);
-+    /// Resets existing public key to a public key with default scope,
-+    /// releasing the old default-scope entry (if any).
-+    /// Does nothing if the existing public key already has default scope.
-+    void clearPublicKeyScope();
-     void setPrivateKey();
-     void expireNow();
-     void releaseRequest();
-@@ -119,7 +123,7 @@ class StoreEntry : public hash_link, public Packable
-     void registerAbort(STABH * cb, void *);
-     void reset();
-     void setMemStatus(mem_status_t);
--    void timestampsSet();
-+    bool timestampsSet();
-     void unregisterAbort();
-     void destroyMemObject();
-     int checkTooSmall();
-@@ -217,6 +221,9 @@ class StoreEntry : public hash_link, public Packable
- 
- private:
-     bool checkTooBig() const;
-+    void forcePublicKey(const cache_key *newkey);
-+    void adjustVary();
-+    const cache_key *calcPublicKey(const KeyScope keyScope);
- 
-     static MemAllocator *pool;
- 
-@@ -286,10 +293,10 @@ void storeEntryReplaceObject(StoreEntry *, HttpReply *);
- StoreEntry *storeGetPublic(const char *uri, const HttpRequestMethod& method);
- 
- /// \ingroup StoreAPI
--StoreEntry *storeGetPublicByRequest(HttpRequest * request);
-+StoreEntry *storeGetPublicByRequest(HttpRequest * request, const KeyScope keyScope = ksDefault);
- 
- /// \ingroup StoreAPI
--StoreEntry *storeGetPublicByRequestMethod(HttpRequest * request, const HttpRequestMethod& method);
-+StoreEntry *storeGetPublicByRequestMethod(HttpRequest * request, const HttpRequestMethod& method, const KeyScope keyScope = ksDefault);
- 
- /// \ingroup StoreAPI
- /// Like storeCreatePureEntry(), but also locks the entry and sets entry key.
-@@ -184,7 +184,8 @@ Transients::copyFromShm(const sfileno index)
-     e->mem_obj->xitTable.io = MemObject::ioReading;
-     e->mem_obj->xitTable.index = index;
- 
--    e->setPublicKey();
-+    // TODO: Support collapsed revalidation for SMP-aware caches.
-+    e->setPublicKey(ksDefault);
-     assert(e->key);
- 
-     // How do we know its SMP- and not just locally-collapsed? A worker gets
-@@ -72,6 +72,7 @@ class Transients: public Store::Controlled, public Ipc::StoreMapCleaner
-     virtual void markForUnlink(StoreEntry &e) override;
-     virtual void unlink(StoreEntry &e) override;
-     virtual void maintain() override;
-+    virtual bool smpAware() const override { return true; }
- 
-     static int64_t EntryLimit();
- 
-@@ -6200,13 +6200,29 @@ DOC_START
-        potentially cachable requests for the same URI before Squid knows
-        whether the response is going to be cachable.
- 
--       This feature is disabled by default: Enabling collapsed forwarding
--       needlessly delays forwarding requests that look cachable (when they are
--       collapsed) but then need to be forwarded individually anyway because
--       they end up being for uncachable content. However, in some cases, such
--       as accelleration of highly cachable content with periodic or groupped
--       expiration times, the gains from collapsing [large volumes of
--       simultenous refresh requests] outweigh losses from such delays.
-+       When enabled, instead of forwarding each concurrent request for
-+       the same URL, Squid just sends the first of them. The other, so
-+       called "collapsed" requests, wait for the response to the first
-+       request and, if it happens to be cachable, use that response.
-+       Here, "concurrent requests" means "received after the first
-+       request headers were parsed and before the corresponding response
-+       headers were parsed".
-+
-+       This feature is disabled by default: enabling collapsed
-+       forwarding needlessly delays forwarding requests that look
-+       cachable (when they are collapsed) but then need to be forwarded
-+       individually anyway because they end up being for uncachable
-+       content. However, in some cases, such as acceleration of highly
-+       cachable content with periodic or grouped expiration times, the
-+       gains from collapsing [large volumes of simultaneous refresh
-+       requests] outweigh losses from such delays.
-+
-+       Squid collapses two kinds of requests: regular client requests
-+       received on one of the listening ports and internal "cache
-+       revalidation" requests which are triggered by those regular
-+       requests hitting a stale cached object. Revalidation collapsing
-+       is currently disabled for Squid instances containing SMP-aware
-+       disk or memory caches and for Vary-controlled cached objects.
+ /** Parse a line containing an obsolete directive.
+@@ -5650,17 +5650,6 @@ DEFAULT: 16 KB
+ DOC_START
+ 	The amount of data the cache will buffer ahead of what has been
+ 	sent to the client when retrieving an object from another server.
+-	
+-	This also influences the maximum network read(2)/write(2) sizes in some
+-	circumstances. Reducing the size of this buffer will decrease
+-	per-connection memory usage at the cost of more read(2)/write(2) calls.
+-	Conversely, increasing the size of this buffer will decrease the number of
+-	read(2)/write(2) calls at the cost of memory usage, potentially improving
+-	performance.
+-
+-	Squid does not slow does the response delivery to the client in order to
+-	fill the buffer.
+-
  DOC_END
  
- NAME: collapsed_forwarding_shared_entries_limit
-@@ -89,7 +89,8 @@ clientReplyContext::clientReplyContext(ClientHttpRequest *clientContext) :
-     reply(NULL),
-     old_entry(NULL),
-     old_sc(NULL),
--    deleting(false)
-+    deleting(false),
-+    collapsedRevalidation(crNone)
- {
-     *tempbuf = 0;
+ NAME: negative_ttl
+@@ -1012,9 +1012,12 @@ ConnStateData::abortRequestParsing(const char *const uri)
+     http->uri = xstrdup(uri);
+     setLogUri (http, uri);
+     auto *context = new Http::Stream(clientConnection, http);
++    StoreIOBuffer tempBuffer;
++    tempBuffer.data = context->reqbuf;
++    tempBuffer.length = HTTP_REQBUF_SZ;
+     clientStreamInit(&http->client_stream, clientGetMoreData, clientReplyDetach,
+                      clientReplyStatus, new clientReplyContext(http), clientSocketRecipient,
+-                     clientSocketDetach, context, context->getClientStreamBuffer());
++                     clientSocketDetach, context, tempBuffer);
+     return context;
  }
-@@ -264,7 +265,6 @@ void
- clientReplyContext::processExpired()
+ 
+@@ -1356,11 +1359,15 @@ parseHttpRequest(ConnStateData *csd, const Http1::RequestParserPointer &hp)
+     http->req_sz = hp->messageHeaderSize();
+     Http::Stream *result = new Http::Stream(csd->clientConnection, http);
+ 
++    StoreIOBuffer tempBuffer;
++    tempBuffer.data = result->reqbuf;
++    tempBuffer.length = HTTP_REQBUF_SZ;
++
+     ClientStreamData newServer = new clientReplyContext(http);
+     ClientStreamData newClient = result;
+     clientStreamInit(&http->client_stream, clientGetMoreData, clientReplyDetach,
+                      clientReplyStatus, newServer, clientSocketRecipient,
+-                     clientSocketDetach, newClient, result->getClientStreamBuffer());
++                     clientSocketDetach, newClient, tempBuffer);
+ 
+     /* set url */
+     debugs(33,5, "Prepare absolute URL from " <<
+@@ -11,7 +11,6 @@
+ #include "http/Stream.h"
+ #include "HttpHdrContRange.h"
+ #include "HttpHeaderTools.h"
+-#include "SquidConfig.h"
+ #include "Store.h"
+ #include "TimeOrTag.h"
+ 
+@@ -21,10 +20,10 @@ Http::Stream::Stream(const Comm::ConnectionPointer &aConn, ClientHttpRequest *aR
+     reply(nullptr),
+     writtenToSocket(0),
+     mayUseConnection_(false),
+-    connRegistered_(false),
+-    requestBuffer(nullptr)
++    connRegistered_(false)
  {
-     const char *url = storeId();
--    StoreEntry *entry = NULL;
-     debugs(88, 3, "clientReplyContext::processExpired: '" << http->uri << "'");
-     assert(http->storeEntry()->lastmod >= 0);
-     /*
-@@ -287,9 +287,36 @@ clientReplyContext::processExpired()
- #endif
-     /* Prepare to make a new temporary request */
-     saveState();
--    entry = storeCreateEntry(url,
--                             http->log_uri, http->request->flags, http->request->method);
--    /* NOTE, don't call StoreEntry->lock(), storeCreateEntry() does it */
-+
-+    // TODO: support collapsed revalidation for Vary-controlled entries
-+    const bool collapsingAllowed = Config.onoff.collapsed_forwarding &&
-+                                   !Store::Root().smpAware() &&
-+                                   http->request->vary_headers.isEmpty();
-+
-+    StoreEntry *entry = nullptr;
-+    if (collapsingAllowed) {
-+        if ((entry = storeGetPublicByRequest(http->request, ksRevalidation)))
-+            entry->lock("clientReplyContext::processExpired#alreadyRevalidating");
-+    }
-+
-+    if (entry) {
-+        debugs(88, 5, "collapsed on existing revalidation entry: " << *entry);
-+        collapsedRevalidation = crSlave;
-+    } else {
-+        entry = storeCreateEntry(url,
-+                                 http->log_uri, http->request->flags, http->request->method);
-+        /* NOTE, don't call StoreEntry->lock(), storeCreateEntry() does it */
-+
-+        if (collapsingAllowed) {
-+            debugs(88, 5, "allow other revalidation requests to collapse on " << *entry);
-+            Store::Root().allowCollapsing(entry, http->request->flags,
-+                                          http->request->method);
-+            collapsedRevalidation = crInitiator;
-+        } else {
-+            collapsedRevalidation = crNone;
-+        }
-+    }
-+
-     sc = storeClientListAdd(entry, this);
- #if USE_DELAY_POOLS
-     /* delay_id is already set on original store client */
-@@ -309,13 +336,14 @@ clientReplyContext::processExpired()
-     assert(http->out.offset == 0);
-     assert(http->request->clientConnectionManager == http->getConn());
+     assert(http != nullptr);
++    memset(reqbuf, '\0', sizeof (reqbuf));
+     flags.deferred = 0;
+     flags.parsed_ok = 0;
+     deferredparams.node = nullptr;
+@@ -110,10 +109,12 @@ Http::Stream::pullData()
+     debugs(33, 5, reply << " written " << http->out.size << " into " << clientConnection);
  
--    /*
--     * A refcounted pointer so that FwdState stays around as long as
--     * this clientReplyContext does
--     */
--    Comm::ConnectionPointer conn = http->getConn() != NULL ? http->getConn()->clientConnection : NULL;
--    FwdState::Start(conn, http->storeEntry(), http->request, http->al);
+     /* More data will be coming from the stream. */
+-    StoreIOBuffer readBuffer = getClientStreamBuffer();
++    StoreIOBuffer readBuffer;
+     /* XXX: Next requested byte in the range sequence */
+     /* XXX: length = getmaximumrangelenfgth */
+     readBuffer.offset = getNextRangeOffset();
++    readBuffer.length = HTTP_REQBUF_SZ;
++    readBuffer.data = reqbuf;
+     /* we may note we have reached the end of the wanted ranges */
+     clientStreamRead(getTail(), http, readBuffer);
+ }
+@@ -567,18 +568,6 @@ Http::Stream::deferRecipientForLater(clientStreamNode *node, HttpReply *rep, Sto
+     deferredparams.queuedBuffer = receivedData;
+ }
+ 
+-StoreIOBuffer
+-Http::Stream::getClientStreamBuffer()
+-{
+-    if (!requestBuffer) {
+-        requestBuffer = new MemBlob(Config.readAheadGap);
+-    }
+-    StoreIOBuffer tempBuffer;
+-    tempBuffer.data = requestBuffer->mem;
+-    tempBuffer.length = requestBuffer->spaceSize();
+-    return tempBuffer;
+-}
 -
-+    if (collapsedRevalidation != crSlave) {
-+        /*
-+         * A refcounted pointer so that FwdState stays around as long as
-+         * this clientReplyContext does
-+         */
-+        Comm::ConnectionPointer conn = http->getConn() != NULL ? http->getConn()->clientConnection : NULL;
-+        FwdState::Start(conn, http->storeEntry(), http->request, http->al);
-+    }
-     /* Register with storage manager to receive updates when data comes in. */
+ void
+ Http::Stream::prepareReply(HttpReply *rep)
+ {
+@@ -120,13 +120,12 @@ class Stream : public RefCountable
  
-     if (EBIT_TEST(entry->flags, ENTRY_ABORTED))
-@@ -427,6 +455,10 @@ clientReplyContext::handleIMSReply(StoreIOBuffer result)
-         // forward response from origin
-         http->logType = LOG_TCP_REFRESH_MODIFIED;
-         debugs(88, 3, "handleIMSReply: origin replied " << status << ", replacing existing entry and forwarding to client");
-+
-+        if (collapsedRevalidation)
-+            http->storeEntry()->clearPublicKeyScope();
-+
-         sendClientUpstreamResponse();
-     }
+     void deferRecipientForLater(clientStreamNode *, HttpReply *, StoreIOBuffer receivedData);
  
-@@ -133,6 +133,14 @@ class clientReplyContext : public RefCountable, public StoreClient
-     StoreEntry *old_entry;
-     store_client *old_sc;   /* ... for entry to be validated */
-     bool deleting;
-+
-+    typedef enum {
-+        crNone = 0, ///< collapsed revalidation is not allowed for this context
-+        crInitiator, ///< we initiated collapsed revalidation request
-+        crSlave ///< we collapsed on the existing revalidation request
-+    } CollapsedRevalidation;
-+
-+    CollapsedRevalidation collapsedRevalidation;
+-    StoreIOBuffer getClientStreamBuffer();
+-
+ public: // HTTP/1.x state data
+ 
+     Comm::ConnectionPointer clientConnection; ///< details about the client connection socket
+     ClientHttpRequest *http;    /* we pretend to own that Job */
+     HttpReply *reply;
++    char reqbuf[HTTP_REQBUF_SZ];
+     struct {
+         unsigned deferred:1; ///< This is a pipelined request waiting for the current object to complete
+         unsigned parsed_ok:1; ///< Was this parsed correctly?
+@@ -159,8 +158,6 @@ class Stream : public RefCountable
+ 
+     bool mayUseConnection_; /* This request may use the connection. Don't read anymore requests for now */
+     bool connRegistered_;
+-
+-    MemBlob::Pointer requestBuffer;
  };
  
- #endif /* SQUID_CLIENTSIDEREPLY_H */
-@@ -47,6 +47,7 @@ class SwapDir: public ::SwapDir, public IORequestor, public Ipc::StoreMapCleaner
-     virtual void swappedOut(const StoreEntry &e);
-     virtual void create();
-     virtual void parse(int index, char *path);
-+    virtual bool smpAware() const { return true; }
+ } // namespace Http
+@@ -759,11 +759,15 @@ Ftp::Server::parseOneRequest()
+     Http::Stream *const result =
+         new Http::Stream(clientConnection, http);
  
-     // temporary path to the shared memory map of first slots of cached entries
-     SBuf inodeMapPath() const;
-@@ -71,6 +71,7 @@ class UFSSwapDir : public SwapDir
-     virtual uint64_t currentSize() const override { return cur_size; }
-     virtual uint64_t currentCount() const override { return n_disk_objects; }
-     virtual ConfigOption *getOptionTree() const override;
-+    virtual bool smpAware() const override { return false; }
- 
-     void unlinkFile(sfileno f);
-     // move down when unlink is a virtual method
-@@ -139,12 +139,11 @@ StoreEntry::operator delete (void *address)
- }
- 
- void
--StoreEntry::makePublic()
-+StoreEntry::makePublic(const KeyScope scope)
- {
-     /* This object can be cached for a long time */
--
-     if (!EBIT_TEST(flags, RELEASE_REQUEST))
--        setPublicKey();
-+        setPublicKey(scope);
- }
- 
- void
-@@ -559,19 +558,19 @@ storeGetPublic(const char *uri, const HttpRequestMethod& method)
- }
- 
- StoreEntry *
--storeGetPublicByRequestMethod(HttpRequest * req, const HttpRequestMethod& method)
-+storeGetPublicByRequestMethod(HttpRequest * req, const HttpRequestMethod& method, const KeyScope keyScope)
- {
--    return Store::Root().get(storeKeyPublicByRequestMethod(req, method));
-+    return Store::Root().get(storeKeyPublicByRequestMethod(req, method, keyScope));
- }
- 
- StoreEntry *
--storeGetPublicByRequest(HttpRequest * req)
-+storeGetPublicByRequest(HttpRequest * req, const KeyScope keyScope)
- {
--    StoreEntry *e = storeGetPublicByRequestMethod(req, req->method);
-+    StoreEntry *e = storeGetPublicByRequestMethod(req, req->method, keyScope);
- 
-     if (e == NULL && req->method == Http::METHOD_HEAD)
-         /* We can generate a HEAD reply from a cached GET object */
--        e = storeGetPublicByRequestMethod(req, Http::METHOD_GET);
-+        e = storeGetPublicByRequestMethod(req, Http::METHOD_GET, keyScope);
- 
-     return e;
- }
-@@ -622,10 +621,8 @@ StoreEntry::setPrivateKey()
- }
- 
- void
--StoreEntry::setPublicKey()
-+StoreEntry::setPublicKey(const KeyScope scope)
- {
--    const cache_key *newkey;
--
-     if (key && !EBIT_TEST(flags, KEY_PRIVATE))
-         return;                 /* is already public */
- 
-@@ -649,80 +646,35 @@ StoreEntry::setPublicKey()
- 
-     assert(!EBIT_TEST(flags, RELEASE_REQUEST));
- 
--    if (mem_obj->request) {
--        HttpRequest *request = mem_obj->request;
--
--        if (mem_obj->vary_headers.isEmpty()) {
--            /* First handle the case where the object no longer varies */
--            request->vary_headers.clear();
--        } else {
--            if (!request->vary_headers.isEmpty() && request->vary_headers.cmp(mem_obj->vary_headers) != 0) {
--                /* Oops.. the variance has changed. Kill the base object
--                 * to record the new variance key
--                 */
--                request->vary_headers.clear();       /* free old "bad" variance key */
--                if (StoreEntry *pe = storeGetPublic(mem_obj->storeId(), mem_obj->method))
--                    pe->release();
--            }
--
--            /* Make sure the request knows the variance status */
--            if (request->vary_headers.isEmpty())
--                request->vary_headers = httpMakeVaryMark(request, mem_obj->getReply());
--        }
--
--        // TODO: storeGetPublic() calls below may create unlocked entries.
--        // We should add/use storeHas() API or lock/unlock those entries.
--        if (!mem_obj->vary_headers.isEmpty() && !storeGetPublic(mem_obj->storeId(), mem_obj->method)) {
--            /* Create "vary" base object */
--            String vary;
--            StoreEntry *pe = storeCreateEntry(mem_obj->storeId(), mem_obj->logUri(), request->flags, request->method);
--            /* We are allowed to do this typecast */
--            HttpReply *rep = new HttpReply;
--            rep->setHeaders(Http::scOkay, "Internal marker object", "x-squid-internal/vary", -1, -1, squid_curtime + 100000);
--            vary = mem_obj->getReply()->header.getList(Http::HdrType::VARY);
--
--            if (vary.size()) {
--                /* Again, we own this structure layout */
--                rep->header.putStr(Http::HdrType::VARY, vary.termedBuf());
--                vary.clean();
--            }
--
--#if X_ACCELERATOR_VARY
--            vary = mem_obj->getReply()->header.getList(Http::HdrType::HDR_X_ACCELERATOR_VARY);
--
--            if (vary.size() > 0) {
--                /* Again, we own this structure layout */
--                rep->header.putStr(Http::HdrType::HDR_X_ACCELERATOR_VARY, vary.termedBuf());
--                vary.clean();
--            }
--
--#endif
--            pe->replaceHttpReply(rep, false); // no write until key is public
--
--            pe->timestampsSet();
--
--            pe->makePublic();
-+    adjustVary();
-+    forcePublicKey(calcPublicKey(scope));
-+}
- 
--            pe->startWriting(); // after makePublic()
-+void
-+StoreEntry::clearPublicKeyScope()
-+{
-+    if (!key || EBIT_TEST(flags, KEY_PRIVATE))
-+        return; // probably the old public key was deleted or made private
- 
--            pe->complete();
-+    // TODO: adjustVary() when collapsed revalidation supports that
- 
--            pe->unlock("StoreEntry::setPublicKey+Vary");
--        }
-+    const cache_key *newKey = calcPublicKey(ksDefault);
-+    if (!storeKeyHashCmp(key, newKey))
-+        return; // probably another collapsed revalidation beat us to this change
- 
--        newkey = storeKeyPublicByRequest(mem_obj->request);
--    } else
--        newkey = storeKeyPublic(mem_obj->storeId(), mem_obj->method);
-+    forcePublicKey(newKey);
-+}
- 
-+/// Unconditionally sets public key for this store entry.
-+/// Releases the old entry with the same public key (if any).
-+void
-+StoreEntry::forcePublicKey(const cache_key *newkey)
-+{
-     if (StoreEntry *e2 = (StoreEntry *)hash_lookup(store_table, newkey)) {
-+        assert(e2 != this);
-         debugs(20, 3, "Making old " << *e2 << " private.");
-         e2->setPrivateKey();
-         e2->release();
--
--        if (mem_obj->request)
--            newkey = storeKeyPublicByRequest(mem_obj->request);
--        else
--            newkey = storeKeyPublic(mem_obj->storeId(), mem_obj->method);
-     }
- 
-     if (key)
-@@ -736,6 +688,88 @@ StoreEntry::setPublicKey()
-         storeDirSwapLog(this, SWAP_LOG_ADD);
- }
- 
-+/// Calculates correct public key for feeding forcePublicKey().
-+/// Assumes adjustVary() has been called for this entry already.
-+const cache_key *
-+StoreEntry::calcPublicKey(const KeyScope keyScope)
-+{
-+    assert(mem_obj);
-+    return mem_obj->request ?  storeKeyPublicByRequest(mem_obj->request, keyScope) :
-+           storeKeyPublic(mem_obj->storeId(), mem_obj->method, keyScope);
-+}
++    StoreIOBuffer tempBuffer;
++    tempBuffer.data = result->reqbuf;
++    tempBuffer.length = HTTP_REQBUF_SZ;
 +
-+/// Updates mem_obj->request->vary_headers to reflect the current Vary.
-+/// The vary_headers field is used to calculate the Vary marker key.
-+/// Releases the old Vary marker with an outdated key (if any).
-+void
-+StoreEntry::adjustVary()
-+{
-+    assert(mem_obj);
-+
-+    if (!mem_obj->request)
-+        return;
-+
-+    HttpRequest *request = mem_obj->request;
-+
-+    if (mem_obj->vary_headers.isEmpty()) {
-+        /* First handle the case where the object no longer varies */
-+        request->vary_headers.clear();
-+    } else {
-+        if (!request->vary_headers.isEmpty() && request->vary_headers.cmp(mem_obj->vary_headers) != 0) {
-+            /* Oops.. the variance has changed. Kill the base object
-+             * to record the new variance key
-+             */
-+            request->vary_headers.clear();       /* free old "bad" variance key */
-+            if (StoreEntry *pe = storeGetPublic(mem_obj->storeId(), mem_obj->method))
-+                pe->release();
-+        }
-+
-+        /* Make sure the request knows the variance status */
-+        if (request->vary_headers.isEmpty())
-+            request->vary_headers = httpMakeVaryMark(request, mem_obj->getReply());
-+    }
-+
-+    // TODO: storeGetPublic() calls below may create unlocked entries.
-+    // We should add/use storeHas() API or lock/unlock those entries.
-+    if (!mem_obj->vary_headers.isEmpty() && !storeGetPublic(mem_obj->storeId(), mem_obj->method)) {
-+        /* Create "vary" base object */
-+        String vary;
-+        StoreEntry *pe = storeCreateEntry(mem_obj->storeId(), mem_obj->logUri(), request->flags, request->method);
-+        /* We are allowed to do this typecast */
-+        HttpReply *rep = new HttpReply;
-+        rep->setHeaders(Http::scOkay, "Internal marker object", "x-squid-internal/vary", -1, -1, squid_curtime + 100000);
-+        vary = mem_obj->getReply()->header.getList(Http::HdrType::VARY);
-+
-+        if (vary.size()) {
-+            /* Again, we own this structure layout */
-+            rep->header.putStr(Http::HdrType::VARY, vary.termedBuf());
-+            vary.clean();
-+        }
-+
-+#if X_ACCELERATOR_VARY
-+        vary = mem_obj->getReply()->header.getList(Http::HdrType::HDR_X_ACCELERATOR_VARY);
-+
-+        if (vary.size() > 0) {
-+            /* Again, we own this structure layout */
-+            rep->header.putStr(Http::HdrType::HDR_X_ACCELERATOR_VARY, vary.termedBuf());
-+            vary.clean();
-+        }
-+
-+#endif
-+        pe->replaceHttpReply(rep, false); // no write until key is public
-+
-+        pe->timestampsSet();
-+
-+        pe->makePublic();
-+
-+        pe->startWriting(); // after makePublic()
-+
-+        pe->complete();
-+
-+        pe->unlock("StoreEntry::forcePublicKey+Vary");
-+    }
-+}
-+
- StoreEntry *
- storeCreatePureEntry(const char *url, const char *log_url, const RequestFlags &flags, const HttpRequestMethod& method)
- {
-@@ -1486,7 +1520,7 @@ StoreEntry::validToSend() const
-     return 1;
- }
+     ClientStreamData newServer = new clientReplyContext(http);
+     ClientStreamData newClient = result;
+     clientStreamInit(&http->client_stream, clientGetMoreData, clientReplyDetach,
+                      clientReplyStatus, newServer, clientSocketRecipient,
+-                     clientSocketDetach, newClient, result->getClientStreamBuffer());
++                     clientSocketDetach, newClient, tempBuffer);
  
--void
-+bool
- StoreEntry::timestampsSet()
- {
-     const HttpReply *reply = getReply();
-@@ -1524,14 +1558,22 @@ StoreEntry::timestampsSet()
-             served_date -= (squid_curtime - request_sent);
-     }
- 
-+    time_t exp = 0;
-     if (reply->expires > 0 && reply->date > -1)
--        expires = served_date + (reply->expires - reply->date);
-+        exp = served_date + (reply->expires - reply->date);
-     else
--        expires = reply->expires;
-+        exp = reply->expires;
-+
-+    if (lastmod == reply->last_modified && timestamp == served_date && expires == exp)
-+        return false;
-+
-+    expires = exp;
- 
-     lastmod = reply->last_modified;
- 
-     timestamp = served_date;
-+
-+    return true;
- }
- 
- void
-@@ -64,7 +64,8 @@ Store::Controller::init()
- 
-     swapDir->init();
- 
--    if (UsingSmp() && IamWorkerProcess() && Config.onoff.collapsed_forwarding) {
-+    if (UsingSmp() && IamWorkerProcess() && Config.onoff.collapsed_forwarding &&
-+            smpAware()) {
-         transients = new Transients;
-         transients->init();
-     }
-@@ -498,8 +499,10 @@ Store::Controller::updateOnNotModified(StoreEntry *old, const StoreEntry &newer)
-     Must(old);
-     HttpReply *oldReply = const_cast<HttpReply*>(old->getReply());
-     Must(oldReply);
--    oldReply->updateOnNotModified(newer.getReply());
--    old->timestampsSet();
-+
-+    const bool modified = oldReply->updateOnNotModified(newer.getReply());
-+    if (!old->timestampsSet() && !modified)
-+        return;
- 
-     /* update stored image of the old entry */
- 
-@@ -514,7 +517,8 @@ void
- Store::Controller::allowCollapsing(StoreEntry *e, const RequestFlags &reqFlags,
-                                    const HttpRequestMethod &reqMethod)
- {
--    e->makePublic(); // this is needed for both local and SMP collapsing
-+    const KeyScope keyScope = reqFlags.refresh ? ksRevalidation : ksDefault;
-+    e->makePublic(keyScope); // this is needed for both local and SMP collapsing
-     if (transients)
-         transients->startWriting(e, reqFlags, reqMethod);
-     debugs(20, 3, "may " << (transients && e->mem_obj->xitTable.index >= 0 ?
-@@ -601,6 +605,12 @@ Store::Controller::anchorCollapsed(StoreEntry &collapsed, bool &inSync)
-     return found;
- }
- 
-+bool
-+Store::Controller::smpAware() const
-+{
-+    return memStore || (swapDir && swapDir->smpAware());
-+}
-+
- namespace Store {
- static RefCount<Controller> TheRoot;
- }
-@@ -41,6 +41,7 @@ class Controller: public Storage
-     virtual void markForUnlink(StoreEntry &) override;
-     virtual void unlink(StoreEntry &) override;
-     virtual int callback() override;
-+    virtual bool smpAware() const override;
- 
-     /// Additional unknown-size entry bytes required by Store in order to
-     /// reduce the risk of selecting the wrong disk cache for the growing entry.
-@@ -71,6 +71,8 @@ class Disk: public Controlled
-     /// called when entry swap out is complete
-     virtual void swappedOut(const StoreEntry &e) = 0;
- 
-+    virtual bool smpAware() const { return false; }
-+
- protected:
-     void parseOptions(int reconfiguring);
-     void dumpOptions(StoreEntry * e) const;
-@@ -530,6 +530,19 @@ Store::Disks::updateCollapsed(StoreEntry &collapsed)
-            dir(collapsed.swap_dirn).updateCollapsed(collapsed);
- }
- 
-+bool
-+Store::Disks::smpAware() const
-+{
-+    for (int i = 0; i < Config.cacheSwap.n_configured; ++i) {
-+        // A mix is not supported, but we conservatively check every
-+        // dir because features like collapsed revalidation should
-+        // currently be disabled if any dir is SMP-aware
-+        if (dir(i).smpAware())
-+            return true;
-+    }
-+    return false;
-+}
-+
- /* Store::Disks globals that should be converted to use RegisteredRunner */
- 
- void
-@@ -48,6 +48,7 @@ class Disks: public Controlled
-     /// Additional unknown-size entry bytes required by disks in order to
-     /// reduce the risk of selecting the wrong disk cache for the growing entry.
-     int64_t accumulateMore(const StoreEntry&) const;
-+    virtual bool smpAware() const override;
- 
- private:
-     /* migration logic */
-@@ -74,6 +74,11 @@ class Storage: public RefCountable
- 
-     /// prepare for shutdown
-     virtual void sync() {}
-+
-+    /// whether this storage is capable of serving multiple workers;
-+    /// a true result does not imply [lack of] non-SMP support because
-+    /// [only] some SMP-aware storages also support non-SMP configss
-+    virtual bool smpAware() const = 0;
- };
- 
- } // namespace Store
-@@ -95,26 +95,28 @@ storeKeyPrivate()
- }
- 
- const cache_key *
--storeKeyPublic(const char *url, const HttpRequestMethod& method)
-+storeKeyPublic(const char *url, const HttpRequestMethod& method, const KeyScope keyScope)
- {
-     static cache_key digest[SQUID_MD5_DIGEST_LENGTH];
-     unsigned char m = (unsigned char) method.id();
-     SquidMD5_CTX M;
-     SquidMD5Init(&M);
-     SquidMD5Update(&M, &m, sizeof(m));
-     SquidMD5Update(&M, (unsigned char *) url, strlen(url));
-+    if (keyScope)
-+        SquidMD5Update(&M, &keyScope, sizeof(keyScope));
-     SquidMD5Final(digest, &M);
-     return digest;
- }
- 
- const cache_key *
--storeKeyPublicByRequest(HttpRequest * request)
-+storeKeyPublicByRequest(HttpRequest * request, const KeyScope keyScope)
- {
--    return storeKeyPublicByRequestMethod(request, request->method);
-+    return storeKeyPublicByRequestMethod(request, request->method, keyScope);
- }
- 
- const cache_key *
--storeKeyPublicByRequestMethod(HttpRequest * request, const HttpRequestMethod& method)
-+storeKeyPublicByRequestMethod(HttpRequest * request, const HttpRequestMethod& method, const KeyScope keyScope)
- {
-     static cache_key digest[SQUID_MD5_DIGEST_LENGTH];
-     unsigned char m = (unsigned char) method.id();
-@@ -123,6 +125,8 @@ storeKeyPublicByRequestMethod(HttpRequest * request, const HttpRequestMethod& me
-     SquidMD5Init(&M);
-     SquidMD5Update(&M, &m, sizeof(m));
-     SquidMD5Update(&M, (unsigned char *) url.rawContent(), url.length());
-+    if (keyScope)
-+        SquidMD5Update(&M, &keyScope, sizeof(keyScope));
- 
-     if (!request->vary_headers.isEmpty()) {
-         SquidMD5Update(&M, request->vary_headers.rawContent(), request->vary_headers.length());
-@@ -17,14 +17,19 @@
- class HttpRequestMethod;
- class HttpRequest;
- 
-+typedef enum {
-+    ksDefault = 0,
-+    ksRevalidation
-+} KeyScope;
-+
- cache_key *storeKeyDup(const cache_key *);
- cache_key *storeKeyCopy(cache_key *, const cache_key *);
- void storeKeyFree(const cache_key *);
- const cache_key *storeKeyScan(const char *);
- const char *storeKeyText(const cache_key *);
--const cache_key *storeKeyPublic(const char *, const HttpRequestMethod&);
--const cache_key *storeKeyPublicByRequest(HttpRequest *);
--const cache_key *storeKeyPublicByRequestMethod(HttpRequest *, const HttpRequestMethod&);
-+const cache_key *storeKeyPublic(const char *, const HttpRequestMethod&, const KeyScope keyScope = ksDefault);
-+const cache_key *storeKeyPublicByRequest(HttpRequest *, const KeyScope keyScope = ksDefault);
-+const cache_key *storeKeyPublicByRequestMethod(HttpRequest *, const HttpRequestMethod&, const KeyScope keyScope = ksDefault);
- const cache_key *storeKeyPrivate();
- int storeKeyHashBuckets(int);
- int storeKeyNull(const cache_key *);
-@@ -28,6 +28,6 @@ HttpReply::HttpReply() : HttpMsg(hoReply), date (0), last_modified (0),
-     void HttpReply::hdrCacheInit() STUB
-     HttpReply * HttpReply::clone() const STUB_RETVAL(NULL)
-     bool HttpReply::inheritProperties(const HttpMsg *aMsg) STUB_RETVAL(false)
--    void HttpReply::updateOnNotModified(HttpReply const*) STUB
-+    bool HttpReply::updateOnNotModified(HttpReply const*) STUB_RETVAL(false)
-     int64_t HttpReply::bodySize(const HttpRequestMethod&) const STUB_RETVAL(0)
- 
-@@ -37,9 +37,9 @@ void StoreEntry::replaceHttpReply(HttpReply *, bool andStartWriting) STUB
- bool StoreEntry::mayStartSwapOut() STUB_RETVAL(false)
- void StoreEntry::trimMemory(const bool preserveSwappable) STUB
- void StoreEntry::abort() STUB
--void StoreEntry::makePublic() STUB
-+void StoreEntry::makePublic(const KeyScope scope) STUB
- void StoreEntry::makePrivate() STUB
--void StoreEntry::setPublicKey() STUB
-+void StoreEntry::setPublicKey(const KeyScope scope) STUB
- void StoreEntry::setPrivateKey() STUB
- void StoreEntry::expireNow() STUB
- void StoreEntry::releaseRequest() STUB
-@@ -62,7 +62,7 @@ void StoreEntry::hashInsert(const cache_key *) STUB
- void StoreEntry::registerAbort(STABH * cb, void *) STUB
- void StoreEntry::reset() STUB
- void StoreEntry::setMemStatus(mem_status_t) STUB
--void StoreEntry::timestampsSet() STUB
-+bool StoreEntry::timestampsSet() STUB_RETVAL(false)
- void StoreEntry::unregisterAbort() STUB
- void StoreEntry::destroyMemObject() STUB
- int StoreEntry::checkTooSmall() STUB_RETVAL(0)
-@@ -121,8 +121,8 @@ std::ostream &operator <<(std::ostream &os, const StoreEntry &)
- size_t storeEntryInUse() STUB_RETVAL(0)
- void storeEntryReplaceObject(StoreEntry *, HttpReply *) STUB
- StoreEntry *storeGetPublic(const char *uri, const HttpRequestMethod& method) STUB_RETVAL(NULL)
--StoreEntry *storeGetPublicByRequest(HttpRequest * request) STUB_RETVAL(NULL)
--StoreEntry *storeGetPublicByRequestMethod(HttpRequest * request, const HttpRequestMethod& method) STUB_RETVAL(NULL)
-+StoreEntry *storeGetPublicByRequest(HttpRequest * request, const KeyScope scope) STUB_RETVAL(NULL)
-+StoreEntry *storeGetPublicByRequestMethod(HttpRequest * request, const HttpRequestMethod& method, const KeyScope scope) STUB_RETVAL(NULL)
- StoreEntry *storeCreateEntry(const char *, const char *, const RequestFlags &, const HttpRequestMethod&) STUB_RETVAL(NULL)
- StoreEntry *storeCreatePureEntry(const char *storeId, const char *logUrl, const RequestFlags &, const HttpRequestMethod&) STUB_RETVAL(NULL)
- void storeConfigure(void) STUB
+     result->flags.parsed_ok = 1;
+     return result;

@@ -1,0 +1,1431 @@
+@@ -1,3 +1,6 @@
++	- Added rudimental statistics for HTTP headers.
++	- Adjusted StatLogHist to a more "generic"/flexible StatHist.
++	  Moved StatHist implementation into a separate file.
+ 	- Added FTP support for PORT if PASV fails, also try the
+ 	  default FTP data port (Henrik Nordstrom).
+ 	- Fixed NULL pointer bug in clientGetHeadersForIMS when a
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: HttpHeader.cc,v 1.6 1998/02/23 20:27:17 rousskov Exp $
++ * $Id: HttpHeader.cc,v 1.7 1998/02/25 09:53:53 rousskov Exp $
+  *
+  * DEBUG: section 55    HTTP Header
+  * AUTHOR: Alex Rousskov
+@@ -83,12 +83,35 @@ struct _HttpHeaderEntry {
+     http_hdr_type id;
+ };
+ 
++
++/* counters and size accumulators for stat objects */
++typedef int StatCount;
++typedef size_t StatSize;
++
++/* per field statistics */
++typedef struct {
++    StatCount aliveCount;  /* created but not destroyed (count)*/
++    StatCount parsCount;   /* #parsing attempts */
++    StatCount errCount;    /* #pasring errors */
++    StatCount repCount;    /* #repetitons */
++} HttpHeaderFieldStat;
++
++/* per header statistics */
++typedef struct {
++    const char *label;
++    StatHist hdrUCountDistr;
++    StatHist fieldTypeDistr;
++    StatHist ccTypeDistr;
++} HttpHeaderStat;
++
++
+ /* constant attributes of fields */
+ typedef struct {
+     const char *name;
+     http_hdr_type id;
+     field_type type;
+     int name_len;
++    HttpHeaderFieldStat stat;
+ } field_attrs_t;
+ 
+ /* use HttpHeaderPos as opaque type, do not interpret */
+@@ -97,20 +120,6 @@ typedef ssize_t HttpHeaderPos;
+ #define HttpHeaderInitPos (-1)
+ 
+ 
+-#if 0 /* moved to HttpHeader.h */
+-typedef struct _HttpHeaderEntry HttpHeaderEntry;
+-struct _HttpHeader {
+-    /* public, read only */
+-    int emask;           /* bits set for present entries */
+-
+-    /* protected, do not use these, use interface functions instead */
+-    int capacity;        /* max #entries before we have to grow */
+-    int ucount;          /* #entries used, including holes */
+-    HttpHeaderEntry *entries;
+-};
+-#endif
+-
+-
+ /*
+  * local constants and vars
+  */
+@@ -197,59 +206,50 @@ static http_hdr_type RequestHeaders[] = {
+     HDR_OTHER
+ };
+ 
+-static const char *KnownSplitableFields[] = {
+-    "Connection", "Range"
+-};
+-/* if you must have KnownSplitableFields empty, set KnownSplitableFieldCount to 0 */
+-static const int KnownSplitableFieldCount = sizeof(KnownSplitableFields)/sizeof(*KnownSplitableFields);
+-
+-/* headers accounting */
++/* when first field is added, this is how much entries we allocate */
+ #define INIT_FIELDS_PER_HEADER 8
+-static u_num32 shortHeadersCount = 0;
+-static u_num32 longHeadersCount = 0;
+-
+-typedef struct {
+-    const char *label;
+-    int parsed;
+-    int misc[HDR_ENUM_END];
+-} HttpHeaderStats;
+ 
+-#if 0 /* not used, add them later @?@ */
+-static struct {
+-    int parsed;
+-    int misc[HDR_MISC_END];
+-    int cc[SCC_ENUM_END];
+-} ReplyHeaderStats;
+-
+-#endif /* if 0 */
+-
+-/* recycle bin for short strings (32KB only) */
++/* recycle bin for short strings (32KB total only) */
+ static const size_t shortStrSize = 32; /* max size of a recyclable string */
+ static const size_t shortStrPoolCount = (32*1024)/32; /* sync this with shortStrSize */
+ static MemPool *shortStrings = NULL;
+ 
++/* header accounting */
++static HttpHeaderStat HttpHeaderStats[] = {
++    { "reply" },
++    { "request" },
++    { "all" }
++};
++static int HttpHeaderStatCount = sizeof(HttpHeaderStats)/sizeof(*HttpHeaderStats);
++
++/* global counters */
++static StatCount HeaderParsedCount = 0;
++static StatCount CcPasredCount = 0;
++static StatCount HeaderEntryParsedCount = 0;
++
+ /* long strings accounting */
+-static u_num32 longStrAllocCount = 0;
+-static u_num32 longStrFreeCount = 0;
+-static u_num32 longStrHighWaterCount = 0;
+-static size_t longStrAllocSize = 0;
+-static size_t longStrFreeSize = 0;
+-static size_t longStrHighWaterSize = 0;
++static StatCount longStrAliveCount = 0;
++static StatCount longStrHighWaterCount = 0;
++static StatSize longStrAliveSize = 0;
++static StatSize longStrHighWaterSize = 0;
+ 
+ 
+-/* local routines */
++/*
++ * local routines
++ */
+ 
+ #define assert_eid(id) assert((id) >= 0 && (id) < HDR_ENUM_END)
+ 
+ static void httpHeaderInitAttrTable(field_attrs_t *table, int count);
+ static int httpHeaderCalcMask(const int *enums, int count);
++static void httpHeaderStatInit(HttpHeaderStat *hs, const char *label);
++
+ static HttpHeaderEntry *httpHeaderGetEntry(const HttpHeader *hdr, HttpHeaderPos *pos);
+ static void httpHeaderDelAt(HttpHeader *hdr, HttpHeaderPos pos);
+ static void httpHeaderAddParsedEntry(HttpHeader *hdr, HttpHeaderEntry *e);
+ static void httpHeaderAddNewEntry(HttpHeader *hdr, const HttpHeaderEntry *e);
+ static void httpHeaderSet(HttpHeader *hdr, http_hdr_type id, const field_store value);
+ static void httpHeaderSyncMasks(HttpHeader *hdr, const HttpHeaderEntry *e, int add);
+-static void httpHeaderSyncStats(HttpHeader *hdr, const HttpHeaderEntry *e);
+ static int httpHeaderIdByName(const char *name, int name_len, const field_attrs_t *attrs, int end, int mask);
+ static void httpHeaderGrow(HttpHeader *hdr);
+ 
+@@ -274,6 +274,8 @@ static HttpScc *httpSccParseCreate(const char *str);
+ static void httpSccParseInit(HttpScc *scc, const char *str);
+ static void httpSccDestroy(HttpScc *scc);
+ static HttpScc *httpSccDup(HttpScc *scc);
++static void httpSccUpdateStats(const HttpScc *scc, StatHist *hist);
++
+ static void httpSccPackValueInto(HttpScc *scc, Packer *p);
+ static void httpSccJoinWith(HttpScc *scc, HttpScc *new_scc);
+ 
+@@ -282,26 +284,8 @@ static HttpHeaderExtField *httpHeaderExtFieldParseCreate(const char *field_start
+ static void httpHeaderExtFieldDestroy(HttpHeaderExtField *f);
+ static HttpHeaderExtField *httpHeaderExtFieldDup(HttpHeaderExtField *f);
+ 
+-static void httpHeaderStoreAReport(StoreEntry *e, void (*reportPacker)(Packer *p));
+-static void httpHeaderPackReport(Packer *p);
+-static void httpHeaderPackReqReport(Packer *p);
+-static void httpHeaderPackRepReport(Packer *p);
+-
+-
+-#if 0
+-static void httpHeaderAddField(HttpHeader *hdr, HttpHeaderField *fld);
+-static void httpHeaderAddSingleField(HttpHeader *hdr, HttpHeaderField *fld);
+-static void httpHeaderAddListField(HttpHeader *hdr, HttpHeaderField *fld);
+-static void httpHeaderCountField(HttpHeader *hdr, HttpHeaderField *fld);
+-static void httpHeaderCountSCCField(HttpHeader *hdr, HttpHeaderField *fld);
+-static int httpHeaderFindFieldType(HttpHeaderField *fld, const field_attrs_t *attrs, int end, int mask);
+-static HttpHeaderField *httpHeaderFieldCreate(const char *name, const char *value);
+-static HttpHeaderField *httpHeaderFieldParseCreate(const char *field_start, const char *field_end);
+-static void httpHeaderFieldDestroy(HttpHeaderField *f);
+-static size_t httpHeaderFieldBufSize(const HttpHeaderField *fld);
+-static int httpHeaderFieldIsList(const HttpHeaderField *fld);
+-static void httpHeaderStoreAReport(Packer *p, HttpHeaderStats *stats);
+-#endif
++static void httpHeaderStatDump(const HttpHeaderStat *hs, StoreEntry *e);
++static void shortStringStatDump(StoreEntry *e);
+ 
+ static char *dupShortStr(const char *str);
+ static char *dupShortBuf(const char *str, size_t len);
+@@ -311,6 +295,8 @@ static void freeShortString(char *str);
+ 
+ static int strListGetItem(const char *str, char del, const char **item, int *ilen, const char **pos);
+ static const char *getStringPrefix(const char *str);
++static double xpercent(double part, double whole);
++static double xdiv(double nom, double denom);
+ 
+ 
+ /* delete this when everybody remembers that ':' is not a part of a name */
+@@ -326,6 +312,7 @@ static const char *getStringPrefix(const char *str);
+ void
+ httpHeaderInitModule()
+ {
++    int i;
+     /* paranoid check if smbd put a big object into field_store */
+     assert(sizeof(field_store) == sizeof(char*));
+     /* have to force removal of const here */
+@@ -337,6 +324,11 @@ httpHeaderInitModule()
+     RequestHeadersMask = httpHeaderCalcMask((const int*)RequestHeaders, countof(RequestHeaders));
+     /* create a pool of short strings @?@ we never destroy it! */
+     shortStrings = memPoolCreate(shortStrPoolCount, shortStrPoolCount/10, shortStrSize, "shortStr");
++    /* init header stats */
++    for (i = 0; i < HttpHeaderStatCount; i++)
++	httpHeaderStatInit(HttpHeaderStats+i, HttpHeaderStats[i].label);
++    cachemgrRegister("http_headers",
++	"HTTP Header Statistics", httpHeaderStoreReport, 0);
+ }
+ 
+ static void
+@@ -360,15 +352,28 @@ httpHeaderInitAttrTable(field_attrs_t *table, int count)
+ 	    i++; /* make progress */
+     }
+ 
+-    /* calculate name lengths */
++    /* calculate name lengths and init stats */
+     for (i = 0; i < count; ++i) {
+ 	assert(table[i].name);
+ 	table[i].name_len = strlen(table[i].name);
+ 	debug(55,5) ("hdr table entry[%d]: %s (%d)\n", i, table[i].name, table[i].name_len);
+ 	assert(table[i].name_len);
++	/* init stats */
++	memset(&table[i].stat, 0, sizeof(table[i].stat));
+     }
+ }
+ 
++static void
++httpHeaderStatInit(HttpHeaderStat *hs, const char *label)
++{
++    assert(hs);
++    assert(label);
++    hs->label = label;
++    statHistEnumInit(&hs->hdrUCountDistr, 32); /* not a real enum */
++    statHistEnumInit(&hs->fieldTypeDistr, HDR_ENUM_END);
++    statHistEnumInit(&hs->ccTypeDistr, SCC_ENUM_END);
++}
++
+ /* calculates a bit mask of a given array (move this to lib/uitils) @?@ */
+ static int
+ httpHeaderCalcMask(const int *enums, int count)
+@@ -413,17 +418,19 @@ void
+ httpHeaderClean(HttpHeader *hdr)
+ {
+     HttpHeaderPos pos = HttpHeaderInitPos;
++    HttpHeaderEntry *e;
+ 
+     debug(55, 7) ("cleaning hdr: %p\n", hdr);
+     assert(hdr);
+ 
+-    if (hdr->capacity > INIT_FIELDS_PER_HEADER)
+-	longHeadersCount++;
+-    else
+-	shortHeadersCount++;
+-
+-    while (httpHeaderGetEntry(hdr, &pos))
++    statHistCount(&HttpHeaderStats[0].hdrUCountDistr, hdr->ucount);
++    while ((e = httpHeaderGetEntry(hdr, &pos))) {
++	/* fix this (for scc too) for req headers @?@ */
++	statHistCount(&HttpHeaderStats[0].fieldTypeDistr, e->id);
++	if (e->id == HDR_CACHE_CONTROL)
++	    httpSccUpdateStats(e->field.v_pscc, &HttpHeaderStats[0].ccTypeDistr);
+ 	httpHeaderDelAt(hdr, pos);
++    }
+     xfree(hdr->entries);
+     hdr->emask = 0;
+     hdr->entries = NULL;
+@@ -643,8 +650,10 @@ httpHeaderAddParsedEntry(HttpHeader *hdr, HttpHeaderEntry *e)
+     if (olde) {
+ 	if (EBIT_TEST(ListHeadersMask, e->id))
+ 	    httpHeaderEntryJoinWith(olde, e);
+-	else
+-	    debug(55, 1) ("ignoring duplicate header: %s\n", httpHeaderEntryName(e));
++	else {
++	    debug(55, 2) ("ignoring duplicate header: %s\n", httpHeaderEntryName(e));
++	    Headers[e->id].stat.repCount++;
++	}
+ 	httpHeaderEntryClean(e);
+     } else {
+ 	/* actual add */
+@@ -661,16 +670,16 @@ static void
+ httpHeaderAddNewEntry(HttpHeader *hdr, const HttpHeaderEntry *e)
+ {
+     assert(hdr && e);
+-    if (hdr->ucount >= hdr->capacity)
+-	httpHeaderGrow(hdr);
+     debug(55,8) ("%p adding entry: %d at %d, (%p:%p)\n", 
+ 	hdr, e->id, hdr->ucount, 
+ 	hdr->entries, hdr->entries + hdr->ucount);
++    if (!hdr->ucount)
++	HeaderParsedCount++;
++    if (hdr->ucount >= hdr->capacity)
++	httpHeaderGrow(hdr);
+     hdr->entries[hdr->ucount++] = *e;
+     /* sync masks */
+     httpHeaderSyncMasks(hdr, e, 1);
+-    /* sync accounting */
+-    httpHeaderSyncStats(hdr, e);
+ }
+ 
+ #if 0 /* save for parts */
+@@ -861,44 +870,6 @@ httpHeaderSyncMasks(HttpHeader *hdr, const HttpHeaderEntry *e, int add)
+     add ? EBIT_SET(hdr->emask, e->id) : EBIT_CLR(hdr->emask, e->id);
+ }
+ 
+-/* updates header stats */
+-static void
+-httpHeaderSyncStats(HttpHeader *hdr, const HttpHeaderEntry *e)
+-{
+-#if 0 /* implement it @?@ */
+-    assert(0); /* implement it */
+-    /* add Req/Pep detection here @?@ */
+-    int type = httpHeaderFindFieldType(fld,
+-	HdrFieldAttrs, HDR_ENUM_END,
+-	(1) ? ReplyHeadersMask : RequestHeadersMask);
+-    /* exception */
+-    if (type == HDR_PROXY_KEEPALIVE && strcasecmp("Keep-Alive", fld->value))
+-	type = -1;
+-    if (type < 0)
+-	type = HDR_OTHER;
+-    /* @?@ update stats for req/resp:type @?@ */
+-    /* process scc @?@ check if we need to do that for requests or not */
+-    if (1 && type == HDR_CACHE_CONTROL)
+-	httpHeaderCountSCCField(hdr, fld);
+-#endif
+-}
+-
+-#if 0 /* move it */
+-/* updates scc mask and stats for an scc field */
+-static void
+-httpHeaderCountSCCField(HttpHeader *hdr, HttpHeaderField *fld)
+-{
+-    int type = httpHeaderFindFieldType(fld,
+-	SccFieldAttrs, SCC_ENUM_END, -1);
+-    if (type < 0)
+-	type = SCC_OTHER;
+-    /* update mask */
+-    EBIT_SET(hdr->scc_mask, type);
+-    /* @?@ update stats for scc @?@ */
+-    SccFieldAttrs[type].dummy.test1++;
+-}
+-#endif
+-
+ static int
+ httpHeaderIdByName(const char *name, int name_len, const field_attrs_t *attrs, int end, int mask)
+ {
+@@ -945,6 +916,7 @@ httpHeaderEntryInit(HttpHeaderEntry *e, http_hdr_type id, field_store field)
+     assert_eid(id);
+     e->id = id;
+     e->field = field;
++    Headers[id].stat.aliveCount++;
+ }
+ 
+ static void
+@@ -972,6 +944,7 @@ httpHeaderEntryClean(HttpHeaderEntry *e) {
+ 	default:
+ 	    assert(0); /* somebody added a new type? */
+     }
++    Headers[e->id].stat.aliveCount--;
+     /* we have to do that so entry will be _invlaid_ */
+     e->id = -1;
+     e->field.v_pchar = NULL;
+@@ -985,16 +958,18 @@ httpHeaderEntryParseInit(HttpHeaderEntry *e, const char *field_start, const char
+     int id;
+     int result;
+ 
++    HeaderEntryParsedCount++;
+     /* paranoid reset */
+     e->id = -1;
+     e->field.v_pchar = NULL;
+     /* first assume it is just an extension field */
+     f = httpHeaderExtFieldParseCreate(field_start, field_end);
+-    if (!f) /* parsing failure */
++    if (!f) /* total parsing failure */
+ 	return 0;
+     id = httpHeaderIdByName(f->name, -1, Headers, countof(Headers), mask);
+     if (id < 0)
+ 	id = HDR_OTHER;
++    Headers[id].stat.parsCount++;
+     if (id == HDR_OTHER) {
+ 	/* hm.. it is an extension field indeed */
+ 	httpHeaderEntryInit(e, id, f);
+@@ -1012,15 +987,15 @@ httpHeaderEntryParseExtFieldInit(HttpHeaderEntry *e, int id, const HttpHeaderExt
+ {
+     assert(e && f);
+     assert_eid(id);
+-    e->id = id;
++    e->id = -1;
+     /*
+      * check for exceptions first (parsing is not determined by value type)
+      * then parse using value type if needed
+      */
+     switch (id) {
+ 	case HDR_PROXY_KEEPALIVE:
+ 	    /*  we treat Proxy-Connection as "keep alive" only if it says so */
+-            e->field.v_int = !strcasecmp(f->value, "Keep-Alive");
++	    httpHeaderEntryInit(e, id, (int)!strcasecmp(f->value, "Keep-Alive"));
+ 	    break;
+ 	default:
+ 	    /* if we got here, it is something that can be parsed based on value type */
+@@ -1069,6 +1044,7 @@ httpHeaderEntryParseByTypeInit(HttpHeaderEntry *e, int id, const HttpHeaderExtFi
+ 	    if (!field.v_int && !isdigit(*f->value)) {
+ 		debug(55, 1) ("cannot parse an int header field: id: %d, field: '%s: %s'\n",
+ 		    id, f->name, f->value);
++		Headers[id].stat.errCount++;
+ 		return 0;
+ 	    }
+ 	    break;
+@@ -1079,6 +1055,8 @@ httpHeaderEntryParseByTypeInit(HttpHeaderEntry *e, int id, const HttpHeaderExtFi
+ 
+ 	case ftDate_1123:
+ 	    field.v_time = parse_rfc1123(f->value);
++	    if (field.v_time <= 0)
++		Headers[id].stat.errCount++;
+ 	    /*
+ 	     * if parse_rfc1123 fails we fall through anyway so upper levels
+ 	     * will notice invalid date
+@@ -1090,14 +1068,15 @@ httpHeaderEntryParseByTypeInit(HttpHeaderEntry *e, int id, const HttpHeaderExtFi
+ 	    if (!field.v_pscc) {
+ 		debug(55, 0) ("failed to parse scc hdr: id: %d, field: '%s: %s'\n",
+ 		    id, f->name, f->value);
++		Headers[id].stat.errCount++;
+ 		return 0;
+ 	    }
+ 	    break;
+ 
+ 	default:
+ 	    debug(55, 0) ("something went wrong with hdr field type analysis: id: %d, type: %d, field: '%s: %s'\n", 
+ 		id, type, f->name, f->value);
+-	    return 0;
++	    assert(0);
+     }
+     /* success, do actual init */
+     httpHeaderEntryInit(e, id, field);
+@@ -1324,6 +1303,7 @@ httpSccParseInit(HttpScc *scc, const char *str)
+     int ilen;
+     assert(scc && str);
+ 
++    CcPasredCount++;
+     /* iterate through comma separated list */
+     while(strListGetItem(str, ',', &item, &ilen, &pos)) {
+ 	/* strip '=' statements @?@ */
+@@ -1338,6 +1318,7 @@ httpSccParseInit(HttpScc *scc, const char *str)
+ 	}
+ 	if (EBIT_TEST(scc->mask, type)) {
+ 	    debug(55, 0) ("cc: ignoring duplicate cache-directive: near '%s' in '%s'\n", item, str);
++	    SccAttrs[type].stat.repCount++;
+ 	    continue;
+ 	}
+ 	/* update mask */
+@@ -1406,7 +1387,15 @@ httpSccJoinWith(HttpScc *scc, HttpScc *new_scc)
+     scc->mask |= new_scc->mask;
+ }
+ 
+-
++static void
++httpSccUpdateStats(const HttpScc *scc, StatHist *hist)
++{
++    http_scc_type c;
++    assert(scc);
++    for (c = 0; c < SCC_ENUM_END; c++)
++	if (EBIT_TEST(scc->mask, c))
++	    statHistCount(hist, c);
++}
+ 
+ /*
+  * HttpHeaderExtField
+@@ -1471,126 +1460,108 @@ httpHeaderExtFieldDup(HttpHeaderExtField *f)
+     return httpHeaderExtFieldCreate(f->name, f->value);
+ }
+ 
+-#if 0 /* save for parts */
+-
+-/*
+- * returns the space requred to put a field (and terminating <CRLF>!) into a
+- * buffer
+- */
+-static size_t
+-httpHeaderFieldBufSize(const HttpHeaderExtField *fld)
+-{
+-    return strlen(fld->name)+2+strlen(fld->value)+2;
+-}
+-
+ /*
+- * returns true if fld.name is a "known" splitable field; 
+- * always call this function to check because the detection algortihm may change
++ * Reports
+  */
+-static int
+-httpHeaderFieldIsList(const HttpHeaderExtField *fld) {
+-    int i;
+-    assert(fld);
+-    /* "onten" should not match "Content"! */
+-    for (i = 0; i < KnownSplitableFieldCount; ++i)
+-	if (strcasecmp(KnownSplitableFields[i], fld->name))
+-	    return 1;
+-    return 0;
+-}
+-
+-#endif
+ 
+ static void
+-httpHeaderStoreAReport(StoreEntry *e, void (*reportPacker)(Packer *p))
++httpHeaderFieldStatDumper(StoreEntry * sentry, int idx, double val, double size, int count)
+ {
+-    Packer p;
+-    assert(e);
+-    packerToStoreInit(&p, e);
+-    (*reportPacker)(&p);
+-    packerClean(&p);
++    const int id = (int) val;
++    const int valid_id = id >= 0 && id < HDR_ENUM_END;
++    const char *name = valid_id ? Headers[id].name : "INVALID";
++    if (count || valid_id)
++	storeAppendPrintf(sentry, "%2d\t %-20s\t %5d\t %6.2f\n",
++	    id, name, count, xdiv(count, HeaderParsedCount));
+ }
+ 
+-void
+-httpHeaderStoreReport(StoreEntry *e)
++static void
++httpHeaderCCStatDumper(StoreEntry * sentry, int idx, double val, double size, int count)
+ {
+-    httpHeaderStoreAReport(e, &httpHeaderPackReport); 
++    const int id = (int) val;
++    const int valid_id = id >= 0 && id < SCC_ENUM_END;
++    const char *name = valid_id ? SccAttrs[id].name : "INVALID";
++    if (count || valid_id)
++	storeAppendPrintf(sentry, "%2d\t %-20s\t %5d\t %6.2f\n",
++	    id, name, count, xdiv(count, CcPasredCount));
+ }
+ 
+-void
+-httpHeaderStoreReqReport(StoreEntry *e)
+-{
+-    httpHeaderStoreAReport(e, &httpHeaderPackReqReport); 
+-}
+ 
+-void
+-httpHeaderStoreRepReport(StoreEntry *e)
++static void
++httpHeaderFldsPerHdrDumper(StoreEntry * sentry, int idx, double val, double size, int count)
+ {
+-    httpHeaderStoreAReport(e, &httpHeaderPackRepReport); 
++    if (count)
++	storeAppendPrintf(sentry, "%2d\t %5d\t %5d\t %6.2f\n",
++	    idx, ((int)(val+size)), count, xpercent(count, HeaderEntryParsedCount));
+ }
+ 
+ 
+ static void
+-httpHeaderPackReport(Packer *p)
+-{
+-    assert(p);
+-
+-    httpHeaderPackRepReport(p);
+-    httpHeaderPackReqReport(p);
+-
+-    /* low level totals; reformat this? @?@ */
+-    packerPrintf(p,
+-	"hdrs totals: %uld+%uld %s lstr: +%uld-%uld<(%uld=%uld)\n",
+-	shortHeadersCount,
+-	longHeadersCount,
+-	memPoolReport(shortStrings),
+-	longStrAllocCount,
+-	longStrFreeCount,
+-	longStrHighWaterCount,
+-	longStrHighWaterSize);
++httpHeaderStatDump(const HttpHeaderStat *hs, StoreEntry *e)
++{
++    assert(hs && e);
++
++    storeAppendPrintf(e, "\n<h3>Header Stats: %s</h3>\n", hs->label);
++    storeAppendPrintf(e, "\t<h3>Field type distribution</h3>\n");
++    storeAppendPrintf(e, "%2s\t %-20s\t %5s\t %6s\n",
++	"id", "name", "count", "#/header");
++    statHistDump(&hs->fieldTypeDistr, e, httpHeaderFieldStatDumper);
++    storeAppendPrintf(e, "\t<h3>Cache-control directives distribution</h3>\n");
++    storeAppendPrintf(e, "%2s\t %-20s\t %5s\t %6s\n",
++	"id", "name", "count", "#/cc_field");
++    statHistDump(&hs->ccTypeDistr, e, httpHeaderCCStatDumper);
++    storeAppendPrintf(e, "\t<h3>Number of fields per header distribution (init size: %d)</h3>\n",
++	INIT_FIELDS_PER_HEADER);
++    storeAppendPrintf(e, "%2s\t %-5s\t %5s\t %6s\n",
++	"id", "#flds", "count", "%total");
++    statHistDump(&hs->hdrUCountDistr, e, httpHeaderFldsPerHdrDumper);
+ }
+ 
+ static void
+-httpHeaderPackRepReport(Packer *p)
+-{
+-    assert(p);
+-#if 0 /* implement this */
+-    httpHeaderPackAReport(p, &ReplyHeaderStats);
+-    for (i = SCC_PUBLIC; i < SCC_ENUM_END; i++)
+-	storeAppendPrintf(entry, "Cache-Control %s: %d\n",
+-	    HttpServerCCStr[i],
+-	    ReplyHeaderStats.cc[i]);
+-#endif
++shortStringStatDump(StoreEntry *e)
++{
++    storeAppendPrintf(e, "<h3>Short String Stats</h3>\n<p>%s\n</p>\n",
++	memPoolReport(shortStrings));
++    storeAppendPrintf(e, "<br><h3>Long String Stats</h3>\n");
++    storeAppendPrintf(e, "\talive: %3d (%5.1f KB) high-water:  %3d (%5.1f KB)\n",
++	longStrAliveCount, longStrAliveSize/1024.,
++	longStrHighWaterCount, longStrHighWaterSize/1024.);
+ }
+ 
+-static void
+-httpHeaderPackReqReport(Packer *p)
++void
++httpHeaderStoreReport(StoreEntry *e)
+ {
+-    assert(p);
+-#if 0 /* implement this */
+-    httpHeaderPackAReport(p, &RequestHeaderStats);
+-#endif
+-}
++    int i;
++    http_hdr_type ht;
++    assert(e);
+ 
+-#if 0 /* implement this */
+-static void
+-httpHeaderPackAReport(Packer *p, HttpHeaderStats *stats)
+-{
+-    assert(p);
+-    assert(stats);
+-    assert(0);
+-    http_server_cc_t i;
+-    http_hdr_misc_t j;
+-    storeAppendPrintf(entry, "HTTP Reply Headers:\n");
+-    storeAppendPrintf(entry, "       Headers parsed: %d\n",
+-	ReplyHeaderStats.parsed);
+-    for (j = HDR_AGE; j < HDR_MISC_END; j++)
+-	storeAppendPrintf(entry, "%21.21s: %d\n",
+-	    HttpHdrMiscStr[j],
+-	    ReplyHeaderStats.misc[j]);
++    /* fix this (including summing for totals) for req hdrs @?@ */
++    for (i = 0; i < 1 /*HttpHeaderStatCount*/; i++) {
++	httpHeaderStatDump(HttpHeaderStats+i, e);
++	storeAppendPrintf(e, "%s\n", "<br>");
++    }
++    storeAppendPrintf(e, "%s\n", "<hr size=1 noshade>");
++    /* field stats */
++    storeAppendPrintf(e, "<h3>Http Fields Stats (replies and requests)</h3>\n");
++    storeAppendPrintf(e, "%2s\t %-20s\t %5s\t %6s\t %6s\n",
++	"id", "name", "#alive", "%err", "%repeat");
++    for (ht = 0; ht < HDR_ENUM_END; ht++) {
++	field_attrs_t *f = Headers+ht;
++	storeAppendPrintf(e, "%2d\t %-20s\t %5d\t %6.3f\t %6.3f\n",
++	    f->id, f->name, f->stat.aliveCount,
++	    xpercent(f->stat.errCount, f->stat.parsCount), 
++	    xpercent(f->stat.repCount, f->stat.parsCount));
++    }
++    storeAppendPrintf(e, "%s\n", "<hr size=1 noshade>");
++    /* short strings */
++    shortStringStatDump(e);
+ }
+-#endif
+ 
+-/* "short string" routines below are trying to recycle memory for short strings */
++
++/*
++ * "short string" routines below are trying to recycle memory for short strings
++ */
++
+ static char *
+ dupShortStr(const char *str)
+ {
+@@ -1630,12 +1601,12 @@ allocShortBuf(size_t sz)
+     /* tmp_debug(here) ("allocating short buffer of size %d (max: %d)\n", sz, shortStrings->obj_size); @?@ */
+     if (sz > shortStrings->obj_size) {
+ 	buf = xmalloc(sz);
+-	longStrAllocCount++;
+-	longStrAllocSize += sz;
+-	if (longStrHighWaterCount < longStrAllocCount - longStrFreeCount)
+-	    longStrHighWaterCount = longStrAllocCount - longStrFreeCount;
+-	if (longStrHighWaterSize < longStrAllocSize - longStrFreeSize)
+-	    longStrHighWaterSize = longStrAllocSize - longStrFreeSize;
++	longStrAliveCount++;
++	longStrAliveSize += sz;
++	if (longStrHighWaterCount < longStrAliveCount)
++	    longStrHighWaterCount = longStrAliveCount;
++	if (longStrHighWaterSize < longStrAliveSize)
++	    longStrHighWaterSize = longStrAliveSize;
+     } else
+ 	buf = memPoolGetObj(shortStrings);
+     return buf;
+@@ -1650,9 +1621,10 @@ freeShortString(char *str)
+         debug(55,9) ("freeing short str of size %d (max: %d) '%s' (%p)\n", sz, shortStrings->obj_size, str, str);
+ 	if (sz > shortStrings->obj_size) {
+ 	    debug(55,9) ("LONG short string[%d>%d]: %s\n", sz, shortStrings->obj_size, str);
++	    assert(longStrAliveCount);
+ 	    xfree(str);
+-	    longStrFreeCount++;
+-	    longStrFreeSize += sz;
++	    longStrAliveCount--;
++	    longStrAliveSize -= sz;
+ 	} else
+ 	    memPoolPutObj(shortStrings, str);
+     }
+@@ -1706,3 +1678,18 @@ getStringPrefix(const char *str) {
+     xstrncpy(buf, str, SHORT_PREFIX_SIZE);
+     return buf;
+ }
++
++/* safe percent calculation */
++static double
++xpercent(double part, double whole)
++{
++    return xdiv(100*part, whole);
++}
++
++/* safe division */
++static double
++xdiv(double nom, double denom)
++{
++    return (denom != 0.0) ? nom/denom : -1;
++}
++
+@@ -1,7 +1,7 @@
+ #
+ #  Makefile for the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.124 1998/02/22 12:01:36 kostas Exp $
++#  $Id: Makefile.in,v 1.125 1998/02/25 09:53:54 rousskov Exp $
+ #
+ #  Uncomment and customize the following to suit your needs:
+ #
+@@ -118,6 +118,7 @@ OBJS	 	= \
+ 		@SNMP_OBJS@ \
+ 		ssl.o \
+ 		stat.o \
++		StatHist.o \
+ 		stmem.o \
+ 		store.o \
+ 		store_clean.o \
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: cachemgr.cc,v 1.68 1998/02/23 13:03:01 rousskov Exp $
++ * $Id: cachemgr.cc,v 1.69 1998/02/25 09:53:55 rousskov Exp $
+  *
+  * DEBUG: section 0     CGI Cache Manager
+  * AUTHOR: Duane Wessels
+@@ -213,8 +213,8 @@ print_trailer(void)
+ static void
+ auth_html(char *host, int port, const char *user_name)
+ {
+-    if (!user_name)
+-	user_name = "";
++    if (!user_name) user_name = "";
++    if (!host || !strlen(host)) host = "localhost";
+     printf("Content-type: text/html\r\n\r\n");
+     printf("<HTML><HEAD><TITLE>Cache Manager Interface</TITLE></HEAD>\n");
+     printf("<BODY><H1>Cache Manager Interface</H1>\n");
+@@ -224,7 +224,7 @@ auth_html(char *host, int port, const char *user_name)
+     printf("<FORM METHOD=\"POST\" ACTION=\"%s\">\n", script_name);
+     printf("<TABLE BORDER=0>\n");
+     printf("<TR><TH ALIGN=\"left\">Cache Host:</TH><TD><INPUT NAME=\"host\" ");
+-    printf("SIZE=30 VALUE=\"%s\"></TD></TR>\n", host ? host : "localhost");
++    printf("SIZE=30 VALUE=\"%s\"></TD></TR>\n", host);
+     printf("<TR><TH ALIGN=\"left\">Cache Port:</TH><TD><INPUT NAME=\"port\" ");
+     printf("SIZE=30 VALUE=\"%d\"></TD></TR>\n", port);
+     printf("<TR><TH ALIGN=\"left\">Manager name:</TH><TD><INPUT NAME=\"user_name\" ");
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: client_side.cc,v 1.214 1998/02/24 21:17:02 wessels Exp $
++ * $Id: client_side.cc,v 1.215 1998/02/25 09:53:55 rousskov Exp $
+  *
+  * DEBUG: section 33    Client-side Routines
+  * AUTHOR: Duane Wessels
+@@ -569,7 +569,7 @@ clientUpdateCounters(clientHttpRequest * http)
+     }
+     if (http->request->err_type != ERR_NONE)
+ 	Counter.client_http.errors++;
+-    statLogHistCount(&Counter.client_http.all_svc_time, svc_time);
++    statHistCount(&Counter.client_http.all_svc_time, svc_time);
+     /*
+      * The idea here is not to be complete, but to get service times
+      * for only well-defined types.  For example, we don't include
+@@ -578,23 +578,23 @@ clientUpdateCounters(clientHttpRequest * http)
+      */
+     switch (http->log_type) {
+     case LOG_TCP_IMS_HIT:
+-	statLogHistCount(&Counter.client_http.nm_svc_time, svc_time);
++	statHistCount(&Counter.client_http.nm_svc_time, svc_time);
+ 	break;
+     case LOG_TCP_HIT:
+     case LOG_TCP_MEM_HIT:
+-	statLogHistCount(&Counter.client_http.hit_svc_time, svc_time);
++	statHistCount(&Counter.client_http.hit_svc_time, svc_time);
+ 	break;
+     case LOG_TCP_MISS:
+     case LOG_TCP_CLIENT_REFRESH_MISS:
+-	statLogHistCount(&Counter.client_http.miss_svc_time, svc_time);
++	statHistCount(&Counter.client_http.miss_svc_time, svc_time);
+ 	break;
+     default:
+ 	/* make compiler warnings go away */
+ 	break;
+     }
+     i = &http->request->hier.icp;
+     if (0 != i->stop.tv_sec)
+-	statLogHistCount(&Counter.icp.query_svc_time, tvSubUsec(i->start, i->stop));
++	statHistCount(&Counter.icp.query_svc_time, tvSubUsec(i->start, i->stop));
+ }
+ 
+ static void
+@@ -206,4 +206,6 @@
+ 
+ #define SKIP_BASIC_SZ ((size_t) 6)
+ 
++#if 0
+ #define STAT_LOG_HIST_BINS 300
++#endif
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: fqdncache.cc,v 1.84 1998/02/23 21:07:12 kostas Exp $
++ * $Id: fqdncache.cc,v 1.85 1998/02/25 09:53:57 rousskov Exp $
+  *
+  * DEBUG: section 35    FQDN Cache
+  * AUTHOR: Harvest Derived
+@@ -468,7 +468,7 @@ fqdncache_dnsHandleRead(int fd, void *data)
+ 	fatal_dump("fqdncache_dnsHandleRead: bad status");
+     if (strstr(dnsData->ip_inbuf, "$end\n")) {
+ 	/* end of record found */
+-	statLogHistCount(&Counter.dns.svc_time,
++	statHistCount(&Counter.dns.svc_time,
+ 	    tvSubMsec(dnsData->dispatch_time, current_time));
+ 	if ((x = fqdncache_parsebuffer(dnsData->ip_inbuf, dnsData)) == NULL) {
+ 	    debug(35, 0) ("fqdncache_dnsHandleRead: fqdncache_parsebuffer failed?!\n");
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: http.cc,v 1.241 1998/02/24 21:17:05 wessels Exp $
++ * $Id: http.cc,v 1.242 1998/02/25 09:53:58 rousskov Exp $
+  *
+  * DEBUG: section 11    Hypertext Transfer Protocol (HTTP)
+  * AUTHOR: Harvest Derived
+@@ -1165,9 +1165,6 @@ httpReplyHeaderStats(StoreEntry * entry)
+ void
+ httpInit(void)
+ {
+-    cachemgrRegister("reply_headers",
+-	"HTTP Reply Header Histograms",
+-	httpHeaderStoreRepReport, 0);
+ }
+ 
+ static void
+@@ -52,7 +52,7 @@ icpUdpReply(int fd, void *data)
+ 	UdpQueueHead = queue->next;
+ 	if (queue->logcode) {
+ 	    icpLogIcp(queue);
+-	    statLogHistCount(&Counter.icp.reply_svc_time,
++	    statHistCount(&Counter.icp.reply_svc_time,
+ 		tvSubUsec(queue->start, current_time));
+ 	}
+ 	safe_free(queue->msg);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: ipcache.cc,v 1.159 1998/02/23 21:07:13 kostas Exp $
++ * $Id: ipcache.cc,v 1.160 1998/02/25 09:53:59 rousskov Exp $
+  *
+  * DEBUG: section 14    IP Cache
+  * AUTHOR: Harvest Derived
+@@ -518,7 +518,7 @@ ipcache_dnsHandleRead(int fd, void *data)
+     assert(i->status == IP_DISPATCHED);
+     if (strstr(dnsData->ip_inbuf, "$end\n")) {
+ 	/* end of record found */
+-	statLogHistCount(&Counter.dns.svc_time,
++	statHistCount(&Counter.dns.svc_time,
+ 	    tvSubMsec(dnsData->dispatch_time, current_time));
+ 	if ((x = ipcache_parsebuffer(dnsData->ip_inbuf, dnsData)) == NULL) {
+ 	    debug(14, 0) ("ipcache_dnsHandleRead: ipcache_parsebuffer failed?!\n");
+@@ -384,7 +384,14 @@ extern void identStart(int, ConnStateData *, IDCB * callback);
+ extern void statInit(void);
+ extern void pconnHistCount(int, int);
+ extern int statMemoryAccounted(void);
+-extern void statLogHistCount(StatLogHist * H, double val);
++
++void statHistClean(StatHist * H);
++void statHistCount(StatHist * H, double val);
++void statHistCopy(StatHist * Dest, const StatHist * Orig);
++double statHistDeltaMedian(const StatHist * A, const StatHist * B);
++void statHistDump(const StatHist * H, StoreEntry * sentry, StatHistBinDumper bd);
++void statHistLogInit(StatHist * H, int capacity, double min, double max);
++void statHistEnumInit(StatHist * H, int last_enum);
+ 
+ 
+ extern void memInit(void);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: stat.cc,v 1.206 1998/02/24 23:26:39 wessels Exp $
++ * $Id: stat.cc,v 1.207 1998/02/25 09:54:01 rousskov Exp $
+  *
+  * DEBUG: section 18    Cache Manager Statistics
+  * AUTHOR: Harvest Derived
+@@ -113,13 +113,10 @@ static const char *describeFlags(const StoreEntry *);
+ static const char *describeTimestamps(const StoreEntry *);
+ static void statAvgTick(void *notused);
+ static void statAvgDump(StoreEntry *, int minutes);
++static void statCountersInit(StatCounters *);
++static void statCountersClean(StatCounters *);
++static void statCountersCopy(StatCounters *dest, const StatCounters *orig);
+ static void statCountersDump(StoreEntry * sentry);
+-static void statCounterInit(StatCounters *);
+-void statLogHistInit(StatLogHist *, double, double);
+-static int statLogHistBin(StatLogHist *, double);
+-static double statLogHistVal(StatLogHist *, double);
+-static double statLogHistDeltaMedian(StatLogHist * A, StatLogHist * B);
+-static void statLogHistDump(StoreEntry * sentry, StatLogHist * H);
+ static OBJH stat_io_get;
+ static OBJH stat_objects_get;
+ static OBJH stat_vmobjects_get;
+@@ -568,70 +565,6 @@ info_get(StoreEntry * sentry)
+ #endif
+ }
+ 
+-static void
+-statCountersDump(StoreEntry * sentry)
+-{
+-    StatCounters *f = &Counter;
+-    struct rusage rusage;
+-    squid_getrusage(&rusage);
+-    f->page_faults = rusage_pagefaults(&rusage);
+-    f->cputime = rusage_cputime(&rusage);
+-
+-    storeAppendPrintf(sentry, "client_http.requests = %d\n",
+-	f->client_http.requests);
+-    storeAppendPrintf(sentry, "client_http.hits = %d\n",
+-	f->client_http.hits);
+-    storeAppendPrintf(sentry, "client_http.errors = %d\n",
+-	f->client_http.errors);
+-    storeAppendPrintf(sentry, "client_http.kbytes_in = %d\n",
+-	(int) f->client_http.kbytes_in.kb);
+-    storeAppendPrintf(sentry, "client_http.kbytes_out = %d\n",
+-	(int) f->client_http.kbytes_out.kb);
+-    storeAppendPrintf(sentry, "client_http.all_svc_time histogram:\n");
+-    statLogHistDump(sentry, &f->client_http.all_svc_time);
+-    storeAppendPrintf(sentry, "client_http.miss_svc_time histogram:\n");
+-    statLogHistDump(sentry, &f->client_http.miss_svc_time);
+-    storeAppendPrintf(sentry, "client_http.nm_svc_time histogram:\n");
+-    statLogHistDump(sentry, &f->client_http.nm_svc_time);
+-    storeAppendPrintf(sentry, "client_http.hit_svc_time histogram:\n");
+-    statLogHistDump(sentry, &f->client_http.hit_svc_time);
+-
+-    storeAppendPrintf(sentry, "server.requests = %d\n",
+-	(int) f->server.requests);
+-    storeAppendPrintf(sentry, "server.errors = %d\n",
+-	(int) f->server.errors);
+-    storeAppendPrintf(sentry, "server.kbytes_in = %d\n",
+-	(int) f->server.kbytes_in.kb);
+-    storeAppendPrintf(sentry, "server.kbytes_out = %d\n",
+-	(int) f->server.kbytes_out.kb);
+-
+-    storeAppendPrintf(sentry, "icp.pkts_sent = %d\n",
+-	f->icp.pkts_sent);
+-    storeAppendPrintf(sentry, "icp.pkts_recv = %d\n",
+-	f->icp.pkts_recv);
+-    storeAppendPrintf(sentry, "icp.kbytes_sent = %d\n",
+-	(int) f->icp.kbytes_sent.kb);
+-    storeAppendPrintf(sentry, "icp.kbytes_recv = %d\n",
+-	(int) f->icp.kbytes_recv.kb);
+-    storeAppendPrintf(sentry, "icp.query_svc_time histogram:\n");
+-    statLogHistDump(sentry, &f->icp.query_svc_time);
+-    storeAppendPrintf(sentry, "icp.reply_svc_time histogram:\n");
+-    statLogHistDump(sentry, &f->icp.reply_svc_time);
+-
+-    storeAppendPrintf(sentry, "dns.svc_time histogram:\n");
+-    statLogHistDump(sentry, &f->dns.svc_time);
+-    storeAppendPrintf(sentry, "unlink.requests = %d\n",
+-	f->unlink.requests);
+-    storeAppendPrintf(sentry, "page_faults = %d\n",
+-	f->page_faults);
+-    storeAppendPrintf(sentry, "select_loops = %d\n",
+-	f->select_loops);
+-    storeAppendPrintf(sentry, "cpu_time = %f\n",
+-	f->cputime);
+-    storeAppendPrintf(sentry, "wall_time = %f\n",
+-	tvSubDsec(f->timestamp, current_time));
+-}
+-
+ #define XAVG(X) (dt ? (double) (f->X - l->X) / dt : 0.0)
+ static void
+ statAvgDump(StoreEntry * sentry, int minutes)
+@@ -661,19 +594,19 @@ statAvgDump(StoreEntry * sentry, int minutes)
+     storeAppendPrintf(sentry, "client_http.kbytes_out = %f/sec\n",
+ 	XAVG(client_http.kbytes_out.kb));
+ 
+-    x = statLogHistDeltaMedian(&l->client_http.all_svc_time,
++    x = statHistDeltaMedian(&l->client_http.all_svc_time,
+ 	&f->client_http.all_svc_time);
+     storeAppendPrintf(sentry, "client_http.all_median_svc_time = %f seconds\n",
+ 	x / 1000.0);
+-    x = statLogHistDeltaMedian(&l->client_http.miss_svc_time,
++    x = statHistDeltaMedian(&l->client_http.miss_svc_time,
+ 	&f->client_http.miss_svc_time);
+     storeAppendPrintf(sentry, "client_http.miss_median_svc_time = %f seconds\n",
+ 	x / 1000.0);
+-    x = statLogHistDeltaMedian(&l->client_http.nm_svc_time,
++    x = statHistDeltaMedian(&l->client_http.nm_svc_time,
+ 	&f->client_http.nm_svc_time);
+     storeAppendPrintf(sentry, "client_http.nm_median_svc_time = %f seconds\n",
+ 	x / 1000.0);
+-    x = statLogHistDeltaMedian(&l->client_http.hit_svc_time,
++    x = statHistDeltaMedian(&l->client_http.hit_svc_time,
+ 	&f->client_http.hit_svc_time);
+     storeAppendPrintf(sentry, "client_http.hit_median_svc_time = %f seconds\n",
+ 	x / 1000.0);
+@@ -695,13 +628,13 @@ statAvgDump(StoreEntry * sentry, int minutes)
+ 	XAVG(icp.kbytes_sent.kb));
+     storeAppendPrintf(sentry, "icp.kbytes_recv = %f/sec\n",
+ 	XAVG(icp.kbytes_recv.kb));
+-    x = statLogHistDeltaMedian(&l->icp.query_svc_time, &f->icp.query_svc_time);
++    x = statHistDeltaMedian(&l->icp.query_svc_time, &f->icp.query_svc_time);
+     storeAppendPrintf(sentry, "icp.query_median_svc_time = %f seconds\n",
+ 	x / 1000000.0);
+-    x = statLogHistDeltaMedian(&l->icp.reply_svc_time, &f->icp.reply_svc_time);
++    x = statHistDeltaMedian(&l->icp.reply_svc_time, &f->icp.reply_svc_time);
+     storeAppendPrintf(sentry, "icp.reply_median_svc_time = %f seconds\n",
+ 	x / 1000000.0);
+-    x = statLogHistDeltaMedian(&l->dns.svc_time, &f->dns.svc_time);
++    x = statHistDeltaMedian(&l->dns.svc_time, &f->dns.svc_time);
+     storeAppendPrintf(sentry, "dns.median_svc_time = %f seconds\n",
+ 	x / 1000.0);
+     storeAppendPrintf(sentry, "unlink.requests = %f/sec\n",
+@@ -715,37 +648,15 @@ statAvgDump(StoreEntry * sentry, int minutes)
+     storeAppendPrintf(sentry, "cpu_usage = %f%%\n", dpercent(ct, dt));
+ }
+ 
+-static void
+-statCounterInit(StatCounters * C)
+-{
+-    C->timestamp = current_time;
+-    /*
+-     * HTTP svc_time hist is kept in milli-seconds; max of 3 hours.
+-     */
+-    statLogHistInit(&C->client_http.all_svc_time, 0.0, 3600000.0 * 3.0);
+-    statLogHistInit(&C->client_http.miss_svc_time, 0.0, 3600000.0 * 3.0);
+-    statLogHistInit(&C->client_http.nm_svc_time, 0.0, 3600000.0 * 3.0);
+-    statLogHistInit(&C->client_http.hit_svc_time, 0.0, 3600000.0 * 3.0);
+-    /*
+-     * ICP svc_time hist is kept in micro-seconds; max of 1 minute.
+-     */
+-    statLogHistInit(&C->icp.query_svc_time, 0.0, 1000000.0 * 60.0);
+-    statLogHistInit(&C->icp.reply_svc_time, 0.0, 1000000.0 * 60.0);
+-    /*
+-     * DNS svc_time hist is kept in milli-seconds; max of 10 minutes.
+-     */
+-    statLogHistInit(&C->dns.svc_time, 0.0, 60000.0 * 10.0);
+-}
+-
+ void
+ statInit(void)
+ {
+     int i;
+     debug(18, 5) ("statInit: Initializing...\n");
+     memset(CountHist, '\0', N_COUNT_HIST * sizeof(StatCounters));
+     for (i = 0; i < N_COUNT_HIST; i++)
+-	statCounterInit(&CountHist[i]);
+-    statCounterInit(&Counter);
++	statCountersInit(&CountHist[i]);
++    statCountersInit(&Counter);
+     eventAdd("statAvgTick", statAvgTick, NULL, 60);
+     cachemgrRegister("info",
+ 	"General Runtime Information",
+@@ -785,114 +696,156 @@ statAvgTick(void *notused)
+     c->page_faults = rusage_pagefaults(&rusage);
+     c->cputime = rusage_cputime(&rusage);
+     c->timestamp = current_time;
++    /* even if NCountHist is small, we already Init()ed the tail */
++    statCountersClean(CountHist+N_COUNT_HIST-1);
+     xmemmove(p, t, (N_COUNT_HIST - 1) * sizeof(StatCounters));
++#if 0
+     memcpy(t, c, sizeof(StatCounters));
++#endif
++    statCountersCopy(t, c);
+     NCountHist++;
+ }
+ 
+-void
+-statCounters(StoreEntry * e)
++/* add special cases here as they arrive */
++static void
++statCountersInit(StatCounters *C)
+ {
+-    statCountersDump(e);
++    assert(C);
++    C->timestamp = current_time;
++    /*
++     * HTTP svc_time hist is kept in milli-seconds; max of 3 hours.
++     */
++    statHistLogInit(&C->client_http.all_svc_time, 300, 0.0, 3600000.0 * 3.0);
++    statHistLogInit(&C->client_http.miss_svc_time, 300, 0.0, 3600000.0 * 3.0);
++    statHistLogInit(&C->client_http.nm_svc_time, 300, 0.0, 3600000.0 * 3.0);
++    statHistLogInit(&C->client_http.hit_svc_time, 300, 0.0, 3600000.0 * 3.0);
++    /*
++     * ICP svc_time hist is kept in micro-seconds; max of 1 minute.
++     */
++    statHistLogInit(&C->icp.query_svc_time, 300, 0.0, 1000000.0 * 60.0);
++    statHistLogInit(&C->icp.reply_svc_time, 300, 0.0, 1000000.0 * 60.0);
++    /*
++     * DNS svc_time hist is kept in milli-seconds; max of 10 minutes.
++     */
++    statHistLogInit(&C->dns.svc_time, 300, 0.0, 60000.0 * 10.0);
+ }
+ 
++/* add special cases here as they arrive */
+ void
+-statAvg5min(StoreEntry * e)
++statCountersClean(StatCounters *C)
+ {
+-    statAvgDump(e, 5);
++    assert(C);
++    statHistClean(&C->client_http.all_svc_time);
++    statHistClean(&C->client_http.miss_svc_time);
++    statHistClean(&C->client_http.nm_svc_time);
++    statHistClean(&C->client_http.hit_svc_time);
++    statHistClean(&C->icp.query_svc_time);
++    statHistClean(&C->icp.reply_svc_time);
++    statHistClean(&C->dns.svc_time);
+ }
+ 
++/* add special cases here as they arrive */
+ void
+-statAvg60min(StoreEntry * e)
++statCountersCopy(StatCounters *dest, const StatCounters *orig)
+ {
+-    statAvgDump(e, 60);
++    assert(dest && orig);
++    /* prepare space where to copy */
++    statCountersInit(dest);
++    /* this should take care of most of the fields */
++    memcpy(dest, orig, sizeof(*dest));
++    /* now handle spacial cases */
++    /* note: we assume that histogram capacities do not change */
++    statHistCopy(&dest->client_http.all_svc_time, &orig->client_http.all_svc_time);
++    statHistCopy(&dest->client_http.miss_svc_time, &orig->client_http.miss_svc_time);
++    statHistCopy(&dest->client_http.nm_svc_time, &orig->client_http.nm_svc_time);
++    statHistCopy(&dest->client_http.hit_svc_time, &orig->client_http.hit_svc_time);
++    statHistCopy(&dest->icp.query_svc_time, &orig->icp.query_svc_time);
++    statHistCopy(&dest->icp.reply_svc_time, &orig->icp.reply_svc_time);
++    statHistCopy(&dest->dns.svc_time, &orig->dns.svc_time);
+ }
+ 
+-void
+-statLogHistInit(StatLogHist * H, double min, double max)
++static void
++statCountersDump(StoreEntry * sentry)
+ {
+-    H->min = min;
+-    H->max = max;
+-    H->scale = (STAT_LOG_HIST_BINS - 1) / log(1.0 + max - min);
++    StatCounters *f = &Counter;
++    struct rusage rusage;
++    squid_getrusage(&rusage);
++    f->page_faults = rusage_pagefaults(&rusage);
++    f->cputime = rusage_cputime(&rusage);
++
++    storeAppendPrintf(sentry, "client_http.requests = %d\n",
++	f->client_http.requests);
++    storeAppendPrintf(sentry, "client_http.hits = %d\n",
++	f->client_http.hits);
++    storeAppendPrintf(sentry, "client_http.errors = %d\n",
++	f->client_http.errors);
++    storeAppendPrintf(sentry, "client_http.kbytes_in = %d\n",
++	(int) f->client_http.kbytes_in.kb);
++    storeAppendPrintf(sentry, "client_http.kbytes_out = %d\n",
++	(int) f->client_http.kbytes_out.kb);
++    storeAppendPrintf(sentry, "client_http.all_svc_time histogram:\n");
++    statHistDump(&f->client_http.all_svc_time, sentry, NULL);
++    storeAppendPrintf(sentry, "client_http.miss_svc_time histogram:\n");
++    statHistDump(&f->client_http.miss_svc_time, sentry, NULL);
++    storeAppendPrintf(sentry, "client_http.nm_svc_time histogram:\n");
++    statHistDump(&f->client_http.nm_svc_time, sentry, NULL);
++    storeAppendPrintf(sentry, "client_http.hit_svc_time histogram:\n");
++    statHistDump(&f->client_http.hit_svc_time, sentry, NULL);
++
++    storeAppendPrintf(sentry, "server.requests = %d\n",
++	(int) f->server.requests);
++    storeAppendPrintf(sentry, "server.errors = %d\n",
++	(int) f->server.errors);
++    storeAppendPrintf(sentry, "server.kbytes_in = %d\n",
++	(int) f->server.kbytes_in.kb);
++    storeAppendPrintf(sentry, "server.kbytes_out = %d\n",
++	(int) f->server.kbytes_out.kb);
++
++    storeAppendPrintf(sentry, "icp.pkts_sent = %d\n",
++	f->icp.pkts_sent);
++    storeAppendPrintf(sentry, "icp.pkts_recv = %d\n",
++	f->icp.pkts_recv);
++    storeAppendPrintf(sentry, "icp.kbytes_sent = %d\n",
++	(int) f->icp.kbytes_sent.kb);
++    storeAppendPrintf(sentry, "icp.kbytes_recv = %d\n",
++	(int) f->icp.kbytes_recv.kb);
++    storeAppendPrintf(sentry, "icp.query_svc_time histogram:\n");
++    statHistDump(&f->icp.query_svc_time, sentry, NULL);
++    storeAppendPrintf(sentry, "icp.reply_svc_time histogram:\n");
++    statHistDump(&f->icp.reply_svc_time, sentry, NULL);
++
++    storeAppendPrintf(sentry, "dns.svc_time histogram:\n");
++    statHistDump(&f->dns.svc_time, sentry, NULL);
++    storeAppendPrintf(sentry, "unlink.requests = %d\n",
++	f->unlink.requests);
++    storeAppendPrintf(sentry, "page_faults = %d\n",
++	f->page_faults);
++    storeAppendPrintf(sentry, "select_loops = %d\n",
++	f->select_loops);
++    storeAppendPrintf(sentry, "cpu_time = %f\n",
++	f->cputime);
++    storeAppendPrintf(sentry, "wall_time = %f\n",
++	tvSubDsec(f->timestamp, current_time));
+ }
+ 
+ void
+-statLogHistCount(StatLogHist * H, double val)
++statCounters(StoreEntry * e)
+ {
+-    int bin = statLogHistBin(H, val);
+-    assert(H->scale != 0.0);	/* make sure it got initialized */
+-    assert(0 <= bin && bin < STAT_LOG_HIST_BINS);
+-    H->bins[bin]++;
++    statCountersDump(e);
+ }
+ 
+-double
+-statLogHistDeltaMedian(StatLogHist * A, StatLogHist * B)
++void
++statAvg5min(StoreEntry * e)
+ {
+-    StatLogHist D;
+-    int i;
+-    int s1 = 0;
+-    int h = 0;
+-    int a = 0;
+-    int b = 0;
+-    int I = 0;
+-    int J = STAT_LOG_HIST_BINS;
+-    int K;
+-    double f;
+-    memset(&D, '\0', sizeof(StatLogHist));
+-    for (i = 0; i < STAT_LOG_HIST_BINS; i++) {
+-	assert(B->bins[i] >= A->bins[i]);
+-	D.bins[i] = B->bins[i] - A->bins[i];
+-    }
+-    for (i = 0; i < STAT_LOG_HIST_BINS; i++)
+-	s1 += D.bins[i];
+-    h = s1 >> 1;
+-    for (i = 0; i < STAT_LOG_HIST_BINS; i++) {
+-	J = i;
+-	b += D.bins[J];
+-	if (a <= h && h <= b)
+-	    break;
+-	I = i;
+-	a += D.bins[I];
+-    }
+-    if (s1 == 0)
+-	return 0.0;
+-    if (a > h) {
+-	debug(0, 0) ("statLogHistDeltaMedian: a=%d, h=%d\n", a, h);
+-	return 0.0;
+-    }
+-    if (a >= b) {
+-	debug(0, 0) ("statLogHistDeltaMedian: a=%d, b=%d\n", a, b);
+-	return 0.0;
+-    }
+-    if (I >= J) {
+-	debug(0, 0) ("statLogHistDeltaMedian: I=%d, J=%d\n", I, J);
+-	return 0.0;
+-    }
+-    f = (h - a) / (b - a);
+-    K = f * (double) (J - I) + I;
+-    return statLogHistVal(A, K);
++    statAvgDump(e, 5);
+ }
+ 
+-static int
+-statLogHistBin(StatLogHist * H, double v)
++void
++statAvg60min(StoreEntry * e)
+ {
+-    int bin;
+-    double x = 1.0 + v - H->min;
+-    if (x < 0.0)
+-	return 0;
+-    bin = (int) (H->scale * log(x) + 0.5);
+-    if (bin < 0)
+-	bin = 0;
+-    if (bin > STAT_LOG_HIST_BINS - 1)
+-	bin = STAT_LOG_HIST_BINS - 1;
+-    return bin;
++    statAvgDump(e, 60);
+ }
+ 
+-static double
+-statLogHistVal(StatLogHist * H, double bin)
+-{
+-    return exp(bin / H->scale) + H->min - 1.0;
+-}
+ 
+ enum {
+     HTTP_SVC, ICP_SVC, DNS_SVC
+@@ -913,30 +866,17 @@ get_median_svc(int interval, int which)
+     assert(l);
+     switch (which) {
+     case HTTP_SVC:
+-	x = statLogHistDeltaMedian(&l->client_http.all_svc_time, &f->client_http.all_svc_time);
++	x = statHistDeltaMedian(&l->client_http.all_svc_time, &f->client_http.all_svc_time);
+ 	break;
+     case ICP_SVC:
+-	x = statLogHistDeltaMedian(&l->icp.query_svc_time, &f->icp.query_svc_time);
++	x = statHistDeltaMedian(&l->icp.query_svc_time, &f->icp.query_svc_time);
+ 	break;
+     case DNS_SVC:
+-	x = statLogHistDeltaMedian(&l->dns.svc_time, &f->dns.svc_time);
++	x = statHistDeltaMedian(&l->dns.svc_time, &f->dns.svc_time);
+ 	break;
+     default:
+ 	debug(49, 5) ("get_median_val: unknown type.\n");
+ 	x = 0;
+     }
+     return (int) x;
+ }
+-static void
+-statLogHistDump(StoreEntry * sentry, StatLogHist * H)
+-{
+-    int i;
+-    for (i = 0; i < STAT_LOG_HIST_BINS; i++) {
+-	if (H->bins[i] == 0)
+-	    continue;
+-	storeAppendPrintf(sentry, "\t%3d/%f\t%d\n",
+-	    i,
+-	    statLogHistVal(H, 0.5 + i),
+-	    H->bins[i]);
+-    }
+-}
+@@ -943,13 +943,24 @@ struct _ErrorState {
+     char *request_hdrs;
+ };
+ 
+-struct _StatLogHist {
+-    int bins[STAT_LOG_HIST_BINS];
++/*
++ * "very generic" histogram; 
++ * see important comments on hbase_f restrictions in StatHist.c
++ */
++struct _StatHist {
++    int *bins;
++    int capacity;
+     double min;
+     double max;
+     double scale;
++    hbase_f val_in;   /* e.g., log() for log-based histogram */
++    hbase_f val_out;  /* e.g., exp() for log based histogram */
+ };
+ 
++/*
++ * if you add a field to StatCounters, 
++ * you MUST sync statCountersInit, statCountersClean, and statCountersCopy
++ */
+ struct _StatCounters {
+     struct {
+ 	int requests;
+@@ -958,10 +969,10 @@ struct _StatCounters {
+ 	kb_t kbytes_in;
+ 	kb_t kbytes_out;
+ 	kb_t hit_kbytes_out;
+-	StatLogHist miss_svc_time;
+-	StatLogHist nm_svc_time;
+-	StatLogHist hit_svc_time;
+-	StatLogHist all_svc_time;
++	StatHist miss_svc_time;
++	StatHist nm_svc_time;
++	StatHist hit_svc_time;
++	StatHist all_svc_time;
+     } client_http;
+     struct {
+ 	int requests;
+@@ -976,14 +987,14 @@ struct _StatCounters {
+ 	int hits_recv;
+ 	kb_t kbytes_sent;
+ 	kb_t kbytes_recv;
+-	StatLogHist query_svc_time;
+-	StatLogHist reply_svc_time;
++	StatHist query_svc_time;
++	StatHist reply_svc_time;
+     } icp;
+     struct {
+ 	int requests;
+     } unlink;
+     struct {
+-	StatLogHist svc_time;
++	StatHist svc_time;
+     } dns;
+     int page_faults;
+     int select_loops;
+@@ -84,7 +84,7 @@ typedef struct _StatCounters StatCounters;
+ typedef struct _tlv tlv;
+ typedef struct _storeSwapLogData storeSwapLogData;
+ typedef struct _cacheSwap cacheSwap;
+-typedef struct _StatLogHist StatLogHist;
++typedef struct _StatHist StatHist;
+ 
+ /* define AIOCB even without USE_ASYNC_IO */
+ typedef void AIOCB(void *, int aio_return, int aio_errno);
+@@ -116,6 +116,8 @@ typedef void OBJH(StoreEntry *);
+ typedef void SIGHDLR(int sig);
+ typedef void STVLDCB(void *, int, int);
+ 
++typedef double (*hbase_f)(double);
++typedef void (*StatHistBinDumper)(StoreEntry *, int idx, double val, double size, int count);
+ /* MD5 cache keys */
+ typedef unsigned char cache_key;
+ 

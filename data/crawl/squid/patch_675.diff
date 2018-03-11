@@ -1,117 +1,3704 @@
-@@ -6,7 +6,7 @@
-  */
+@@ -3794,6 +3794,7 @@ AC_CONFIG_FILES([\
+ 	src/ident/Makefile \
+ 	src/ip/Makefile \
+ 	src/log/Makefile \
++	src/ipc/Makefile \
+ 	contrib/Makefile \
+ 	snmplib/Makefile \
+ 	icons/Makefile \
+@@ -34,6 +34,7 @@ The 3.2 change history can be <url url="http://www.squid-cache.org/Versions/v3/3
  
- #include "config.h"
--
+ <p>The most important of these new features are:
+ <itemize>
++	<item>SMP scalability
+ 	<item>Helper Multiplexer
+ 	<item>Helper Name Changes
+ 	<item>Multi-Lingual manuals
+@@ -42,6 +43,49 @@ The 3.2 change history can be <url url="http://www.squid-cache.org/Versions/v3/3
+ 
+ Most user-facing changes are reflected in squid.conf (see below).
+ 
++<sect1>SMP scalability
++<p>The new "workers" squid.conf option can be used to launch multiple worker
++   processes and utilize multiple CPU cores. The overall intent is to make
++   multiple workers look like one to an outside observer, while providing
++   knobs to customize each worker behavior if needed.
++
++<p>By default, all worker processes are configured identically and do what a
++   single Squid instance would have done. Squid.conf macro substitutions and
++   conditionals (see below) can be used to customize individual worker
++   configurations. In the paragraphs below, "can share" implies "will share by
++   default".
++
++<p>Workers can share HTTP, HTTPS, SNMP, ICP, and HTCP listening addresses.
++   Configuration related to ICP and HTCP clients must be adjusted to avoid
++   source address conflicts: Modify the IP address and/or the port used for
++   the protocol. Workers do not share DNS addresses by default because the OS
++   assigns each worker a unique DNS port.
++
++<p>Workers can share logs.
++
++<p>Workers cannot share caches, for now. Cache_dir options must be adjusted to
++   point each disk-caching worker to its own disk area. ICP and HTCP responses
++   are based on the responding worker cache state. Overall, SMP Squid behaves
++   as a Squid farm behind a load-balancer with no cache affinity awareness.
++   This is perfect for non-caching Squids but inappropriate for Squids that
++   must coordinate caching activities (in-between environments are in a gray
++   area requiring case-by-case analysis).
++
++<p>Cache manager and SNMP statistics are reported from a worker point of
++   view, for now.
++
++<p>Startup, reconfiguration, shutdown, and log rotation are handled as for a
++   monolithic Squid. Abnormally terminated workers are restarted while
++   other workers continue serving traffic.
++
++
++<sect2>Squid.conf macros and conditionals
++<p>Added support for process_name and process_number macros as well as simple
++   if-statement conditionals in squid.conf. These features allow individual
++   worker customization in SMP mode. For details, search for "Conditional
++   configuration" and "SMP-Related Macros" sections in squid.conf.documented.
++
++
+ <sect1>Helper Multiplexer
+ <p>The helper multiplexer's purpose is to relieve some of the burden
+    Squid has when dealing with slow helpers. It does so by acting as a
+@@ -34,7 +34,7 @@ LOADABLE_MODULES_SOURCES = \
+ 	LoadableModules.h \
+ 	LoadableModules.cc
+ 
+-SUBDIRS	= base comm eui acl fs repl auth ip icmp ident log
++SUBDIRS	= base comm eui acl fs repl auth ip icmp ident log ipc
+ 
+ if USE_ADAPTATION
+ SUBDIRS += adaptation
+@@ -164,7 +164,8 @@ COMMON_LIBS = \
+ 	base/libbase.la \
+ 	libsquid.la \
+ 	ip/libip.la \
+-	fs/libfs.la
++	fs/libfs.la \
++	ipc/libipc.la
+ 
+ EXTRA_PROGRAMS = \
+ 	DiskIO/DiskDaemon/diskd \
+@@ -70,6 +70,7 @@
+ #include "StoreFileSystem.h"
+ #include "SwapDir.h"
+ #include "wordlist.h"
++#include "ipc/Kids.h"
+ 
+ #if HAVE_GLOB_H
+ #include <glob.h>
+@@ -263,6 +264,110 @@ parseManyConfigFiles(char* files, int depth)
+     return error_count;
+ }
+ 
++static void
++ReplaceSubstr(char*& str, int& len, unsigned substrIdx, unsigned substrLen, const char* newSubstr)
++{
++    assert(str != NULL);
++    assert(newSubstr != NULL);
++
++    unsigned newSubstrLen = strlen(newSubstr);
++    if (newSubstrLen > substrLen)
++        str = (char*)realloc(str, len - substrLen + newSubstrLen + 1);
++
++    // move tail part including zero
++    memmove(str + substrIdx + newSubstrLen, str + substrIdx + substrLen, len - substrIdx - substrLen + 1);
++    // copy new substring in place
++    memcpy(str + substrIdx, newSubstr, newSubstrLen);
++
++    len = strlen(str);
++}
++
++static void
++SubstituteMacro(char*& line, int& len, const char* macroName, const char* substStr)
++{
++    assert(line != NULL);
++    assert(macroName != NULL);
++    assert(substStr != NULL);
++    unsigned macroNameLen = strlen(macroName);
++    while (const char* macroPos = strstr(line, macroName)) // we would replace all occurrences
++        ReplaceSubstr(line, len, macroPos - line, macroNameLen, substStr);
++}
++
++static void
++ProcessMacros(char*& line, int& len)
++{
++    SubstituteMacro(line, len, "${process_name}", KidName);
++    SubstituteMacro(line, len, "${process_number}", xitoa(KidIdentifier));
++}
++
++static void
++trim_trailing_ws(char* str)
++{
++    assert(str != NULL);
++    unsigned i = strlen(str);
++    while ((i > 0) && xisspace(str[i - 1]))
++        --i;
++    str[i] = '\0';
++}
++
++static const char*
++FindStatement(const char* line, const char* statement)
++{
++    assert(line != NULL);
++    assert(statement != NULL);
++
++    const char* str = skip_ws(line);
++    unsigned len = strlen(statement);
++    if (strncmp(str, statement, len) == 0) {
++        str += len;
++        if (*str == '\0')
++            return str;
++        else if (xisspace(*str))
++            return skip_ws(str);
++    }
++
++    return NULL;
++}
++
++static bool
++StrToInt(const char* str, long& number)
++{
++    assert(str != NULL);
++
++    char* end;
++    number = strtol(str, &end, 0);
++
++    return (end != str) && (*end == '\0'); // returns true if string contains nothing except number
++}
++
++static bool
++EvalBoolExpr(const char* expr)
++{
++    assert(expr != NULL);
++    if (strcmp(expr, "true") == 0) {
++        return true;
++    } else if (strcmp(expr, "false") == 0) {
++        return false;
++    } else if (const char* equation = strchr(expr, '=')) {
++        const char* rvalue = skip_ws(equation + 1);
++        char* lvalue = (char*)xmalloc(equation - expr + 1);
++        xstrncpy(lvalue, expr, equation - expr + 1);
++        trim_trailing_ws(lvalue);
++
++        long number1;
++        if (!StrToInt(lvalue, number1))
++            fatalf("String is not a integer number: '%s'\n", lvalue);
++        long number2;
++        if (!StrToInt(rvalue, number2))
++            fatalf("String is not a integer number: '%s'\n", rvalue);
++
++        xfree(lvalue);
++        return number1 == number2;
++    }
++    fatalf("Unable to evaluate expression '%s'\n", expr);
++    return false; // this place cannot be reached
++}
++
+ static int
+ parseOneConfigFile(const char *file_name, unsigned int depth)
+ {
+@@ -303,6 +408,7 @@ parseOneConfigFile(const char *file_name, unsigned int depth)
+ 
+     config_lineno = 0;
+ 
++    Vector<bool> if_states;
+     while (fgets(config_input_line, BUFSIZ, fp)) {
+         config_lineno++;
+ 
+@@ -362,20 +468,38 @@ parseOneConfigFile(const char *file_name, unsigned int depth)
+             continue;
+         }
+ 
++        trim_trailing_ws(tmp_line);
++        ProcessMacros(tmp_line, tmp_line_len);
+         debugs(3, 5, "Processing: '" << tmp_line << "'");
+ 
+-        /* Handle includes here */
+-        if (tmp_line_len >= 9 && strncmp(tmp_line, "include", 7) == 0 && xisspace(tmp_line[7])) {
+-            err_count += parseManyConfigFiles(tmp_line + 8, depth + 1);
+-        } else if (!parse_line(tmp_line)) {
+-            debugs(3, 0, HERE << cfg_filename << ":" << config_lineno << " unrecognized: '" << tmp_line << "'");
+-            err_count++;
++        if (const char* expr = FindStatement(tmp_line, "if")) {
++            if_states.push_back(EvalBoolExpr(expr)); // store last if-statement meaning
++        } else if (FindStatement(tmp_line, "endif")) {
++            if (!if_states.empty())
++                if_states.pop_back(); // remove last if-statement meaning
++            else
++                fatalf("'endif' without 'if'\n");
++        } else if (FindStatement(tmp_line, "else")) {
++            if (!if_states.empty())
++                if_states.back() = !if_states.back();
++            else
++                fatalf("'else' without 'if'\n");
++        } else if (if_states.empty() || if_states.back()) { // test last if-statement meaning if present
++            /* Handle includes here */
++            if (tmp_line_len >= 9 && strncmp(tmp_line, "include", 7) == 0 && xisspace(tmp_line[7])) {
++                err_count += parseManyConfigFiles(tmp_line + 8, depth + 1);
++            } else if (!parse_line(tmp_line)) {
++                debugs(3, 0, HERE << cfg_filename << ":" << config_lineno << " unrecognized: '" << tmp_line << "'");
++                err_count++;
++            }
+         }
+ 
+         safe_free(tmp_line);
+         tmp_line_len = 0;
+ 
+     }
++    if (!if_states.empty())
++        fatalf("if-statement without 'endif'\n");
+ 
+     if (is_pipe) {
+         int ret = pclose(fp);
+@@ -57,6 +57,43 @@ COMMENT_START
+   This arbitrary restriction is to prevent recursive include references
+   from causing Squid entering an infinite loop whilst trying to load
+   configuration files.
++
++
++  Conditional configuration
++
++	If-statements can be used to make configuration directives
++	depend on conditions:
++
++	    if <CONDITION>
++	        ... regular configuration directives ...
++	    [else
++	        ... regular configuration directives ...]
++	    endif
++
++	The else part is optional. The keywords "if", "else", and "endif"
++	must be typed on their own lines, as if they were regular
++	configuration directives.
++
++	These individual conditions types are supported:
++
++	    true
++		Always evaluates to true.
++	    false
++		Always evaluates to false.
++	    <integer> = <integer>
++	        Equality comparison of two integer numbers.
++
++
++  SMP-Related Macros
++
++	The following SMP-related preprocessor macros can be used.
++
++	${process_name} expands to the current Squid process "name"
++	(e.g., squid1, squid2, or cache1).
++
++	${process_number} expands to the current Squid process
++	identifier, which is an integer number (e.g., 1, 2, 3) unique
++	across all Squid processes.
+ COMMENT_END
+ 
+ COMMENT_START
+@@ -7018,4 +7055,18 @@ DOC_START
+ 	not all comm loops supports large values.
+ DOC_END
+ 
++NAME: workers
++TYPE: int
++LOC: Config.workers
++DEFAULT: 1
++DOC_START
++	Number of main Squid processes or "workers" to fork and maintain.
++	0: "no daemon" mode, like running "squid -N ..."
++	1: "no SMP" mode, start one main Squid process daemon (default)
++	N: start N main Squid process daemons (i.e., SMP mode)
++
++	In SMP mode, each worker does nearly all what a single Squid daemon
++	does (e.g., listen on http_port and forward HTTP requests).
++DOC_END
++
+ EOF
+@@ -93,6 +93,7 @@
+ #include "clientStream.h"
+ #include "comm.h"
+ #include "comm/ListenStateData.h"
 +#include "base/TextException.h"
- #include "ipc/mem/Segment.h"
- #include "protos.h"
+ #include "ConnectionDetail.h"
+ #include "eui/Config.h"
+ #include "fde.h"
+@@ -102,6 +103,7 @@
+ #include "ident/Config.h"
+ #include "ident/Ident.h"
+ #include "ip/Intercept.h"
++#include "ipc/StartListening.h"
+ #include "MemBuf.h"
+ #include "MemObject.h"
+ #include "ProtoPort.h"
+@@ -113,6 +115,35 @@
+ #define comm_close comm_lingering_close
+ #endif
  
-@@ -31,7 +31,7 @@ Ipc::Mem::Segment::~Segment() {
++/// dials clientHttpConnectionOpened or clientHttpsConnectionOpened call
++class ListeningStartedDialer: public CallDialer, public Ipc::StartListeningCb
++{
++public:
++    typedef void (*Handler)(int fd, int errNo, http_port_list *portCfg);
++    ListeningStartedDialer(Handler aHandler, http_port_list *aPortCfg):
++            handler(aHandler), portCfg(aPortCfg) {}
++
++    virtual void print(std::ostream &os) const {
++        startPrint(os) <<
++        ", port=" << (void*)portCfg << ')';
++    }
++
++    virtual bool canDial(AsyncCall &) const { return true; }
++    virtual void dial(AsyncCall &) { (handler)(fd, errNo, portCfg); }
++
++public:
++    Handler handler;
++
++private:
++    http_port_list *portCfg; ///< from Config.Sockaddr.http
++};
++
++
++static void clientHttpConnectionOpened(int fd, int errNo, http_port_list *s);
++#if USE_SSL
++static void clientHttpsConnectionOpened(int fd, int errNo, http_port_list *s);
++#endif
++
+ /* our socket-related context */
+ 
+ 
+@@ -3349,12 +3380,39 @@ ConnStateData::switchToHttps()
+ 
+ #endif /* USE_SSL */
+ 
++/// check FD after clientHttp[s]ConnectionOpened, adjust HttpSockets as needed
++static bool
++OpenedHttpSocket(int fd, const char *msgIfFail)
++{
++    if (fd < 0) {
++        Must(NHttpSockets > 0); // we tried to open some
++        --NHttpSockets; // there will be fewer sockets than planned
++        Must(HttpSockets[NHttpSockets] < 0); // no extra fds received
++
++        if (!NHttpSockets) // we could not open any listen sockets at all
++            fatal(msgIfFail);
++
++        return false;
++    }
++    return true;
++}
++
++/// find any unused HttpSockets[] slot and store fd there or return false
++static bool
++AddOpenedHttpSocket(int fd)
++{
++    bool found = false;
++    for (int i = 0; i < NHttpSockets && !found; i++) {
++        if ((found = HttpSockets[i] < 0))
++            HttpSockets[i] = fd;
++    }
++    return found;
++}
+ 
+ static void
+ clientHttpConnectionsOpen(void)
+ {
+     http_port_list *s = NULL;
+-    int fd = -1;
+ #if USE_SSL
+     int bumpCount = 0; // counts http_ports with sslBump option
+ #endif
+@@ -3378,33 +3436,16 @@ clientHttpConnectionsOpen(void)
+ 
+         /* AYJ: 2009-12-27: bit bumpy. new ListenStateData(...) should be doing all the Comm:: stuff ... */
+ 
+-        enter_suid();
+-
+-        if (s->spoof_client_ip) {
+-            fd = comm_open_listener(SOCK_STREAM, IPPROTO_TCP, s->s, (COMM_NONBLOCKING|COMM_TRANSPARENT), "HTTP Socket");
+-        } else {
+-            fd = comm_open_listener(SOCK_STREAM, IPPROTO_TCP, s->s, COMM_NONBLOCKING, "HTTP Socket");
+-        }
++        const int openFlags = COMM_NONBLOCKING |
++                              (s->spoof_client_ip ? COMM_TRANSPARENT : 0);
+ 
+-        leave_suid();
++        AsyncCall::Pointer callback = asyncCall(33,2,
++                                                "clientHttpConnectionOpened",
++                                                ListeningStartedDialer(&clientHttpConnectionOpened, s));
++        Ipc::StartListening(SOCK_STREAM, IPPROTO_TCP, s->s, openFlags,
++                            Ipc::fdnHttpSocket, callback);
+ 
+-        if (fd < 0)
+-            continue;
+-
+-        AsyncCall::Pointer call = commCbCall(5,5, "SomeCommAcceptHandler(httpAccept)",
+-                                             CommAcceptCbPtrFun(httpAccept, s));
+-
+-        s->listener = new Comm::ListenStateData(fd, call, true);
+-
+-        debugs(1, 1, "Accepting " <<
+-               (s->intercepted ? " intercepted" : "") <<
+-               (s->spoof_client_ip ? " spoofing" : "") <<
+-               (s->sslBump ? " bumpy" : "") <<
+-               (s->accel ? " accelerated" : "")
+-               << " HTTP connections at " << s->s
+-               << ", FD " << fd << "." );
+-
+-        HttpSockets[NHttpSockets++] = fd;
++        HttpSockets[NHttpSockets++] = -1; // set in clientHttpConnectionOpened
+     }
+ 
+ #if USE_SSL
+@@ -3415,12 +3456,36 @@ clientHttpConnectionsOpen(void)
+ #endif
+ }
+ 
++/// process clientHttpConnectionsOpen result
++static void
++clientHttpConnectionOpened(int fd, int, http_port_list *s)
++{
++    if (!OpenedHttpSocket(fd, "Cannot open HTTP Port"))
++        return;
++
++    Must(s);
++
++    AsyncCall::Pointer call = commCbCall(5,5, "SomeCommAcceptHandler(httpAccept)",
++                                         CommAcceptCbPtrFun(httpAccept, s));
++
++    s->listener = new Comm::ListenStateData(fd, call, true);
++
++    debugs(1, 1, "Accepting " <<
++           (s->intercepted ? " intercepted" : "") <<
++           (s->spoof_client_ip ? " spoofing" : "") <<
++           (s->sslBump ? " bumpy" : "") <<
++           (s->accel ? " accelerated" : "")
++           << " HTTP connections at " << s->s
++           << ", FD " << fd << "." );
++
++    Must(AddOpenedHttpSocket(fd)); // otherwise, we have received a fd we did not ask for
++}
++
+ #if USE_SSL
+ static void
+ clientHttpsConnectionsOpen(void)
+ {
+     https_port_list *s;
+-    int fd;
+ 
+     for (s = Config.Sockaddr.https; s; s = (https_port_list *)s->http.next) {
+         if (MAXHTTPPORTS == NHttpSockets) {
+@@ -3435,25 +3500,33 @@ clientHttpsConnectionsOpen(void)
+             continue;
+         }
+ 
+-        enter_suid();
+-        fd = comm_open_listener(SOCK_STREAM,
+-                                IPPROTO_TCP,
+-                                s->http.s,
+-                                COMM_NONBLOCKING, "HTTPS Socket");
+-        leave_suid();
++        AsyncCall::Pointer call = asyncCall(33, 2, "clientHttpsConnectionOpened",
++                                            ListeningStartedDialer(&clientHttpsConnectionOpened, &s->http));
+ 
+-        if (fd < 0)
+-            continue;
++        Ipc::StartListening(SOCK_STREAM, IPPROTO_TCP, s->http.s, COMM_NONBLOCKING,
++                            Ipc::fdnHttpsSocket, call);
+ 
+-        AsyncCall::Pointer call = commCbCall(5,5, "SomeCommAcceptHandler(httpsAccept)",
+-                                             CommAcceptCbPtrFun(httpsAccept, s));
++        HttpSockets[NHttpSockets++] = -1;
++    }
++}
+ 
+-        s->listener = new Comm::ListenStateData(fd, call, true);
++/// process clientHttpsConnectionsOpen result
++static void
++clientHttpsConnectionOpened(int fd, int, http_port_list *s)
++{
++    if (!OpenedHttpSocket(fd, "Cannot open HTTPS Port"))
++        return;
+ 
+-        debugs(1, 1, "Accepting HTTPS connections at " << s->http.s << ", FD " << fd << ".");
++    Must(s);
+ 
+-        HttpSockets[NHttpSockets++] = fd;
+-    }
++    AsyncCall::Pointer call = commCbCall(5,5, "SomeCommAcceptHandler(httpsAccept)",
++                                         CommAcceptCbPtrFun(httpsAccept, s));
++
++    s->listener = new Comm::ListenStateData(fd, call, true);
++
++    debugs(1, 1, "Accepting HTTPS connections at " << s->s << ", FD " << fd << ".");
++
++    Must(AddOpenedHttpSocket(fd)); // otherwise, we have received a fd we did not ask for
+ }
+ 
+ #endif
+@@ -3467,7 +3540,7 @@ clientOpenListenSockets(void)
+ #endif
+ 
+     if (NHttpSockets < 1)
+-        fatal("Cannot open HTTP Port");
++        fatal("No HTTP or HTTPS ports configured");
  }
  
  void
--Ipc::Mem::Segment::create(const int aSize)
-+Ipc::Mem::Segment::create(const off_t aSize)
+@@ -71,6 +71,8 @@ typedef enum {
+ 
+ static void commStopHalfClosedMonitor(int fd);
+ static IOCB commHalfClosedReader;
++static void comm_init_opened(int new_socket, Ip::Address &addr, unsigned char TOS, const char *note, struct addrinfo *AI);
++static int comm_apply_flags(int new_socket, Ip::Address &addr, int flags, struct addrinfo *AI);
+ 
+ 
+ struct comm_io_callback_t {
+@@ -677,7 +679,6 @@ comm_openex(int sock_type,
+             const char *note)
  {
-     assert(aSize > 0);
-     assert(theFD < 0);
-@@ -48,6 +48,8 @@ Ipc::Mem::Segment::create(const int aSize)
-         fatal("Ipc::Mem::Segment::create failed to ftruncate");
-     }
+     int new_socket;
+-    fde *F = NULL;
+     int tos = 0;
+     struct addrinfo *AI = NULL;
  
-+    assert(statSize("Ipc::Mem::Segment::create") == aSize); // paranoid
+@@ -750,6 +751,29 @@ comm_openex(int sock_type,
+ 
+ #endif
+ 
++    comm_init_opened(new_socket, addr, TOS, note, AI);
++    new_socket = comm_apply_flags(new_socket, addr, flags, AI);
 +
-     theSize = aSize;
-     theReserved = 0;
- 
-@@ -69,18 +71,7 @@ Ipc::Mem::Segment::open()
-         fatal(s.termedBuf());
-     }
- 
--    {
--        struct stat s;
--        memset(&s, 0, sizeof(s));
--        if (fstat(theFD, &s)) {
--            debugs(54, 5, HERE << "fstat: " << xstrerror());
--        String s = "Ipc::Mem::Segment::open failed to fstat";
--        s.append(theName);
--        fatal(s.termedBuf());
--        }
--
--        theSize = s.st_size;
--    }
-+    theSize = statSize("Ipc::Mem::Segment::open");
- 
-     debugs(54, 3, HERE << "opened " << theName << " segment: " << theSize);
- 
-@@ -120,13 +111,35 @@ Ipc::Mem::Segment::detach()
- void *
- Ipc::Mem::Segment::reserve(size_t chunkSize)
- {
--    assert(chunkSize <= theSize);
--    assert(theReserved <= theSize - chunkSize);
-+    // check for overflows
-+    assert(static_cast<off_t>(chunkSize) >= 0);
-+    assert(static_cast<off_t>(chunkSize) <= theSize);
-+    assert(theReserved <= theSize - static_cast<off_t>(chunkSize));
-     void *result = reinterpret_cast<char*>(mem()) + theReserved;
-     theReserved += chunkSize;
-     return result;
- }
- 
-+/// determines the size of the underlying "file"
-+off_t
-+Ipc::Mem::Segment::statSize(const char *context) const
-+{
-+    Must(theFD >= 0);
++    addr.FreeAddrInfo(AI);
 +
-+    struct stat s;
-+    memset(&s, 0, sizeof(s));
++    PROF_stop(comm_open);
 +
-+    if (fstat(theFD, &s) != 0) {
-+        debugs(54, 5, HERE << "fstat: " << xstrerror());
-+        String s = context;
-+        s.append("failed to fstat(2)");
-+        s.append(theName);
-+        fatal(s.termedBuf());
-+    }
-+
-+    return s.st_size;
++    return new_socket;
 +}
 +
- /// Generate name for shared memory segment. Replaces all slashes with dots.
- String
- Ipc::Mem::Segment::GenerateName(const char *id)
-@@ -21,26 +21,27 @@ class Segment {
++/// update FD tables after a local or remote (IPC) comm_openex();
++void
++comm_init_opened(int new_socket,
++                 Ip::Address &addr,
++                 unsigned char TOS,
++                 const char *note,
++                 struct addrinfo *AI)
++{
++    assert(new_socket >= 0);
++    assert(AI);
++
++    fde *F = NULL;
++
+     /* update fdstat */
+     debugs(5, 5, "comm_open: FD " << new_socket << " is a new socket");
  
-     /// Create a new shared memory segment. Fails if a segment with
-     /// the same name already exists.
--    void create(const int aSize);
-+    void create(const off_t aSize);
-     void open(); ///< Open an existing shared memory segment.
+@@ -767,6 +791,19 @@ comm_openex(int sock_type,
+     F->tos = TOS;
  
-     const String &name() { return theName; } ///< shared memory segment name
--    int size() { return theSize; } ///< shared memory segment size
-+    off_t size() { return theSize; } ///< shared memory segment size
-     void *mem() { return theMem; } ///< pointer to mmapped shared memory segment
-     void *reserve(size_t chunkSize); ///< reserve and return the next chunk
-     // TODO: convert most mem() calls to reserve()
+     F->sock_family = AI->ai_family;
++}
++
++/// apply flags after a local comm_open*() call;
++/// returns new_socket or -1 on error
++static int
++comm_apply_flags(int new_socket,
++                 Ip::Address &addr,
++                 int flags,
++                 struct addrinfo *AI)
++{
++    assert(new_socket >= 0);
++    assert(AI);
++    const int sock_type = AI->ai_socktype;
  
- private:
-     void attach();
-     void detach();
-+    off_t statSize(const char *context) const;
+     if (!(flags & COMM_NOCLOEXEC))
+         commSetCloseOnExec(new_socket);
+@@ -797,18 +834,14 @@ comm_openex(int sock_type,
  
-     static String GenerateName(const char *id);
+         if (commBind(new_socket, *AI) != COMM_OK) {
+             comm_close(new_socket);
+-            addr.FreeAddrInfo(AI);
+             return -1;
+-            PROF_stop(comm_open);
+         }
+     }
  
-     const String theName; ///< shared memory segment file name
-     int theFD; ///< shared memory segment file descriptor
-     void *theMem; ///< pointer to mmapped shared memory segment
--    size_t theSize; ///< shared memory segment size
--    size_t theReserved; ///< the total number of reserve()d bytes
-+    off_t theSize; ///< shared memory segment size
-+    off_t theReserved; ///< the total number of reserve()d bytes
+-    addr.FreeAddrInfo(AI);
+-
+     if (flags & COMM_NONBLOCKING)
+         if (commSetNonBlocking(new_socket) == COMM_ERROR) {
++            comm_close(new_socket);
+             return -1;
+-            PROF_stop(comm_open);
+         }
+ 
+ #ifdef TCP_NODELAY
+@@ -820,11 +853,50 @@ comm_openex(int sock_type,
+     if (Config.tcpRcvBufsz > 0 && sock_type == SOCK_STREAM)
+         commSetTcpRcvbuf(new_socket, Config.tcpRcvBufsz);
+ 
+-    PROF_stop(comm_open);
+-
+     return new_socket;
+ }
+ 
++void
++comm_import_opened(int fd,
++                   Ip::Address &addr,
++                   int flags,
++                   const char *note,
++                   struct addrinfo *AI)
++{
++    debugs(5, 2, HERE << " FD " << fd << " at " << addr);
++    assert(fd >= 0);
++    assert(AI);
++
++    comm_init_opened(fd, addr, 0, note, AI);
++
++    if (!(flags & COMM_NOCLOEXEC))
++        fd_table[fd].flags.close_on_exec = 1;
++
++    if (addr.GetPort() > (u_short) 0) {
++#ifdef _SQUID_MSWIN_
++        if (sock_type != SOCK_DGRAM)
++#endif
++            fd_table[fd].flags.nolinger = 1;
++    }
++
++    if ((flags & COMM_TRANSPARENT))
++        fd_table[fd].flags.transparent = 1;
++
++    if (flags & COMM_NONBLOCKING)
++        fd_table[fd].flags.nonblocking = 1;
++
++#ifdef TCP_NODELAY
++    if (AI->ai_socktype == SOCK_STREAM)
++        fd_table[fd].flags.nodelay = 1;
++#endif
++
++    /* no fd_table[fd].flags. updates needed for these conditions:
++     * if ((flags & COMM_REUSEADDR)) ...
++     * if ((flags & COMM_DOBIND) ...) ...
++     */
++}
++
++
+ CBDATA_CLASS_INIT(ConnectStateData);
+ 
+ void *
+@@ -2420,3 +2492,97 @@ CommSelectEngine::checkEvents(int timeout)
+         return EVENT_ERROR;
+     };
+ }
++
++/// Create a unix-domain socket (UDS) that only supports FD_MSGHDR I/O.
++int
++comm_open_uds(int sock_type,
++              int proto,
++              struct sockaddr_un* addr,
++              int flags)
++{
++    // TODO: merge with comm_openex() when Ip::Address becomes NetAddress
++
++    int new_socket;
++
++    PROF_start(comm_open);
++    /* Create socket for accepting new connections. */
++    statCounter.syscalls.sock.sockets++;
++
++    /* Setup the socket addrinfo details for use */
++    struct addrinfo AI;
++    AI.ai_flags = 0;
++    AI.ai_family = PF_UNIX;
++    AI.ai_socktype = sock_type;
++    AI.ai_protocol = proto;
++    AI.ai_addrlen = SUN_LEN(addr);
++    AI.ai_addr = (sockaddr*)addr;
++    AI.ai_canonname = NULL;
++    AI.ai_next = NULL;
++
++    debugs(50, 3, HERE << "Attempt open socket for: " << addr->sun_path);
++
++    if ((new_socket = socket(AI.ai_family, AI.ai_socktype, AI.ai_protocol)) < 0) {
++        /* Increase the number of reserved fd's if calls to socket()
++         * are failing because the open file table is full.  This
++         * limits the number of simultaneous clients */
++
++        if (limitError(errno)) {
++            debugs(50, DBG_IMPORTANT, HERE << "socket failure: " << xstrerror());
++            fdAdjustReserved();
++        } else {
++            debugs(50, DBG_CRITICAL, HERE << "socket failure: " << xstrerror());
++        }
++
++        PROF_stop(comm_open);
++        return -1;
++    }
++
++    debugs(50, 3, HERE "Opened UDS FD " << new_socket << " : family=" << AI.ai_family << ", type=" << AI.ai_socktype << ", protocol=" << AI.ai_protocol);
++
++    /* update fdstat */
++    debugs(50, 5, HERE << "FD " << new_socket << " is a new socket");
++
++    assert(!isOpen(new_socket));
++    fd_open(new_socket, FD_MSGHDR, NULL);
++
++    fdd_table[new_socket].close_file = NULL;
++
++    fdd_table[new_socket].close_line = 0;
++
++    fd_table[new_socket].sock_family = AI.ai_family;
++
++    if (!(flags & COMM_NOCLOEXEC))
++        commSetCloseOnExec(new_socket);
++
++    if (flags & COMM_REUSEADDR)
++        commSetReuseAddr(new_socket);
++
++    if (flags & COMM_NONBLOCKING) {
++        if (commSetNonBlocking(new_socket) != COMM_OK) {
++            comm_close(new_socket);
++            PROF_stop(comm_open);
++            return -1;
++        }
++    }
++
++    if (flags & COMM_DOBIND) {
++        if (commBind(new_socket, AI) != COMM_OK) {
++            comm_close(new_socket);
++            PROF_stop(comm_open);
++            return -1;
++        }
++    }
++
++#ifdef TCP_NODELAY
++    if (sock_type == SOCK_STREAM)
++        commSetTcpNoDelay(new_socket);
++
++#endif
++
++    if (Config.tcpRcvBufsz > 0 && sock_type == SOCK_STREAM)
++        commSetTcpRcvbuf(new_socket, Config.tcpRcvBufsz);
++
++    PROF_stop(comm_open);
++
++    return new_socket;
++}
+@@ -53,6 +53,9 @@ SQUIDCEXTERN void comm_init(void);
+ SQUIDCEXTERN void comm_exit(void);
+ 
+ SQUIDCEXTERN int comm_open(int, int, Ip::Address &, int, const char *note);
++SQUIDCEXTERN int comm_open_uds(int sock_type, int proto, struct sockaddr_un* addr, int flags);
++/// update Comm state after getting a comm_open() FD from another process
++SQUIDCEXTERN void comm_import_opened(int fd, Ip::Address &addr, int flags, const char *note, struct addrinfo *AI);
+ 
+ /**
+  * Open a port specially bound for listening or sending through a specific port.
+@@ -36,6 +36,7 @@
+ #include "Debug.h"
+ #include "SquidTime.h"
+ #include "util.h"
++#include "ipc/Kids.h"
+ 
+ /* for shutting_down flag in xassert() */
+ #include "globals.h"
+@@ -52,6 +53,7 @@ FILE *debug_log = NULL;
+ static char *debug_log_file = NULL;
+ static int Ctx_Lock = 0;
+ static const char *debugLogTime(void);
++static const char *debugLogKid(void);
+ static void ctx_print(void);
+ #if HAVE_SYSLOG
+ #ifdef LOG_LOCAL4
+@@ -117,8 +119,9 @@ _db_print(const char *format,...)
+     va_start(args2, format);
+     va_start(args3, format);
+ 
+-    snprintf(f, BUFSIZ, "%s| %s",
++    snprintf(f, BUFSIZ, "%s%s| %s",
+              debugLogTime(),
++             debugLogKid(),
+              format);
+ 
+     _db_print_file(f, args1);
+@@ -543,6 +546,19 @@ debugLogTime(void)
+     return buf;
+ }
+ 
++static const char *
++debugLogKid(void)
++{
++    if (KidIdentifier != 0) {
++        static char buf[16];
++        if (!*buf) // optimization: fill only once after KidIdentifier is set
++            snprintf(buf, sizeof(buf), " kid%d", KidIdentifier);
++        return buf;
++    }
++
++    return "";
++}
++
+ void
+ xassert(const char *msg, const char *file, int line)
+ {
+@@ -69,6 +69,7 @@ enum fd_type {
+     FD_FILE,
+     FD_SOCKET,
+     FD_PIPE,
++    FD_MSGHDR,
+     FD_UNKNOWN
  };
  
- } // namespace Mem
+@@ -45,6 +45,9 @@ int socket_read_method(int, char *, int);
+ int socket_write_method(int, const char *, int);
+ int file_read_method(int, char *, int);
+ int file_write_method(int, const char *, int);
++#else
++int msghdr_read_method(int, char *, int);
++int msghdr_write_method(int, const char *, int);
+ #endif
+ 
+ const char *fdTypeStr[] = {
+@@ -53,6 +56,7 @@ const char *fdTypeStr[] = {
+     "File",
+     "Socket",
+     "Pipe",
++    "MsgHdr",
+     "Unknown"
+ };
+ 
+@@ -169,6 +173,24 @@ default_write_method(int fd, const char *buf, int len)
+     return i;
+ }
+ 
++int
++msghdr_read_method(int fd, char *buf, int len)
++{
++    PROF_start(read);
++    const int i = recvmsg(fd, reinterpret_cast<msghdr*>(buf), MSG_DONTWAIT);
++    PROF_stop(read);
++    return i;
++}
++
++int
++msghdr_write_method(int fd, const char *buf, int len)
++{
++    PROF_start(write);
++    const int i = sendmsg(fd, reinterpret_cast<const msghdr*>(buf), MSG_NOSIGNAL);
++    PROF_stop(write);
++    return i > 0 ? len : i; // len is imprecise but the caller expects a match
++}
++
+ #endif
+ 
+ void
+@@ -213,9 +235,18 @@ fd_open(int fd, unsigned int type, const char *desc)
+     }
+ 
+ #else
+-    F->read_method = &default_read_method;
++    switch (type) {
+ 
+-    F->write_method = &default_write_method;
++    case FD_MSGHDR:
++        F->read_method = &msghdr_read_method;
++        F->write_method = &msghdr_write_method;
++        break;
++
++    default:
++        F->read_method = &default_read_method;
++        F->write_method = &default_write_method;
++        break;
++    }
+ 
+ #endif
+ 
+@@ -46,6 +46,24 @@
+ #include "http.h"
+ #include "icmp/net_db.h"
+ #include "AccessLogEntry.h"
++#include "ipc/StartListening.h"
++
++/// dials htcpIncomingConnectionOpened call
++class HtcpListeningStartedDialer: public CallDialer,
++        public Ipc::StartListeningCb
++{
++public:
++    typedef void (*Handler)(int fd, int errNo);
++    HtcpListeningStartedDialer(Handler aHandler): handler(aHandler) {}
++
++    virtual void print(std::ostream &os) const { startPrint(os) << ')'; }
++
++    virtual bool canDial(AsyncCall &) const { return true; }
++    virtual void dial(AsyncCall &) { (handler)(fd, errNo); }
++
++public:
++    Handler handler;
++};
+ 
+ typedef struct _Countstr Countstr;
+ 
+@@ -225,6 +243,8 @@ enum {
+     RR_RESPONSE
+ };
+ 
++static void htcpIncomingConnectionOpened(int fd, int errNo);
++
+ static u_int32_t msg_id_counter = 0;
+ static int htcpInSocket = -1;
+ static int htcpOutSocket = -1;
+@@ -1483,20 +1503,15 @@ htcpInit(void)
+     Ip::Address incomingAddr = Config.Addrs.udp_incoming;
+     incomingAddr.SetPort(Config.Port.htcp);
+ 
+-    enter_suid();
+-    htcpInSocket = comm_open_listener(SOCK_DGRAM,
+-                                      IPPROTO_UDP,
+-                                      incomingAddr,
+-                                      COMM_NONBLOCKING,
+-                                      "HTCP Socket");
+-    leave_suid();
+-
+-    if (htcpInSocket < 0)
+-        fatal("Cannot open HTCP Socket");
++    AsyncCall::Pointer call = asyncCall(31, 2,
++                                        "htcpIncomingConnectionOpened",
++                                        HtcpListeningStartedDialer(&htcpIncomingConnectionOpened));
+ 
+-    commSetSelect(htcpInSocket, COMM_SELECT_READ, htcpRecv, NULL, 0);
+-
+-    debugs(31, 1, "Accepting HTCP messages on port " << Config.Port.htcp << ", FD " << htcpInSocket << ".");
++    Ipc::StartListening(SOCK_DGRAM,
++                        IPPROTO_UDP,
++                        incomingAddr,
++                        COMM_NONBLOCKING,
++                        Ipc::fdnInHtcpSocket, call);
+ 
+     if (!Config.Addrs.udp_outgoing.IsNoAddr()) {
+         Ip::Address outgoingAddr = Config.Addrs.udp_outgoing;
+@@ -1518,15 +1533,29 @@ htcpInit(void)
+         debugs(31, 1, "Outgoing HTCP messages on port " << Config.Port.htcp << ", FD " << htcpOutSocket << ".");
+ 
+         fd_note(htcpInSocket, "Incoming HTCP socket");
+-    } else {
+-        htcpOutSocket = htcpInSocket;
+     }
+ 
+     if (!htcpDetailPool) {
+         htcpDetailPool = memPoolCreate("htcpDetail", sizeof(htcpDetail));
+     }
+ }
+ 
++static void
++htcpIncomingConnectionOpened(int fd, int errNo)
++{
++    htcpInSocket = fd;
++
++    if (htcpInSocket < 0)
++        fatal("Cannot open HTCP Socket");
++
++    commSetSelect(htcpInSocket, COMM_SELECT_READ, htcpRecv, NULL, 0);
++
++    debugs(31, 1, "Accepting HTCP messages on port " << Config.Port.htcp << ", FD " << htcpInSocket << ".");
++
++    if (Config.Addrs.udp_outgoing.IsNoAddr())
++        htcpOutSocket = htcpInSocket;
++}
++
+ int
+ htcpQuery(StoreEntry * e, HttpRequest * req, peer * p)
+ {
+@@ -48,8 +48,33 @@
+ #include "SwapDir.h"
+ #include "icmp/net_db.h"
+ #include "ip/Address.h"
++#include "ipc/StartListening.h"
+ #include "rfc1738.h"
+ 
++/// dials icpIncomingConnectionOpened call
++class IcpListeningStartedDialer: public CallDialer,
++        public Ipc::StartListeningCb
++{
++public:
++    typedef void (*Handler)(int fd, int errNo, Ip::Address& addr);
++    IcpListeningStartedDialer(Handler aHandler, Ip::Address& anAddr):
++            handler(aHandler), addr(anAddr) {}
++
++    virtual void print(std::ostream &os) const {
++        startPrint(os) <<
++        ", address=" << addr << ')';
++    }
++
++    virtual bool canDial(AsyncCall &) const { return true; }
++    virtual void dial(AsyncCall &) { (handler)(fd, errNo, addr); }
++
++public:
++    Handler handler;
++    Ip::Address addr;
++};
++
++static void icpIncomingConnectionOpened(int fd, int errNo, Ip::Address& addr);
++
+ /// \ingroup ServerProtocolICPInternal2
+ static void icpLogIcp(const Ip::Address &, log_type, int, const char *, int);
+ 
+@@ -654,35 +679,22 @@ icpConnectionsOpen(void)
+ 
+     struct addrinfo *xai = NULL;
+     int x;
+-    wordlist *s;
+ 
+     if ((port = Config.Port.icp) <= 0)
+         return;
+ 
+-    enter_suid();
+-
+     addr = Config.Addrs.udp_incoming;
+     addr.SetPort(port);
+-    theInIcpConnection = comm_open_listener(SOCK_DGRAM,
+-                                            IPPROTO_UDP,
+-                                            addr,
+-                                            COMM_NONBLOCKING,
+-                                            "ICP Socket");
+-    leave_suid();
+ 
+-    if (theInIcpConnection < 0)
+-        fatal("Cannot open ICP Port");
++    AsyncCall::Pointer call = asyncCall(12, 2,
++                                        "icpIncomingConnectionOpened",
++                                        IcpListeningStartedDialer(&icpIncomingConnectionOpened, addr));
+ 
+-    commSetSelect(theInIcpConnection,
+-                  COMM_SELECT_READ,
+-                  icpHandleUdp,
+-                  NULL,
+-                  0);
+-
+-    for (s = Config.mcast_group_list; s; s = s->next)
+-        ipcache_nbgethostbyname(s->key, mcastJoinGroups, NULL);
+-
+-    debugs(12, 1, "Accepting ICP messages at " << addr << ", FD " << theInIcpConnection << ".");
++    Ipc::StartListening(SOCK_DGRAM,
++                        IPPROTO_UDP,
++                        addr,
++                        COMM_NONBLOCKING,
++                        Ipc::fdnInIcpSocket, call);
+ 
+     addr.SetEmpty(); // clear for next use.
+     addr = Config.Addrs.udp_outgoing;
+@@ -708,10 +720,6 @@ icpConnectionsOpen(void)
+         debugs(12, 1, "Outgoing ICP messages on port " << addr.GetPort() << ", FD " << theOutIcpConnection << ".");
+ 
+         fd_note(theOutIcpConnection, "Outgoing ICP socket");
+-
+-        fd_note(theInIcpConnection, "Incoming ICP socket");
+-    } else {
+-        theOutIcpConnection = theInIcpConnection;
+     }
+ 
+     theOutICPAddr.SetEmpty();
+@@ -728,6 +736,31 @@ icpConnectionsOpen(void)
+     theOutICPAddr.FreeAddrInfo(xai);
+ }
+ 
++static void
++icpIncomingConnectionOpened(int fd, int errNo, Ip::Address& addr)
++{
++    theInIcpConnection = fd;
++
++    if (theInIcpConnection < 0)
++        fatal("Cannot open ICP Port");
++
++    commSetSelect(theInIcpConnection,
++                  COMM_SELECT_READ,
++                  icpHandleUdp,
++                  NULL,
++                  0);
++
++    for (const wordlist *s = Config.mcast_group_list; s; s = s->next)
++        ipcache_nbgethostbyname(s->key, mcastJoinGroups, NULL);
++
++    debugs(12, 1, "Accepting ICP messages at " << addr << ", FD " << theInIcpConnection << ".");
++
++    fd_note(theInIcpConnection, "Incoming ICP socket");
++
++    if (Config.Addrs.udp_outgoing.IsNoAddr())
++        theOutIcpConnection = theInIcpConnection;
++}
++
+ /**
+  * icpConnectionShutdown only closes the 'in' socket if it is
+  * different than the 'out' socket.
+@@ -888,6 +888,12 @@ Ip::Address::matchIPAddr(const Ip::Address &rhs) const
+     return 0;
+ }
+ 
++int
++Ip::Address::compareWhole(const Ip::Address &rhs) const
++{
++    return memcmp(this, &rhs, sizeof(*this));
++}
++
+ bool
+ Ip::Address::operator ==(const Ip::Address &s) const
+ {
+@@ -321,6 +321,13 @@ class Address
+      */
+     int matchIPAddr(const Address &rhs) const;
+ 
++    /** Compare taking IP, port, protocol, etc. into account. Returns an
++        integer  less  than,  equal  to,  or greater than zero if the object
++        is found, respectively, to be less than, to match, or to be greater
++        than rhs. The exact ordering algorithm is not specified and may change.
++    */
++    int compareWhole(const Ip::Address &rhs) const;
++
+     /**
+      *  Get RFC 3493 addrinfo structure from the Ip::Address data
+      *  for protocol-neutral socket operations.
+@@ -0,0 +1,139 @@
++/*
++ * $Id$
++ *
++ * DEBUG: section 54    Interprocess Communication
++ *
++ */
++
++
++#include "config.h"
++#include "comm.h"
++#include "ipc/Coordinator.h"
++#include "ipc/FdNotes.h"
++#include "ipc/SharedListen.h"
++
++
++CBDATA_NAMESPACED_CLASS_INIT(Ipc, Coordinator);
++Ipc::Coordinator* Ipc::Coordinator::TheInstance = NULL;
++
++
++Ipc::Coordinator::Coordinator():
++        Port(coordinatorAddr)
++{
++}
++
++void Ipc::Coordinator::start()
++{
++    Port::start();
++}
++
++Ipc::StrandCoord* Ipc::Coordinator::findStrand(int kidId)
++{
++    typedef Strands::iterator SI;
++    for (SI iter = strands.begin(); iter != strands.end(); ++iter) {
++        if (iter->kidId == kidId)
++            return &(*iter);
++    }
++    return NULL;
++}
++
++void Ipc::Coordinator::registerStrand(const StrandCoord& strand)
++{
++    if (StrandCoord* found = findStrand(strand.kidId))
++        *found = strand;
++    else
++        strands.push_back(strand);
++}
++
++void Ipc::Coordinator::receive(const TypedMsgHdr& message)
++{
++    switch (message.type()) {
++    case mtRegistration:
++        debugs(54, 6, HERE << "Registration request");
++        handleRegistrationRequest(StrandCoord(message));
++        break;
++
++    case mtSharedListenRequest:
++        debugs(54, 6, HERE << "Shared listen request");
++        handleSharedListenRequest(SharedListenRequest(message));
++        break;
++
++    default:
++        debugs(54, 1, HERE << "Unhandled message type: " << message.type());
++        break;
++    }
++}
++
++void Ipc::Coordinator::handleRegistrationRequest(const StrandCoord& strand)
++{
++    registerStrand(strand);
++
++    // send back an acknowledgement; TODO: remove as not needed?
++    TypedMsgHdr message;
++    strand.pack(message);
++    SendMessage(MakeAddr(strandAddrPfx, strand.kidId), message);
++}
++
++void
++Ipc::Coordinator::handleSharedListenRequest(const SharedListenRequest& request)
++{
++    debugs(54, 4, HERE << "kid" << request.requestorId <<
++           " needs shared listen FD for " << request.params.addr);
++    Listeners::const_iterator i = listeners.find(request.params);
++    int errNo = 0;
++    const int sock = (i != listeners.end()) ?
++                     i->second : openListenSocket(request, errNo);
++
++    debugs(54, 3, HERE << "sending shared listen FD " << sock << " for " <<
++           request.params.addr << " to kid" << request.requestorId <<
++           " mapId=" << request.mapId);
++
++    SharedListenResponse response(sock, errNo, request.mapId);
++    TypedMsgHdr message;
++    response.pack(message);
++    SendMessage(MakeAddr(strandAddrPfx, request.requestorId), message);
++}
++
++int
++Ipc::Coordinator::openListenSocket(const SharedListenRequest& request,
++                                   int &errNo)
++{
++    const OpenListenerParams &p = request.params;
++
++    debugs(54, 6, HERE << "opening listen FD at " << p.addr << " for kid" <<
++           request.requestorId);
++
++    Ip::Address addr = p.addr; // comm_open_listener may modify it
++
++    enter_suid();
++    const int sock = comm_open_listener(p.sock_type, p.proto, addr, p.flags,
++                                        FdNote(p.fdNote));
++    errNo = (sock >= 0) ? 0 : errno;
++    leave_suid();
++
++    // cache positive results
++    if (sock >= 0)
++        listeners[request.params] = sock;
++
++    return sock;
++}
++
++void Ipc::Coordinator::broadcastSignal(int sig) const
++{
++    typedef Strands::const_iterator SCI;
++    for (SCI iter = strands.begin(); iter != strands.end(); ++iter) {
++        debugs(54, 5, HERE << "signal " << sig << " to kid" << iter->kidId <<
++               ", PID=" << iter->pid);
++        kill(iter->pid, sig);
++    }
++}
++
++Ipc::Coordinator* Ipc::Coordinator::Instance()
++{
++    if (!TheInstance)
++        TheInstance = new Coordinator;
++    // XXX: if the Coordinator job quits, this pointer will become invalid
++    // we could make Coordinator death fatal, except during exit, but since
++    // Strands do not re-register, even process death would be pointless.
++    return TheInstance;
++}
+@@ -0,0 +1,65 @@
++/*
++ * $Id$
++ *
++ * DEBUG: section 54    Interprocess Communication
++ *
++ */
++
++#ifndef SQUID_IPC_COORDINATOR_H
++#define SQUID_IPC_COORDINATOR_H
++
++
++#include "Array.h"
++#include <map>
++#include "ipc/Port.h"
++#include "ipc/Messages.h"
++#include "ipc/SharedListen.h"
++
++namespace Ipc
++{
++
++///  Coordinates shared activities of Strands (Squid processes or threads)
++class Coordinator: public Port
++{
++public:
++    static Coordinator* Instance();
++
++public:
++    Coordinator();
++
++    void broadcastSignal(int sig) const; ///< send sig to registered strands
++
++protected:
++    virtual void start(); // Port (AsyncJob) API
++    virtual void receive(const TypedMsgHdr& message); // Port API
++
++    StrandCoord* findStrand(int kidId); ///< registered strand or NULL
++    void registerStrand(const StrandCoord &); ///< adds or updates existing
++    void handleRegistrationRequest(const StrandCoord &); ///< register,ACK
++
++    /// returns cached socket or calls openListenSocket()
++    void handleSharedListenRequest(const SharedListenRequest& request);
++
++    /// calls comm_open_listener()
++    int openListenSocket(const SharedListenRequest& request, int &errNo);
++
++private:
++    typedef Vector<StrandCoord> Strands; ///< unsorted strands
++    Strands strands; ///< registered processes and threads
++
++    typedef std::map<OpenListenerParams, int> Listeners; ///< params:fd map
++    Listeners listeners; ///< cached comm_open_listener() results
++
++    static Coordinator* TheInstance; ///< the only class instance in existence
++
++private:
++    Coordinator(const Coordinator&); // not implemented
++    Coordinator& operator =(const Coordinator&); // not implemented
++
++    CBDATA_CLASS2(Coordinator);
++};
++
++
++} // namespace Ipc
++
++#endif /* SQUID_IPC_COORDINATOR_H */
+@@ -0,0 +1,31 @@
++/*
++ * $Id$
++ *
++ * DEBUG: section 54    Interprocess Communication
++ *
++ */
++
++#include "config.h"
++#include "Debug.h"
++#include "ipc/FdNotes.h"
++
++
++const char *
++Ipc::FdNote(int fdNoteId)
++{
++    static const char *FdNotes[Ipc::fdnEnd] = {
++        "None", // fdnNone
++        "HTTP Socket", // fdnHttpSocket
++        "HTTPS Socket", // fdnHttpsSocket
++        "Incoming SNMP Socket", // fdnInSnmpSocket
++        "Outgoing SNMP Socket", // fdnOutSnmpSocket
++        "Incoming ICP Socket", // fdnInIcpSocket
++        "Incoming HTCP Socket" // fdnInHtcpSocket
++    };
++
++    if (fdnNone < fdNoteId && fdNoteId < fdnEnd)
++        return FdNotes[fdNoteId];
++
++    debugs(54, 1, HERE << "salvaged bug: wrong fd_note ID: " << fdNoteId);
++    return FdNotes[fdnNone];
++}
+@@ -0,0 +1,27 @@
++/*
++ * $Id$
++ *
++ * DEBUG: section 54    Interprocess Communication
++ *
++ */
++
++#ifndef SQUID_IPC_FD_NOTES_H
++#define SQUID_IPC_FD_NOTES_H
++
++namespace Ipc
++{
++
++/// We cannot send char* FD notes to other processes. Pass int IDs and convert.
++
++/// fd_note() label ID
++typedef enum { fdnNone, fdnHttpSocket, fdnHttpsSocket,
++               fdnInSnmpSocket, fdnOutSnmpSocket,
++               fdnInIcpSocket, fdnInHtcpSocket, fdnEnd
++             } FdNoteId;
++
++extern const char *FdNote(int fdNodeId); ///< converts FdNoteId into a string
++
++} // namespace Ipc;
++
++
++#endif /* SQUID_IPC_FD_NOTES_H */
+@@ -0,0 +1,122 @@
++/*
++ * $Id$
++ *
++ * DEBUG: section 54    Interprocess Communication
++ *
++ */
++
++#include "config.h"
++#include "ipc/Kid.h"
++
++Kid::Kid():
++        badFailures(0),
++        pid(-1),
++        startTime(0),
++        isRunning(false)
++{
++}
++
++Kid::Kid(const String& kid_name):
++        theName(kid_name),
++        badFailures(0),
++        pid(-1),
++        startTime(0),
++        isRunning(false)
++{
++}
++
++/// called when this kid got started, records PID
++void Kid::start(pid_t cpid)
++{
++    assert(!running());
++    assert(cpid > 0);
++
++    isRunning = true;
++    pid = cpid;
++    time(&startTime);
++}
++
++/// called when kid terminates, sets exiting status
++void Kid::stop(status_type exitStatus)
++{
++    assert(running());
++    assert(startTime != 0);
++
++    isRunning = false;
++
++    time_t stop_time;
++    time(&stop_time);
++    if ((stop_time - startTime) < fastFailureTimeLimit)
++        badFailures++;
++    else
++        badFailures = 0; // the failures are not "frequent" [any more]
++
++    status = exitStatus;
++}
++
++/// returns true if tracking of kid is stopped
++bool Kid::running() const
++{
++    return isRunning;
++}
++
++/// returns current pid for a running kid and last pid for a stopped kid
++pid_t Kid::getPid() const
++{
++    assert(pid > 0);
++    return pid;
++}
++
++/// whether the failures are "repeated and frequent"
++bool Kid::hopeless() const
++{
++    return badFailures > badFailureLimit;
++}
++
++/// returns true if the process terminated normally
++bool Kid::calledExit() const
++{
++    return (pid > 0) && !running() && WIFEXITED(status);
++}
++
++/// returns the exit status of the process
++int Kid::exitStatus() const
++{
++    return WEXITSTATUS(status);
++}
++
++/// whether the process exited with a given exit status code
++bool Kid::calledExit(int code) const
++{
++    return calledExit() && (exitStatus() == code);
++}
++
++/// whether the process exited with code 0
++bool Kid::exitedHappy() const
++{
++    return calledExit(0);
++}
++
++/// returns true if the kid was terminated by a signal
++bool Kid::signaled() const
++{
++    return (pid > 0) && !running() && WIFSIGNALED(status);
++}
++
++/// returns the number of the signal that caused the kid to terminate
++int Kid::termSignal() const
++{
++    return WTERMSIG(status);
++}
++
++/// whether the process was terminated by a given signal
++bool Kid::signaled(int sgnl) const
++{
++    return signaled() && (termSignal() == sgnl);
++}
++
++/// returns kid name
++const String& Kid::name() const
++{
++    return theName;
++}
+@@ -0,0 +1,85 @@
++/*
++ * $Id$
++ *
++ */
++
++#ifndef SQUID_IPC_KID_H
++#define SQUID_IPC_KID_H
++
++#include "SquidString.h"
++
++
++/// Squid child, including current forked process info and
++/// info persistent across restarts
++class Kid
++{
++public:
++#ifdef _SQUID_NEXT_
++    typedef union wait status_type;
++#else
++    typedef int status_type;
++#endif
++
++    /// keep restarting until the number of bad failures exceed this limit
++    enum { badFailureLimit = 4 };
++
++    /// slower start failures are not "frequent enough" to be counted as "bad"
++    enum { fastFailureTimeLimit = 10 }; // seconds
++
++public:
++    Kid();
++
++    Kid(const String& kid_name);
++
++    /// called when this kid got started, records PID
++    void start(pid_t cpid);
++
++    /// called when kid terminates, sets exiting status
++    void stop(status_type exitStatus);
++
++    /// returns true if tracking of kid is stopped
++    bool running() const;
++
++    /// returns current pid for a running kid and last pid for a stopped kid
++    pid_t getPid() const;
++
++    /// whether the failures are "repeated and frequent"
++    bool hopeless() const;
++
++    /// returns true if the process terminated normally
++    bool calledExit() const;
++
++    /// returns the exit status of the process
++    int exitStatus() const;
++
++    /// whether the process exited with a given exit status code
++    bool calledExit(int code) const;
++
++    /// whether the process exited with code 0
++    bool exitedHappy() const;
++
++    /// returns true if the kid was terminated by a signal
++    bool signaled() const;
++
++    /// returns the number of the signal that caused the kid to terminate
++    int termSignal() const;
++
++    /// whether the process was terminated by a given signal
++    bool signaled(int sgnl) const;
++
++    /// returns kid name
++    const String& name() const;
++
++private:
++    // Information preserved across restarts
++    String theName; ///< process name
++    int badFailures; ///< number of "repeated frequent" failures
++
++    // Information specific to a running or stopped kid
++    pid_t  pid; ///< current (for a running kid) or last (for stopped kid) PID
++    time_t startTime; ///< last start time
++    bool   isRunning; ///< whether the kid is assumed to be alive
++    status_type status; ///< exit status of a stopped kid
++};
++
++#endif /* SQUID_IPC_KID_H */
+@@ -0,0 +1,98 @@
++/*
++ * $Id$
++ *
++ * DEBUG: section 54    Interprocess Communication
++ *
++ */
++
++#include "config.h"
++#include "ipc/Kids.h"
++
++Kids TheKids;
++char KidName[NAME_MAX];
++int  KidIdentifier;
++
++Kids::Kids()
++{
++}
++
++/// maintain n kids
++void Kids::init(size_t n)
++{
++    assert(n > 0);
++
++    if (storage.size() > 0)
++        storage.clean();
++
++    storage.reserve(n);
++
++    char kid_name[32];
++
++    // add Kid records for all n main strands
++    for (size_t i = 1; i <= n; ++i) {
++        snprintf(kid_name, sizeof(kid_name), "(squid-%d)", (int)i);
++        storage.push_back(Kid(kid_name));
++    }
++
++    // if coordination is needed, add a Kid record for Coordinator
++    if (n > 1) {
++        snprintf(kid_name, sizeof(kid_name), "(squid-coord-%d)", (int)(n + 1));
++        storage.push_back(Kid(kid_name));
++    }
++}
++
++/// returns kid by pid
++Kid* Kids::find(pid_t pid)
++{
++    assert(pid > 0);
++    assert(count() > 0);
++
++    for (size_t i = 0; i < storage.size(); ++i) {
++        if (storage[i].getPid() == pid)
++            return &storage[i];
++    }
++    return NULL;
++}
++
++/// returns the kid by index, useful for kids iteration
++Kid& Kids::get(size_t i)
++{
++    assert(i >= 0 && i < count());
++    return storage[i];
++}
++
++/// whether all kids are hopeless
++bool Kids::allHopeless() const
++{
++    for (size_t i = 0; i < storage.size(); ++i) {
++        if (!storage[i].hopeless())
++            return false;
++    }
++    return true;
++}
++
++/// whether all kids called exited happy
++bool Kids::allExitedHappy() const
++{
++    for (size_t i = 0; i < storage.size(); ++i) {
++        if (!storage[i].exitedHappy())
++            return false;
++    }
++    return true;
++}
++
++/// whether all kids died from a given signal
++bool Kids::allSignaled(int sgnl) const
++{
++    for (size_t i = 0; i < storage.size(); ++i) {
++        if (!storage[i].signaled(sgnl))
++            return false;
++    }
++    return true;
++}
++
++/// returns the number of kids
++size_t Kids::count() const
++{
++    return storage.size();
++}
+@@ -0,0 +1,55 @@
++/*
++ * $Id$
++ *
++ */
++
++#ifndef SQUID_IPC_KIDS_H
++#define SQUID_IPC_KIDS_H
++
++#include "Array.h"
++#include "ipc/Kid.h"
++
++
++/// a collection of kids
++class Kids
++{
++public:
++    Kids ();
++
++private:
++    Kids (const Kids&); ///< not implemented
++    Kids& operator= (const Kids&); ///< not implemented
++
++public:
++    /// maintain n kids
++    void init(size_t n);
++
++    /// returns kid by pid
++    Kid* find(pid_t pid);
++
++    /// returns the kid by index, useful for kids iteration
++    Kid& get(size_t i);
++
++    /// whether all kids are hopeless
++    bool allHopeless() const;
++
++    /// whether all kids called exited happy
++    bool allExitedHappy() const;
++
++    /// whether all kids died from a given signal
++    bool allSignaled(int sgnl) const;
++
++    /// returns the number of kids
++    size_t count() const;
++
++private:
++    Vector<Kid> storage;
++};
++
++extern Kids TheKids; ///< All kids being maintained
++
++extern char KidName[NAME_MAX]; ///< current Squid process name (e.g., squid2)
++extern int KidIdentifier; ///< current Squid process number (e.g., 4)
++
++
++#endif /* SQUID_IPC_KIDS_H */
+@@ -0,0 +1,30 @@
++include $(top_srcdir)/src/Common.am
++include $(top_srcdir)/src/TestHeaders.am
++
++noinst_LTLIBRARIES = libipc.la
++
++libipc_la_SOURCES = \
++	FdNotes.cc \
++	FdNotes.h \
++	Kid.cc \
++	Kid.h \
++	Kids.cc \
++	Kids.h \
++	Messages.cc \
++	Messages.h \
++	StartListening.cc \
++	StartListening.h \
++	SharedListen.cc \
++	SharedListen.h \
++	TypedMsgHdr.cc \
++	TypedMsgHdr.h \
++	Coordinator.cc \
++	Coordinator.h \
++	UdsOp.cc \
++	UdsOp.h \
++	Port.cc \
++	Port.h \
++	Strand.cc \
++	Strand.h
++
++DEFS += -DDEFAULT_PREFIX=\"$(prefix)\"
+@@ -0,0 +1,30 @@
++/*
++ * $Id$
++ *
++ * DEBUG: section 54    Interprocess Communication
++ *
++ */
++
++
++#include "config.h"
++#include "ipc/Messages.h"
++#include "ipc/TypedMsgHdr.h"
++
++
++Ipc::StrandCoord::StrandCoord(): kidId(-1), pid(0)
++{
++}
++
++Ipc::StrandCoord::StrandCoord(int aKidId, pid_t aPid): kidId(aKidId), pid(aPid)
++{
++}
++
++Ipc::StrandCoord::StrandCoord(const TypedMsgHdr &hdrMsg): kidId(-1), pid(0)
++{
++    hdrMsg.getData(mtRegistration, this, sizeof(*this));
++}
++
++void Ipc::StrandCoord::pack(TypedMsgHdr &hdrMsg) const
++{
++    hdrMsg.putData(mtRegistration, this, sizeof(*this));
++}
+@@ -0,0 +1,42 @@
++/*
++ * $Id$
++ *
++ * DEBUG: section 54    Interprocess Communication
++ *
++ */
++
++#ifndef SQUID_IPC_MESSAGES_H
++#define SQUID_IPC_MESSAGES_H
++
++#include <sys/types.h>
++
++/** Declarations used by varios IPC messages */
++
++namespace Ipc
++{
++
++class TypedMsgHdr;
++
++/// message class identifier
++typedef enum { mtNone = 0, mtRegistration,
++               mtSharedListenRequest, mtSharedListenResponse
++             } MessageType;
++
++/// Strand location details
++class StrandCoord
++{
++public:
++    StrandCoord(); ///< unknown location
++    StrandCoord(int akidId, pid_t aPid); ///< from registrant
++    explicit StrandCoord(const TypedMsgHdr &hdrMsg); ///< from recvmsg()
++    void pack(TypedMsgHdr &hdrMsg) const; ///< prepare for sendmsg()
++
++public:
++    int kidId; ///< internal Squid process number
++    pid_t pid; ///< OS process or thread identifier
++};
++
++} // namespace Ipc;
++
++
++#endif /* SQUID_IPC_MESSAGES_H */
+@@ -0,0 +1,65 @@
++/*
++ * $Id$
++ *
++ * DEBUG: section 54    Interprocess Communication
++ *
++ */
++
++
++#include "config.h"
++#include "CommCalls.h"
++#include "ipc/Port.h"
++
++const char Ipc::coordinatorAddr[] = DEFAULT_PREFIX "/var/run/coordinator.ipc";
++const char Ipc::strandAddrPfx[] = DEFAULT_PREFIX "/var/run/squid";
++
++
++Ipc::Port::Port(const String& aListenAddr):
++        UdsOp(aListenAddr)
++{
++    setOptions(COMM_NONBLOCKING | COMM_DOBIND);
++}
++
++void Ipc::Port::start()
++{
++    UdsOp::start();
++    listen();
++}
++
++void Ipc::Port::listen()
++{
++    debugs(54, 6, HERE);
++    buf.prepForReading();
++    AsyncCall::Pointer readHandler = asyncCall(54, 6, "Ipc::Port::noteRead",
++                                     CommCbMemFunT<Port, CommIoCbParams>(this, &Port::noteRead));
++    comm_read(fd(), buf.raw(), buf.size(), readHandler);
++}
++
++bool Ipc::Port::doneAll() const
++{
++    return false; // listen forever
++}
++
++String Ipc::Port::MakeAddr(const char* pathAddr, int id)
++{
++    assert(id >= 0);
++    String addr = pathAddr;
++    addr.append('-');
++    addr.append(xitoa(id));
++    addr.append(".ipc");
++    return addr;
++}
++
++void Ipc::Port::noteRead(const CommIoCbParams& params)
++{
++    debugs(54, 6, HERE << "FD " << params.fd << " flag " << params.flag <<
++           " [" << this << ']');
++    if (params.flag == COMM_OK) {
++        assert(params.buf == buf.raw());
++        receive(buf);
++    }
++    // TODO: if there was a fatal error on our socket, close the socket before
++    // trying to listen again and print a level-1 error message.
++
++    listen();
++}
+@@ -0,0 +1,53 @@
++/*
++ * $Id$
++ *
++ * DEBUG: section 54    Interprocess Communication
++ *
++ */
++
++#ifndef SQUID_IPC_PORT_H
++#define SQUID_IPC_PORT_H
++
++
++#include "SquidString.h"
++#include "ipc/UdsOp.h"
++
++
++namespace Ipc
++{
++
++
++/// Waits for and receives incoming IPC messages; kids handle the messages
++class Port: public UdsOp
++{
++public:
++    Port(const String &aListenAddr);
++
++protected:
++    /// calculates IPC message address for strand #id at path
++    static String MakeAddr(const char *path, int id);
++
++    virtual void start() = 0; // UdsOp (AsyncJob) API; has body
++    virtual bool doneAll() const; // UdsOp (AsyncJob) API
++
++    /// read the next incoming message
++    void listen();
++
++    /// handle IPC message just read
++    virtual void receive(const TypedMsgHdr& message) = 0;
++
++private:
++    void noteRead(const CommIoCbParams &params); // Comm callback API
++
++private:
++    TypedMsgHdr buf; ///< msghdr struct filled by Comm
++};
++
++
++extern const char coordinatorAddr[]; ///< where coordinator listens
++extern const char strandAddrPfx[]; ///< strand's listening address prefix
++
++} // namespace Ipc
++
++
++#endif /* SQUID_IPC_PORT_H */
+@@ -0,0 +1,150 @@
++/*
++ * $Id$
++ *
++ * DEBUG: section 54    Interprocess Communication
++ *
++ */
++
++#include "config.h"
++#include <map>
++#include "comm.h"
++#include "base/TextException.h"
++#include "ipc/Port.h"
++#include "ipc/Messages.h"
++#include "ipc/Kids.h"
++#include "ipc/TypedMsgHdr.h"
++#include "ipc/StartListening.h"
++#include "ipc/SharedListen.h"
++
++
++/// holds information necessary to handle JoinListen response
++class PendingOpenRequest
++{
++public:
++    Ipc::OpenListenerParams params; ///< actual comm_open_sharedListen() parameters
++    AsyncCall::Pointer callback; // who to notify
++};
++
++/// maps ID assigned at request time to the response callback
++typedef std::map<int, PendingOpenRequest> SharedListenRequestMap;
++static SharedListenRequestMap TheSharedListenRequestMap;
++
++static int
++AddToMap(const PendingOpenRequest &por)
++{
++    // find unused ID using linear seach; there should not be many entries
++    for (int id = 0; true; ++id) {
++        if (TheSharedListenRequestMap.find(id) == TheSharedListenRequestMap.end()) {
++            TheSharedListenRequestMap[id] = por;
++            return id;
++        }
++    }
++    assert(false); // not reached
++    return -1;
++}
++
++Ipc::OpenListenerParams::OpenListenerParams()
++{
++    xmemset(this, 0, sizeof(*this));
++}
++
++bool
++Ipc::OpenListenerParams::operator <(const OpenListenerParams &p) const
++{
++    if (sock_type != p.sock_type)
++        return sock_type < p.sock_type;
++
++    if (proto != p.proto)
++        return proto < p.proto;
++
++    // ignore flags and fdNote differences because they do not affect binding
++
++    return addr.compareWhole(p.addr) < 0;
++}
++
++
++
++Ipc::SharedListenRequest::SharedListenRequest(): requestorId(-1), mapId(-1)
++{
++    // caller will then set public data members
++}
++
++Ipc::SharedListenRequest::SharedListenRequest(const TypedMsgHdr &hdrMsg)
++{
++    hdrMsg.getData(mtSharedListenRequest, this, sizeof(*this));
++}
++
++void Ipc::SharedListenRequest::pack(TypedMsgHdr &hdrMsg) const
++{
++    hdrMsg.putData(mtSharedListenRequest, this, sizeof(*this));
++}
++
++
++Ipc::SharedListenResponse::SharedListenResponse(int aFd, int anErrNo, int aMapId):
++        fd(aFd), errNo(anErrNo), mapId(aMapId)
++{
++}
++
++Ipc::SharedListenResponse::SharedListenResponse(const TypedMsgHdr &hdrMsg):
++        fd(-1), errNo(0), mapId(-1)
++{
++    hdrMsg.getData(mtSharedListenResponse, this, sizeof(*this));
++    fd = hdrMsg.getFd();
++}
++
++void Ipc::SharedListenResponse::pack(TypedMsgHdr &hdrMsg) const
++{
++    hdrMsg.putData(mtSharedListenResponse, this, sizeof(*this));
++    hdrMsg.putFd(fd);
++}
++
++
++void Ipc::JoinSharedListen(const OpenListenerParams &params,
++                           AsyncCall::Pointer &callback)
++{
++    PendingOpenRequest por;
++    por.params = params;
++    por.callback = callback;
++
++    SharedListenRequest request;
++    request.requestorId = KidIdentifier;
++    request.params = por.params;
++    request.mapId = AddToMap(por);
++
++    debugs(54, 3, HERE << "getting listening FD for " << request.params.addr <<
++           " mapId=" << request.mapId);
++
++    TypedMsgHdr message;
++    request.pack(message);
++    SendMessage(coordinatorAddr, message);
++}
++
++void Ipc::SharedListenJoined(const SharedListenResponse &response)
++{
++    const int fd = response.fd;
++
++    debugs(54, 3, HERE << "got listening FD " << fd << " errNo=" <<
++           response.errNo << " mapId=" << response.mapId);
++
++    Must(TheSharedListenRequestMap.find(response.mapId) != TheSharedListenRequestMap.end());
++    PendingOpenRequest por = TheSharedListenRequestMap[response.mapId];
++    Must(por.callback != NULL);
++    TheSharedListenRequestMap.erase(response.mapId);
++
++    if (fd >= 0) {
++        OpenListenerParams &p = por.params;
++        struct addrinfo *AI = NULL;
++        p.addr.GetAddrInfo(AI);
++        AI->ai_socktype = p.sock_type;
++        AI->ai_protocol = p.proto;
++        comm_import_opened(fd, p.addr, p.flags, FdNote(p.fdNote), AI);
++        p.addr.FreeAddrInfo(AI);
++    }
++
++    StartListeningCb *cbd =
++        dynamic_cast<StartListeningCb*>(por.callback->getDialer());
++    Must(cbd);
++    cbd->fd = fd;
++    cbd->errNo = response.errNo;
++    ScheduleCallHere(por.callback);
++}
+@@ -0,0 +1,74 @@
++/*
++ * $Id$
++ *
++ * DEBUG: section 54    Interprocess Communication
++ *
++ */
++
++#ifndef SQUID_IPC_SHARED_LISTEN_H
++#define SQUID_IPC_SHARED_LISTEN_H
++
++#include "base/AsyncCall.h"
++
++namespace Ipc
++{
++
++/// "shared listen" is when concurrent processes are listening on the same fd
++
++/// comm_open_listener() parameters holder
++class OpenListenerParams
++{
++public:
++    OpenListenerParams();
++
++    bool operator <(const OpenListenerParams &p) const; ///< useful for map<>
++
++    int sock_type;
++    int proto;
++    Ip::Address addr; ///< will be memset and memcopied
++    int flags;
++    int fdNote; ///< index into fd_note() comment strings
++};
++
++class TypedMsgHdr;
++
++/// a request for a listen socket with given parameters
++class SharedListenRequest
++{
++public:
++    SharedListenRequest(); ///< from OpenSharedListen() which then sets public data
++    explicit SharedListenRequest(const TypedMsgHdr &hdrMsg); ///< from recvmsg()
++    void pack(TypedMsgHdr &hdrMsg) const; ///< prepare for sendmsg()
++
++public:
++    int requestorId; ///< kidId of the requestor
++
++    OpenListenerParams params; ///< actual comm_open_sharedListen() parameters
++
++    int mapId; ///< to map future response to the requestor's callback
++};
++
++/// a response to SharedListenRequest
++class SharedListenResponse
++{
++public:
++    SharedListenResponse(int fd, int errNo, int mapId);
++    explicit SharedListenResponse(const TypedMsgHdr &hdrMsg); ///< from recvmsg()
++    void pack(TypedMsgHdr &hdrMsg) const; ///< prepare for sendmsg()
++
++public:
++    int fd; ///< opened listening socket or -1
++    int errNo; ///< errno value from comm_open_sharedListen() call
++    int mapId; ///< to map future response to the requestor's callback
++};
++
++/// prepare and send SharedListenRequest to Coordinator
++extern void JoinSharedListen(const OpenListenerParams &, AsyncCall::Pointer &);
++
++/// process Coordinator response to SharedListenRequest
++extern void SharedListenJoined(const SharedListenResponse &response);
++
++} // namespace Ipc;
++
++
++#endif /* SQUID_IPC_SHARED_LISTEN_H */
+@@ -0,0 +1,58 @@
++/*
++ * $Id$
++ *
++ * DEBUG: section 54    Interprocess Communication
++ *
++ */
++
++#include "config.h"
++#include "comm.h"
++#include "base/TextException.h"
++#include "ipc/SharedListen.h"
++#include "ipc/StartListening.h"
++
++
++Ipc::StartListeningCb::StartListeningCb(): fd(-1), errNo(0)
++{
++}
++
++Ipc::StartListeningCb::~StartListeningCb()
++{
++}
++
++std::ostream &Ipc::StartListeningCb::startPrint(std::ostream &os) const
++{
++    return os << "(FD " << fd << ", err=" << errNo;
++}
++
++
++void Ipc::StartListening(int sock_type, int proto, Ip::Address &addr,
++                         int flags, FdNoteId fdNote, AsyncCall::Pointer &callback)
++{
++    OpenListenerParams p;
++    p.sock_type = sock_type;
++    p.proto = proto;
++    p.addr = addr;
++    p.flags = flags;
++    p.fdNote = fdNote;
++
++    if (UsingSmp()) { // if SMP is on, share
++        Ipc::JoinSharedListen(p, callback);
++        return; // wait for the call back
++    }
++
++    enter_suid();
++    const int sock = comm_open_listener(p.sock_type, p.proto, p.addr, p.flags,
++                                        FdNote(p.fdNote));
++    const int errNo = (sock >= 0) ? 0 : errno;
++    leave_suid();
++
++    debugs(54, 3, HERE << "opened listen FD " << sock << " for " << p.addr);
++
++    StartListeningCb *cbd =
++        dynamic_cast<StartListeningCb*>(callback->getDialer());
++    Must(cbd);
++    cbd->fd = sock;
++    cbd->errNo = errNo;
++    ScheduleCallHere(callback);
++}
+@@ -0,0 +1,42 @@
++/*
++ * $Id$
++ *
++ * DEBUG: section 54    Interprocess Communication
++ *
++ */
++
++#ifndef SQUID_IPC_START_LISTENING_H
++#define SQUID_IPC_START_LISTENING_H
++
++#include <iosfwd>
++#include "ip/forward.h"
++#include "ipc/FdNotes.h"
++#include "base/AsyncCall.h"
++
++namespace Ipc
++{
++
++/// common API for all StartListening() callbacks
++class StartListeningCb
++{
++public:
++    StartListeningCb();
++    virtual ~StartListeningCb();
++
++    /// starts printing arguments, return os
++    std::ostream &startPrint(std::ostream &os) const;
++
++public:
++    int fd; ///< opened listening socket or -1
++    int errNo; ///< errno value from the comm_open_listener() call
++};
++
++/// Depending on whether SMP is on, either ask Coordinator to send us
++/// the listening FD or call comm_open_listener() directly.
++extern void StartListening(int sock_type, int proto, Ip::Address &addr,
++                           int flags, FdNoteId fdNote, AsyncCall::Pointer &callback);
++
++} // namespace Ipc;
++
++
++#endif /* SQUID_IPC_START_LISTENING_H */
+@@ -0,0 +1,78 @@
++/*
++ * $Id$
++ *
++ * DEBUG: section 54    Interprocess Communication
++ *
++ */
++
++#include "config.h"
++#include "base/TextException.h"
++#include "ipc/Strand.h"
++#include "ipc/Messages.h"
++#include "ipc/SharedListen.h"
++#include "ipc/Kids.h"
++
++
++CBDATA_NAMESPACED_CLASS_INIT(Ipc, Strand);
++
++
++Ipc::Strand::Strand():
++        Port(MakeAddr(strandAddrPfx, KidIdentifier)),
++        isRegistered(false)
++{
++}
++
++void Ipc::Strand::start()
++{
++    Port::start();
++    registerSelf();
++}
++
++void Ipc::Strand::registerSelf()
++{
++    debugs(54, 6, HERE);
++    Must(!isRegistered);
++    TypedMsgHdr message;
++    StrandCoord(KidIdentifier, getpid()).pack(message);
++    SendMessage(coordinatorAddr, message);
++    setTimeout(6, "Ipc::Strand::timeoutHandler"); // TODO: make 6 configurable?
++}
++
++void Ipc::Strand::receive(const TypedMsgHdr &message)
++{
++    debugs(54, 6, HERE << message.type());
++    switch (message.type()) {
++
++    case mtRegistration:
++        handleRegistrationResponse(StrandCoord(message));
++        break;
++
++    case mtSharedListenResponse:
++        SharedListenJoined(SharedListenResponse(message));
++        break;
++
++    default:
++        debugs(54, 1, HERE << "Unhandled message type: " << message.type());
++        break;
++    }
++}
++
++void Ipc::Strand::handleRegistrationResponse(const StrandCoord &strand)
++{
++    // handle registration response from the coordinator; it could be stale
++    if (strand.kidId == KidIdentifier && strand.pid == getpid()) {
++        debugs(54, 6, "kid" << KidIdentifier << " registered");
++        clearTimeout(); // we are done
++    } else {
++        // could be an ACK to the registration message of our dead predecessor
++        debugs(54, 6, "kid" << KidIdentifier << " is not yet registered");
++        // keep listening, with a timeout
++    }
++}
++
++void Ipc::Strand::timedout()
++{
++    debugs(54, 6, HERE << isRegistered);
++    if (!isRegistered)
++        fatalf("kid%d registration timed out", KidIdentifier);
++}
+@@ -0,0 +1,51 @@
++/*
++ * $Id$
++ *
++ * DEBUG: section 54    Interprocess Communication
++ *
++ */
++
++#ifndef SQUID_IPC_STRAND_H
++#define SQUID_IPC_STRAND_H
++
++#include "ipc/Port.h"
++
++
++namespace Ipc
++{
++
++class StrandCoord;
++class Descriptor;
++
++/// Receives coordination messages on behalf of its process or thread
++class Strand: public Port
++{
++public:
++    Strand();
++
++    virtual void start(); // Port (AsyncJob) API
++
++protected:
++    virtual void timedout(); // Port (UsdOp) API
++    virtual void receive(const TypedMsgHdr &message); // Port API
++
++private:
++    void registerSelf(); /// let Coordinator know this strand exists
++    void handleRegistrationResponse(const StrandCoord &strand);
++    void putDescriptor(const Descriptor &message);
++
++private:
++    bool isRegistered; ///< whether Coordinator ACKed registration (unused)
++
++private:
++    Strand(const Strand&); // not implemented
++    Strand& operator =(const Strand&); // not implemented
++
++    CBDATA_CLASS2(Strand);
++};
++
++
++}
++
++
++#endif /* SQUID_IPC_STRAND_H */
+@@ -0,0 +1,168 @@
++/*
++ * $Id$
++ *
++ * DEBUG: section 54    Interprocess Communication
++ *
++ */
++
++
++#include "config.h"
++#include <string.h>
++#include "protos.h"
++#include "base/TextException.h"
++#include "ipc/TypedMsgHdr.h"
++
++Ipc::TypedMsgHdr::TypedMsgHdr()
++{
++    xmemset(this, 0, sizeof(*this));
++    sync();
++}
++
++Ipc::TypedMsgHdr::TypedMsgHdr(const TypedMsgHdr &tmh)
++{
++    xmemcpy(this, &tmh, sizeof(*this));
++    sync();
++}
++
++Ipc::TypedMsgHdr &Ipc::TypedMsgHdr::operator =(const TypedMsgHdr &tmh)
++{
++    if (this != &tmh) { // skip assignment to self
++        xmemcpy(this, &tmh, sizeof(*this));
++        sync();
++    }
++    return *this;
++}
++
++// update msghdr and ios pointers based on msghdr counters
++void Ipc::TypedMsgHdr::sync()
++{
++    if (msg_name) { // we have a name
++        msg_name = &name;
++    } else {
++        Must(!msg_namelen && !msg_name);
++    }
++
++    if (msg_iov) { // we have a data component
++        Must(msg_iovlen == 1);
++        msg_iov = ios;
++        ios[0].iov_base = &data;
++        Must(ios[0].iov_len == sizeof(data));
++    } else {
++        Must(!msg_iovlen && !msg_iov);
++    }
++
++    if (msg_control) { // we have a control component
++        Must(msg_controllen > 0);
++        msg_control = &ctrl;
++    } else {
++        Must(!msg_controllen && !msg_control);
++    }
++}
++
++
++
++int
++Ipc::TypedMsgHdr::type() const
++{
++    Must(msg_iovlen == 1);
++    return data.type_;
++}
++
++void
++Ipc::TypedMsgHdr::address(const struct sockaddr_un& addr)
++{
++    allocName();
++    name = addr;
++    msg_name = &name;
++    msg_namelen = SUN_LEN(&name);
++}
++
++void
++Ipc::TypedMsgHdr::getData(int destType, void *raw, size_t size) const
++{
++    Must(type() == destType);
++    Must(size == data.size);
++    xmemcpy(raw, data.raw, size);
++}
++
++void
++Ipc::TypedMsgHdr::putData(int aType, const void *raw, size_t size)
++{
++    Must(size <= sizeof(data.raw));
++    allocData();
++    data.type_ = aType;
++    data.size = size;
++    xmemcpy(data.raw, raw, size);
++}
++
++void
++Ipc::TypedMsgHdr::putFd(int fd)
++{
++    Must(fd >= 0);
++    allocControl();
++
++    const int fdCount = 1;
++
++    struct cmsghdr *cmsg = CMSG_FIRSTHDR(this);
++    cmsg->cmsg_level = SOL_SOCKET;
++    cmsg->cmsg_type = SCM_RIGHTS;
++    cmsg->cmsg_len = CMSG_LEN(sizeof(int) * fdCount);
++
++    int *fdStore = reinterpret_cast<int*>(CMSG_DATA(cmsg));
++    xmemcpy(fdStore, &fd, fdCount * sizeof(int));
++    msg_controllen = cmsg->cmsg_len;
++}
++
++int
++Ipc::TypedMsgHdr::getFd() const
++{
++    Must(msg_control && msg_controllen);
++
++    struct cmsghdr *cmsg = CMSG_FIRSTHDR(this);
++    Must(cmsg->cmsg_level == SOL_SOCKET);
++    Must(cmsg->cmsg_type == SCM_RIGHTS);
++
++    const int fdCount = 1;
++    const int *fdStore = reinterpret_cast<const int*>(CMSG_DATA(cmsg));
++    int fd = -1;
++    xmemcpy(&fd, fdStore, fdCount * sizeof(int));
++    return fd;
++}
++
++void
++Ipc::TypedMsgHdr::prepForReading()
++{
++    xmemset(this, 0, sizeof(*this));
++    allocName();
++    allocData();
++    allocControl();
++}
++
++/// initialize io vector with one io record
++void
++Ipc::TypedMsgHdr::allocData()
++{
++    Must(!msg_iovlen && !msg_iov);
++    msg_iovlen = 1;
++    msg_iov = ios;
++    ios[0].iov_base = &data;
++    ios[0].iov_len = sizeof(data);
++    data.type_ = 0;
++    data.size = 0;
++}
++
++void
++Ipc::TypedMsgHdr::allocName()
++{
++    Must(!msg_name && !msg_namelen);
++    msg_name = &name;
++    msg_namelen = sizeof(name); // is that the right size?
++}
++
++void
++Ipc::TypedMsgHdr::allocControl()
++{
++    Must(!msg_control && !msg_controllen);
++    msg_control = &ctrl;
++    msg_controllen = sizeof(ctrl);
++}
+@@ -0,0 +1,67 @@
++/*
++ * $Id$
++ *
++ * DEBUG: section 54    Interprocess Communication
++ *
++ */
++
++#ifndef SQUID_IPC_TYPED_MSG_HDR_H
++#define SQUID_IPC_TYPED_MSG_HDR_H
++
++#include "config.h"
++#include <sys/types.h>
++#include <sys/socket.h>
++#if HAVE_SYS_UN_H
++#include <sys/un.h>
++#endif
++
++namespace Ipc
++{
++
++/// struct msghdr with a known type, fixed-size I/O and control buffers
++class TypedMsgHdr: public msghdr
++{
++public:
++    TypedMsgHdr();
++    TypedMsgHdr(const TypedMsgHdr &tmh);
++    TypedMsgHdr &operator =(const TypedMsgHdr &tmh);
++
++    // type-safe access to message details
++    int type() const; ///< returns stored type or zero if none
++    void address(const struct sockaddr_un& addr); ///< sets [dest.] address
++    void getData(int ofType, void *raw, size_t size) const; ///< checks type
++    void putData(int aType, const void *raw, size_t size); ///< stores type
++    void putFd(int aFd); ///< stores descriptor
++    int getFd() const; ///< returns descriptor
++
++    /// raw, type-independent access for I/O
++    void prepForReading(); ///< reset and provide all buffers
++    char *raw() { return reinterpret_cast<char*>(this); }
++    const char *raw() const { return reinterpret_cast<const char*>(this); }
++    size_t size() const { return sizeof(*this); } ///< not true message size
++
++private:
++    void sync();
++    void allocData();
++    void allocName();
++    void allocControl();
++
++private:
++    struct sockaddr_un name; ///< same as .msg_name
++
++    struct iovec ios[1]; ///< same as .msg_iov[]
++
++    struct DataBuffer {
++        int type_; ///< Message kind, uses MessageType values
++        size_t size; ///< actual raw data size (for sanity checks)
++        char raw[250]; ///< buffer with type-specific data
++    } data; ///< same as .msg_iov[0].iov_base
++
++    struct CtrlBuffer {
++        char raw[CMSG_SPACE(sizeof(int))]; ///< control buffer space for one fd
++    } ctrl; ///< same as .msg_control
++};
++
++} // namespace Ipc
++
++#endif /* SQUID_IPC_TYPED_MSG_HDR_H */
+@@ -0,0 +1,132 @@
++/*
++ * $Id$
++ *
++ * DEBUG: section 54    Interprocess Communication
++ *
++ */
++
++
++#include "config.h"
++#include "comm.h"
++#include "CommCalls.h"
++#include "base/TextException.h"
++#include "ipc/UdsOp.h"
++
++
++Ipc::UdsOp::UdsOp(const String& pathAddr):
++        AsyncJob("Ipc::UdsOp"),
++        address(PathToAddress(pathAddr)),
++        options(COMM_NONBLOCKING),
++        fd_(-1)
++{
++    debugs(54, 5, HERE << '[' << this << "] pathAddr=" << pathAddr);
++}
++
++Ipc::UdsOp::~UdsOp()
++{
++    debugs(54, 5, HERE << '[' << this << ']');
++    if (fd_ >= 0)
++        comm_close(fd_);
++}
++
++void Ipc::UdsOp::setOptions(int newOptions)
++{
++    options = newOptions;
++}
++
++int Ipc::UdsOp::fd()
++{
++    if (fd_ < 0) {
++        if (options & COMM_DOBIND)
++            unlink(address.sun_path);
++        fd_ = comm_open_uds(SOCK_DGRAM, 0, &address, options);
++        Must(fd_ >= 0);
++    }
++    return fd_;
++}
++
++void Ipc::UdsOp::setTimeout(int seconds, const char *handlerName)
++{
++    AsyncCall::Pointer handler = asyncCall(54,5, handlerName,
++                                           CommCbMemFunT<UdsOp, CommTimeoutCbParams>(this,
++                                                   &UdsOp::noteTimeout));
++    commSetTimeout(fd(), seconds, handler);
++}
++
++void Ipc::UdsOp::clearTimeout()
++{
++    commSetTimeout(fd(), -1, NULL, NULL); // TODO: add Comm::ClearTimeout(fd)
++}
++
++void Ipc::UdsOp::noteTimeout(const CommTimeoutCbParams &)
++{
++    timedout(); // our kid handles communication timeout
++}
++
++
++struct sockaddr_un
++Ipc::PathToAddress(const String& pathAddr) {
++    assert(pathAddr.size() != 0);
++    struct sockaddr_un unixAddr;
++    memset(&unixAddr, 0, sizeof(unixAddr));
++    unixAddr.sun_family = AF_LOCAL;
++    xstrncpy(unixAddr.sun_path, pathAddr.termedBuf(), sizeof(unixAddr.sun_path));
++    return unixAddr;
++}
++
++
++CBDATA_NAMESPACED_CLASS_INIT(Ipc, UdsSender);
++
++Ipc::UdsSender::UdsSender(const String& pathAddr, const TypedMsgHdr& aMessage):
++        UdsOp(pathAddr),
++        message(aMessage),
++        retries(10), // TODO: make configurable?
++        timeout(10), // TODO: make configurable?
++        writing(false)
++{
++    message.address(address);
++}
++
++void Ipc::UdsSender::start()
++{
++    UdsOp::start();
++    write();
++    if (timeout > 0)
++        setTimeout(timeout, "Ipc::UdsSender::noteTimeout");
++}
++
++bool Ipc::UdsSender::doneAll() const
++{
++    return !writing && UdsOp::doneAll();
++}
++
++void Ipc::UdsSender::write()
++{
++    debugs(54, 5, HERE);
++    AsyncCall::Pointer writeHandler = asyncCall(54, 5, "Ipc::UdsSender::wrote",
++                                      CommCbMemFunT<UdsSender, CommIoCbParams>(this, &UdsSender::wrote));
++    comm_write(fd(), message.raw(), message.size(), writeHandler);
++    writing = true;
++}
++
++void Ipc::UdsSender::wrote(const CommIoCbParams& params)
++{
++    debugs(54, 5, HERE << "FD " << params.fd << " flag " << params.flag << " [" << this << ']');
++    writing = false;
++    if (params.flag != COMM_OK && retries-- > 0) {
++        sleep(1); // do not spend all tries at once; XXX: use an async timed event instead of blocking here; store the time when we started writing so that we do not sleep if not needed?
++        write(); // XXX: should we close on error so that fd() reopens?
++    }
++}
++
++void Ipc::UdsSender::timedout()
++{
++    debugs(54, 5, HERE);
++    mustStop("timedout");
++}
++
++
++void Ipc::SendMessage(const String& toAddress, const TypedMsgHdr &message)
++{
++    AsyncJob::AsyncStart(new UdsSender(toAddress, message));
++}
+@@ -0,0 +1,97 @@
++/*
++ * $Id$
++ *
++ * DEBUG: section 54    Interprocess Communication
++ *
++ */
++
++#ifndef SQUID_IPC_ASYNCUDSOP_H
++#define SQUID_IPC_ASYNCUDSOP_H
++
++
++#include "SquidString.h"
++#include "base/AsyncJob.h"
++#include "ipc/TypedMsgHdr.h"
++
++class CommTimeoutCbParams;
++class CommIoCbParams;
++
++namespace Ipc
++{
++
++/// code shared by unix-domain socket senders (e.g., UdsSender or Coordinator)
++/// and receivers (e.g. Port or Coordinator)
++class UdsOp: public AsyncJob
++{
++public:
++    UdsOp(const String &pathAddr);
++    virtual ~UdsOp();
++
++public:
++    struct sockaddr_un address; ///< UDS address from path; treat as read-only
++
++protected:
++    virtual void timedout() {} ///< called after setTimeout() if timed out
++
++    int fd(); ///< creates if needed and returns raw UDS socket descriptor
++
++    /// call timedout() if no UDS messages in a given number of seconds
++    void setTimeout(int seconds, const char *handlerName);
++    void clearTimeout(); ///< remove previously set timeout, if any
++
++    void setOptions(int newOptions); ///< changes socket options
++
++private:
++    /// Comm timeout callback; calls timedout()
++    void noteTimeout(const CommTimeoutCbParams &p);
++
++private:
++    int options; ///< UDS options
++    int fd_; ///< UDS descriptor
++
++private:
++    UdsOp(const UdsOp &); // not implemented
++    UdsOp &operator= (const UdsOp &); // not implemented
++};
++
++/// converts human-readable filename path into UDS address
++extern struct sockaddr_un PathToAddress(const String &pathAddr);
++
++
++
++// XXX: move UdsSender code to UdsSender.{cc,h}
++/// attempts to send an IPC message a few times, with a timeout
++class UdsSender: public UdsOp
++{
++public:
++    UdsSender(const String& pathAddr, const TypedMsgHdr& aMessage);
++
++protected:
++    virtual void start(); // UdsOp (AsyncJob) API
++    virtual bool doneAll() const; // UdsOp (AsyncJob) API
++    virtual void timedout(); // UdsOp API
++
++private:
++    void write(); ///< schedule writing
++    void wrote(const CommIoCbParams& params); ///< done writing or error
++
++private:
++    TypedMsgHdr message; ///< what to send
++    int retries; ///< how many times to try after a write error
++    int timeout; ///< total time to send the message
++    bool writing; ///< whether Comm started and did not finish writing
++
++private:
++    UdsSender(const UdsSender&); // not implemented
++    UdsSender& operator= (const UdsSender&); // not implemented
++
++    CBDATA_CLASS2(UdsSender);
++};
++
++
++void SendMessage(const String& toAddress, const TypedMsgHdr& message);
++
++
++}
++
++#endif /* SQUID_IPC_ASYNCUDSOP_H */
+@@ -56,6 +56,9 @@
+ #include "StoreFileSystem.h"
+ #include "DiskIO/DiskIOModule.h"
+ #include "comm.h"
++#include "ipc/Kids.h"
++#include "ipc/Coordinator.h"
++#include "ipc/Strand.h"
+ #if USE_EPOLL
+ #include "comm_epoll.h"
+ #endif
+@@ -124,6 +127,10 @@ static volatile int do_rotate = 0;
+ static volatile int do_shutdown = 0;
+ static volatile int shutdown_status = 0;
+ 
++static int RotateSignal = -1;
++static int ReconfigureSignal = -1;
++static int ShutdownSignal = -1;
++
+ static void mainRotate(void);
+ static void mainReconfigureStart(void);
+ static void mainReconfigureFinish(void*);
+@@ -195,6 +202,10 @@ SignalEngine::checkEvents(int timeout)
+         doShutdown(do_shutdown > 0 ? (int) Config.shutdownLifetime : 0);
+         do_shutdown = 0;
+     }
++    BroadcastSignalIfAny(DebugSignal);
++    BroadcastSignalIfAny(RotateSignal);
++    BroadcastSignalIfAny(ReconfigureSignal);
++    BroadcastSignalIfAny(ShutdownSignal);
+ 
+     PROF_stop(SignalEngine_checkEvents);
+     return EVENT_IDLE;
+@@ -558,6 +569,7 @@ void
+ rotate_logs(int sig)
+ {
+     do_rotate = 1;
++    RotateSignal = sig;
+ #ifndef _SQUID_MSWIN_
+ #if !HAVE_SIGACTION
+ 
+@@ -571,6 +583,7 @@ void
+ reconfigure(int sig)
+ {
+     do_reconfigure = 1;
++    ReconfigureSignal = sig;
+ #ifndef _SQUID_MSWIN_
+ #if !HAVE_SIGACTION
+ 
+@@ -583,14 +596,15 @@ void
+ shut_down(int sig)
+ {
+     do_shutdown = sig == SIGINT ? -1 : 1;
++    ShutdownSignal = sig;
+ #ifdef SIGTTIN
+ 
+     if (SIGTTIN == sig)
+         shutdown_status = 1;
+ 
+ #endif
+ #ifndef _SQUID_MSWIN_
+-#ifdef KILL_PARENT_OPT
++#if KILL_PARENT_OPT
+ 
+     if (getppid() > 1) {
+         debugs(1, 1, "Killing master process, pid " << getppid());
+@@ -612,64 +626,74 @@ shut_down(int sig)
+ static void
+ serverConnectionsOpen(void)
+ {
+-    clientOpenListenSockets();
+-    icpConnectionsOpen();
+-#if USE_HTCP
++    if (IamPrimaryProcess()) {
++#if USE_WCCP
+ 
+-    htcpInit();
++        wccpConnectionOpen();
+ #endif
+-#if SQUID_SNMP
+ 
+-    snmpConnectionOpen();
+-#endif
+-#if USE_WCCP
++#if USE_WCCPv2
+ 
+-    wccpConnectionOpen();
++        wccp2ConnectionOpen();
+ #endif
++    }
++    // Coordinator does not start proxying services
++    if (!IamCoordinatorProcess()) {
++        clientOpenListenSockets();
++        icpConnectionsOpen();
++#if USE_HTCP
+ 
+-#if USE_WCCPv2
++        htcpInit();
++#endif
++#if SQUID_SNMP
+ 
+-    wccp2ConnectionOpen();
++        snmpConnectionOpen();
+ #endif
+ 
+-    clientdbInit();
+-    icmpEngine.Open();
+-    netdbInit();
+-    asnInit();
+-    ACL::Initialize();
+-    peerSelectInit();
+-
+-    carpInit();
+-    peerUserHashInit();
+-    peerSourceHashInit();
++        clientdbInit();
++        icmpEngine.Open();
++        netdbInit();
++        asnInit();
++        ACL::Initialize();
++        peerSelectInit();
++
++        carpInit();
++        peerUserHashInit();
++        peerSourceHashInit();
++    }
+ }
+ 
+ static void
+ serverConnectionsClose(void)
+ {
+     assert(shutting_down || reconfiguring);
+-    clientHttpConnectionsClose();
+-    icpConnectionShutdown();
+-#if USE_HTCP
+ 
+-    htcpSocketShutdown();
+-#endif
++    if (IamPrimaryProcess()) {
++#if USE_WCCP
+ 
+-    icmpEngine.Close();
+-#if SQUID_SNMP
++        wccpConnectionClose();
++#endif
++#if USE_WCCPv2
+ 
+-    snmpConnectionShutdown();
++        wccp2ConnectionClose();
+ #endif
+-#if USE_WCCP
++    }
++    if (!IamCoordinatorProcess()) {
++        clientHttpConnectionsClose();
++        icpConnectionShutdown();
++#if USE_HTCP
+ 
+-    wccpConnectionClose();
++        htcpSocketShutdown();
+ #endif
+-#if USE_WCCPv2
+ 
+-    wccp2ConnectionClose();
++        icmpEngine.Close();
++#if SQUID_SNMP
++
++        snmpConnectionShutdown();
+ #endif
+ 
+-    asnFreeMemory();
++        asnFreeMemory();
++    }
+ }
+ 
+ static void
+@@ -726,10 +750,17 @@ mainReconfigureFinish(void *)
+         Config2.onoff.enable_purge = 2;
+ 
+     // parse the config returns a count of errors encountered.
++    const int oldWorkers = Config.workers;
+     if ( parseConfigFile(ConfigFile) != 0) {
+         // for now any errors are a fatal condition...
+         self_destruct();
+     }
++    if (oldWorkers != Config.workers) {
++        debugs(1, DBG_CRITICAL, "WARNING: Changing 'workers' (from " <<
++               oldWorkers << " to " << Config.workers <<
++               ") is not supported and ignored");
++        Config.workers = oldWorkers;
++    }
+ 
+     setUmask(Config.umask);
+     Mem::Report();
+@@ -775,14 +806,17 @@ mainReconfigureFinish(void *)
+     redirectInit();
+     authenticateInit(&Auth::TheConfig);
+     externalAclInit();
++
++    if (IamPrimaryProcess()) {
+ #if USE_WCCP
+ 
+-    wccpInit();
++        wccpInit();
+ #endif
+ #if USE_WCCPv2
+ 
+-    wccp2Init();
++        wccp2Init();
+ #endif
++    }
+ 
+     serverConnectionsOpen();
+ 
+@@ -1037,15 +1071,17 @@ mainInitialize(void)
+         //   moved to PconnModule::PconnModule()
+     }
+ 
++    if (IamPrimaryProcess()) {
+ #if USE_WCCP
+-    wccpInit();
++        wccpInit();
+ 
+ #endif
+ #if USE_WCCPv2
+ 
+-    wccp2Init();
++        wccp2Init();
+ 
+ #endif
++    }
+ 
+     serverConnectionsOpen();
+ 
+@@ -1171,9 +1207,28 @@ SquidMainSafe(int argc, char **argv)
+     return -1; // not reached
+ }
+ 
++/// computes name and ID for the current kid process
++static void
++ConfigureCurrentKid(const char *processName)
++{
++    // kids are marked with parenthesis around their process names
++    if (processName && processName[0] == '(') {
++        if (const char *idStart = strrchr(processName, '-')) {
++            KidIdentifier = atoi(idStart + 1);
++            const int nameLen = idStart - (processName + 1);
++            xstrncpy(KidName, processName + 1, nameLen + 1);
++        }
++    } else {
++        xstrncpy(KidName, APP_SHORTNAME, sizeof(KidName));
++        KidIdentifier = 0;
++    }
++}
++
+ int
+ SquidMain(int argc, char **argv)
+ {
++    ConfigureCurrentKid(argv[0]);
++
+ #ifdef _SQUID_WIN32_
+ 
+     int WIN32_init_err;
+@@ -1344,7 +1399,7 @@ SquidMain(int argc, char **argv)
+         return 0;
+     }
+ 
+-    if (!opt_no_daemon)
++    if (!opt_no_daemon && Config.workers > 0)
+         watch_child(argv);
+ 
+     setMaxFD();
+@@ -1400,6 +1455,11 @@ SquidMain(int argc, char **argv)
+ 
+     mainLoop.setTimeService(&time_engine);
+ 
++    if (IamCoordinatorProcess())
++        AsyncJob::AsyncStart(Ipc::Coordinator::Instance());
++    else if (UsingSmp() && IamWorkerProcess())
++        AsyncJob::AsyncStart(new Ipc::Strand);
++
+     /* at this point we are finished the synchronous startup. */
+     starting_up = 0;
+ 
+@@ -1501,11 +1561,11 @@ mainStartScript(const char *prog)
+         do {
+ #ifdef _SQUID_NEXT_
+             union wait status;
+-            rpid = wait3(&status, 0, NULL);
++            rpid = wait4(cpid, &status, 0, NULL);
+ #else
+ 
+             int status;
+-            rpid = waitpid(-1, &status, 0);
++            rpid = waitpid(cpid, &status, 0);
+ #endif
+ 
+         } while (rpid != cpid);
+@@ -1517,6 +1577,10 @@ mainStartScript(const char *prog)
+ static int
+ checkRunningPid(void)
+ {
++    // master process must start alone, but its kids processes may co-exist
++    if (!IamMasterProcess())
++        return 0;
++
+     pid_t pid;
+ 
+     if (!debug_log)
+@@ -1540,9 +1604,6 @@ watch_child(char *argv[])
+ {
+ #ifndef _SQUID_MSWIN_
+     char *prog;
+-    int failcount = 0;
+-    time_t start;
+-    time_t stop;
+ #ifdef _SQUID_NEXT_
+ 
+     union wait status;
+@@ -1559,7 +1620,7 @@ watch_child(char *argv[])
+ 
+     int nullfd;
+ 
+-    if (*(argv[0]) == '(')
++    if (!IamMasterProcess())
+         return;
+ 
+     openlog(APP_SHORTNAME, LOG_PID | LOG_NDELAY | LOG_CONS, LOG_LOCAL4);
+@@ -1601,25 +1662,39 @@ watch_child(char *argv[])
+         dup2(nullfd, 2);
+     }
+ 
++    if (Config.workers > 128) {
++        syslog(LOG_ALERT, "Suspiciously high workers value: %d",
++               Config.workers);
++        // but we keep going in hope that user knows best
++    }
++    TheKids.init(Config.workers);
++
++    // keep [re]starting kids until it is time to quit
+     for (;;) {
+         mainStartScript(argv[0]);
+ 
+-        if ((pid = fork()) == 0) {
+-            /* child */
+-            openlog(APP_SHORTNAME, LOG_PID | LOG_NDELAY | LOG_CONS, LOG_LOCAL4);
+-            prog = xstrdup(argv[0]);
+-            argv[0] = xstrdup("(squid)");
+-            execvp(prog, argv);
+-            syslog(LOG_ALERT, "execvp failed: %s", xstrerror());
++        // start each kid that needs to be [re]started; once
++        for (int i = TheKids.count() - 1; i >= 0; --i) {
++            Kid& kid = TheKids.get(i);
++            if (kid.hopeless() || kid.exitedHappy() || kid.running())
++                continue;
++
++            if ((pid = fork()) == 0) {
++                /* child */
++                openlog(APP_SHORTNAME, LOG_PID | LOG_NDELAY | LOG_CONS, LOG_LOCAL4);
++                prog = argv[0];
++                argv[0] = const_cast<char*>(kid.name().termedBuf());
++                execvp(prog, argv);
++                syslog(LOG_ALERT, "execvp failed: %s", xstrerror());
++            }
++
++            kid.start(pid);
++            syslog(LOG_NOTICE, "Squid Parent: child process %d started", pid);
+         }
+ 
+         /* parent */
+         openlog(APP_SHORTNAME, LOG_PID | LOG_NDELAY | LOG_CONS, LOG_LOCAL4);
+ 
+-        syslog(LOG_NOTICE, "Squid Parent: child process %d started", pid);
+-
+-        time(&start);
+-
+         squid_signal(SIGINT, SIG_IGN, SA_RESTART);
+ 
+ #ifdef _SQUID_NEXT_
+@@ -1631,51 +1706,48 @@ watch_child(char *argv[])
+         pid = waitpid(-1, &status, 0);
+ 
+ #endif
+-
+-        time(&stop);
+-
+-        if (WIFEXITED(status)) {
+-            syslog(LOG_NOTICE,
+-                   "Squid Parent: child process %d exited with status %d",
+-                   pid, WEXITSTATUS(status));
+-        } else if (WIFSIGNALED(status)) {
+-            syslog(LOG_NOTICE,
+-                   "Squid Parent: child process %d exited due to signal %d with status %d",
+-                   pid, WTERMSIG(status), WEXITSTATUS(status));
+-        } else {
+-            syslog(LOG_NOTICE, "Squid Parent: child process %d exited", pid);
++        // Loop to collect all stopped kids before we go to sleep below.
++        do {
++            Kid* kid = TheKids.find(pid);
++            if (kid) {
++                kid->stop(status);
++                if (kid->calledExit()) {
++                    syslog(LOG_NOTICE,
++                           "Squid Parent: child process %d exited with status %d",
++                           kid->getPid(), kid->exitStatus());
++                } else if (kid->signaled()) {
++                    syslog(LOG_NOTICE,
++                           "Squid Parent: child process %d exited due to signal %d with status %d",
++                           kid->getPid(), kid->termSignal(), kid->exitStatus());
++                } else {
++                    syslog(LOG_NOTICE, "Squid Parent: child process %d exited", kid->getPid());
++                }
++            } else {
++                syslog(LOG_NOTICE, "Squid Parent: unknown child process %d exited", pid);
++            }
++#ifdef _SQUID_NEXT_
++        } while ((pid = wait3(&status, WNOHANG, NULL)) > 0);
++#else
+         }
++        while ((pid = waitpid(-1, &status, WNOHANG)) > 0);
++#endif
+ 
+-        if (stop - start < 10)
+-            failcount++;
+-        else
+-            failcount = 0;
++        if (TheKids.allExitedHappy()) {
++            exit(0);
++        }
+ 
+-        if (failcount == 5) {
++        if (TheKids.allHopeless()) {
+             syslog(LOG_ALERT, "Exiting due to repeated, frequent failures");
+             exit(1);
+         }
+ 
+-        if (WIFEXITED(status))
+-            if (WEXITSTATUS(status) == 0)
+-                exit(0);
+-
+-        if (WIFSIGNALED(status)) {
+-            switch (WTERMSIG(status)) {
+-
+-            case SIGKILL:
+-                exit(0);
+-                break;
+-
+-            case SIGINT:
+-            case SIGTERM:
+-                syslog(LOG_ALERT, "Exiting due to unexpected forced shutdown");
+-                exit(1);
+-                break;
++        if (TheKids.allSignaled(SIGKILL)) {
++            exit(0);
++        }
+ 
+-            default:
+-                break;
+-            }
++        if (TheKids.allSignaled(SIGINT) || TheKids.allSignaled(SIGTERM)) {
++            syslog(LOG_ALERT, "Exiting due to unexpected forced shutdown");
++            exit(1);
+         }
+ 
+         squid_signal(SIGINT, SIG_DFL, SA_RESTART);
+@@ -1813,10 +1885,12 @@ SquidShutdown()
+ 
+ #endif
+ 
+-    if (Config.pidFilename && strcmp(Config.pidFilename, "none") != 0) {
+-        enter_suid();
+-        safeunlink(Config.pidFilename, 0);
+-        leave_suid();
++    if (IamPrimaryProcess()) {
++        if (Config.pidFilename && strcmp(Config.pidFilename, "none") != 0) {
++            enter_suid();
++            safeunlink(Config.pidFilename, 0);
++            leave_suid();
++        }
+     }
+ 
+     debugs(1, 1, "Squid Cache (Version " << version_string << "): Exiting normally.");
+@@ -573,6 +573,22 @@ SQUIDCEXTERN void squid_signal(int sig, SIGHDLR *, int flags);
+ SQUIDCEXTERN pid_t readPidFile(void);
+ SQUIDCEXTERN void keepCapabilities(void);
+ 
++SQUIDCEXTERN void BroadcastSignalIfAny(int& sig);
++/// whether the current process is the parent of all other Squid processes
++SQUIDCEXTERN bool IamMasterProcess();
++/**
++    whether the current process is dedicated to doing things that only
++    a single process should do, such as PID file maintenance and WCCP
++*/
++SQUIDCEXTERN bool IamPrimaryProcess();
++/// whether the current process coordinates worker processes
++SQUIDCEXTERN bool IamCoordinatorProcess();
++/// whether the current process handles HTTP transactions and such
++SQUIDCEXTERN bool IamWorkerProcess();
++/// Whether there should be more than one worker process running
++SQUIDCEXTERN bool UsingSmp(); // try using specific Iam*() checks above first
++SQUIDCEXTERN int DebugSignal;
++
+ /* AYJ debugs function to show locations being reset with memset() */
+ SQUIDCEXTERN void *xmemset(void *dst, int, size_t);
+ 
+@@ -33,12 +33,31 @@
+ #include "acl/FilledChecklist.h"
+ #include "cache_snmp.h"
+ #include "comm.h"
++#include "ipc/StartListening.h"
+ #include "compat/strsep.h"
+ #include "ip/Address.h"
+ 
+ #define SNMP_REQUEST_SIZE 4096
+ #define MAX_PROTOSTAT 5
+ 
++/// dials snmpConnectionOpened call
++class SnmpListeningStartedDialer: public CallDialer,
++        public Ipc::StartListeningCb
++{
++public:
++    typedef void (*Handler)(int fd, int errNo);
++    SnmpListeningStartedDialer(Handler aHandler): handler(aHandler) {}
++
++    virtual void print(std::ostream &os) const { startPrint(os) << ')'; }
++
++    virtual bool canDial(AsyncCall &) const { return true; }
++    virtual void dial(AsyncCall &) { (handler)(fd, errNo); }
++
++public:
++    Handler handler;
++};
++
++
+ Ip::Address theOutSNMPAddr;
+ 
+ typedef struct _mib_tree_entry mib_tree_entry;
+@@ -59,6 +78,9 @@ struct _mib_tree_entry {
+ mib_tree_entry *mib_tree_head;
+ mib_tree_entry *mib_tree_last;
+ 
++static void snmpIncomingConnectionOpened(int fd, int errNo);
++static void snmpOutgoingConnectionOpened(int fd, int errNo);
++
+ static mib_tree_entry * snmpAddNodeStr(const char *base_str, int o, oid_ParseFn * parsefunction, instance_Fn * instancefunction);
+ static mib_tree_entry *snmpAddNode(oid * name, int len, oid_ParseFn * parsefunction, instance_Fn * instancefunction, int children,...);
+ static oid *snmpCreateOid(int length,...);
+@@ -279,54 +301,71 @@ snmpInit(void)
+ void
+ snmpConnectionOpen(void)
+ {
+-    struct addrinfo *xaddr = NULL;
+-    int x;
+-
+     debugs(49, 5, "snmpConnectionOpen: Called");
+ 
+     if (Config.Port.snmp > 0) {
+         Config.Addrs.snmp_incoming.SetPort(Config.Port.snmp);
+-        enter_suid();
+-        theInSnmpConnection = comm_open_listener(SOCK_DGRAM,
+-                              IPPROTO_UDP,
+-                              Config.Addrs.snmp_incoming,
+-                              COMM_NONBLOCKING,
+-                              "SNMP Port");
+-        leave_suid();
+ 
+-        if (theInSnmpConnection < 0)
+-            fatal("Cannot open SNMP Port");
++        AsyncCall::Pointer call = asyncCall(49, 2,
++                                            "snmpIncomingConnectionOpened",
++                                            SnmpListeningStartedDialer(&snmpIncomingConnectionOpened));
+ 
+-        commSetSelect(theInSnmpConnection, COMM_SELECT_READ, snmpHandleUdp, NULL, 0);
+-
+-        debugs(1, 1, "Accepting SNMP messages on " << Config.Addrs.snmp_incoming << ", FD " << theInSnmpConnection << ".");
++        Ipc::StartListening(SOCK_DGRAM,
++                            IPPROTO_UDP,
++                            Config.Addrs.snmp_incoming,
++                            COMM_NONBLOCKING,
++                            Ipc::fdnInSnmpSocket, call);
+ 
+         if (!Config.Addrs.snmp_outgoing.IsNoAddr()) {
+             Config.Addrs.snmp_outgoing.SetPort(Config.Port.snmp);
+-            enter_suid();
+-            theOutSnmpConnection = comm_open_listener(SOCK_DGRAM,
+-                                   IPPROTO_UDP,
+-                                   Config.Addrs.snmp_outgoing,
+-                                   COMM_NONBLOCKING,
+-                                   "SNMP Port");
+-            leave_suid();
+ 
+-            if (theOutSnmpConnection < 0)
+-                fatal("Cannot open Outgoing SNMP Port");
++            AsyncCall::Pointer call = asyncCall(49, 2,
++                                                "snmpOutgoingConnectionOpened",
++                                                SnmpListeningStartedDialer(&snmpOutgoingConnectionOpened));
++
++            Ipc::StartListening(SOCK_DGRAM,
++                                IPPROTO_UDP,
++                                Config.Addrs.snmp_outgoing,
++                                COMM_NONBLOCKING,
++                                Ipc::fdnOutSnmpSocket, call);
++        }
++    }
++}
++
++static void
++snmpIncomingConnectionOpened(int fd, int errNo)
++{
++    theInSnmpConnection = fd;
++    if (theInSnmpConnection < 0)
++        fatal("Cannot open Incoming SNMP Port");
+ 
+-            commSetSelect(theOutSnmpConnection,
+-                          COMM_SELECT_READ,
+-                          snmpHandleUdp,
+-                          NULL, 0);
++    commSetSelect(theInSnmpConnection, COMM_SELECT_READ, snmpHandleUdp, NULL,
++                  0);
+ 
+-            debugs(1, 1, "Outgoing SNMP messages on " << Config.Addrs.snmp_outgoing << ", FD " << theOutSnmpConnection << ".");
++    debugs(1, 1, "Accepting SNMP messages on " << Config.Addrs.snmp_incoming <<
++           ", FD " << theInSnmpConnection << ".");
+ 
+-            fd_note(theOutSnmpConnection, "Outgoing SNMP socket");
++    if (Config.Addrs.snmp_outgoing.IsNoAddr())
++        theOutSnmpConnection = theInSnmpConnection;
++}
++
++static void
++snmpOutgoingConnectionOpened(int fd, int errNo)
++{
++    theOutSnmpConnection = fd;
++    if (theOutSnmpConnection < 0)
++        fatal("Cannot open Outgoing SNMP Port");
++
++    commSetSelect(theOutSnmpConnection, COMM_SELECT_READ, snmpHandleUdp, NULL,
++                  0);
++
++    debugs(1, 1, "Outgoing SNMP messages on " << Config.Addrs.snmp_outgoing <<
++           ", FD " << theOutSnmpConnection << ".");
++
++    {
++        struct addrinfo *xaddr = NULL;
++        int x;
+ 
+-            fd_note(theInSnmpConnection, "Incoming SNMP socket");
+-        } else {
+-            theOutSnmpConnection = theInSnmpConnection;
+-        }
+ 
+         theOutSNMPAddr.SetEmpty();
+ 
+@@ -611,6 +611,7 @@ struct SquidConfig {
+     char *accept_filter;
+     int umask;
+     int max_filedescriptors;
++    int workers;
+ 
+ #if USE_LOADABLE_MODULES
+     wordlist *loadable_module_names;
+@@ -43,6 +43,8 @@
+ #include "ProtoPort.h"
+ #include "SquidMath.h"
+ #include "SquidTime.h"
++#include "ipc/Kids.h"
++#include "ipc/Coordinator.h"
+ #include "SwapDir.h"
+ #include "wordlist.h"
+ 
+@@ -68,6 +70,7 @@ extern void log_trace_done();
+ extern void log_trace_init(char *);
+ #endif
+ static void restoreCapabilities(int keep);
++int DebugSignal = -1;
+ 
+ #ifdef _SQUID_LINUX_
+ /* Workaround for crappy glic header files */
+@@ -401,13 +404,24 @@ death(int sig)
+     abort();
+ }
+ 
++void
++BroadcastSignalIfAny(int& sig)
++{
++    if (sig > 0) {
++        if (IamCoordinatorProcess())
++            Ipc::Coordinator::Instance()->broadcastSignal(sig);
++        sig = -1;
++    }
++}
+ 
+ void
+ sigusr2_handle(int sig)
+ {
+     static int state = 0;
+     /* no debugs() here; bad things happen if the signal is delivered during _db_print() */
+ 
++    DebugSignal = sig;
++
+     if (state == 0) {
+ #if !MEM_GEN_TRACE
+         Debug::parseOptions("ALL,7");
+@@ -794,6 +808,50 @@ no_suid(void)
+ #endif
+ }
+ 
++bool
++IamMasterProcess()
++{
++    return KidIdentifier == 0;
++}
++
++bool
++IamWorkerProcess()
++{
++    // when there is only one process, it has to be the worker
++    if (opt_no_daemon || Config.workers == 0)
++        return true;
++
++    return 0 < KidIdentifier && KidIdentifier <= Config.workers;
++}
++
++bool
++UsingSmp()
++{
++    return !opt_no_daemon && Config.workers > 1;
++}
++
++bool
++IamCoordinatorProcess()
++{
++    return UsingSmp() && KidIdentifier == Config.workers + 1;
++}
++
++bool
++IamPrimaryProcess()
++{
++    // when there is only one process, it has to be primary
++    if (opt_no_daemon || Config.workers == 0)
++        return true;
++
++    // when there is a master and worker process, the master delegates
++    // primary functions to its only kid
++    if (Config.workers == 1)
++        return IamWorkerProcess();
++
++    // in SMP mode, multiple kids delegate primary functions to the coordinator
++    return IamCoordinatorProcess();
++}
++
+ void
+ writePidFile(void)
+ {
+@@ -802,6 +860,9 @@ writePidFile(void)
+     mode_t old_umask;
+     char buf[32];
+ 
++    if (!IamPrimaryProcess())
++        return;
++
+     if ((f = Config.pidFilename) == NULL)
+         return;
+ 

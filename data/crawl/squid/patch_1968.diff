@@ -1,0 +1,588 @@
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: acl.cc,v 1.28 1996/08/26 19:57:02 wessels Exp $
++ * $Id: acl.cc,v 1.29 1996/09/04 22:03:18 wessels Exp $
+  *
+  * DEBUG: section 28    Access Control
+  * AUTHOR: Duane Wessels
+@@ -41,6 +41,7 @@ static void aclDestroyAclList _PARAMS((struct _acl_list * list));
+ static void aclDestroyIpList _PARAMS((struct _acl_ip_data * data));
+ static void aclDestroyRegexList _PARAMS((struct _relist * data));
+ static void aclDestroyTimeList _PARAMS((struct _acl_time_data * data));
++static int aclMatchDomainList _PARAMS((wordlist *, char *));
+ static int aclMatchAclList _PARAMS((struct _acl_list *, aclCheck_t *));
+ static int aclMatchInteger _PARAMS((intlist * data, int i));
+ static int aclMatchIp _PARAMS((struct _acl_ip_data * data, struct in_addr c));
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: client.cc,v 1.7 1996/07/09 03:41:20 wessels Exp $
++ * $Id: client.cc,v 1.8 1996/09/04 22:03:19 wessels Exp $
+  *
+  * DEBUG: section 0     WWW Client
+  * AUTHOR: Harvest Derived
+@@ -209,7 +209,7 @@ int main(argc, argv)
+     sprintf(buf, "Accept: */*\r\n");
+     strcat(msg, buf);
+     if (ims) {
+-	sprintf(buf, "If-Modified-Since: %s\r\n", mkrfc850(&ims));
++	sprintf(buf, "If-Modified-Since: %s\r\n", mkrfc850(ims));
+ 	strcat(msg, buf);
+     }
+     sprintf(buf, "\r\n");
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: client_side.cc,v 1.14 1996/08/29 16:55:48 wessels Exp $
++ * $Id: client_side.cc,v 1.15 1996/09/04 22:03:20 wessels Exp $
+  *
+  * DEBUG: section 33    Client-side Routines
+  * AUTHOR: Duane Wessels
+@@ -32,6 +32,8 @@
+ #include "squid.h"
+ 
+ static void clientRedirectDone _PARAMS((void *data, char *result));
++static int icpHandleIMSReply _PARAMS((int fd, StoreEntry * entry, void *data));
++
+ 
+ static int clientLookupDstIPDone(fd, hp, data)
+      int fd;
+@@ -205,7 +207,7 @@ static void clientRedirectDone(data, result)
+ 	COMM_SELECT_READ,
+ 	(PF) icpDetectClientClose,
+ 	(void *) icpState);
+-    icp_hit_or_miss(fd, icpState);
++    icpProcessRequest(fd, icpState);
+ #if USE_PROXY_AUTH
+ }
+ 
+@@ -345,3 +347,90 @@ char *proxyAuthenticate(char *headers)
+     return (sent_user);
+ #endif /* USE_PROXY_AUTH */
+ }
++
++int icpProcessExpired(fd, icpState)
++     int fd;
++     icpStateData *icpState;
++{
++    char *url = icpState->url;
++    char *request_hdr = icpState->request_hdr;
++    StoreEntry *entry = NULL;
++
++    debug(33, 3, "icpProcessExpired: FD %d '%s'\n", fd, icpState->url);
++
++    icpState->old_entry = icpState->entry;
++    entry = storeCreateEntry(url,
++	request_hdr,
++	icpState->flags,
++	icpState->method);
++    /* NOTE, don't call storeLockObject(), storeCreateEntry() does it */
++
++    entry->lastmod = icpState->old_entry->lastmod;
++    debug(33, 5, "icpProcessExpired: setting lmt = %d\n",
++	entry->lastmod);
++
++    entry->refcount++;		/* MISS CASE */
++    entry->mem_obj->fd_of_first_client = fd;
++    icpState->entry = entry;
++    icpState->offset = 0;
++    /* Register with storage manager to receive updates when data comes in. */
++    storeRegister(entry, fd, (PIF) icpHandleIMSReply, (void *) icpState);
++    return (protoDispatch(fd, url, icpState->entry, icpState->request));
++}
++
++
++int icpHandleIMSReply(fd, entry, data)
++     int fd;
++     StoreEntry *entry;
++     void *data;
++{
++    icpStateData *icpState = data;
++    MemObject *mem = entry->mem_obj;
++    LOCAL_ARRAY(char, hbuf, 8192);
++    int len;
++    debug(33, 0, "icpHandleIMSReply: FD %d '%s'\n", fd, entry->url);
++    /* unregister this handler */
++    storeUnregister(entry, fd);
++    if (entry->store_status == STORE_ABORTED) {
++	debug(33, 0, "icpHandleIMSReply: abort_code=%d\n",
++	    entry->mem_obj->abort_code);
++	icpSendERROR(fd,
++	    entry->mem_obj->abort_code,
++	    entry->mem_obj->e_abort_msg,
++	    icpState,
++	    400);
++	return 0;
++    }
++    if (mem->reply->code == 304 && !BIT_TEST(icpState->flags, REQ_IMS)) {
++	icpState->log_type = LOG_TCP_EXPIRED_HIT;
++	/* We initiated the IMS request, the client is not expecting
++	 * 304, so put the good one back */
++	storeUnlockObject(entry);
++	entry = icpState->entry = icpState->old_entry;
++	/* Extend the TTL
++	 * * XXX race condition here.  Assumes old_entry has been swapped 
++	 * * in by the time this 304 reply arrives.  */
++	storeClientCopy(entry, 0, 8191, hbuf, &len, fd);
++	if (!mime_headers_end(hbuf))
++	    fatal_dump("icpHandleIMSReply: failed to load headers, lost race");
++	httpParseHeaders(hbuf, entry->mem_obj->reply);
++	debug(44, 0, "OLD EXPIRES=%d\n", entry->expires);
++	ttlSet(entry);
++	debug(44, 0, "NEW EXPIRES=%d\n", entry->expires);
++    } else {
++	/* the client can handle this reply, whatever it is */
++	icpState->log_type = LOG_TCP_EXPIRED_MISS;
++	storeUnlockObject(icpState->old_entry);
++    }
++    /* done with old_entry */
++    icpState->old_entry = NULL;
++    /* switch the handler for incoming data */
++    if (entry->store_status != STORE_OK)
++	storeRegister(icpState->entry,
++	    fd,
++	    (PIF) icpHandleStore,
++	    (void *) icpState);
++    /* give it to the client */
++    icpSendMoreData(fd, icpState);
++    return 1;
++}
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: errorpage.cc,v 1.35 1996/08/30 23:23:28 wessels Exp $
++ * $Id: errorpage.cc,v 1.36 1996/09/04 22:03:22 wessels Exp $
+  *
+  * DEBUG: section 4     Error Generation
+  * AUTHOR: Duane Wessels
+@@ -150,7 +150,7 @@ void errorInitialize()
+ 
+ void squid_error_entry(entry, type, msg)
+      StoreEntry *entry;
+-     int type;
++     log_type type;
+      char *msg;
+ {
+     int index;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: fqdncache.cc,v 1.14 1996/09/03 18:50:37 wessels Exp $
++ * $Id: fqdncache.cc,v 1.15 1996/09/04 22:03:23 wessels Exp $
+  *
+  * DEBUG: section 35    FQDN Cache
+  * AUTHOR: Harvest Derived
+@@ -458,7 +458,7 @@ static fqdncache_entry *fqdncache_parsebuffer(inbuf, dnsData)
+     debug(35, 5, "fqdncache_parsebuffer: parsing:\n%s", inbuf);
+     memset(&f, '\0', sizeof(fqdncache_entry));
+     f.expires = squid_curtime + Config.positiveDnsTtl;
+-    f.status = IP_DISPATCHED;
++    f.status = FQDN_DISPATCHED;
+     for (token = strtok(buf, w_space); token; token = strtok(NULL, w_space)) {
+ 	if (!strcmp(token, "$end")) {
+ 	    break;
+@@ -468,15 +468,15 @@ static fqdncache_entry *fqdncache_parsebuffer(inbuf, dnsData)
+ 	    if ((token = strtok(NULL, w_space)) == NULL)
+ 		fatal_dump("Invalid $fail");
+ 	    f.expires = squid_curtime + Config.negativeDnsTtl;
+-	    f.status = IP_NEGATIVE_CACHED;
++	    f.status = FQDN_NEGATIVE_CACHED;
+ 	} else if (!strcmp(token, "$message")) {
+ 	    if ((token = strtok(NULL, "\n")) == NULL)
+ 		fatal_dump("Invalid $message");
+ 	    f.error_message = xstrdup(token);
+ 	} else if (!strcmp(token, "$name")) {
+ 	    if ((token = strtok(NULL, w_space)) == NULL)
+ 		fatal_dump("Invalid $name");
+-	    f.status = IP_CACHED;
++	    f.status = FQDN_CACHED;
+ 	} else if (!strcmp(token, "$h_name")) {
+ 	    if ((token = strtok(NULL, w_space)) == NULL)
+ 		fatal_dump("Invalid $h_name");
+@@ -491,7 +491,7 @@ static fqdncache_entry *fqdncache_parsebuffer(inbuf, dnsData)
+ 	    ipcount = atoi(token);
+ 	    for (k = 0; k < ipcount; k++) {
+ 		if ((token = strtok(NULL, w_space)) == NULL)
+-		    fatal_dump("Invalid IP address");
++		    fatal_dump("Invalid FQDN address");
+ 	    }
+ 	} else if (!strcmp(token, "$aliascount")) {
+ 	    if ((token = strtok(NULL, w_space)) == NULL)
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: http.cc,v 1.70 1996/09/03 19:24:03 wessels Exp $
++ * $Id: http.cc,v 1.71 1996/09/04 22:03:23 wessels Exp $
+  *
+  * DEBUG: section 11    Hypertext Transfer Protocol (HTTP)
+  * AUTHOR: Harvest Derived
+@@ -496,9 +496,9 @@ static void httpReadReply(fd, httpState)
+ 	squid_error_entry(entry, ERR_CLIENT_ABORT, NULL);
+ 	comm_close(fd);
+     } else {
+-	storeAppend(entry, buf, len);
+ 	if (httpState->reply_hdr_state < 2 && len > 0)
+ 	    httpProcessReplyHeader(httpState, buf, len);
++	storeAppend(entry, buf, len);
+ 	comm_set_select_handler(fd,
+ 	    COMM_SELECT_READ,
+ 	    (PF) httpReadReply,
+@@ -557,13 +557,13 @@ static void httpSendRequest(fd, httpState)
+     char *t = NULL;
+     char *post_buf = NULL;
+     static char *crlf = "\r\n";
+-    static char *VIA_PROXY_TEXT = "via Squid Cache version";
+     int len = 0;
+     int buflen;
+     int cfd = -1;
+     request_t *req = httpState->request;
+     char *Method = RequestMethodStr[req->method];
+     int buftype = 0;
++    StoreEntry *entry = httpState->entry;
+ 
+     debug(11, 5, "httpSendRequest: FD %d: httpState %p.\n", fd, httpState);
+     buflen = strlen(Method) + strlen(req->urlpath);
+@@ -593,12 +593,7 @@ static void httpSendRequest(fd, httpState)
+     if (httpState->req_hdr) {	/* we have to parse the request header */
+ 	xbuf = xstrdup(httpState->req_hdr);
+ 	for (t = strtok(xbuf, crlf); t; t = strtok(NULL, crlf)) {
+-	    if (strncasecmp(t, "User-Agent:", 11) == 0) {
+-		ybuf = (char *) get_free_4k_page();
+-		memset(ybuf, '\0', SM_PAGE_SIZE);
+-		sprintf(ybuf, "%s %s %s", t, VIA_PROXY_TEXT, version_string);
+-		t = ybuf;
+-	    } else if (strncasecmp(t, "Connection:", 11) == 0)
++	    if (strncasecmp(t, "Connection:", 11) == 0)
+ 		continue;
+ 	    if (len + (int) strlen(t) > buflen - 10)
+ 		continue;
+@@ -607,15 +602,11 @@ static void httpSendRequest(fd, httpState)
+ 	    len += strlen(t) + 2;
+ 	}
+ 	xfree(xbuf);
+-	if (ybuf) {
+-	    put_free_4k_page(ybuf);
+-	    ybuf = NULL;
+-	}
+     }
+     /* Add Forwarded: header */
+     ybuf = get_free_4k_page();
+-    if (httpState->entry->mem_obj)
+-	cfd = httpState->entry->mem_obj->fd_of_first_client;
++    if (entry->mem_obj)
++	cfd = entry->mem_obj->fd_of_first_client;
+     if (cfd < 0) {
+ 	sprintf(ybuf, "%s\r\n", ForwardedBy);
+     } else {
+@@ -626,6 +617,16 @@ static void httpSendRequest(fd, httpState)
+     put_free_4k_page(ybuf);
+     ybuf = NULL;
+ 
++    /* Add IMS header */
++    if (entry->lastmod && req->method == METHOD_GET) {
++	debug(11, 3, "httpSendRequest: Adding IMS: %s\r\n",
++	    mkrfc850(entry->lastmod));
++	ybuf = get_free_4k_page();
++	sprintf(ybuf, "If-Modified-Since: %s\r\n", mkrfc850(entry->lastmod));
++	strcat(buf, ybuf);
++	len += strlen(ybuf);
++	put_free_4k_page(ybuf);
++    }
+     strcat(buf, crlf);
+     len += 2;
+     if (post_buf) {
+@@ -715,10 +716,6 @@ int proxyhttpStart(e, url, entry)
+     strncpy(request->host, e->host, SQUIDHOSTNAMELEN);
+     request->port = e->http_port;
+     strncpy(request->urlpath, url, MAX_URL);
+-
+-    /* check if IP is already in cache. It must be. 
+-     * It should be done before this route is called. 
+-     * Otherwise, we cannot check return code for connect. */
+     ipcache_nbgethostbyname(request->host,
+ 	sock,
+ 	(IPH) httpConnect,
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: ipcache.cc,v 1.54 1996/09/03 18:54:45 wessels Exp $
++ * $Id: ipcache.cc,v 1.55 1996/09/04 22:03:26 wessels Exp $
+  *
+  * DEBUG: section 14    IP Cache
+  * AUTHOR: Harvest Derived
+@@ -146,7 +146,6 @@ static ipcache_entry *ipcache_GetNext _PARAMS((void));
+ static ipcache_entry *ipcache_create _PARAMS((void));
+ static void ipcache_add_to_hash _PARAMS((ipcache_entry *));
+ static void ipcache_call_pending _PARAMS((ipcache_entry *));
+-static void ipcache_call_pending_badname _PARAMS((int fd, IPH handler, void *));
+ static void ipcache_add _PARAMS((char *, ipcache_entry *, struct hostent *, int));
+ static int ipcacheHasPending _PARAMS((ipcache_entry *));
+ static ipcache_entry *ipcache_get _PARAMS((char *));
+@@ -158,6 +157,8 @@ static void *ipcacheDequeue _PARAMS((void));
+ static void ipcache_dnsDispatch _PARAMS((dnsserver_t *, ipcache_entry *));
+ static struct hostent *ipcacheCheckNumeric _PARAMS((char *name));
+ static void ipcacheStatPrint _PARAMS((ipcache_entry *, StoreEntry *));
++static void ipcacheUnlockEntry _PARAMS((ipcache_entry *));
++static void ipcacheLockEntry _PARAMS((ipcache_entry *));
+ 
+ static struct hostent *static_result = NULL;
+ static HashID ip_table = 0;
+@@ -314,6 +315,8 @@ static int ipcacheExpiredEntry(i)
+ 	return 0;
+     if (i->status == IP_DISPATCHED)
+ 	return 0;
++    if (i->locks != 0)
++	return 0;
+     if (i->expires > squid_curtime)
+ 	return 0;
+     return 1;
+@@ -469,6 +472,7 @@ static void ipcache_call_pending(i)
+ 
+     i->lastref = squid_curtime;
+ 
++    ipcacheLockEntry(i);
+     while (i->pending_head != NULL) {
+ 	p = i->pending_head;
+ 	i->pending_head = p->next;
+@@ -484,15 +488,7 @@ static void ipcache_call_pending(i)
+     }
+     i->pending_head = NULL;	/* nuke list */
+     debug(14, 10, "ipcache_call_pending: Called %d handlers.\n", nhandler);
+-}
+-
+-static void ipcache_call_pending_badname(fd, handler, data)
+-     int fd;
+-     IPH handler;
+-     void *data;
+-{
+-    debug(14, 0, "ipcache_call_pending_badname: Bad Name: Calling handler with NULL result.\n");
+-    handler(fd, NULL, data);
++    ipcacheUnlockEntry(i);
+ }
+ 
+ static ipcache_entry *ipcache_parsebuffer(inbuf, dnsData)
+@@ -683,7 +679,7 @@ void ipcache_nbgethostbyname(name, fd, handler, handlerData)
+ 
+     if (name == NULL || name[0] == '\0') {
+ 	debug(14, 4, "ipcache_nbgethostbyname: Invalid name!\n");
+-	ipcache_call_pending_badname(fd, handler, handlerData);
++	handler(fd, NULL, handlerData);
+ 	return;
+     }
+     if ((hp = ipcacheCheckNumeric(name))) {
+@@ -744,11 +740,11 @@ static void ipcache_dnsDispatch(dns, i)
+ 	ipcache_release(i);
+ 	return;
+     }
+-    i->status = IP_DISPATCHED;
+     buf = xcalloc(1, 256);
+     sprintf(buf, "%1.254s\n", i->name);
+     dns->flags |= DNS_FLAG_BUSY;
+     dns->data = i;
++    i->status = IP_DISPATCHED;
+     comm_write(dns->outpipe,
+ 	buf,
+ 	strlen(buf),
+@@ -1023,3 +1019,17 @@ int ipcacheQueueDrain()
+ 	ipcache_dnsDispatch(dnsData, i);
+     return 1;
+ }
++
++static void ipcacheLockEntry(i)
++     ipcache_entry *i;
++{
++    i->locks++;
++}
++
++static void ipcacheUnlockEntry(i)
++     ipcache_entry *i;
++{
++    i->locks--;
++    if (ipcacheExpiredEntry(i))
++	ipcache_release(i);
++}
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: mime.cc,v 1.14 1996/07/18 20:27:05 wessels Exp $
++ * $Id: mime.cc,v 1.15 1996/09/04 22:03:27 wessels Exp $
+  *
+  * DEBUG: section 25    MIME Parsing
+  * AUTHOR: Harvest Derived
+@@ -240,11 +240,11 @@ int mk_mime_hdr(result, ttl, size, lmt, type)
+     expiretime = ttl ? t + ttl : 0;
+     date[0] = expires[0] = last_modified[0] = '\0';
+     content_length[0] = result[0] = '\0';
+-    sprintf(date, "Date: %s\r\n", mkrfc850(&t));
++    sprintf(date, "Date: %s\r\n", mkrfc850(t));
+     if (ttl >= 0)
+-	sprintf(expires, "Expires: %s\r\n", mkrfc850(&expiretime));
++	sprintf(expires, "Expires: %s\r\n", mkrfc850(expiretime));
+     if (lmt)
+-	sprintf(last_modified, "Last-Modified: %s\r\n", mkrfc850(&lmt));
++	sprintf(last_modified, "Last-Modified: %s\r\n", mkrfc850(lmt));
+     if (size > 0)
+ 	sprintf(content_length, "Content-Length: %d\r\n", size);
+     sprintf(result, "Server: %s/%s\r\n%s%s%sContent-Type: %s\r\n%s",
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: stat.cc,v 1.58 1996/09/03 19:24:05 wessels Exp $
++ * $Id: stat.cc,v 1.59 1996/09/04 22:03:29 wessels Exp $
+  *
+  * DEBUG: section 18    Cache Manager Statistics
+  * AUTHOR: Harvest Derived
+@@ -637,9 +637,9 @@ void info_get(obj, sentry)
+     storeAppendPrintf(sentry, open_bracket);
+     storeAppendPrintf(sentry, "{Squid Object Cache: Version %s}\n",
+ 	version_string);
+-    tod = mkrfc850(&squid_starttime);
++    tod = mkrfc850(squid_starttime);
+     storeAppendPrintf(sentry, "{Start Time:\t%s}\n", tod);
+-    tod = mkrfc850(&squid_curtime);
++    tod = mkrfc850(squid_curtime);
+     storeAppendPrintf(sentry, "{Current Time:\t%s}\n", tod);
+     storeAppendPrintf(sentry, "{Connection information for %s:}\n",
+ 	appname);
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: store.cc,v 1.94 1996/09/03 19:24:06 wessels Exp $
++ * $Id: store.cc,v 1.95 1996/09/04 22:03:31 wessels Exp $
+  *
+  * DEBUG: section 20    Storeage Manager
+  * AUTHOR: Harvest Derived
+@@ -209,6 +209,7 @@ static MemObject *new_MemObject _PARAMS((void));
+ static mem_ptr new_MemObjectData _PARAMS((void));
+ static StoreEntry *new_StoreEntry _PARAMS((int mem_obj_flag));
+ static int storeCheckPurgeMem _PARAMS((StoreEntry * e));
++static int storeCheckExpired _PARAMS((StoreEntry * e));
+ static void storeSwapLog _PARAMS((StoreEntry *));
+ static int storeHashDelete _PARAMS((StoreEntry *));
+ static char *storeDescribeStatus _PARAMS((StoreEntry *));
+@@ -476,25 +477,21 @@ static void storeLog(tag, e)
+ 
+ 
+ /* get rid of memory copy of the object */
++/* Only call this if storeCheckPurgeMem(e) returns 1 */
+ void storePurgeMem(e)
+      StoreEntry *e;
+ {
+     debug(20, 3, "storePurgeMem: Freeing memory-copy of %s\n", e->key);
+     if (e->mem_obj == NULL)
+ 	return;
+-    if (storeEntryLocked(e)) {
+-	debug(20, 0, "storePurgeMem: someone is purging a locked object?\n");
+-	debug(20, 0, "%s", storeToString(e));
+-	fatal_dump(NULL);
+-    }
+     storeSetMemStatus(e, NOT_IN_MEMORY);
+     destroy_MemObject(e->mem_obj);
+     e->mem_obj = NULL;
+ }
+ 
+ /* lock the object for reading, start swapping in if necessary */
+ /* Called by:
+- * icp_hit_or_miss()
++ * icpProcessRequest()
+  * storeAbort()
+  * {http,ftp,gopher,wais}Start()
+  */
+@@ -1819,17 +1816,12 @@ StoreEntry *storeGetNext()
+     return ((StoreEntry *) storeFindNext(store_table));
+ }
+ 
+-
+-
+-/* walk through every single entry in the storage and invoke a given routine */
+-int storeWalkThrough(proc, data)
+-     int (*proc) _PARAMS((StoreEntry * e, void *data));
+-     void *data;
++/* free up all ttl-expired objects */
++int storePurgeOld()
+ {
+     StoreEntry *e = NULL;
+-    int count = 0;
+     int n = 0;
+-
++    int count = 0;
+     for (e = storeGetFirst(); e; e = storeGetNext()) {
+ 	if ((++n & 0xFF) == 0) {
+ 	    getCurrentTime();
+@@ -1838,47 +1830,14 @@ int storeWalkThrough(proc, data)
+ 	}
+ 	if ((n & 0xFFF) == 0)
+ 	    debug(20, 2, "storeWalkThrough: %7d objects so far.\n", n);
+-	count += proc(e, data);
++	if (storeCheckExpired(e))
++	    if (storeRelease(e) == 0)
++		count++;
+     }
+     return count;
+ }
+ 
+ 
+-/* compare an object timestamp and see if ttl is expired. Free it if so. */
+-/* return 1 if it expired, 0 if not */
+-int removeOldEntry(e, data)
+-     StoreEntry *e;
+-     void *data;
+-{
+-    time_t curtime = *((time_t *) data);
+-
+-    debug(20, 5, "removeOldEntry: Checking: %s\n", e->url);
+-    debug(20, 6, "removeOldEntry:   *       curtime: %8ld\n", curtime);
+-    debug(20, 6, "removeOldEntry:   *  e->timestamp: %8ld\n", e->timestamp);
+-    debug(20, 6, "removeOldEntry:   * time in cache: %8ld\n",
+-	curtime - e->timestamp);
+-    debug(20, 6, "removeOldEntry:   *  time-to-live: %8ld\n",
+-	e->expires - squid_curtime);
+-
+-    if ((squid_curtime > e->expires) && (e->store_status != STORE_PENDING)) {
+-	return (storeRelease(e) == 0 ? 1 : 0);
+-    }
+-    return 0;
+-}
+-
+-
+-/* free up all ttl-expired objects */
+-int storePurgeOld()
+-{
+-    int n;
+-
+-    debug(20, 0, "Performing Garbage Collection...\n");
+-    n = storeWalkThrough(removeOldEntry, (void *) &squid_curtime);
+-    debug(20, 0, "Done.  %d objects removed\n", n);
+-    return n;
+-}
+-
+-
+ #define MEM_LRUSCAN_BLOCK 16
+ #define MEM_MAX_HELP 5
+ /* Clear Memory storage to accommodate the given object len */
+@@ -1908,11 +1867,11 @@ int storeGetMemSpace(size, check_vm_number)
+     for (e = storeGetInMemFirst(); e; e = storeGetInMemNext()) {
+ 	if (list_count == meta_data.store_in_mem_objects)
+ 	    break;
+-	if (storeEntryLocked(e)) {
++	if (!storeCheckPurgeMem(e)) {
+ 	    n_locked++;
+ 	    continue;
+ 	}
+-	if (squid_curtime > e->expires) {
++	if (storeCheckExpired(e)) {
+ 	    debug(20, 2, "storeGetMemSpace: Expired: %s\n", e->url);
+ 	    n_expired++;
+ 	    storeRelease(e);
+@@ -2899,6 +2858,16 @@ static int storeCheckPurgeMem(e)
+     return 1;
+ }
+ 
++static int storeCheckExpired(e)
++     StoreEntry *e;
++{
++    if (storeEntryLocked(e))
++	return 0;
++    if (squid_curtime < e->expires)
++	return 0;
++    return 1;
++}
++
+ static char *storeDescribeStatus(e)
+      StoreEntry *e;
+ {

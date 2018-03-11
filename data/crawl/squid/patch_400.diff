@@ -1,39 +1,236 @@
-@@ -5287,6 +5287,8 @@ FtpHandleFeatReply(ClientSocketContext *context, const HttpReply *reply, StoreIO
-     // Remove all unsupported commands from the response wrapper.
-     int deletedCount = 0;
-     HttpHeaderPos pos = HttpHeaderInitPos;
-+    bool hasEPRT = false;
-+    bool hasEPSV = false;
-     while (const HttpHeaderEntry *e = filteredHeader.getEntry(&pos)) {
-         if (e->id == HDR_FTP_PRE) {
-             // assume RFC 2389 FEAT response format, quoted by Squid:
-@@ -5303,12 +5305,27 @@ FtpHandleFeatReply(ClientSocketContext *context, const HttpReply *reply, StoreIO
- 
-             if (!FtpSupportedCommand(cmd))
-                 filteredHeader.delAt(pos, deletedCount);
+@@ -0,0 +1,131 @@
++/*
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sources; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ */
 +
-+            if (cmd == "EPRT")
-+                hasEPRT = true;
-+            else if (cmd == "EPSV")
-+                hasEPSV = true;
-         }
-     }
- 
--    if (deletedCount) {
-+    int insertedCount = 0;
-+    if (!hasEPRT) {
-+        filteredHeader.putStr(HDR_FTP_PRE, "\" EPRT\"");
-+        ++insertedCount;
++#include "squid.h"
++#include "globals.h"
++#include "acl/FilledChecklist.h"
++#include "acl/Gadgets.h"
++#include "ConfigParser.h"
++#include "HttpRequest.h"
++#include "HttpReply.h"
++#include "SquidConfig.h"
++#include "Store.h"
++
++#include <algorithm>
++#include <string>
++
++Note::Value::~Value()
++{
++    aclDestroyAclList(&aclList);
++}
++
++Note::Value::Pointer
++Note::addValue(const String &value)
++{
++    Value::Pointer v = new Value(value);
++    values.push_back(v);
++    return v;
++}
++
++const char *
++Note::match(HttpRequest *request, HttpReply *reply)
++{
++
++    typedef Values::iterator VLI;
++    ACLFilledChecklist ch(NULL, request, NULL);
++    if (reply)
++        ch.reply = HTTPMSGLOCK(reply);
++
++    for (VLI i = values.begin(); i != values.end(); ++i ) {
++        const int ret= ch.fastCheck((*i)->aclList);
++        debugs(93, 5, HERE << "Check for header name: " << key << ": " << (*i)->value
++               <<", HttpRequest: " << request << " HttpReply: " << reply << " matched: " << ret);
++        if (ret == ACCESS_ALLOWED)
++            return (*i)->value.termedBuf();
 +    }
-+    if (!hasEPSV) {
-+        filteredHeader.putStr(HDR_FTP_PRE, "\" EPSV\"");
-+        ++insertedCount;
++    return NULL;
++}
++
++Note::Pointer
++Notes::add(const String &noteKey)
++{
++    typedef Notes::NotesList::iterator AMLI;
++    for (AMLI i = notes.begin(); i != notes.end(); ++i) {
++        if ((*i)->key == noteKey)
++            return (*i);
 +    }
 +
-+    if (deletedCount || insertedCount) {
-         filteredHeader.refreshMask();
--        debugs(33, 5, "deleted " << deletedCount);
-+        debugs(33, 5, "deleted " << deletedCount << " inserted " << insertedCount);
-     }
- 
-     FtpWriteForwardedReply(context, filteredReply);
++    Note::Pointer note = new Note(noteKey);
++    notes.push_back(note);
++    return note;
++}
++
++Note::Pointer
++Notes::parse(ConfigParser &parser)
++{
++    String key, value;
++    ConfigParser::ParseString(&key);
++    ConfigParser::ParseQuotedString(&value);
++    Note::Pointer note = add(key);
++    Note::Value::Pointer noteValue = note->addValue(value);
++    aclParseAclList(parser, &noteValue->aclList);
++
++    if (blacklisted) {
++        for (int i = 0; blacklisted[i] != NULL; ++i) {
++            if (note->key.caseCmp(blacklisted[i]) == 0) {
++                fatalf("%s:%d: meta key \"%s\" is a reserved %s name",
++                       cfg_filename, config_lineno, note->key.termedBuf(),
++                       descr ? descr : "");
++            }
++        }
++    }
++
++    return note;
++}
++
++void
++Notes::dump(StoreEntry *entry, const char *key)
++{
++    typedef Notes::NotesList::iterator AMLI;
++    for (AMLI m = notes.begin(); m != notes.end(); ++m) {
++        typedef Note::Values::iterator VLI;
++        for (VLI v =(*m)->values.begin(); v != (*m)->values.end(); ++v ) {
++            storeAppendPrintf(entry, "%s " SQUIDSTRINGPH " %s",
++                              key, SQUIDSTRINGPRINT((*m)->key), ConfigParser::QuoteString((*v)->value));
++            dump_acl_list(entry, (*v)->aclList);
++            storeAppendPrintf(entry, "\n");
++        }
++    }
++}
++
++void
++Notes::clean()
++{
++    notes.clean();
++}
+@@ -0,0 +1,103 @@
++#ifndef SQUID_NOTES_H
++#define SQUID_NOTES_H
++
++#include "HttpHeader.h"
++#include "HttpHeaderTools.h"
++#include "typedefs.h"
++
++#if HAVE_STRING
++#include <string>
++#endif
++
++
++class HttpRequest;
++class HttpReply;
++
++/**
++ * Used to store notes. The notes are custom key:value pairs
++ * ICAP request headers or ECAP options used to pass
++ * custom transaction-state related meta information to squid
++ * internal subsystems or to addaptation services.
++ */
++class Note: public RefCountable
++{
++public:
++    typedef RefCount<Note> Pointer;
++    /// Stores a value for the note.
++    class Value: public RefCountable
++    {
++    public:
++        typedef RefCount<Value> Pointer;
++        String value; ///< a note value
++        ACLList *aclList; ///< The access list used to determine if this value is valid for a request
++        explicit Value(const String &aVal) : value(aVal), aclList(NULL) {}
++        ~Value();
++    };
++    typedef Vector<Value::Pointer> Values;
++
++    explicit Note(const String &aKey): key(aKey) {}
++
++    /**
++     * Adds a value to the note and returns a  pointer to the
++     * related Value object.
++     */
++    Value::Pointer addValue(const String &value);
++
++    /**
++     * Walks through the  possible values list of the note and selects
++     * the first value which matches the given HttpRequest and HttpReply
++     * or NULL if none matches.
++     */
++    const char *match(HttpRequest *request, HttpReply *reply);
++    String key; ///< The note key
++    Values values; ///< The possible values list for the note
++};
++
++class ConfigParser;
++/**
++ * Used to store a notes list.
++ */
++class Notes {
++public:
++    typedef Vector<Note::Pointer> NotesList;
++    typedef NotesList::iterator iterator; ///< iterates over the notes list
++
++    Notes(const char *aDescr, const char **metasBlacklist): descr(aDescr), blacklisted(metasBlacklist) {}
++    Notes(): descr(NULL), blacklisted(NULL) {}
++    ~Notes() { notes.clean(); }
++    /**
++     * Parse a notes line and returns a pointer to the
++     * parsed Note object.
++     */
++    Note::Pointer parse(ConfigParser &parser);
++    /**
++     * Dump the notes list to the given StoreEntry object.
++     */
++    void dump(StoreEntry *entry, const char *name);
++    void clean(); /// clean the notes list
++
++    /// points to the first argument
++    iterator begin() { return notes.begin(); }
++    /// points to the end of list
++    iterator end() { return notes.end(); }
++    /// return true if the notes list is empty
++    bool empty() { return notes.empty(); }
++
++    NotesList notes; ///< The Note::Pointer objects array list
++    const char *descr; ///< A short description for notes list
++    const char **blacklisted; ///< Null terminated list of blacklisted note keys
++private:
++    /**
++     * Adds a note to the notes list and returns a pointer to the
++     * related Note object. If the note key already exists in list,
++     * returns a pointer to the existing object.
++     */
++    Note::Pointer add(const String &noteKey);
++};
++
++class NotePairs : public HttpHeader {
++public:
++    NotePairs() : HttpHeader(hoNote) {}
++};
++
++#endif

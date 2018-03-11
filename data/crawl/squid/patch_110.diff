@@ -1,97 +1,90 @@
-@@ -198,6 +198,8 @@ Security::PeerOptions::createBlankContext() const
-     Security::ContextPtr t = nullptr;
- 
- #if USE_OPENSSL
-+    Ssl::Initialize();
-+
- #if (OPENSSL_VERSION_NUMBER >= 0x10100000L)
-     t = SSL_CTX_new(TLS_client_method());
- #else
-@@ -10,6 +10,9 @@
- #include "base/Packable.h"
- #include "globals.h"
- #include "security/ServerOptions.h"
-+#if USE_OPENSSL
-+#include "ssl/support.h"
-+#endif
- 
- #if HAVE_OPENSSL_ERR_H
- #include <openssl/err.h>
-@@ -96,6 +99,8 @@ Security::ServerOptions::createBlankContext() const
-     Security::ContextPtr t = nullptr;
- 
- #if USE_OPENSSL
-+    Ssl::Initialize();
-+
- #if (OPENSSL_VERSION_NUMBER >= 0x10100000L)
-     t = SSL_CTX_new(TLS_server_method());
- #else
-@@ -430,9 +430,8 @@ ssl_free_SBuf(void *, void *ptr, CRYPTO_EX_DATA *,
-     delete buf;
+@@ -52,7 +52,7 @@
+  * data, or sending it.
+  *
+  \par
+- * ClientKeepAliveNextRequest will then detect the presence of data in
++ * ConnStateData::kick() will then detect the presence of data in
+  * the next ClientHttpRequest, and will send it, restablishing the
+  * data flow.
+  */
+@@ -1427,19 +1427,14 @@ ClientSocketContextPushDeferredIfNeeded(ClientSocketContext::Pointer deferredReq
+      */
  }
  
--/// \ingroup ServerProtocolSSLInternal
--static void
--ssl_initialize(void)
-+void
-+Ssl::Initialize(void)
- {
-     static bool initialized = false;
-     if (initialized)
-@@ -443,22 +442,22 @@ ssl_initialize(void)
-     SSLeay_add_ssl_algorithms();
- 
- #if HAVE_OPENSSL_ENGINE_H
--    if (Config.SSL.ssl_engine) {
-+    if (::Config.SSL.ssl_engine) {
-         ENGINE *e;
--        if (!(e = ENGINE_by_id(Config.SSL.ssl_engine)))
--            fatalf("Unable to find SSL engine '%s'\n", Config.SSL.ssl_engine);
-+        if (!(e = ENGINE_by_id(::Config.SSL.ssl_engine)))
-+            fatalf("Unable to find SSL engine '%s'\n", ::Config.SSL.ssl_engine);
- 
-         if (!ENGINE_set_default(e, ENGINE_METHOD_ALL)) {
-             const int ssl_error = ERR_get_error();
-             fatalf("Failed to initialise SSL engine: %s\n", ERR_error_string(ssl_error, NULL));
-         }
-     }
- #else
--    if (Config.SSL.ssl_engine)
-+    if (::Config.SSL.ssl_engine)
-         fatalf("Your OpenSSL has no SSL engine support\n");
- #endif
- 
--    const char *defName = Config.SSL.certSignHash ? Config.SSL.certSignHash : SQUID_SSL_SIGN_HASH_IF_NONE;
-+    const char *defName = ::Config.SSL.certSignHash ? ::Config.SSL.certSignHash : SQUID_SSL_SIGN_HASH_IF_NONE;
-     Ssl::DefaultSignHash = EVP_get_digestbyname(defName);
-     if (!Ssl::DefaultSignHash)
-         fatalf("Sign hash '%s' is not supported\n", defName);
-@@ -560,8 +559,6 @@ configureSslContext(Security::ContextPtr sslContext, AnyP::PortCfg &port)
- Security::ContextPtr
- sslCreateServerContext(AnyP::PortCfg &port)
- {
--    ssl_initialize();
+-/// called when we have successfully finished writing the response
+-void
+-ClientSocketContext::keepaliveNextRequest()
+-{
+-    debugs(33, 3, "ConnnStateData(" << http->getConn()->clientConnection << "), Context(" << clientConnection << ")");
 -
-     Security::ContextPtr sslContext(port.secure.createBlankContext());
-     if (!sslContext)
-         return nullptr;
-@@ -636,7 +633,7 @@ ssl_next_proto_cb(SSL *s, unsigned char **out, unsigned char *outlen, const unsi
- Security::ContextPtr
- sslCreateClientContext(const char *certfile, const char *keyfile, const char *cipher, long options, long fl)
+-    // mark ourselves as completed
+-    connIsFinished();
+-}
+-
+ void
+ ConnStateData::kick()
  {
--    ssl_initialize();
-+    Ssl::Initialize();
- 
- #if (OPENSSL_VERSION_NUMBER >= 0x10100000L)
-     Security::ContextPtr sslContext(SSL_CTX_new(TLS_client_method()));
-@@ -56,6 +56,10 @@ class PortCfg;
- 
- namespace Ssl
- {
-+/// initialize the SSL library global state.
-+/// call before generating any SSL context
-+void Initialize();
++    if (!Comm::IsConnOpen(clientConnection)) {
++        debugs(33, 2, clientConnection << " Connection was closed");
++        return;
++    }
 +
- /// Squid defined error code (<0),  an error code returned by SSL X509 api, or SSL_ERROR_NONE
- typedef int ssl_error_t;
+     if (pinning.pinned && !Comm::IsConnOpen(pinning.serverConnection)) {
+         debugs(33, 2, clientConnection << " Connection was pinned but server side gone. Terminating client connection");
+         clientConnection->close();
+@@ -1704,6 +1699,7 @@ ClientSocketContext::doClose()
+ void
+ ClientSocketContext::initiateClose(const char *reason)
+ {
++    debugs(33, 4, clientConnection << " because " << reason);
+     http->getConn()->stopSending(reason); // closes ASAP
+ }
  
+@@ -1760,10 +1756,9 @@ ClientSocketContext::writeComplete(const Comm::ConnectionPointer &conn, char *,
+ 
+     case STREAM_COMPLETE:
+         debugs(33, 5, conn << " Stream complete, keepalive is " << http->request->flags.proxyKeepalive);
+-        if (http->request->flags.proxyKeepalive)
+-            keepaliveNextRequest();
+-        else
+-            initiateClose("STREAM_COMPLETE NOKEEPALIVE");
++        if (!http->request->flags.proxyKeepalive)
++            clientConnection->close();
++        connIsFinished();
+         return;
+ 
+     case STREAM_UNPLANNED_COMPLETE:
+@@ -4717,7 +4712,7 @@ ConnStateData::clientPinnedConnectionRead(const CommIoCbParams &io)
+     pinning.serverConnection->close();
+ 
+     // If we are still sending data to the client, do not close now. When we are done sending,
+-    // ClientSocketContext::keepaliveNextRequest() checks pinning.serverConnection and will close.
++    // ConnStateData::kick() checks pinning.serverConnection and will close.
+     // However, if we are idle, then we must close to inform the idle client and minimize races.
+     if (clientIsIdle && clientConnection != NULL)
+         clientConnection->close();
+@@ -76,7 +76,6 @@ class ClientSocketContext : public RefCountable
+     ~ClientSocketContext();
+     bool startOfOutput() const;
+     void writeComplete(const Comm::ConnectionPointer &conn, char *bufnotused, size_t size, Comm::Flag errflag);
+-    void keepaliveNextRequest();
+ 
+     Comm::ConnectionPointer clientConnection; /// details about the client connection socket.
+     ClientHttpRequest *http;    /* we pretend to own that job */
+@@ -1274,7 +1274,7 @@ Ftp::Server::wroteReply(const CommIoCbParams &io)
+         changeState(fssConnected, "Ftp::Server::wroteReply");
+         if (bodyParser)
+             finishDechunkingRequest(false);
+-        context->keepaliveNextRequest();
++        context->connIsFinished();
+         return;
+     }
+ }
+@@ -16,7 +16,6 @@
+ //ClientSocketContext::~ClientSocketContext() STUB
+ bool ClientSocketContext::startOfOutput() const STUB_RETVAL(false)
+ void ClientSocketContext::writeComplete(const Comm::ConnectionPointer &conn, char *bufnotused, size_t size, Comm::Flag errflag) STUB
+-void ClientSocketContext::keepaliveNextRequest() STUB
+ void ClientSocketContext::pullData() STUB
+ int64_t ClientSocketContext::getNextRangeOffset() const STUB_RETVAL(0)
+ bool ClientSocketContext::canPackMoreRanges() const STUB_RETVAL(false)

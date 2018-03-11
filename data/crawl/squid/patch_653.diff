@@ -1,2741 +1,745 @@
-@@ -374,299 +374,3 @@ HttpMsg::_unlock()
-     if (0 == lock_count)
-         delete this;
- }
--
--
--void
--HttpParserInit(HttpParser *hdr, const char *buf, int bufsiz)
--{
--    hdr->clear();
--    hdr->state = 1;
--    hdr->buf = buf;
--    hdr->bufsiz = bufsiz;
--    debugs(74, 5, "httpParseInit: Request buffer is " << buf);
--}
--
--#if MSGDODEBUG
--/* XXX This should eventually turn into something inlined or #define'd */
--int
--HttpParserReqSz(HttpParser *hp)
--{
--    assert(hp->state == 1);
--    assert(hp->req_start != -1);
--    assert(hp->req_end != -1);
--    return hp->req_end - hp->req_start + 1;
--}
--
--
--/*
-- * This +1 makes it 'right' but won't make any sense if
-- * there's a 0 byte header? This won't happen normally - a valid header
-- * is at -least- a blank line (\n, or \r\n.)
-- */
--int
--HttpParserHdrSz(HttpParser *hp)
--{
--    assert(hp->state == 1);
--    assert(hp->hdr_start != -1);
--    assert(hp->hdr_end != -1);
--    return hp->hdr_end - hp->hdr_start + 1;
--}
--
--const char *
--HttpParserHdrBuf(HttpParser *hp)
--{
--    assert(hp->state == 1);
--    assert(hp->hdr_start != -1);
--    assert(hp->hdr_end != -1);
--    return hp->buf + hp->hdr_start;
--}
--
--int
--HttpParserRequestLen(HttpParser *hp)
--{
--    return hp->hdr_end - hp->req_start + 1;
--}
--#endif
--
--HttpParser::HttpParser(const char *buf, int len)
--{
--    HttpParserInit(this, buf, len);
--}
--
--void
--HttpParser::clear()
--{
--    state = 0;
--    request_parse_status = HTTP_STATUS_NONE;
--    buf = NULL; // NP: we do not own the buffer, merely reference to it.
--    bufsiz = 0;
--    req_start = req_end = -1;
--    hdr_start = hdr_end = -1;
--    m_start = m_end = -1;
--    u_start = u_end = -1;
--    v_start = v_end = -1;
--    v_maj = v_min = 0;
--}
--
--int
--HttpParser::parseRequestFirstLine()
--{
--    int second_word = -1; // track the suspected URI start
--    int first_whitespace = -1, last_whitespace = -1; // track the first and last SP byte
--    int line_end = -1; // tracks the last byte BEFORE terminal \r\n or \n sequence
--
--    debugs(74, 5, HERE << "parsing possible request: " << buf);
--
--    // Single-pass parse: (provided we have the whole line anyways)
--
--    req_start = 0;
--    if (Config.onoff.relaxed_header_parser) {
--        if (Config.onoff.relaxed_header_parser < 0 && buf[req_start] == ' ')
--            debugs(74, DBG_IMPORTANT, "WARNING: Invalid HTTP Request: " <<
--                   "Whitespace bytes received ahead of method. " <<
--                   "Ignored due to relaxed_header_parser.");
--        // Be tolerant of prefix spaces (other bytes are valid method values)
--        for (; req_start < bufsiz && buf[req_start] == ' '; req_start++);
--    }
--    req_end = -1;
--    for (int i = 0; i < bufsiz; i++) {
--        // track first and last whitespace (SP only)
--        if (buf[i] == ' ') {
--            last_whitespace = i;
--            if (first_whitespace < req_start)
--                first_whitespace = i;
--        }
--
--        // track next non-SP/non-HT byte after first_whitespace
--        if (second_word < first_whitespace && buf[i] != ' ' && buf[i] != '\t') {
--            second_word = i;
--        }
--
--        // locate line terminator
--        if (buf[i] == '\n') {
--            req_end = i;
--            line_end = i - 1;
--            break;
--        }
--        if (i < bufsiz - 1 && buf[i] == '\r') {
--            if (Config.onoff.relaxed_header_parser) {
--                if (Config.onoff.relaxed_header_parser < 0 && buf[i + 1] == '\r')
--                    debugs(74, DBG_IMPORTANT, "WARNING: Invalid HTTP Request: " <<
--                           "Series of carriage-return bytes received prior to line terminator. " <<
--                           "Ignored due to relaxed_header_parser.");
--
--                // Be tolerant of invalid multiple \r prior to terminal \n
--                if (buf[i + 1] == '\n' || buf[i + 1] == '\r')
--                    line_end = i - 1;
--                while (i < bufsiz - 1 && buf[i + 1] == '\r')
--                    i++;
--
--                if (buf[i + 1] == '\n') {
--                    req_end = i + 1;
--                    break;
--                }
--            } else {
--                if (buf[i + 1] == '\n') {
--                    req_end = i + 1;
--                    line_end = i - 1;
--                    break;
--                }
--            }
--
--            // RFC 2616 section 5.1
--            // "No CR or LF is allowed except in the final CRLF sequence"
--            request_parse_status = HTTP_BAD_REQUEST;
--            return -1;
--        }
--    }
--    if (req_end == -1) {
--        debugs(74, 5, "Parser: retval 0: from " << req_start <<
--               "->" << req_end << ": needs more data to complete first line.");
--        return 0;
--    }
--
--    // NP: we have now seen EOL, more-data (0) cannot occur.
--    //     From here on any failure is -1, success is 1
--
--
--    // Input Validation:
--
--    // Process what we now know about the line structure into field offsets
--    // generating HTTP status for any aborts as we go.
--
--    // First non-whitespace = beginning of method
--    if (req_start > line_end) {
--        request_parse_status = HTTP_BAD_REQUEST;
--        return -1;
--    }
--    m_start = req_start;
--
--    // First whitespace = end of method
--    if (first_whitespace > line_end || first_whitespace < req_start) {
--        request_parse_status = HTTP_BAD_REQUEST; // no method
--        return -1;
--    }
--    m_end = first_whitespace - 1;
--    if (m_end < m_start) {
--        request_parse_status = HTTP_BAD_REQUEST; // missing URI?
--        return -1;
--    }
--
--    // First non-whitespace after first SP = beginning of URL+Version
--    if (second_word > line_end || second_word < req_start) {
--        request_parse_status = HTTP_BAD_REQUEST; // missing URI
--        return -1;
--    }
--    u_start = second_word;
--
--    // RFC 1945: SP and version following URI are optional, marking version 0.9
--    // we identify this by the last whitespace being earlier than URI start
--    if (last_whitespace < second_word && last_whitespace >= req_start) {
--        v_maj = 0;
--        v_min = 9;
--        u_end = line_end;
--        request_parse_status = HTTP_OK; // HTTP/0.9
--        return 1;
--    } else {
--        // otherwise last whitespace is somewhere after end of URI.
--        u_end = last_whitespace;
--        // crop any trailing whitespace in the area we think of as URI
--        for (; u_end >= u_start && xisspace(buf[u_end]); u_end--);
--    }
--    if (u_end < u_start) {
--        request_parse_status = HTTP_BAD_REQUEST; // missing URI
--        return -1;
--    }
--
--    // Last whitespace SP = before start of protocol/version
--    if (last_whitespace >= line_end) {
--        request_parse_status = HTTP_BAD_REQUEST; // missing version
--        return -1;
--    }
--    v_start = last_whitespace + 1;
--    v_end = line_end;
--
--    // We only accept HTTP protocol requests right now.
--    // TODO: accept other protocols; RFC 2326 (RTSP protocol) etc
--    if ((v_end - v_start +1) < 5 || strncasecmp(&buf[v_start], "HTTP/", 5) != 0) {
--#if USE_HTTP_VIOLATIONS
--        // being lax; old parser accepted strange versions
--        // there is a LOT of cases which are ambiguous, therefore we cannot use relaxed_header_parser here.
--        v_maj = 0;
--        v_min = 9;
--        u_end = line_end;
--        request_parse_status = HTTP_OK; // treat as HTTP/0.9
--        return 1;
--#else
--        request_parse_status = HTTP_HTTP_VERSION_NOT_SUPPORTED; // protocol not supported / implemented.
--        return -1;
--#endif
--    }
--
--    int i = v_start + sizeof("HTTP/") -1;
--
--    /* next should be 1 or more digits */
--    if (!isdigit(buf[i])) {
--        request_parse_status = HTTP_HTTP_VERSION_NOT_SUPPORTED;
--        return -1;
--    }
--    int maj = 0;
--    for (; i <= line_end && (isdigit(buf[i])) && maj < 65536; i++) {
--        maj = maj * 10;
--        maj = maj + (buf[i]) - '0';
--    }
--    // catch too-big values or missing remainders
--    if (maj >= 65536 || i > line_end) {
--        request_parse_status = HTTP_HTTP_VERSION_NOT_SUPPORTED;
--        return -1;
--    }
--    v_maj = maj;
--
--    /* next should be .; we -have- to have this as we have a whole line.. */
--    if (buf[i] != '.') {
--        request_parse_status = HTTP_HTTP_VERSION_NOT_SUPPORTED;
--        return -1;
--    }
--    // catch missing minor part
--    if (++i > line_end) {
--        request_parse_status = HTTP_HTTP_VERSION_NOT_SUPPORTED;
--        return -1;
--    }
--
--    /* next should be one or more digits */
--    if (!isdigit(buf[i])) {
--        request_parse_status = HTTP_HTTP_VERSION_NOT_SUPPORTED;
--        return -1;
--    }
--    int min = 0;
--    for (; i <= line_end && (isdigit(buf[i])) && min < 65536; i++) {
--        min = min * 10;
--        min = min + (buf[i]) - '0';
--    }
--    // catch too-big values or trailing garbage
--    if (min >= 65536 || i < line_end) {
--        request_parse_status = HTTP_HTTP_VERSION_NOT_SUPPORTED;
--        return -1;
--    }
--    v_min = min;
--
--    /*
--     * Rightio - we have all the schtuff. Return true; we've got enough.
--     */
--    request_parse_status = HTTP_OK;
--    return 1;
--}
--
--int
--HttpParserParseReqLine(HttpParser *hmsg)
--{
--    PROF_start(HttpParserParseReqLine);
--    int retcode = hmsg->parseRequestFirstLine();
--    debugs(74, 5, "Parser: retval " << retcode << ": from " << hmsg->req_start <<
--           "->" << hmsg->req_end << ": method " << hmsg->m_start << "->" <<
--           hmsg->m_end << "; url " << hmsg->u_start << "->" << hmsg->u_end <<
--           "; version " << hmsg->v_start << "->" << hmsg->v_end << " (" << hmsg->v_maj <<
--           "/" << hmsg->v_min << ")");
--    PROF_stop(HttpParserParseReqLine);
--    return retcode;
--}
-@@ -132,67 +132,6 @@ class HttpMsg
+@@ -2125,6 +2125,7 @@ AC_CHECK_HEADERS( \
+   regex.h \
+   sched.h \
+   security/pam_appl.h \
++  siginfo.h \
+   signal.h \
+   sstream \
+   stdarg.h \
+@@ -2145,7 +2146,7 @@ AC_CHECK_HEADERS( \
+   sys/md5.h \
+   sys/msg.h \
+   sys/resource.h \
+-  sys/select.h\
++  sys/select.h \
+   sys/socket.h \
+   sys/stat.h \
+   sys/statvfs.h \
+@@ -2917,6 +2918,7 @@ AC_REPLACE_FUNCS(\
+ 	initgroups \
+ 	getaddrinfo \
+ 	getnameinfo \
++	psignal \
+ 	strerror \
+ 	strsep \
+ 	strtoll \
+@@ -3238,6 +3240,7 @@ AC_CONFIG_FILES([\
+ 	helpers/url_rewrite/Makefile \
+ 	helpers/url_rewrite/fake/Makefile \
+ 	tools/Makefile
++	tools/purge/Makefile
+ ])
  
- };
- 
--/* Temporary parsing state; might turn into the replacement parser later on */
--class HttpParser
--{
--public:
--    HttpParser() { clear(); }
--    HttpParser(const char *buf, int len);
--
--    /// Set this parser back to a default state.
--    /// Will DROP any reference to a buffer (does not free).
--    void clear();
--
--    /**
--     * Attempt to parse the first line of a new request message.
--     *
--     * Governed by:
--     *  RFC 1945 section 5.1
--     *  RFC 2616 section 5.1
--     *
--     * Parsing state is stored between calls. However the current implementation
--     * begins parsing from scratch on every call.
--     * The return value tells you whether the parsing state fields are valid or not.
--     *
--     * \retval -1  an error occurred. request_parse_status indicates HTTP status result.
--     * \retval  1  successful parse
--     * \retval  0  more data is needed to complete the parse
--     */
--    int parseRequestFirstLine();
--
--public:
--    char state;
--    const char *buf;
--    int bufsiz;
--    int req_start, req_end;
--    int hdr_start, hdr_end;
--    int m_start, m_end;
--    int u_start, u_end;
--    int v_start, v_end;
--    int v_maj, v_min;
--
--    /** HTTP status code to be used on the invalid-request error page
--     * HTTP_STATUS_NONE indicates incomplete parse, HTTP_OK indicates no error.
--     */
--    http_status request_parse_status;
--};
--
--extern void HttpParserInit(HttpParser *, const char *buf, int len);
--extern int HttpParserParseReqLine(HttpParser *hp);
--
--#define MSGDODEBUG 0
--#if MSGDODEBUG
--extern int HttpParserReqSz(HttpParser *);
--extern int HttpParserHdrSz(HttpParser *);
--extern const char * HttpParserHdrBuf(HttpParser *);
--extern int HttpParserRequestLen(HttpParser *hp);
--#else
--#define	HttpParserReqSz(hp)	( (hp)->req_end - (hp)->req_start + 1 )
--#define	HttpParserHdrSz(hp)	( (hp)->hdr_end - (hp)->hdr_start + 1 )
--#define	HttpParserHdrBuf(hp)	( (hp)->buf + (hp)->hdr_start )
--#define	HttpParserRequestLen(hp)	( (hp)->hdr_end - (hp)->req_start + 1 )
--#endif
--
- SQUIDCEXTERN int httpMsgIsolateHeaders(const char **parse_start, int len, const char **blk_start, const char **blk_end);
- 
- #define HTTPMSGUNLOCK(a) if(a){(a)->_unlock();(a)=NULL;}
-@@ -0,0 +1,293 @@
-+#include "config.h"
-+#include "Debug.h"
-+#include "HttpParser.h"
-+#include "structs.h"
+ AC_CONFIG_SUBDIRS(lib/libTrie)
+@@ -46,6 +46,7 @@ EXTRA_libmiscutil_a_SOURCES = \
+ 	md5.c \
+ 	Profiler.c \
+ 	win32lib.c
 +
-+void
-+HttpParser::clear()
-+{
-+    state = HTTP_PARSE_NONE;
-+    request_parse_status = HTTP_STATUS_NONE;
-+    buf = NULL;
-+    bufsiz = 0;
-+    req_start = req_end = -1;
-+    hdr_start = hdr_end = -1;
-+    m_start = m_end = -1;
-+    u_start = u_end = -1;
-+    v_start = v_end = -1;
-+    v_maj = v_min = 0;
-+}
-+
-+void
-+HttpParser::reset(const char *aBuf, int len)
-+{
-+    clear(); // empty the state.
-+    state = HTTP_PARSE_NEW;
-+    buf = aBuf;
-+    bufsiz = len;
-+    debugs(74, 5, HERE << "Request buffer is " << buf);
-+}
-+
-+int
-+HttpParser::parseRequestFirstLine()
-+{
-+    int second_word = -1; // track the suspected URI start
-+    int first_whitespace = -1, last_whitespace = -1; // track the first and last SP byte
-+    int line_end = -1; // tracks the last byte BEFORE terminal \r\n or \n sequence
-+
-+    debugs(74, 5, HERE << "parsing possible request: " << buf);
-+
-+    // Single-pass parse: (provided we have the whole line anyways)
-+
-+    req_start = 0;
-+    if (Config.onoff.relaxed_header_parser) {
-+        if (Config.onoff.relaxed_header_parser < 0 && buf[req_start] == ' ')
-+            debugs(74, DBG_IMPORTANT, "WARNING: Invalid HTTP Request: " <<
-+                   "Whitespace bytes received ahead of method. " <<
-+                   "Ignored due to relaxed_header_parser.");
-+        // Be tolerant of prefix spaces (other bytes are valid method values)
-+        for (; req_start < bufsiz && buf[req_start] == ' '; req_start++);
-+    }
-+    req_end = -1;
-+    for (int i = 0; i < bufsiz; i++) {
-+        // track first and last whitespace (SP only)
-+        if (buf[i] == ' ') {
-+            last_whitespace = i;
-+            if (first_whitespace < req_start)
-+                first_whitespace = i;
-+        }
-+
-+        // track next non-SP/non-HT byte after first_whitespace
-+        if (second_word < first_whitespace && buf[i] != ' ' && buf[i] != '\t') {
-+            second_word = i;
-+        }
-+
-+        // locate line terminator
-+        if (buf[i] == '\n') {
-+            req_end = i;
-+            line_end = i - 1;
-+            break;
-+        }
-+        if (i < bufsiz - 1 && buf[i] == '\r') {
-+            if (Config.onoff.relaxed_header_parser) {
-+                if (Config.onoff.relaxed_header_parser < 0 && buf[i + 1] == '\r')
-+                    debugs(74, DBG_IMPORTANT, "WARNING: Invalid HTTP Request: " <<
-+                           "Series of carriage-return bytes received prior to line terminator. " <<
-+                           "Ignored due to relaxed_header_parser.");
-+
-+                // Be tolerant of invalid multiple \r prior to terminal \n
-+                if (buf[i + 1] == '\n' || buf[i + 1] == '\r')
-+                    line_end = i - 1;
-+                while (i < bufsiz - 1 && buf[i + 1] == '\r')
-+                    i++;
-+
-+                if (buf[i + 1] == '\n') {
-+                    req_end = i + 1;
-+                    break;
-+                }
-+            } else {
-+                if (buf[i + 1] == '\n') {
-+                    req_end = i + 1;
-+                    line_end = i - 1;
-+                    break;
-+                }
-+            }
-+
-+            // RFC 2616 section 5.1
-+            // "No CR or LF is allowed except in the final CRLF sequence"
-+            request_parse_status = HTTP_BAD_REQUEST;
-+            return -1;
-+        }
-+    }
-+    if (req_end == -1) {
-+        debugs(74, 5, "Parser: retval 0: from " << req_start <<
-+               "->" << req_end << ": needs more data to complete first line.");
-+        return 0;
-+    }
-+
-+    // NP: we have now seen EOL, more-data (0) cannot occur.
-+    //     From here on any failure is -1, success is 1
-+
-+
-+    // Input Validation:
-+
-+    // Process what we now know about the line structure into field offsets
-+    // generating HTTP status for any aborts as we go.
-+
-+    // First non-whitespace = beginning of method
-+    if (req_start > line_end) {
-+        request_parse_status = HTTP_BAD_REQUEST;
-+        return -1;
-+    }
-+    m_start = req_start;
-+
-+    // First whitespace = end of method
-+    if (first_whitespace > line_end || first_whitespace < req_start) {
-+        request_parse_status = HTTP_BAD_REQUEST; // no method
-+        return -1;
-+    }
-+    m_end = first_whitespace - 1;
-+    if (m_end < m_start) {
-+        request_parse_status = HTTP_BAD_REQUEST; // missing URI?
-+        return -1;
-+    }
-+
-+    // First non-whitespace after first SP = beginning of URL+Version
-+    if (second_word > line_end || second_word < req_start) {
-+        request_parse_status = HTTP_BAD_REQUEST; // missing URI
-+        return -1;
-+    }
-+    u_start = second_word;
-+
-+    // RFC 1945: SP and version following URI are optional, marking version 0.9
-+    // we identify this by the last whitespace being earlier than URI start
-+    if (last_whitespace < second_word && last_whitespace >= req_start) {
-+        v_maj = 0;
-+        v_min = 9;
-+        u_end = line_end;
-+        request_parse_status = HTTP_OK; // HTTP/0.9
-+        return 1;
-+    } else {
-+        // otherwise last whitespace is somewhere after end of URI.
-+        u_end = last_whitespace;
-+        // crop any trailing whitespace in the area we think of as URI
-+        for (; u_end >= u_start && xisspace(buf[u_end]); u_end--);
-+    }
-+    if (u_end < u_start) {
-+        request_parse_status = HTTP_BAD_REQUEST; // missing URI
-+        return -1;
-+    }
-+
-+    // Last whitespace SP = before start of protocol/version
-+    if (last_whitespace >= line_end) {
-+        request_parse_status = HTTP_BAD_REQUEST; // missing version
-+        return -1;
-+    }
-+    v_start = last_whitespace + 1;
-+    v_end = line_end;
-+
-+    // We only accept HTTP protocol requests right now.
-+    // TODO: accept other protocols; RFC 2326 (RTSP protocol) etc
-+    if ((v_end - v_start +1) < 5 || strncasecmp(&buf[v_start], "HTTP/", 5) != 0) {
-+#if USE_HTTP_VIOLATIONS
-+        // being lax; old parser accepted strange versions
-+        // there is a LOT of cases which are ambiguous, therefore we cannot use relaxed_header_parser here.
-+        v_maj = 0;
-+        v_min = 9;
-+        u_end = line_end;
-+        request_parse_status = HTTP_OK; // treat as HTTP/0.9
-+        return 1;
-+#else
-+        request_parse_status = HTTP_HTTP_VERSION_NOT_SUPPORTED; // protocol not supported / implemented.
-+        return -1;
-+#endif
-+    }
-+
-+    int i = v_start + sizeof("HTTP/") -1;
-+
-+    /* next should be 1 or more digits */
-+    if (!isdigit(buf[i])) {
-+        request_parse_status = HTTP_HTTP_VERSION_NOT_SUPPORTED;
-+        return -1;
-+    }
-+    int maj = 0;
-+    for (; i <= line_end && (isdigit(buf[i])) && maj < 65536; i++) {
-+        maj = maj * 10;
-+        maj = maj + (buf[i]) - '0';
-+    }
-+    // catch too-big values or missing remainders
-+    if (maj >= 65536 || i > line_end) {
-+        request_parse_status = HTTP_HTTP_VERSION_NOT_SUPPORTED;
-+        return -1;
-+    }
-+    v_maj = maj;
-+
-+    /* next should be .; we -have- to have this as we have a whole line.. */
-+    if (buf[i] != '.') {
-+        request_parse_status = HTTP_HTTP_VERSION_NOT_SUPPORTED;
-+        return -1;
-+    }
-+    // catch missing minor part
-+    if (++i > line_end) {
-+        request_parse_status = HTTP_HTTP_VERSION_NOT_SUPPORTED;
-+        return -1;
-+    }
-+    /* next should be one or more digits */
-+    if (!isdigit(buf[i])) {
-+        request_parse_status = HTTP_HTTP_VERSION_NOT_SUPPORTED;
-+        return -1;
-+    }
-+    int min = 0;
-+    for (; i <= line_end && (isdigit(buf[i])) && min < 65536; i++) {
-+        min = min * 10;
-+        min = min + (buf[i]) - '0';
-+    }
-+    // catch too-big values or trailing garbage
-+    if (min >= 65536 || i < line_end) {
-+        request_parse_status = HTTP_HTTP_VERSION_NOT_SUPPORTED;
-+        return -1;
-+    }
-+    v_min = min;
-+
-+    /*
-+     * Rightio - we have all the schtuff. Return true; we've got enough.
-+     */
-+    request_parse_status = HTTP_OK;
-+    return 1;
-+}
-+
-+int
-+HttpParserParseReqLine(HttpParser *hmsg)
-+{
-+    PROF_start(HttpParserParseReqLine);
-+    int retcode = hmsg->parseRequestFirstLine();
-+    debugs(74, 5, "Parser: retval " << retcode << ": from " << hmsg->req_start <<
-+           "->" << hmsg->req_end << ": method " << hmsg->m_start << "->" <<
-+           hmsg->m_end << "; url " << hmsg->u_start << "->" << hmsg->u_end <<
-+           "; version " << hmsg->v_start << "->" << hmsg->v_end << " (" << hmsg->v_maj <<
-+           "/" << hmsg->v_min << ")");
-+    PROF_stop(HttpParserParseReqLine);
-+    return retcode;
-+}
-+
-+#if MSGDODEBUG
-+/* XXX This should eventually turn into something inlined or #define'd */
-+int
-+HttpParserReqSz(HttpParser *hp)
-+{
-+    assert(hp->state == HTTP_PARSE_NEW);
-+    assert(hp->req_start != -1);
-+    assert(hp->req_end != -1);
-+    return hp->req_end - hp->req_start + 1;
-+}
-+
-+/*
-+ * This +1 makes it 'right' but won't make any sense if
-+ * there's a 0 byte header? This won't happen normally - a valid header
-+ * is at -least- a blank line (\n, or \r\n.)
-+ */
-+int
-+HttpParserHdrSz(HttpParser *hp)
-+{
-+    assert(hp->state == HTTP_PARSE_NEW);
-+    assert(hp->hdr_start != -1);
-+    assert(hp->hdr_end != -1);
-+    return hp->hdr_end - hp->hdr_start + 1;
-+}
-+
-+const char *
-+HttpParserHdrBuf(HttpParser *hp)
-+{
-+    assert(hp->state == HTTP_PARSE_NEW);
-+    assert(hp->hdr_start != -1);
-+    assert(hp->hdr_end != -1);
-+    return hp->buf + hp->hdr_start;
-+}
-+
-+int
-+HttpParserRequestLen(HttpParser *hp)
-+{
-+    return hp->hdr_end - hp->req_start + 1;
-+}
-+#endif
-+
-@@ -0,0 +1,90 @@
-+#ifndef _SQUID_SRC_HTTPPARSER_H
-+#define _SQUID_SRC_HTTPPARSER_H
-+
-+#include "HttpStatusCode.h"
-+
-+// Parser states
-+#define HTTP_PARSE_NONE   0 // nothing. completely unset state.
-+#define HTTP_PARSE_NEW    1 // initialized, but nothing usefully parsed yet.
-+
-+/** HTTP protocol parser.
-+ *
-+ * Works on a raw character I/O buffer and tokenizes the content into
-+ * either an error state or, an HTTP procotol request major segments:
-+ *
-+ * \item Request Line (method, URL, protocol, version)
-+ * \item Mime header block
-+ */
-+class HttpParser
-+{
-+public:
-+    HttpParser() { clear(); }
-+
-+    /** Initialize a new parser.
-+     * Presenting it a buffer to work on and the current length of available
-+     * data.
-+     * NOTE: This is *not* the buffer size, just the parse-able data length.
-+     * The parse routines may be called again later with more data.
-+     */
-+    HttpParser(const char *aBuf, int len) { reset(aBuf,len); };
-+
-+    /// Set this parser back to a default state.
-+    /// Will DROP any reference to a buffer (does not free).
-+    void clear();
-+
-+    /// Reset the parser for use on a new buffer.
-+    void reset(const char *aBuf, int len);
-+
-+    /**
-+     * Attempt to parse the first line of a new request message.
-+     *
-+     * Governed by:
-+     *  RFC 1945 section 5.1
-+     *  RFC 2616 section 5.1
-+     *
-+     * Parsing state is stored between calls. However the current implementation
-+     * begins parsing from scratch on every call.
-+     * The return value tells you whether the parsing state fields are valid or not.
-+     *
-+     * \retval -1  an error occurred. request_parse_status indicates HTTP status result.
-+     * \retval  1  successful parse. member fields contain the request-line items
-+     * \retval  0  more data is needed to complete the parse
-+     */
-+    int parseRequestFirstLine();
-+
-+public:
-+    uint8_t state;
-+    const char *buf;
-+    int bufsiz;
-+    int req_start, req_end;
-+    int hdr_start, hdr_end;
-+    int m_start, m_end;
-+    int u_start, u_end;
-+    int v_start, v_end;
-+    int v_maj, v_min;
-+
-+    /** HTTP status code to be used on the invalid-request error page
-+     * HTTP_STATUS_NONE indicates incomplete parse, HTTP_OK indicates no error.
-+     */
-+    http_status request_parse_status;
-+};
-+
-+// Legacy functions
-+#define HttpParserInit(h,b,l) (h)->reset((b),(l))
-+extern int HttpParserParseReqLine(HttpParser *hp);
-+
-+#define MSGDODEBUG 0
-+#if MSGDODEBUG
-+extern int HttpParserReqSz(HttpParser *);
-+extern int HttpParserHdrSz(HttpParser *);
-+extern const char * HttpParserHdrBuf(HttpParser *);
-+extern int HttpParserRequestLen(HttpParser *hp);
-+#else
-+#define HttpParserReqSz(hp)     ( (hp)->req_end - (hp)->req_start + 1 )
-+#define HttpParserHdrSz(hp)     ( (hp)->hdr_end - (hp)->hdr_start + 1 )
-+#define HttpParserHdrBuf(hp)    ( (hp)->buf + (hp)->hdr_start )
-+#define HttpParserRequestLen(hp)        ( (hp)->hdr_end - (hp)->req_start + 1 )
-+#endif
-+
-+
-+#endif /*  _SQUID_SRC_HTTPPARSER_H */
-@@ -361,6 +361,8 @@ squid_SOURCES = \
- 	HttpControlMsg.h \
- 	HttpMsg.cc \
- 	HttpMsg.h \
-+	HttpParser.cc \
-+	HttpParser.h \
- 	HttpReply.cc \
- 	HttpReply.h \
- 	HttpRequest.cc \
-@@ -962,6 +964,7 @@ check_PROGRAMS+=\
- 	tests/testEvent \
- 	tests/testEventLoop \
- 	tests/test_http_range \
-+	tests/testHttpParser \
- 	tests/testHttpReply \
- 	tests/testHttpRequest \
- 	tests/testStore \
-@@ -1195,6 +1198,8 @@ tests_testBoilerplate_DEPENDENCIES = \
- tests_testCacheManager_SOURCES = \
- 	$(ACL_REGISTRATION_SOURCES) \
- 	debug.cc \
-+	HttpParser.cc \
-+	HttpParser.h \
- 	HttpRequest.cc \
- 	HttpRequestMethod.cc \
- 	mem.cc \
-@@ -1550,6 +1555,8 @@ tests_testEvent_SOURCES = \
- 	HttpHdrSc.cc \
- 	HttpHdrScTarget.cc \
- 	HttpMsg.cc \
-+	HttpParser.cc \
-+	HttpParser.h \
- 	HttpReply.cc \
- 	HttpRequest.cc \
- 	HttpRequestMethod.cc \
-@@ -1725,6 +1732,8 @@ tests_testEventLoop_SOURCES = \
- 	HttpHdrSc.cc \
- 	HttpHdrScTarget.cc \
- 	HttpMsg.cc \
-+	HttpParser.cc \
-+	HttpParser.h \
- 	HttpReply.cc \
- 	HttpRequest.cc \
- 	HttpRequestMethod.cc \
-@@ -1898,6 +1907,8 @@ tests_test_http_range_SOURCES = \
- 	HttpHeader.cc \
- 	HttpHeaderTools.cc \
- 	HttpMsg.cc \
-+	HttpParser.cc \
-+	HttpParser.h \
- 	HttpReply.cc \
- 	HttpRequest.cc \
- 	HttpRequestMethod.cc \
-@@ -2011,9 +2022,41 @@ tests_test_http_range_DEPENDENCIES = \
- 	$(SQUID_CPPUNIT_LA)
- 
- 
-+tests_testHttpParser_SOURCES = \
-+	Debug.h \
-+	HttpParser.cc \
-+	HttpParser.h \
-+	MemBuf.cc \
-+	MemBuf.h \
-+	mem.cc \
-+	structs.h \
-+	tests/stub_cache_manager.cc \
-+	tests/stub_debug.cc \
-+	tests/stub_event.cc \
-+	tests/stub_HelperChildConfig.cc \
-+	tests/testHttpParser.cc \
-+	tests/testHttpParser.h \
-+	tests/testMain.cc \
-+	time.cc
-+nodist_tests_testHttpParser_SOURCES = \
-+	$(TESTSOURCES)
-+tests_testHttpParser_LDADD= \
-+	SquidConfig.o \
-+	base/libbase.la \
-+	ip/libip.la \
-+	$(top_builddir)/lib/libmiscutil.la \
-+	$(SQUID_CPPUNIT_LIBS) \
-+	$(COMPAT_LIB) \
-+	$(XTRA_LIBS)
-+tests_testHttpParser_LDFLAGS = $(LIBADD_DL)
-+tests_testHttpParser_DEPENDENCIES = \
-+	$(SQUID_CPPUNIT_LA)
-+
- ## Tests of the HttpRequest module.
- tests_testHttpRequest_SOURCES = \
- 	$(ACL_REGISTRATION_SOURCES) \
-+	HttpParser.cc \
-+	HttpParser.h \
- 	HttpRequest.cc \
- 	HttpRequestMethod.cc \
- 	mem.cc \
-@@ -2790,6 +2833,8 @@ tests_testURL_SOURCES = \
- 	HttpHeader.cc \
- 	HttpHeaderTools.cc \
- 	HttpMsg.cc \
-+	HttpParser.cc \
-+	HttpParser.h \
- 	HttpReply.cc \
- 	HttpRequest.cc \
- 	HttpRequestMethod.cc \
-@@ -43,14 +43,14 @@
- #include "eui/Eui48.h"
- #include "eui/Eui64.h"
- #include "HttpControlMsg.h"
-+#include "HttpParser.h"
- #include "RefCount.h"
- #include "StoreIOBuffer.h"
- 
- class ConnStateData;
- class ClientHttpRequest;
- class clientStreamNode;
- class ChunkedCodingParser;
--class HttpParser;
- 
- class ClientSocketContext : public RefCountable
+ libmiscutil_a_SOURCES = \
+ 	MemPool.cc \
+ 	MemPoolChunked.cc \
+@@ -319,22 +319,21 @@ HttpMsg::setContentLength(int64_t clen)
+ bool
+ HttpMsg::persistent() const
  {
-@@ -0,0 +1,30 @@
+-    const HttpHeader *hdr = &header; // XXX: diff-minimizer; remove on commit
+     if ((http_ver.major >= 1) && (http_ver.minor >= 1)) {
+         /*
+          * for modern versions of HTTP: persistent unless there is
+          * a "Connection: close" header.
+          */
+-        return !httpHeaderHasConnDir(hdr, "close");
++        return !httpHeaderHasConnDir(&header, "close");
+     } else {
+         /*
+          * Persistent connections in Netscape 3.x are allegedly broken,
+          * return false if it is a browser connection.  If there is a
+          * VIA header, then we assume this is NOT a browser connection.
+          */
+-        const char *agent = hdr->getStr(HDR_USER_AGENT);
++        const char *agent = header.getStr(HDR_USER_AGENT);
+ 
+-        if (agent && !hdr->has(HDR_VIA)) {
++        if (agent && !header.has(HDR_VIA)) {
+             if (!strncasecmp(agent, "Mozilla/3.", 10))
+                 return 0;
+ 
+@@ -343,7 +342,7 @@ HttpMsg::persistent() const
+         }
+ 
+         /* for old versions of HTTP: persistent if has "keep-alive" */
+-        return httpHeaderHasConnDir(hdr, "keep-alive");
++        return httpHeaderHasConnDir(&header, "keep-alive");
+     }
+ }
+ 
+@@ -11,7 +11,7 @@ AUTOMAKE_OPTIONS = subdir-objects
+ ## we need our local files too (but avoid -I. at all costs)
+ INCLUDES += -I$(srcdir)
+ 
+-SUBDIRS = 
++SUBDIRS = purge
+ EXTRA_DIST = 
+ man_MANS = 
+ DISTCLEANFILES = 
+@@ -1,181 +0,0 @@
+-#
+-# Makefile
+-#
+-# The Makefile is divided into three sections, the "generic section", the
+-# "host section" and the "rules section". The generics section defines
+-# defaults which you should not change. Changes should solely be made to
+-# the rules section.
+-#
+-# You will need to select several parameters befitting your compiler/system:
+-#
+-# -DHAS_BOOL	- set, if your C++ compiler knows about the 'bool' type.
+-# -DHAS_PSIGNAL - set, if your libc supports psignal(int,const char*).
+-# -fno-exceptions - may not be recognized by all variants of g++
+-# -ffor-scope	- the new ANSI C++ scoping of for() variables is used...
+-#
+-# === [1] ==================================================== generics section
+-#
+-CXX	= g++ -ffor-scope -DHAS_BOOL -DHAS_PSIGNAL
+-CC	= gcc
+-LD	= $(CC)		# yes, I do mean gcc and not g++
+-CXXFLAGS = # -pg -g # -fprofile-arcs -ftest-coverage
+-SYSTEM  = $(shell uname -s | tr '[a-z]' '[A-Z]' | tr -d '_ -/')
+-CPU	= $(shell uname -p)
+-VERSION = $(shell uname -r)
+-HOST	= $(shell uname -n)
+-MAJOR   = $(firstword $(subst ., ,$(VERSION)))
+-MINOR   = $(strip $(word 2,$(subst ., ,$(VERSION))))
+-LOADLIBES =
+-SOCKLEN	= int # default except for glibc2?
+-
+-# optimization levels - Do *not* use levels above -O1 with g++,
+-# if -fprofile-arcs or -ftest-coverage is selected! Set to different
+-# values in the host specific section below.
+-#
+-# - OPT_NORM for normal level optimization, O2 is a good choice.
+-#
+-OPT_NORM = -O2
+-
+-# electric fence library, for test purposes only (helps w/ memory leaks)
+-# (developers only)
+-EFENCE	= -L/usr/local/lib -lefence
+-
+-#
+-# === [2] ======================================================= hosts section
+-#
+-
+-ifeq (SUNOS,${SYSTEM})
+-ifeq (5,${MAJOR})
+-# use these for the SUN CC compiler (for STL, see below or above)
+-# You must define this for Solaris 2.x: CXXFLAGS = -DSOLARIS 
+-CC	= cc
+-#CXX	= CC -DHAS_BOOL -DHAS_PSIGNAL -DHAS_MUTABLE
+-#CXXFLAGS = -DSOLARIS  '-library=%none,Cstd,Crun' 
+-#CXXFLAGS += -dalign -ftrap=%none -fsimple -xlibmil
+-#OPT_NORM = -xtarget=ultra2 -xO4
+-#EXTRALIB += -lnsl -lsocket
+-#LD	= CC
+-#
+-## g++ settings for Solaris on Ultra Sparcs (comment out all of above):
+-CXXFLAGS += -DSOLARIS # -ggdb
+-OPT_NORM = -O2 # -mcpu=supersparc
+-LD	= $(CC)
+-##
+-#EXTRALIB += -lnsl -lsocket -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic
+-else
+-# old SunOS 4.1.x, not supported!
+-CXXFLAGS += -DSUN
+-endif
+-endif
+-
+-ifeq (IRIX64,${SYSTEM})
+-# The regular 64bit Irix stuff is just too slow, use n32!
+-SYSTEM        := IRIX
+-endif
+-
+-ifeq (FREEBSD,${SYSTEM})
+-SOCKLEN	= socklen_t
+-endif
+-
+-ifeq (IRIX,${SYSTEM})
+-CXX     = CC -n32 -mips3 -r4000 -DEFAULT:abi=n32:isa=mips3:proc=r4k
+-CXX	+= -LANG:ansi-for-init-scope=on -LANG:bool=on
+-CXX	+= -LANG:exceptions=off -LANG:explicit=off -LANG:wchar_t=off
+-CXX	+= -LANG:mutable=on -LANG:namespaces=on -LANG:std
+-CC	= cc -n32 -mips3 -r4000
+-CXXFLAGS = -woff 1174 -LANG:exceptions=off -DHAS_BOOL -DHAS_PSIGNAL
+-LD	= $(CXX)
+-OPT_NORM = -O3 -IPA -LNO:opt=1
+-# for g++
+-#CXXFLAGS += -mips3 -mcpu=r4000 
+-endif
+-
+-ifeq (AIX,${SYSTEM})
+-ifeq (,${MINOR})
+-MINOR	:= ${MAJOR}
+-MAJOR	= 4
+-endif
+-CXX	= xlC -UHAS_BOOL -UHAS_PSIGNAL
+-CC	= xlc
+-CXXFLAGS = -qtune=pwr # -qdbxextra -g
+-#CXX	= g++ -ffor-scope -DHAS_BOOL -UHAS_PSIGNAL
+-SOCKLEN	= size_t
+-LD	= $(CXX)
+-endif
+-
+-ifeq (LINUX,${SYSTEM})
+-# determine highest version of all installed libc's.
+-LIBCVER = $(shell /bin/ls /lib/libc.so.? | \
+-	awk -F'.' '{ if (m<$$3) m=$$3;} END { print m} ')
+-ifeq (6,${LIBCVER})
+-SOCKLEN	= socklen_t
+-endif
+-CXXFLAGS += -DHAS_PSIGNAL -DLIBCVERSION=$(LIBCVER) -pipe # -Wall -pedantic
+-OPT_NORM = -O2
+-# if your g++ balks (e.g. SuSE still uses 2.7.2.3)
+-#CXXFLAGS += -DHAS_PSIGNAL -DLIBCVERSION=$(LIBCVER) -m486
+-LD	= $(CC)
+-EXTRALIB = -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic
+-endif
+-
+-#
+-# === [3] ======================================================= rules section
+-# There is no need to change things below this line.
+-CXXFLAGS += -D${SYSTEM} -DMAJOR=${MAJOR} -DMINOR=${MINOR} -DSOCKLEN=${SOCKLEN}
+-CFLAGS	= $(CXXFLAGS)
+-LDFLAGS += $(OPT_NORM)
+-
+-%.o:%.cc
+-	$(CXX) $(CXXFLAGS) $(OPT_NORM) -c $< -o $@
+-
+-OBJS	= convert.o socket.o signal.o squid-tlv.o copyout.o conffile.o
+-SRCS	= $(OBJS:.o=.cc)
+-HDRS	= $(OBJS:.o=.hh)
+-FILES	= $(SRCS) $(HDRS) Makefile purge.cc hexd.c
+-DIST	= $(addprefix purge/,$(FILES) README)
+-
+-all: purge
+-
+-purge: $(OBJS) purge.o 
+-	$(LD) $(OPT_NORM) $(LDFLAGS) $^ -o $@ $(LOADLIBES) $(EXTRALIB)
+-hexd: hexd.o
+-	$(CC) $(OPT_NORM) $(LDFLAGS) $^ -o $@ $(LOADLIBES)
+-#
+-# object file rules, generated with "g++ -MM -E *.cc"
+-#
+-purge.o: purge.cc $(HDRS)
+-	$(CXX) $(CXXFLAGS) $(OPT_NORM) -c $< -o $@
+-convert.o: convert.cc convert.hh
+-conffile.o: conffile.cc conffile.hh
+-signal.o: signal.cc signal.hh
+-socket.o: socket.cc socket.hh convert.hh
+-squid-tlv.o: squid-tlv.cc squid-tlv.hh
+-copyout.o: copyout.cc copyout.hh
+-hexd.o: hexd.c
+-
+-clean:
+-	$(RM) *.o
+-	if [ "${SYSTEM}" = "IRIX"  ]; then rm -rf ii_files; fi
+-	if [ "${SYSTEM}" = "SUNOS" ]; then rm -rf Templates.DB; fi
+-	if [ "${SYSTEM}" = "SUNOS" ]; then rm -rf SunWS_cache; fi
+-
+-distclean: clean
+-	$(RM) purge hexd
+-
+-realclean: distclean
+-clobber: distclean
+-
+-co-all:	$(FILES)
+-	echo all checked out
+-co-all-lock:
+-	co -l $(FILES)
+-ci-all:
+-	for i in $(FILES); do \
+-		test -w $$i && ci $$i; \
+-		rm -f $$i; \
+-	done
+-
+-dist: distclean co-all
+-	( cd .. ; gtar cvzf purge-`date +"%Y%m%d"`-src.tar.gz $(DIST) )
+-tar: distclean ci-all
+-	( cd .. ; gtar cvzf purge-`date +"%Y%m%d"`-all.tar.gz purge )
+@@ -57,9 +57,6 @@
+ #define SA struct sockaddr
+ #endif
+ 
+-static const char* RCS_ID =
+-    "$Id$";
+-
+ const char*
+ my_inet_ntoa( const struct in_addr& a, HostAddress output )
+ // purpose: thread-safely convert IPv4 address -> ASCII representation
+@@ -107,7 +104,7 @@ my_sock_fd2a( int fd, SockAddress buffer, bool peer )
+ //          Refer to errno in case of error (usually unconnected fd...)
+ {
+     struct sockaddr_in socket;
+-    SOCKLEN len = sizeof(socket);
++    socklen_t len = sizeof(socket);
+ 
+     if ( (peer ? getpeername( fd, (SA*) &socket, &len ) :
+             getsockname( fd, (SA*) &socket, &len )) == -1 )
+@@ -42,25 +42,23 @@
+ #pragma implementation
+ #endif
+ 
+-#include <assert.h>
+-#include <sys/types.h>
 +#include "config.h"
-+#include "event.h"
++#include "copyout.hh"
 +
-+#define STUB_API "event.cc"
-+#include "tests/STUB.h"
++//#include <assert.h>
++//#include <sys/types.h>
+ #include <sys/stat.h>
+ #include <stdio.h>
+ #include <string.h>
+ #include <fcntl.h>
+ #include <errno.h>
+ #include <unistd.h>
+-
+ #include <sys/mman.h>
 +
-+void eventAdd(const char *name, EVH * func, void *arg, double when, int, bool cbdata) STUB
-+void eventAddIsh(const char *name, EVH * func, void *arg, double delta_ish, int) STUB
-+void eventDelete(EVH * func, void *arg) STUB
-+void eventInit(void) STUB
-+void eventFreeMemory(void) STUB
-+int eventFind(EVH *, void *) STUB_RETVAL(-1)
-+
-+// ev_entry::ev_entry(char const * name, EVH * func, void *arg, double when, int weight, bool cbdata) STUB
-+// ev_entry::~ev_entry() STUB
-+//    MEMPROXY_CLASS(ev_entry);
-+//    EVH *func;
-+
-+//MEMPROXY_CLASS_INLINE(ev_entry);
-+
-+EventScheduler::EventScheduler() STUB
-+EventScheduler::~EventScheduler() STUB
-+void EventScheduler::cancel(EVH * func, void * arg) STUB
-+void EventScheduler::clean() STUB
-+int EventScheduler::checkDelay() STUB_RETVAL(-1)
-+void EventScheduler::dump(StoreEntry *) STUB
-+bool EventScheduler::find(EVH * func, void * arg) STUB_RETVAL(false)
-+void EventScheduler::schedule(const char *name, EVH * func, void *arg, double when, int weight, bool cbdata) STUB
-+int EventScheduler::checkEvents(int timeout) STUB_RETVAL(-1)
-+EventScheduler *EventScheduler::GetInstance() STUB_RETVAL(NULL)
-@@ -0,0 +1,912 @@
-+#define SQUID_UNIT_TEST 1
+ #ifndef MAP_FILE
+ #define MAP_FILE 0
+ #endif // MAP_FILE
+ 
+-#include "copyout.hh"
+-
+-static const char* RCS_ID =
+-    "$Id$";
+-
+ int
+ assert_copydir( const char* copydir )
+ // purpose: check, if copydir is a directory and that we can write into it.
+@@ -1,94 +0,0 @@
+-#include <ctype.h>
+-#include <stdio.h>
+-#include <sys/types.h>
+-#include <sys/stat.h>
+-#include <fcntl.h>
+-#include <stdlib.h>
+-#include <unistd.h>
+-#include <errno.h>
+-
+-unsigned char
+-xlate( unsigned char ch )
+-{
+-    return (isprint(ch & 0x7f) ? ch : '.');
+-}
+-
+-typedef struct {
+-    int fd, rsize, cursor;
+-    size_t bufsize;
+-    unsigned char* buffer;
+-} InputByByte;
+-
+-int
+-in_open( InputByByte* this, const char* fn, size_t size )
+-{
+-    if ( (this->fd = open( fn, O_RDONLY )) == -1 ) return -1;
+-    if ( (this->buffer=(unsigned char*) malloc(size)) == 0 ) {
+-        close(this->fd);
+-        return -1;
+-    }
+-    this->bufsize = size;
+-    this->rsize = this->cursor = 0;
+-    return 0;
+-}
+-
+-int
+-in_get( InputByByte* this )
+-/*
+- * purpose: read next character
+- * returns: 0..255 as valid character, -1 for error, -2 for EOF
+- */
+-{
+-    if ( this->cursor >= this->rsize ) {
+-        do {
+-            this->rsize = read( this->fd, this->buffer, this->bufsize );
+-        } while ( this->rsize == -1 && errno == EINTR );
+-        if ( this->rsize > 0 ) this->cursor = 0;
+-        else return ((-2) - this->rsize);
+-    }
+-
+-    return this->buffer[this->cursor++];
+-}
+-
+-int
+-in_close( InputByByte* this )
+-{
+-    free((void*) this->buffer);
+-    return close(this->fd);
+-}
+-
+-int
+-main( int argc, char* argv[] )
+-{
+-    int ch, i;
+-    unsigned line = 0;
+-    InputByByte in;
+-    char b2[20];
+-
+-    if ( argc != 2 ) {
+-        fprintf( stderr, "Usage: %s filename\n", argv[0] );
+-        return 1;
+-    }
+-
+-    if ( in_open(&in,argv[1],32768) == -1 ) {
+-        perror( "open" );
+-        return 1;
+-    }
+-
+-    for ( ch = in_get(&in); ch >= 0; ) {
+-        printf( "%08X: ", line );
+-        memset( b2, 0, sizeof(b2) );
+-        for ( i=0; i < 16 && ch >= 0; i++ ) {
+-            printf( "%02X%c", ch, ((i==7) ? '-' : ' ' ) );
+-            b2[i] = xlate(ch);
+-            ch = in_get(&in);
+-        }
+-        line += i;
+-        for ( ; i<16; i++ ) fputs("   ",stdout);
+-        printf( " %s\n", b2 );
+-    }
+-
+-    return in_close(&in);
+-}
+-
+-
+@@ -0,0 +1,93 @@
 +#include "config.h"
 +
-+#include <cppunit/TestAssert.h>
++#include <stdio.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <errno.h>
 +
-+#include "testHttpParser.h"
-+#include "HttpParser.h"
-+#include "Mem.h"
-+#include "MemBuf.h"
-+
-+
-+CPPUNIT_TEST_SUITE_REGISTRATION( testHttpParser );
-+
-+void
-+testHttpParser::globalSetup()
++class InputByByte
 +{
-+    static bool setup_done = false;
-+    if (setup_done)
-+        return;
-+    
-+    Mem::Init();
-+    setup_done = true;
-+}
++public:
++    int open(const char* fn, const size_t size);
++    int get();
++    int close();
 +
-+void
-+testHttpParser::testParseRequestLine()
-+{
-+    // ensure MemPools etc exist
-+    globalSetup();
-+
-+    MemBuf input;
-+    HttpParser output;
-+    input.init();
-+
-+    // TEST: Do we comply with RFC 1945 section 5.1 ?
-+    // TEST: Do we comply with RFC 2616 section 5.1 ?
-+
-+    // RFC 1945 : HTTP/0.9 simple-request
-+    input.append("GET /\r\n", 7);
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("GET /\r\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start], (output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_end);
-+    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start], (output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(9, output.v_min);
-+    input.reset();
-+
-+    // RFC 1945 and 2616 : HTTP/1.0 full-request
-+    input.append("GET / HTTP/1.0\r\n", 16);
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("GET / HTTP/1.0\r\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_end);
-+    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(6, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(13, output.v_end);
-+    CPPUNIT_ASSERT(memcmp("HTTP/1.0", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
-+    input.reset();
-+
-+
-+    // RFC 2616 : HTTP/1.1 full-request
-+    input.append("GET / HTTP/1.1\r\n", 16);
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("GET / HTTP/1.1\r\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_end);
-+    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(6, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(13, output.v_end);
-+    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_min);
-+    input.reset();
-+
-+    // RFC 2616 : future version full-request
-+    input.append("GET / HTTP/10.12\r\n", 18);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("GET / HTTP/10.12\r\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_end);
-+    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(6, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(15, output.v_end);
-+    CPPUNIT_ASSERT(memcmp("HTTP/10.12", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(10, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(12, output.v_min);
-+    input.reset();
-+
-+    // space padded URL
-+    input.append("GET  /     HTTP/1.1\r\n", 21);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("GET  /     HTTP/1.1\r\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(5, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(5, output.u_end);
-+    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(11, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(18, output.v_end);
-+    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_min);
-+    input.reset();
-+
-+    // space padded version
-+    // RFC 1945 and 2616 specify version is followed by CRLF. No intermediary bytes.
-+    // NP: the terminal whitespace is a special case: invalid for even HTTP/0.9 with no version tag
-+    input.append("GET / HTTP/1.1 \n", 16);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_BAD_REQUEST, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("GET / HTTP/1.1 \n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(13, output.u_end);
-+    CPPUNIT_ASSERT(memcmp("/ HTTP/1.1", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
-+    input.reset();
-+
-+    // whitespace inside URI. (nasty but happens)
-+    input.append("GET /fo o/ HTTP/1.1\n", 20);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("GET /fo o/ HTTP/1.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(9, output.u_end);
-+    CPPUNIT_ASSERT(memcmp("/fo o/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(11, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(18, output.v_end);
-+    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_min);
-+    input.reset();
-+
-+    // additional data in buffer
-+    input.append("GET /     HTTP/1.1\nboo!", 23);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-5, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("GET /     HTTP/1.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_end); // strangeness generated by following RFC
-+    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(10, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(17, output.v_end);
-+    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_min);
-+    input.reset();
-+
-+    // alternative EOL sequence: NL-only
-+    input.append("GET / HTTP/1.1\n", 15);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("GET / HTTP/1.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_end);
-+    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(6, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(13, output.v_end);
-+    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_min);
-+    input.reset();
-+
-+    // alternative EOL sequence: double-NL-only
-+    input.append("GET / HTTP/1.1\n\n", 16);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-2, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("GET / HTTP/1.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_end);
-+    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(6, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(13, output.v_end);
-+    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_min);
-+    input.reset();
-+
-+    // RELAXED alternative EOL sequence: multi-CR-NL
-+    input.append("GET / HTTP/1.1\r\r\r\n", 18);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    Config.onoff.relaxed_header_parser = 1;
-+    // Being tolerant we can ignore and elide these apparently benign CR
-+    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("GET / HTTP/1.1\r\r\r\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_end);
-+    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(6, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(13, output.v_end);
-+    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_min);
-+    input.reset();
-+
-+    // STRICT alternative EOL sequence: multi-CR-NL
-+    input.append("GET / HTTP/1.1\r\r\r\n", 18);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    // strict mode treats these as several bare-CR in the request line which is explicitly invalid.
-+    Config.onoff.relaxed_header_parser = 0;
-+    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_BAD_REQUEST, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.req_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.m_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.u_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
-+    input.reset();
-+
-+    // RFC 2616 : . method
-+    input.append(". / HTTP/1.1\n", 13);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp(". / HTTP/1.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_end);
-+    CPPUNIT_ASSERT(memcmp(".", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(2, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(2, output.u_end);
-+    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(4, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(11, output.v_end);
-+    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_min);
-+    input.reset();
-+
-+    // OPTIONS with * URL
-+    input.append("OPTIONS * HTTP/1.1\n", 19);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("OPTIONS * HTTP/1.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(6, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("OPTIONS", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(8, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(8, output.u_end);
-+    CPPUNIT_ASSERT(memcmp("*", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(10, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(17, output.v_end);
-+    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_min);
-+    input.reset();
-+
-+    // unknown method
-+    input.append("HELLOWORLD / HTTP/1.1\n", 22);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("HELLOWORLD / HTTP/1.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(9, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("HELLOWORLD", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(11, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(11, output.u_end);
-+    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(13, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(20, output.v_end);
-+    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_min);
-+    input.reset();
-+
-+    // This stage of the parser does not yet accept non-HTTP protocol names.
-+    // violations mode treats them as HTTP/0.9 requests!
-+    input.append("GET / FOO/1.0\n", 14);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+#if USE_HTTP_VIOLATIONS
-+    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(12, output.u_end);
-+    CPPUNIT_ASSERT(memcmp("/ FOO/1.0", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(9, output.v_min);
-+#else
-+    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_HTTP_VERSION_NOT_SUPPORTED, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_end);
-+    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
-+#endif
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("GET / FOO/1.0\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(6, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(12, output.v_end);
-+    CPPUNIT_ASSERT(memcmp("FOO/1.0", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
-+    input.reset();
-+
-+    // RELAXED space padded method (in strict mode SP is reserved so invalid as a method byte)
-+    input.append(" GET / HTTP/1.1\n", 16);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    Config.onoff.relaxed_header_parser = 1;
-+    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(1, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("GET / HTTP/1.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(1, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(3, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(5, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(5, output.u_end);
-+    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(7, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(14, output.v_end);
-+    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_min);
-+    input.reset();
-+
-+    // STRICT space padded method (in strict mode SP is reserved so invalid as a method byte)
-+    input.append(" GET / HTTP/1.1\n", 16);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    Config.onoff.relaxed_header_parser = 0;
-+    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_BAD_REQUEST, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp(" GET / HTTP/1.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.m_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.u_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
-+    input.reset();
-+
-+    // tab padded method (NP: tab is not SP so treated as any other binary)
-+    input.append("\tGET / HTTP/1.1\n", 16);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("\tGET / HTTP/1.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(3, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("\tGET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(5, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(5, output.u_end);
-+    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(7, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(14, output.v_end);
-+    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_min);
-+    input.reset();
-+
-+    input.append("GET", 3);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(0, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_STATUS_NONE, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.req_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.m_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.u_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
-+    input.reset();
-+
-+    input.append("GET ", 4);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(0, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_STATUS_NONE, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.req_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.m_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.u_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
-+    input.reset();
-+
-+    input.append("GET / HT", 8);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(0, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_STATUS_NONE, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.req_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.m_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.u_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
-+    input.reset();
-+
-+    input.append("GET / HTTP/1.1", 14);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(0, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_STATUS_NONE, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.req_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.m_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.u_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
-+    input.reset();
-+
-+    // method-only
-+    input.append("A\n", 2);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_BAD_REQUEST, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("A\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.m_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.u_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
-+    input.reset();
-+
-+    // no method (but in a form which is ambiguous with HTTP/0.9 simple-request)
-+    input.append("/ HTTP/1.0\n", 11);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("/ HTTP/1.0\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(2, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(9, output.u_end);
-+    CPPUNIT_ASSERT(memcmp("HTTP/1.0", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(9, output.v_min);
-+    input.reset();
-+
-+    // RELAXED no method (an invalid format)
-+    input.append(" / HTTP/1.0\n", 12);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    // When tolerantly ignoring SP prefix this case becomes ambiguous with HTTP/0.9 simple-request)
-+    Config.onoff.relaxed_header_parser = 1;
-+    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(1, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("/ HTTP/1.0\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(1, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(1, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(3, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(10, output.u_end);
-+    CPPUNIT_ASSERT(memcmp("HTTP/1.0", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(9, output.v_min);
-+    input.reset();
-+
-+    // STRICT no method (an invalid format)
-+    input.append(" / HTTP/1.0\n", 12);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    // When tolerantly ignoring SP prefix this case becomes ambiguous with HTTP/0.9 simple-request)
-+    Config.onoff.relaxed_header_parser = 0;
-+    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_BAD_REQUEST, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp(" / HTTP/1.0\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.m_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.u_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
-+    input.reset();
-+
-+    // binary code in method (strange but ...)
-+    input.append("GET\x0B / HTTP/1.1\n", 16);
-+    //printf("TEST: %d-%d/%d '%.*s'\n", output.req_start, output.req_end, input.contentSize(), 16, input.content());
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("GET\x0B / HTTP/1.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(3, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("GET\x0B", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(5, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(5, output.u_end);
-+    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(7, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(14, output.v_end);
-+    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_min);
-+    input.reset();
-+
-+    // CR in method
-+    // RFC 2616 sec 5.1 prohibits CR other than in terminator.
-+    input.append("GET\r / HTTP/1.1\r\n", 16);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_BAD_REQUEST, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.req_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.m_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.u_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
-+    input.reset();
-+
-+    // binary code NUL! in method (strange but ...)
-+    input.append("GET\0 / HTTP/1.1\n", 16);
-+    //printf("TEST: %d-%d/%d '%.*s'\n", output.req_start, output.req_end, input.contentSize(), 16, input.content());
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("GET\0 / HTTP/1.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(3, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("GET\0", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(5, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(5, output.u_end);
-+    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(7, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(14, output.v_end);
-+    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_min);
-+    input.reset();
-+
-+    // no URL (grammer otherwise correct)
-+    input.append("GET  HTTP/1.1\n", 14);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("GET  HTTP/1.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(5, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(12, output.u_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
-+    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(9, output.v_min);
-+    input.reset();
-+
-+    // no URL (grammer invalid, ambiguous with RFC 1945 HTTP/0.9 simple-request)
-+    input.append("GET HTTP/1.1\n", 13);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("GET HTTP/1.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(11, output.u_end);
-+    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(9, output.v_min);
-+    input.reset();
-+
-+    // no version
-+    input.append("GET / HTTP/\n", 12);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_HTTP_VERSION_NOT_SUPPORTED, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("GET / HTTP/\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_end);
-+    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(6, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(10, output.v_end);
-+    CPPUNIT_ASSERT(memcmp("HTTP/", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
-+    input.reset();
-+
-+    // no major version
-+    input.append("GET / HTTP/.1\n", 14);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_HTTP_VERSION_NOT_SUPPORTED, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("GET / HTTP/.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_end);
-+    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(6, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(12, output.v_end);
-+    CPPUNIT_ASSERT(memcmp("HTTP/.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
-+    input.reset();
-+
-+    // no version dot
-+    input.append("GET / HTTP/11\n", 14);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_HTTP_VERSION_NOT_SUPPORTED, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("GET / HTTP/11\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_end);
-+    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(6, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(12, output.v_end);
-+    CPPUNIT_ASSERT(memcmp("HTTP/11", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
-+    input.reset();
-+
-+    // negative major version (bug 3062)
-+    input.append("GET / HTTP/-999999.1\n", 21);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_HTTP_VERSION_NOT_SUPPORTED, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("GET / HTTP/-999999.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_end);
-+    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(6, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(19, output.v_end);
-+    CPPUNIT_ASSERT(memcmp("HTTP/-999999.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
-+    input.reset();
-+
-+    // no minor version
-+    input.append("GET / HTTP/1.\n", 14);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_HTTP_VERSION_NOT_SUPPORTED, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("GET / HTTP/1.\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_end);
-+    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(6, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(12, output.v_end);
-+    CPPUNIT_ASSERT(memcmp("HTTP/1.", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
-+    input.reset();
-+
-+    // negative major version (bug 3062 corollary)
-+    input.append("GET / HTTP/1.-999999\n", 21);
-+    //printf("TEST: '%s'\n",input.content());
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_HTTP_VERSION_NOT_SUPPORTED, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("GET / HTTP/1.-999999\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(4, output.u_end);
-+    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(6, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(19, output.v_end);
-+    CPPUNIT_ASSERT(memcmp("HTTP/1.-999999", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
-+    input.reset();
-+
-+    // binary line
-+    input.append("\xB\xC\xE\xF\n", 5);
-+    //printf("TEST: binary-line\n");
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_BAD_REQUEST, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("\xB\xC\xE\xF\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.m_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.u_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
-+    input.reset();
-+
-+    // mixed whitespace line
-+    // We accept non-space binary bytes for method so first \t shows up as that
-+    // but remaining space and tabs are skipped searching for URI-start
-+    input.append("\t \t \t\n", 6);
-+    //printf("TEST: mixed whitespace\n");
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_BAD_REQUEST, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
-+    CPPUNIT_ASSERT(memcmp("\t \t \t\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(0, output.m_end);
-+    CPPUNIT_ASSERT(memcmp("\t", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.u_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
-+    input.reset();
-+
-+    // mixed whitespace line with CR middle
-+    // CR aborts on sight, so even initial \t method is not marked as above
-+    // (not when parsing clean with whole line available anyway)
-+    input.append("\t  \r \n", 6);
-+    //printf("TEST: mixed whitespace with CR\n");
-+    output.reset(input.content(), input.contentSize());
-+    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
-+    CPPUNIT_ASSERT_EQUAL(HTTP_BAD_REQUEST, output.request_parse_status);
-+    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.req_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.m_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.m_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.u_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.u_end);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
-+    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
-+    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
-+    input.reset();
-+}
-@@ -0,0 +1,17 @@
-+#ifndef SQUID_SRC_TESTS_TESTHTTPPARSER_H
-+#define SQUID_SRC_TESTS_TESTHTTPPARSER_H
-+
-+#include <cppunit/extensions/HelperMacros.h>
-+
-+class testHttpParser : public CPPUNIT_NS::TestFixture
-+{
-+    CPPUNIT_TEST_SUITE( testHttpParser );
-+    CPPUNIT_TEST( testParseRequestLine );
-+    CPPUNIT_TEST_SUITE_END();
-+
-+protected:
-+    void globalSetup(); // MemPools init etc.
-+    void testParseRequestLine();
++private:
++    int fd, rsize, cursor;
++    size_t bufsize;
++    unsigned char* buffer;
 +};
 +
-+#endif
-@@ -199,889 +199,3 @@ testHttpRequest::testSanityCheckStartLine()
-     input.reset();
-     error = HTTP_STATUS_NONE;
- }
--
--void
--testHttpRequest::testParseRequestLine()
--{
--    MemBuf input;
--    HttpParser output;
--    input.init();
--
--    // TEST: Do we comply with RFC 1945 section 5.1 ?
--    // TEST: Do we comply with RFC 2616 section 5.1 ?
--
--    // RFC 1945 : HTTP/0.9 simple-request
--    input.append("GET /\r\n", 7);
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("GET /\r\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
--    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start], (output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_end);
--    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start], (output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(9, output.v_min);
--    input.reset();
--
--    // RFC 1945 and 2616 : HTTP/1.0 full-request
--    input.append("GET / HTTP/1.0\r\n", 16);
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("GET / HTTP/1.0\r\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
--    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_end);
--    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(6, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(13, output.v_end);
--    CPPUNIT_ASSERT(memcmp("HTTP/1.0", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
--    input.reset();
--
--
--    // RFC 2616 : HTTP/1.1 full-request
--    input.append("GET / HTTP/1.1\r\n", 16);
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("GET / HTTP/1.1\r\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
--    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_end);
--    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(6, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(13, output.v_end);
--    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_min);
--    input.reset();
--
--    // RFC 2616 : future version full-request
--    input.append("GET / HTTP/10.12\r\n", 18);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("GET / HTTP/10.12\r\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
--    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_end);
--    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(6, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(15, output.v_end);
--    CPPUNIT_ASSERT(memcmp("HTTP/10.12", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(10, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(12, output.v_min);
--    input.reset();
--
--    // space padded URL
--    input.append("GET  /     HTTP/1.1\r\n", 21);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("GET  /     HTTP/1.1\r\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
--    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(5, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(5, output.u_end);
--    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(11, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(18, output.v_end);
--    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_min);
--    input.reset();
--
--    // space padded version
--    // RFC 1945 and 2616 specify version is followed by CRLF. No intermediary bytes.
--    // NP: the terminal whitespace is a special case: invalid for even HTTP/0.9 with no version tag
--    input.append("GET / HTTP/1.1 \n", 16);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_BAD_REQUEST, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("GET / HTTP/1.1 \n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
--    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(13, output.u_end);
--    CPPUNIT_ASSERT(memcmp("/ HTTP/1.1", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
--    input.reset();
--
--    // whitespace inside URI. (nasty but happens)
--    input.append("GET /fo o/ HTTP/1.1\n", 20);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("GET /fo o/ HTTP/1.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
--    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(9, output.u_end);
--    CPPUNIT_ASSERT(memcmp("/fo o/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(11, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(18, output.v_end);
--    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_min);
--    input.reset();
--
--    // additional data in buffer
--    input.append("GET /     HTTP/1.1\nboo!", 23);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-5, output.req_end);
--    CPPUNIT_ASSERT(memcmp("GET /     HTTP/1.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
--    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_end); // strangeness generated by following RFC
--    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(10, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(17, output.v_end);
--    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_min);
--    input.reset();
--
--    // alternative EOL sequence: NL-only
--    input.append("GET / HTTP/1.1\n", 15);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("GET / HTTP/1.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
--    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_end);
--    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(6, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(13, output.v_end);
--    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_min);
--    input.reset();
--
--    // alternative EOL sequence: double-NL-only
--    input.append("GET / HTTP/1.1\n\n", 16);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-2, output.req_end);
--    CPPUNIT_ASSERT(memcmp("GET / HTTP/1.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
--    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_end);
--    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(6, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(13, output.v_end);
--    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_min);
--    input.reset();
--
--    // RELAXED alternative EOL sequence: multi-CR-NL
--    input.append("GET / HTTP/1.1\r\r\r\n", 18);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    Config.onoff.relaxed_header_parser = 1;
--    // Being tolerant we can ignore and elide these apparently benign CR
--    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("GET / HTTP/1.1\r\r\r\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
--    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_end);
--    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(6, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(13, output.v_end);
--    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_min);
--    input.reset();
--
--    // STRICT alternative EOL sequence: multi-CR-NL
--    input.append("GET / HTTP/1.1\r\r\r\n", 18);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    // strict mode treats these as several bare-CR in the request line which is explicitly invalid.
--    Config.onoff.relaxed_header_parser = 0;
--    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_BAD_REQUEST, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.req_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.m_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.u_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
--    input.reset();
--
--    // RFC 2616 : . method
--    input.append(". / HTTP/1.1\n", 13);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp(". / HTTP/1.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_end);
--    CPPUNIT_ASSERT(memcmp(".", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(2, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(2, output.u_end);
--    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(4, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(11, output.v_end);
--    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_min);
--    input.reset();
--
--    // OPTIONS with * URL
--    input.append("OPTIONS * HTTP/1.1\n", 19);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("OPTIONS * HTTP/1.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(6, output.m_end);
--    CPPUNIT_ASSERT(memcmp("OPTIONS", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(8, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(8, output.u_end);
--    CPPUNIT_ASSERT(memcmp("*", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(10, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(17, output.v_end);
--    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_min);
--    input.reset();
--
--    // unknown method
--    input.append("HELLOWORLD / HTTP/1.1\n", 22);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("HELLOWORLD / HTTP/1.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(9, output.m_end);
--    CPPUNIT_ASSERT(memcmp("HELLOWORLD", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(11, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(11, output.u_end);
--    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(13, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(20, output.v_end);
--    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_min);
--    input.reset();
--
--    // This stage of the parser does not yet accept non-HTTP protocol names.
--    // violations mode treats them as HTTP/0.9 requests!
--    input.append("GET / FOO/1.0\n", 14);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--#if USE_HTTP_VIOLATIONS
--    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(12, output.u_end);
--    CPPUNIT_ASSERT(memcmp("/ FOO/1.0", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(9, output.v_min);
++int
++InputByByte::open(const char* fn, const size_t size )
++{
++    if ( (fd = open( fn, O_RDONLY )) == -1 ) return -1;
++    if ( (buffer=(unsigned char*) malloc(size)) == 0 ) {
++        ::close(fd);
++        return -1;
++    }
++    bufsize = size;
++    rsize = cursor = 0;
++    return 0;
++}
++
++int
++InputByByte::get()
++/*
++ * purpose: read next character
++ * returns: 0..255 as valid character, -1 for error, -2 for EOF
++ */
++{
++    if ( cursor >= rsize ) {
++        do {
++            rsize = read(fd, buffer, bufsize );
++        } while ( rsize == -1 && errno == EINTR );
++        if ( rsize > 0 ) cursor = 0;
++        else return ((-2) - rsize);
++    }
++
++    return buffer[cursor++];
++}
++
++int
++InputByByte::close()
++{
++    free((void*) buffer);
++    return close(fd);
++}
++
++int
++main( int argc, char* argv[] )
++{
++    int ch, i;
++    unsigned line = 0;
++    InputByByte in;
++    char b2[20];
++
++    if ( argc != 2 ) {
++        fprintf( stderr, "Usage: %s filename\n", argv[0] );
++        return 1;
++    }
++
++    if ( in.open(argv[1],32768) == -1 ) {
++        perror( "open" );
++        return 1;
++    }
++
++    for ( ch = in.get(); ch >= 0; ) {
++        printf( "%08X: ", line );
++        memset( b2, 0, sizeof(b2) );
++        for ( i=0; i < 16 && ch >= 0; i++ ) {
++            printf( "%02X%c", ch, ((i==7) ? '-' : ' ' ) );
++            b2[i] = (isprint(ch & 0x7f) ? ch : '.');
++            ch = in.get();
++        }
++        line += i;
++        for ( ; i<16; i++ ) fputs("   ",stdout);
++        printf( " %s\n", b2 );
++    }
++
++    return in.close();
++}
+@@ -95,22 +95,19 @@
+ //
+ #if defined(__GNUC__) || defined(__GNUG__)
+ #pragma implementation
 -#else
--    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_HTTP_VERSION_NOT_SUPPORTED, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_end);
--    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
+-#ifndef HAS_BOOL
+-#define HAS_BOOL
+-typedef int bool;
+-#define false 0
+-#define true  1
 -#endif
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("GET / FOO/1.0\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
--    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(6, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(12, output.v_end);
--    CPPUNIT_ASSERT(memcmp("FOO/1.0", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
--    input.reset();
--
--    // RELAXED space padded method (in strict mode SP is reserved so invalid as a method byte)
--    input.append(" GET / HTTP/1.1\n", 16);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    Config.onoff.relaxed_header_parser = 1;
--    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(1, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("GET / HTTP/1.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(1, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(3, output.m_end);
--    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(5, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(5, output.u_end);
--    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(7, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(14, output.v_end);
--    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_min);
--    input.reset();
--
--    // STRICT space padded method (in strict mode SP is reserved so invalid as a method byte)
--    input.append(" GET / HTTP/1.1\n", 16);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    Config.onoff.relaxed_header_parser = 0;
--    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_BAD_REQUEST, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp(" GET / HTTP/1.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.m_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.u_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
--    input.reset();
--
--    // tab padded method (NP: tab is not SP so treated as any other binary)
--    input.append("\tGET / HTTP/1.1\n", 16);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("\tGET / HTTP/1.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(3, output.m_end);
--    CPPUNIT_ASSERT(memcmp("\tGET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(5, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(5, output.u_end);
--    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(7, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(14, output.v_end);
--    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_min);
--    input.reset();
--
--    input.append("GET", 3);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(0, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_STATUS_NONE, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.req_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.m_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.u_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
--    input.reset();
--
--    input.append("GET ", 4);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(0, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_STATUS_NONE, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.req_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.m_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.u_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
--    input.reset();
--
--    input.append("GET / HT", 8);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(0, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_STATUS_NONE, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.req_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.m_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.u_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
--    input.reset();
--
--    input.append("GET / HTTP/1.1", 14);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(0, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_STATUS_NONE, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.req_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.m_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.u_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
--    input.reset();
--
--    // method-only
--    input.append("A\n", 2);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_BAD_REQUEST, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("A\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.m_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.u_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
--    input.reset();
--
--    // no method (but in a form which is ambiguous with HTTP/0.9 simple-request)
--    input.append("/ HTTP/1.0\n", 11);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("/ HTTP/1.0\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_end);
--    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(2, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(9, output.u_end);
--    CPPUNIT_ASSERT(memcmp("HTTP/1.0", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(9, output.v_min);
--    input.reset();
--
--    // RELAXED no method (an invalid format)
--    input.append(" / HTTP/1.0\n", 12);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    // When tolerantly ignoring SP prefix this case becomes ambiguous with HTTP/0.9 simple-request)
--    Config.onoff.relaxed_header_parser = 1;
--    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(1, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("/ HTTP/1.0\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(1, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(1, output.m_end);
--    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(3, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(10, output.u_end);
--    CPPUNIT_ASSERT(memcmp("HTTP/1.0", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(9, output.v_min);
--    input.reset();
--
--    // STRICT no method (an invalid format)
--    input.append(" / HTTP/1.0\n", 12);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    // When tolerantly ignoring SP prefix this case becomes ambiguous with HTTP/0.9 simple-request)
--    Config.onoff.relaxed_header_parser = 0;
--    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_BAD_REQUEST, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp(" / HTTP/1.0\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.m_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.u_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
--    input.reset();
--
--    // binary code in method (strange but ...)
--    input.append("GET\x0B / HTTP/1.1\n", 16);
--    //printf("TEST: %d-%d/%d '%.*s'\n", output.req_start, output.req_end, input.contentSize(), 16, input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("GET\x0B / HTTP/1.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(3, output.m_end);
--    CPPUNIT_ASSERT(memcmp("GET\x0B", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(5, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(5, output.u_end);
--    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(7, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(14, output.v_end);
--    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_min);
--    input.reset();
--
--    // CR in method
--    // RFC 2616 sec 5.1 prohibits CR other than in terminator.
--    input.append("GET\r / HTTP/1.1\r\n", 16);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_BAD_REQUEST, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.req_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.m_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.u_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
--    input.reset();
--
--    // binary code NUL! in method (strange but ...)
--    input.append("GET\0 / HTTP/1.1\n", 16);
--    //printf("TEST: %d-%d/%d '%.*s'\n", output.req_start, output.req_end, input.contentSize(), 16, input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("GET\0 / HTTP/1.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(3, output.m_end);
--    CPPUNIT_ASSERT(memcmp("GET\0", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(5, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(5, output.u_end);
--    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(7, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(14, output.v_end);
--    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_min);
--    input.reset();
--
--    // no URL (grammer otherwise correct)
--    input.append("GET  HTTP/1.1\n", 14);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("GET  HTTP/1.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
--    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(5, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(12, output.u_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
--    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(9, output.v_min);
--    input.reset();
--
--    // no URL (grammer invalid, ambiguous with RFC 1945 HTTP/0.9 simple-request)
--    input.append("GET HTTP/1.1\n", 13);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_OK, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("GET HTTP/1.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
--    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(11, output.u_end);
--    CPPUNIT_ASSERT(memcmp("HTTP/1.1", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(9, output.v_min);
--    input.reset();
--
--    // no version
--    input.append("GET / HTTP/\n", 12);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_HTTP_VERSION_NOT_SUPPORTED, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("GET / HTTP/\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
--    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_end);
--    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(6, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(10, output.v_end);
--    CPPUNIT_ASSERT(memcmp("HTTP/", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
--    input.reset();
--
--    // no major version
--    input.append("GET / HTTP/.1\n", 14);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_HTTP_VERSION_NOT_SUPPORTED, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("GET / HTTP/.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
--    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_end);
--    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(6, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(12, output.v_end);
--    CPPUNIT_ASSERT(memcmp("HTTP/.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
--    input.reset();
--
--    // no version dot
--    input.append("GET / HTTP/11\n", 14);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_HTTP_VERSION_NOT_SUPPORTED, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("GET / HTTP/11\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
--    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_end);
--    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(6, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(12, output.v_end);
--    CPPUNIT_ASSERT(memcmp("HTTP/11", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
--    input.reset();
--
--    // negative major version (bug 3062)
--    input.append("GET / HTTP/-999999.1\n", 21);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_HTTP_VERSION_NOT_SUPPORTED, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("GET / HTTP/-999999.1\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
--    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_end);
--    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(6, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(19, output.v_end);
--    CPPUNIT_ASSERT(memcmp("HTTP/-999999.1", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
--    input.reset();
--
--    // no minor version
--    input.append("GET / HTTP/1.\n", 14);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_HTTP_VERSION_NOT_SUPPORTED, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("GET / HTTP/1.\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
--    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_end);
--    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(6, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(12, output.v_end);
--    CPPUNIT_ASSERT(memcmp("HTTP/1.", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
--    input.reset();
--
--    // negative major version (bug 3062 corollary)
--    input.append("GET / HTTP/1.-999999\n", 21);
--    //printf("TEST: '%s'\n",input.content());
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_HTTP_VERSION_NOT_SUPPORTED, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("GET / HTTP/1.-999999\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(2, output.m_end);
--    CPPUNIT_ASSERT(memcmp("GET", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(4, output.u_end);
--    CPPUNIT_ASSERT(memcmp("/", &output.buf[output.u_start],(output.u_end-output.u_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(6, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(19, output.v_end);
--    CPPUNIT_ASSERT(memcmp("HTTP/1.-999999", &output.buf[output.v_start],(output.v_end-output.v_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(1, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
--    input.reset();
--
--    // binary line
--    input.append("\xB\xC\xE\xF\n", 5);
--    //printf("TEST: binary-line\n");
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_BAD_REQUEST, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("\xB\xC\xE\xF\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.m_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.u_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
--    input.reset();
--
--    // mixed whitespace line
--    // We accept non-space binary bytes for method so first \t shows up as that
--    // but remaining space and tabs are skipped searching for URI-start
--    input.append("\t \t \t\n", 6);
--    //printf("TEST: mixed whitespace\n");
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_BAD_REQUEST, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL((int)input.contentSize()-1, output.req_end);
--    CPPUNIT_ASSERT(memcmp("\t \t \t\n", &output.buf[output.req_start],(output.req_end-output.req_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(0, output.m_end);
--    CPPUNIT_ASSERT(memcmp("\t", &output.buf[output.m_start],(output.m_end-output.m_start+1)) == 0);
--    CPPUNIT_ASSERT_EQUAL(-1, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.u_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
--    input.reset();
--
--    // mixed whitespace line with CR middle
--    // CR aborts on sight, so even initial \t method is not marked as above
--    // (not when parsing clean with whole line available anyway)
--    input.append("\t  \r \n", 6);
--    //printf("TEST: mixed whitespace with CR\n");
--    HttpParserInit(&output, input.content(), input.contentSize());
--    CPPUNIT_ASSERT_EQUAL(-1, HttpParserParseReqLine(&output));
--    CPPUNIT_ASSERT_EQUAL(HTTP_BAD_REQUEST, output.request_parse_status);
--    CPPUNIT_ASSERT_EQUAL(0, output.req_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.req_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.m_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.m_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.u_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.u_end);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_start);
--    CPPUNIT_ASSERT_EQUAL(-1, output.v_end);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_maj);
--    CPPUNIT_ASSERT_EQUAL(0, output.v_min);
--    input.reset();
--}
-@@ -15,7 +15,6 @@ class testHttpRequest : public CPPUNIT_NS::TestFixture
-     CPPUNIT_TEST( testCreateFromUrl );
-     CPPUNIT_TEST( testIPv6HostColonBug );
-     CPPUNIT_TEST( testSanityCheckStartLine );
--    CPPUNIT_TEST( testParseRequestLine );
-     CPPUNIT_TEST_SUITE_END();
+ #endif
  
- public:
-@@ -26,7 +25,6 @@ class testHttpRequest : public CPPUNIT_NS::TestFixture
-     void testCreateFromUrl();
-     void testIPv6HostColonBug();
-     void testSanityCheckStartLine();
--    void testParseRequestLine();
+-#include <assert.h>
++#include "config.h"
++// for xstrdup
++#include "util.h"
++
++//#include <assert.h>
+ #include <stdarg.h>
+ #include <stdio.h>
+ #include <dirent.h>
+-#include <ctype.h>
++//#include <ctype.h>
+ #include <string.h>
+-#include <sys/types.h>
++//#include <sys/types.h>
+ #include <sys/stat.h>
+ #include <sys/wait.h>
+ #include <fcntl.h>
+@@ -120,9 +117,9 @@ typedef int bool;
+ #include <signal.h>
+ #include <errno.h>
+ 
+-#if defined(HAS_PSIGNAL) && !defined(LINUX) && !defined(FREEBSD)
++#if HAVE_SIGINFO_H
+ #include <siginfo.h>
+-#endif // HAS_PSIGNAL
++#endif
+ 
+ #include <netinet/in.h>
+ #include <netinet/tcp.h>  // TCP_NODELAY
+@@ -157,8 +154,7 @@ static bool verbose  = false;
+ static bool envelope = false;
+ static bool no_fork  = false;
+ static const char* programname = 0;
+-static const char* RCS_ID =
+-    "$Id$";
++static const char* RCS_ID = "$Id$";
+ 
+ // ----------------------------------------------------------------------
+ 
+@@ -173,7 +169,7 @@ struct REList {
  };
  
+ REList::REList( const char* what, bool doCase )
+-        :next(0),data(strdup(what))
++        :next(0),data(xstrdup(what))
+ {
+     int result = regcomp( &rexp, what,
+                           REG_EXTENDED | REG_NOSUB | (doCase ? 0 : REG_ICASE) );
+@@ -635,13 +631,13 @@ parseCommandline( int argc, char* argv[], REList*& head,
+         case 'C':
+             if ( optarg && *optarg ) {
+                 if ( copydir ) free( (void*) copydir );
+-                assert( (copydir = strdup(optarg)) );
++                assert( (copydir = xstrdup(optarg)) );
+             }
+             break;
+         case 'c':
+             if ( optarg && *optarg ) {
+                 if ( *conffile ) free((void*) conffile );
+-                assert( (conffile = strdup(optarg)) );
++                assert( (conffile = xstrdup(optarg)) );
+             }
+             break;
+ 
+@@ -846,7 +842,7 @@ main( int argc, char* argv[] )
+ {
+     // setup variables
+     REList* list = 0;
+-    char* conffile = strdup( DEFAULT_SQUID_CONF );
++    char* conffile = xstrdup( DEFAULT_SQUID_CONF );
+     serverPort = htons(DEFAULTPORT);
+     if ( convertHostname(DEFAULTHOST,serverHost) == -1 ) {
+         fprintf( stderr, "unable to resolve host %s!\n", DEFAULTHOST );
+@@ -907,7 +903,7 @@ main( int argc, char* argv[] )
+                 ::iamalive = false;
+             }
+ 
+-            for ( int i=0; i < cdv.size(); ++i ) {
++            for ( size_t i=0; i < cdv.size(); ++i ) {
+                 if ( getpid() == getpgrp() ) {
+                     // only parent == group leader may fork off new processes
+                     if ( (child[i]=fork()) < 0 ) {
+@@ -933,7 +929,7 @@ main( int argc, char* argv[] )
+             // collect the garbase
+             pid_t temp;
+             int status;
+-            for ( int i=0; i < cdv.size(); ++i ) {
++            for ( size_t i=0; i < cdv.size(); ++i ) {
+                 while ( (temp=waitpid( (pid_t)-1, &status, 0 )) == -1 )
+                     if ( errno == EINTR ) continue;
+                 if ( ::debug ) printf( "collected child %d\n", (int) temp );
+@@ -49,40 +49,17 @@
+ #pragma implementation
  #endif
+ 
+-#include <sys/types.h>
++#include "config.h"
++#include "signal.hh"
++
++//#include <sys/types.h>
+ #include <errno.h>
+ #include <string.h>
+ #include <memory.h>
+ #include <stdio.h>
+ #include <unistd.h>
+ #include <sys/wait.h>
+-#include <signal.h>
+-
+-#include "signal.hh"
+-
+-static const char* RCS_ID =
+-    "$Id$";
+-
+-#ifndef HAS_PSIGNAL
+-#ifdef AIX
+-extern const char* const sys_siglist[];
+-#define _sys_nsig 64
+-#define _sys_siglist sys_siglist
+-#endif // AIX
+-
+-void
+-psignal( int sig, const char* msg )
+-// purpose: print message, colon, space, signal name and LF.
+-// paramtr: sig (IN): signal number
+-//          msg (IN): message to prepend
+-{
+-    if ( msg && *msg ) fprintf( stderr, "%s: ", msg );
+-    if ( sig > 0 && sig < _sys_nsig )
+-        fprintf( stderr, "%s\n", _sys_siglist[sig] );
+-    else
+-        fputs( "(unknown)\n", stderr );
+-}
+-#endif // !HAS_PSIGNAL
++//#include <signal.h>
+ 
+ SigFunc*
+ Signal( int signo, SigFunc* newhandler, bool doInterrupt )
+@@ -138,10 +115,10 @@ sigChild( int signo )
+     int saveerr = errno;
+     while ( (pid = waitpid( -1, &status, WNOHANG )) > 0 ) {
+         if ( WIFEXITED(status) ) {
+-            sprintf( line, "child (pid=%ld) reaped, status %d\n%c",
++            snprintf( line, 128, "child (pid=%ld) reaped, status %d\n%c",
+                      (long) pid, WEXITSTATUS(status), 0 );
+         } else if ( WIFSIGNALED(status) ) {
+-            sprintf( line, "child (pid=%ld) died on signal %d%s\n%c",
++            snprintf( line, 128, "child (pid=%ld) died on signal %d%s\n%c",
+                      (long) pid, WTERMSIG(status),
+ #ifdef WCOREDUMP
+                      WCOREDUMP(status) ? " (core generated)" : "",
+@@ -150,7 +127,7 @@ sigChild( int signo )
+ #endif
+                      0 );
+         } else {
+-            sprintf( line, "detected dead child (pid=%ld), status %d\n%c",
++            snprintf( line, 128, "detected dead child (pid=%ld), status %d\n%c",
+                      (long) pid, status, 0 );
+         }
+         write( STDERR_FILENO, line, strlen(line) );
+@@ -47,9 +47,16 @@
+ // Initial revision
+ //
+ //
++
+ #ifndef _SIGNAL_HH
+ #define _SIGNAL_HH
+ 
++#include "config.h"
++
++#if HAVE_SIGNAL_H
++#include <signal.h>
++#endif
++
+ #if defined(__GNUC__) || defined(__GNUG__)
+ #pragma interface
+ #else
+@@ -77,14 +84,6 @@ extern "C" {
+   typedef SIGRETTYPE SigFunc( SIGPARAM );
+ }
+ 
+-#ifndef HAS_PSIGNAL
+-void
+-psignal( int sig, const char* msg );
+-  // purpose: print message, colon, space, signal name and LF.
+-  // paramtr: sig (IN): signal number
+-  //          msg (IN): message to prepend
+-#endif // ! HAS_PSIGNAL
+-
+ SigFunc*
+ Signal( int signo, SigFunc* newhandler, bool doInterrupt );
+   // purpose: install reliable signals
+@@ -60,9 +60,6 @@
+ 
+ #include "convert.hh"
+ 
+-static const char* RCS_ID =
+-    "$Id$";
+-
+ int
+ setSocketBuffers( int sockfd, int size )
+ // purpose: set socket buffers for both directions to the specified size
+@@ -95,7 +92,7 @@ getSocketNoDelay( int sockfd )
+ //         -1, if an error occurred (e.g. datagram socket)
+ {
+     int delay = 0;
+-    SOCKLEN len = sizeof(delay);
++    socklen_t len = sizeof(delay);
+     if ( getsockopt( sockfd, IPPROTO_TCP, TCP_NODELAY,
+                      (char*) &delay, &len ) == -1 ) {
+         perror( "# getsockopt( TCP_NODELAY ) failed" );
+@@ -39,12 +39,10 @@
+ #pragma implementation
+ #endif
+ 
+-#include <assert.h>
++#include "config.h"
++//#include <assert.h>
+ #include "squid-tlv.hh"
+ 
+-static const char* RCS_ID =
+-    "$Id$";
+-
+ SquidTLV::SquidTLV( SquidMetaType _type, size_t _size, void* _data )
+         :next(0),size(_size)
+ {

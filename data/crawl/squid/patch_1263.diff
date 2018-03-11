@@ -1,0 +1,1728 @@
+@@ -3,7 +3,7 @@ dnl  Configuration input file for Squid
+ dnl
+ dnl  Duane Wessels, wessels@nlanr.net, February 1996 (autoconf v2.9)
+ dnl
+-dnl  $Id: configure.in,v 1.306 2002/11/29 22:36:37 hno Exp $
++dnl  $Id: configure.in,v 1.307 2002/12/06 23:19:12 hno Exp $
+ dnl
+ dnl
+ dnl
+@@ -13,7 +13,7 @@ AC_CONFIG_SRCDIR([src/main.cc])
+ AC_CONFIG_AUX_DIR(cfgaux)
+ AM_INIT_AUTOMAKE(squid, 3.0-DEVEL)
+ AM_CONFIG_HEADER(include/autoconf.h)
+-AC_REVISION($Revision: 1.306 $)dnl
++AC_REVISION($Revision: 1.307 $)dnl
+ AC_PREFIX_DEFAULT(/usr/local/squid)
+ AM_MAINTAINER_MODE
+ 
+@@ -1279,6 +1279,7 @@ AC_CHECK_HEADERS( \
+ 	openssl/err.h \
+ 	openssl/md5.h \
+ 	openssl/ssl.h \
++	openssl/engine.h \
+ 	poll.h \
+ 	pwd.h \
+ 	regex.h \
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: HttpHeader.cc,v 1.81 2002/10/13 20:34:56 robertc Exp $
++ * $Id: HttpHeader.cc,v 1.82 2002/12/06 23:19:13 hno Exp $
+  *
+  * DEBUG: section 55    HTTP Header
+  * AUTHOR: Alex Rousskov
+@@ -131,6 +131,7 @@ static const HttpHeaderFieldAttrs HeadersAttrs[] =
+ #if X_ACCELERATOR_VARY
+     {"X-Accelerator-Vary", HDR_X_ACCELERATOR_VARY, ftStr},
+ #endif
++    {"Front-End-Https", HDR_FRONT_END_HTTPS, ftStr},
+     {"Other:", HDR_OTHER, ftStr}	/* ':' will not allow matches */
+ };
+ static HttpHeaderFieldInfo *Headers = NULL;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: access_log.cc,v 1.77 2002/10/13 20:34:57 robertc Exp $
++ * $Id: access_log.cc,v 1.78 2002/12/06 23:19:13 hno Exp $
+  *
+  * DEBUG: section 46    Access Log
+  * AUTHOR: Duane Wessels
+@@ -235,13 +235,20 @@ static void
+ accessLogSquid(AccessLogEntry * al)
+ {
+     const char *client = NULL;
+-    char *user = NULL;
++    const char *user = NULL;
+     if (Config.onoff.log_fqdn)
+ 	client = fqdncache_gethostbyaddr(al->cache.caddr, FQDN_LOOKUP_IF_MISS);
+     if (client == NULL)
+ 	client = inet_ntoa(al->cache.caddr);
+-    user = accessLogFormatName(al->cache.authuser ?
+-	al->cache.authuser : al->cache.rfc931);
++    user = accessLogFormatName(al->cache.authuser);
++#if USE_SSL
++    if (!user)
++	user = accessLogFormatName(al->cache.ssluser);
++#endif
++    if (!user)
++	user = accessLogFormatName(al->cache.rfc931);
++    if (user && !*user)
++	safe_free(user);
+     logfilePrintf(logfile, "%9d.%03d %6d %s %s/%03d %ld %s %s %s %s%s/%s %s",
+ 	(int) current_time.tv_sec,
+ 	(int) current_time.tv_usec / 1000,
+@@ -252,7 +259,7 @@ accessLogSquid(AccessLogEntry * al)
+ 	(long int) al->cache.size,
+ 	al->_private.method_str,
+ 	al->url,
+-	user && *user ? user : dash_str,
++	user ? user : dash_str,
+ 	al->hier.ping.timedout ? "TIMEOUT_" : "",
+ 	hier_strings[al->hier.code],
+ 	al->hier.host,
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: acl.cc,v 1.292 2002/11/10 04:19:39 hno Exp $
++ * $Id: acl.cc,v 1.293 2002/12/06 23:19:13 hno Exp $
+  *
+  * DEBUG: section 28    Access Control
+  * AUTHOR: Duane Wessels
+@@ -102,6 +102,13 @@ static SPLAYCMP aclArpCompare;
+ static SPLAYWALKEE aclDumpArpListWalkee;
+ #endif
+ static int aclCacheMatchAcl(dlink_list * cache, squid_acl acltype, void *data, char const *MatchParam);
++#if USE_SSL
++static void aclParseCertList(void *curlist);
++static int aclMatchUserCert(void *data, aclCheck_t *);
++static int aclMatchCACert(void *data, aclCheck_t *);
++static wordlist *aclDumpCertList(void *data);
++static void aclDestroyCertList(void *data);
++#endif
+ 
+ static squid_acl
+ aclStrToType(const char *s)
+@@ -178,6 +185,12 @@ aclStrToType(const char *s)
+ 	return ACL_MAX_USER_IP;
+     if (!strcmp(s, "external"))
+ 	return ACL_EXTERNAL;
++#if USE_SSL
++    if (!strcmp(s, "user_cert"))
++	return ACL_USER_CERT;
++    if (!strcmp(s, "ca_cert"))
++	return ACL_CA_CERT;
++#endif
+     return ACL_NONE;
+ }
+ 
+@@ -252,6 +265,12 @@ aclTypeToStr(squid_acl type)
+ 	return "max_user_ip";
+     if (type == ACL_EXTERNAL)
+ 	return "external";
++#if USE_SSL
++    if (type == ACL_USER_CERT)
++	return "user_cert";
++    if (type == ACL_CA_CERT)
++	return "ca_cert";
++#endif
+     return "ERROR";
+ }
+ 
+@@ -672,6 +691,91 @@ aclParseDomainList(void *curlist)
+     }
+ }
+ 
++#if USE_SSL
++static void
++aclParseCertList(void *curlist)
++{
++    acl_cert_data **datap = (acl_cert_data **)curlist;
++    splayNode **Top;
++    char *t;
++    char *attribute = strtokFile();
++    if (!attribute)
++	self_destruct();
++    if (*datap) {
++	if (strcasecmp((*datap)->attribute, attribute) != 0)
++	    self_destruct();
++    } else {
++	*datap = (acl_cert_data *)memAllocate(MEM_ACL_CERT_DATA);
++	(*datap)->attribute = xstrdup(attribute);
++    }
++    Top = &(*datap)->values;
++    while ((t = strtokFile())) {
++	*Top = splay_insert(xstrdup(t), *Top, aclDomainCompare);
++    }
++}
++
++static int
++aclMatchUserCert(void *data, aclCheck_t * checklist)
++{
++    acl_cert_data *cert_data = (acl_cert_data *)data;
++    const char *value;
++    SSL *ssl = fd_table[checklist->conn->fd].ssl;
++
++    if (!ssl)
++	return 0;
++    value = sslGetUserAttribute(ssl, cert_data->attribute);
++    if (!value)
++	return 0;
++    cert_data->values = splay_splay(value, cert_data->values, (SPLAYCMP *) strcmp);
++    return !splayLastResult;
++}
++
++static int
++aclMatchCACert(void *data, aclCheck_t * checklist)
++{
++    acl_cert_data *cert_data = (acl_cert_data *)data;
++    const char *value;
++    SSL *ssl = fd_table[checklist->conn->fd].ssl;
++
++    if (!ssl)
++	return 0;
++    value = sslGetCAAttribute(ssl, cert_data->attribute);
++    if (!value)
++	return 0;
++    cert_data->values = splay_splay(value, cert_data->values, (SPLAYCMP *) strcmp);
++    return !splayLastResult;
++}
++
++static void
++aclDestroyCertList(void *curlist)
++{
++    acl_cert_data **datap = (acl_cert_data **)curlist;
++    if (!*datap)
++	return;
++    splay_destroy((*datap)->values, xfree);
++    memFree(*datap, MEM_ACL_CERT_DATA);
++    *datap = NULL;
++}
++
++static void
++aclDumpCertListWalkee(void *node_data, void *outlist)
++{
++    wordlist **wl = (wordlist **)outlist;
++    wordlistAdd(wl, (const char *)node_data);
++}
++
++static wordlist *
++aclDumpCertList(void *curlist)
++{
++    acl_cert_data *data = (acl_cert_data *)curlist;
++    wordlist *wl = NULL;
++    wordlistAdd(&wl, data->attribute);
++    if (data->values)
++	splay_walk(data->values, aclDumpCertListWalkee, &wl);
++    return wl;
++}
++#endif
++
+ void
+ aclParseAclLine(acl ** head)
+ {
+@@ -812,6 +916,12 @@ because no authentication schemes are fully configured.\n", A->cfgline);
+     case ACL_EXTERNAL:
+ 	aclParseExternal(&A->data);
+ 	break;
++#if USE_SSL
++    case ACL_USER_CERT:
++    case ACL_CA_CERT:
++	aclParseCertList(&A->data);
++	break;
++#endif
+     case ACL_NONE:
+     case ACL_ENUM_MAX:
+ 	fatal("Bad ACL type");
+@@ -1676,6 +1786,14 @@ aclMatchAcl(acl * ae, aclCheck_t * checklist)
+     case ACL_EXTERNAL:
+ 	return aclMatchExternal(ae->data, checklist);
+ 	/* NOTREACHED */
++#if USE_SSL
++    case ACL_USER_CERT:
++	return aclMatchUserCert(ae->data, checklist);
++	/* NOTREACHED */
++    case ACL_CA_CERT:
++	return aclMatchCACert(ae->data, checklist);
++	/* NOTREACHED */
++#endif
+     case ACL_NONE:
+     case ACL_ENUM_MAX:
+ 	break;
+@@ -2105,6 +2223,12 @@ aclDestroyAcls(acl ** head)
+ 	case ACL_EXTERNAL:
+ 	    aclDestroyExternal(&a->data);
+ 	    break;
++#if USE_SSL
++	case ACL_USER_CERT:
++	case ACL_CA_CERT:
++	    aclDestroyCertList(&a->data);
++	    break;
++#endif
+ 	case ACL_NONE:
+ 	case ACL_ENUM_MAX:
+ 	    debug(28, 1) ("aclDestroyAcls: no case for ACL type %d\n", a->type);
+@@ -2518,6 +2642,11 @@ aclDumpGeneric(const acl * a)
+ #endif
+     case ACL_EXTERNAL:
+ 	return aclDumpExternal(a->data);
++#if USE_SSL
++    case ACL_USER_CERT:
++    case ACL_CA_CERT:
++	return aclDumpCertList(a->data);
++#endif
+     case ACL_NONE:
+     case ACL_ENUM_MAX:
+ 	break;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: cache_cf.cc,v 1.421 2002/11/15 13:09:31 hno Exp $
++ * $Id: cache_cf.cc,v 1.422 2002/12/06 23:19:13 hno Exp $
+  *
+  * DEBUG: section 3     Configuration File Parsing
+  * AUTHOR: Harvest Derived
+@@ -503,6 +503,9 @@ configDoConfigure(void)
+ 	    debug(22, 0) ("WARNING: 'maxconn' ACL (%s) won't work with client_db disabled\n", a->name);
+ 	}
+     }
++#if USE_SSL
++    Config.ssl_client.sslContext = sslCreateClientContext(Config.ssl_client.cert, Config.ssl_client.key, Config.ssl_client.version, Config.ssl_client.cipher, Config.ssl_client.options, Config.ssl_client.flags, Config.ssl_client.cafile, Config.ssl_client.capath);
++#endif
+ }
+ 
+ /* Parse a time specification from the config file.  Store the
+@@ -1541,6 +1544,42 @@ parse_peer(peer ** head)
+ 	    p->options.allow_miss = 1;
+ 	} else if (!strncasecmp(token, "max-conn=", 9)) {
+ 	    p->max_conn = xatoi(token + 9);
++#if USE_SSL
++	} else if (strcmp(token, "ssl") == 0) {
++	    p->use_ssl = 1;
++	} else if (strncmp(token, "sslcert=", 8) == 0) {
++	    safe_free(p->sslcert);
++	    p->sslcert = xstrdup(token + 8);
++	} else if (strncmp(token, "sslkey=", 7) == 0) {
++	    safe_free(p->sslkey);
++	    p->sslkey = xstrdup(token + 7);
++	} else if (strncmp(token, "sslversion=", 11) == 0) {
++	    p->sslversion = atoi(token + 11);
++	} else if (strncmp(token, "ssloptions=", 11) == 0) {
++	    safe_free(p->ssloptions);
++	    p->ssloptions = xstrdup(token + 11);
++	} else if (strncmp(token, "sslcipher=", 10) == 0) {
++	    safe_free(p->sslcipher);
++	    p->sslcipher = xstrdup(token + 10);
++	} else if (strncmp(token, "sslcafile=", 10) == 0) {
++	    safe_free(p->sslcafile);
++	    p->sslcipher = xstrdup(token + 10);
++	} else if (strncmp(token, "sslcapath=", 10) == 0) {
++	    safe_free(p->sslcapath);
++	    p->sslcipher = xstrdup(token + 10);
++	} else if (strncmp(token, "sslflags=", 9) == 0) {
++	    safe_free(p->sslflags);
++	    p->sslflags = xstrdup(token + 9);
++	} else if (strncmp(token, "ssldomain=", 10) == 0) {
++	    safe_free(p->ssldomain);
++	    p->ssldomain = xstrdup(token + 10);
++#endif
++	} else if (strcmp(token, "front-end-https") == 0) {
++	    p->front_end_https = 1;
++	} else if (strcmp(token, "front-end-https=on") == 0) {
++	    p->front_end_https = 1;
++	} else if (strcmp(token, "front-end-https=auto") == 0) {
++	    p->front_end_https = 2;
+ 	} else {
+ 	    debug(3, 0) ("parse_peer: token='%s'\n", token);
+ 	    self_destruct();
+@@ -1559,6 +1598,11 @@ parse_peer(peer ** head)
+ 	PeerDigest *pd = peerDigestCreate(p);
+ 	p->digest = cbdataReference(pd);
+     }
++#endif
++#if USE_SSL
++    if (p->use_ssl) {
++	p->sslContext = sslCreateClientContext(p->sslcert, p->sslkey, p->sslversion, p->sslcipher, p->ssloptions, p->sslflags, p->sslcafile, p->sslcapath);
++    }
+ #endif
+     while (*head != NULL)
+ 	head = &(*head)->next;
+@@ -2405,31 +2449,52 @@ parse_https_port_list(https_port_list ** head)
+ 	} else if (strncmp(token, "cipher=", 7) == 0) {
+ 	    safe_free(s->cipher);
+ 	    s->cipher = xstrdup(token + 7);
++	} else if (strncmp(token, "clientca=", 9) == 0) {
++	    safe_free(s->clientca);
++	    s->clientca = xstrdup(token + 9);
++	} else if (strncmp(token, "cafile=", 7) == 0) {
++	    safe_free(s->cafile);
++	    s->cafile = xstrdup(token + 7);
++	} else if (strncmp(token, "capath=", 7) == 0) {
++	    safe_free(s->capath);
++	    s->capath = xstrdup(token + 7);
++	} else if (strncmp(token, "sslflags=", 9) == 0) {
++	    safe_free(s->sslflags);
++	    s->sslflags = xstrdup(token + 9);
+ 	} else {
+ 	    self_destruct();
+ 	}
+     }
+     while (*head)
+ 	head = &(*head)->next;
++    s->sslContext = sslCreateServerContext(s->cert, s->key, s->version, s->cipher, s->options, s->sslflags, s->clientca, s->cafile, s->capath);
+     *head = s;
+ }
+ 
+ static void
+ dump_https_port_list(StoreEntry * e, const char *n, const https_port_list * s)
+ {
+     while (s) {
+-	storeAppendPrintf(e, "%s %s:%d cert=\"%s\" key=\"%s\"",
++	storeAppendPrintf(e, "%s %s:%d",
+ 	    n,
+ 	    inet_ntoa(s->s.sin_addr),
+-	    ntohs(s->s.sin_port),
+-	    s->cert,
+-	    s->key);
++	    ntohs(s->s.sin_port));
++	if (s->cert)
++	    storeAppendPrintf(e, " cert=%s", s->cert);
++	if (s->key)
++	    storeAppendPrintf(e, " key=%s", s->cert);
+ 	if (s->version)
+ 	    storeAppendPrintf(e, " version=%d", s->version);
+ 	if (s->options)
+ 	    storeAppendPrintf(e, " options=%s", s->options);
+ 	if (s->cipher)
+ 	    storeAppendPrintf(e, " cipher=%s", s->cipher);
++	if (s->cafile)
++	    storeAppendPrintf(e, " cafile=%s", s->cafile);
++	if (s->capath)
++	    storeAppendPrintf(e, " capath=%s", s->capath);
++	if (s->sslflags)
++	    storeAppendPrintf(e, " sslflags=%s", s->sslflags);
+ 	storeAppendPrintf(e, "\n");
+ 	s = s->next;
+     }
+@@ -1,6 +1,6 @@
+ 
+ #
+-# $Id: cf.data.pre,v 1.291 2002/11/15 13:12:36 hno Exp $
++# $Id: cf.data.pre,v 1.292 2002/12/06 23:19:14 hno Exp $
+ #
+ #
+ # SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -133,6 +133,26 @@ DOC_START
+ 			    NO_TLSv1  Disallow the use of TLSv1
+ 			See src/ssl_support.c or OpenSSL documentation
+ 			for a more complete list.
++
++	   clientca=	File containing the list of CAs to use when
++			requesting a client certificate
++
++	   cafile=	File containing additional CA certificates to
++			use when verifying client certificates. If unset
++			clientca will be used.
++
++	   capath=	Directory containing additional CA certificates
++			to use when verifying client certificates
++
++	   sslflags=	Various flags modifying the use of SSL:
++			    DELAYED_AUTH
++				Don't request client certificates
++				immediately, but wait until acl processing
++				requires a certificate
++			    NO_DEFAULT_CA	
++				Don't use the default CA list built in
++				to OpenSSL.
++
+ DOC_END
+ 
+ NAME: ssl_unclean_shutdown
+@@ -145,6 +165,85 @@ DOC_START
+ 	messages.
+ DOC_END
+ 
++NAME: ssl_engine
++IFDEF: USE_SSL
++TYPE: string
++LOC: Config.SSL.ssl_engine
++DEFAULT: none
++DOC_START
++	The openssl engine to use. You will need to set this if you
++	would like to use hardware SSL acceleration for example.
++DOC_END
++
++NAME: sslproxy_client_certificate
++IFDEF: USE_SSL
++DEFAULT: none
++LOC: Config.ssl_client.cert
++TYPE: string
++DOC_START
++	Client SSL Certificate to use when proxying https:// URLs
++DOC_END
++
++NAME: sslproxy_client_key
++IFDEF: USE_SSL
++DEFAULT: none
++LOC: Config.ssl_client.key
++TYPE: string
++DOC_START
++	Client SSL Key to use when proxying https:// URLs
++DOC_END
++
++NAME: sslproxy_version
++IFDEF: USE_SSL
++DEFAULT: 1
++LOC: Config.ssl_client.version
++TYPE: int
++DOC_START
++	SSL version level to use when proxying https:// URLs
++DOC_END
++
++NAME: sslproxy_options
++IFDEF: USE_SSL
++DEFAULT: none
++LOC: Config.ssl_client.options
++TYPE: string
++DOC_START
++	SSL engine options to use when proxying https:// URLs
++DOC_END
++
++NAME: sslproxy_cipher
++IFDEF: USE_SSL
++DEFAULT: none
++LOC: Config.ssl_client.cipher
++TYPE: string
++DOC_START
++	SSL cipher list to use when proxying https:// URLs
++DOC_END
++
++NAME: sslproxy_cafile
++IFDEF: USE_SSL
++DEFAULT: none
++LOC: Config.ssl_client.cafile
++TYPE: string
++DOC_START
++DOC_END
++
++NAME: sslproxy_capath
++IFDEF: USE_SSL
++DEFAULT: none
++LOC: Config.ssl_client.capath
++TYPE: string
++DOC_START
++DOC_END
++
++NAME: sslproxy_flags
++IFDEF: USE_SSL
++DEFAULT: none
++LOC: Config.ssl_client.flags
++TYPE: string
++DOC_START
++DOC_END
++
+ NAME: icp_port udp_port
+ TYPE: ushort
+ DEFAULT: 3130
+@@ -238,7 +337,7 @@ LOC: Config.peers
+ DOC_START
+ 	To specify other caches in a hierarchy, use the format:
+ 
+-		cache_peer hostname type http_port icp_port
++		cache_peer hostname type http_port icp_port [options]
+ 
+ 	For example,
+ 
+@@ -279,6 +378,13 @@ DOC_START
+ 		     digest-url=url
+ 		     allow-miss
+ 		     max-conn
++		     ssl
++		     sslcert=/path/to/ssl/certificate
++		     sslkey=/path/to/ssl/key
++		     sslversion=1|2|3|4
++		     sslcipher=...
++		     ssloptions=...
++		     front-end-https[=on|auto]
+ 
+ 		     use 'proxy-only' to specify that objects fetched
+ 		     from this cache should not be saved locally.
+@@ -385,6 +491,64 @@ DOC_START
+ 		     use 'max-conn' to limit the amount of connections Squid
+ 		     may open to this peer.
+ 
++		     use 'ssl' to indicate that connections to this peer should
++		     bs SSL/TLS encrypted.
++
++		     use 'sslcert=/path/to/ssl/certificate' to specify a client
++		     SSL certificate to use when connecting to this peer.
++
++		     use 'sslkey=/path/to/ssl/key' to specify the private SSL
++		     key corresponding to sslcert above. If 'sslkey' is not
++		     specified then 'sslcert' is assumed to reference a
++		     combined file containing both the certificate and the key.
++
++		     use sslversion=1|2|3|4 to specify the SSL version to use
++		     when connecting to this peer
++			1 = automatic (default)
++			2 = SSL v2 only
++			3 = SSL v3 only
++			4 = TLS v1 only
++
++		     use sslcipher=... to specify the list of valid SSL chipers
++		     to use when connecting to this peer
++
++		     use ssloptions=... to specify various SSL engine options:
++			NO_SSLv2  Disallow the use of SSLv2
++			NO_SSLv3  Disallow the use of SSLv3
++			NO_TLSv1  Disallow the use of TLSv1
++		     See src/ssl_support.c or the OpenSSL documentation for
++		     a more complete list.
++
++		     use cafile=... to specify a file containing additional
++		     CA certificates to use when verifying the peer certificate
++
++		     use capath=... to specify a directory containing additional
++		     CA certificates to use when verifying the peer certificate
++
++		     use sslflags=... to specify various flags modifying the
++		     SSL implementation:
++			DONT_VERIFY_PEER
++				Accept certificates even if they fail to
++				verify.
++			NO_DEFAULT_CA	
++				Don't use the default CA list built in
++				to OpenSSL.
++			DONT_VERIFY_DOMAIN
++				Don't verify that the peer certificate
++				matches the server name
++
++		     use sslname= to specify the peer name as advertised
++		     in it's certificate. Used for verifying the correctness
++		     of the received peer certificate. If not specified the
++		     peer hostname will be used.
++
++		     use front-end-https to enable the "Front-End-Https: On"
++		     header needed when using Squid as a SSL frontend infront
++		     of Microsoft OWA. See MS KB document Q307347 for details
++		     on this header. If set to auto then the header will
++		     only be added if the request is forwarded as a https://
++		     URL.
++
+ 	NOTE: non-ICP neighbors must be specified as 'parent'.
+ DOC_END
+ 
+@@ -1529,6 +1693,8 @@ DOC_START
+ 	  %PORT		Requested port
+ 	  %PATH		Requested URL path
+ 	  %METHOD	Request method
++	  %USER_CERT_xx	SSL User certificate attribute xx
++	  %USER_CA_xx	SSL User certificate CA attribute xx
+ 	  %{Header}	HTTP request header
+ 	  %{Hdr:member}	HTTP request header list member
+ 	  %{Hdr:;member}
+@@ -2062,6 +2228,14 @@ DOC_START
+ 	  # external ACL lookup via a helper class defined by the
+ 	  # external_acl_type directive.
+ 
++	acl aclname user_cert attribute values...
++	  # match against attributes in a user SSL certificate
++	  # attribute is one of DN/C/O/CN/L/ST
++
++	acl aclname ca_cert attribute values...
++	  # match against attributes a users issuing CA SSL certificate
++	  # attribute is one of DN/C/O/CN/L/ST
++
+ Examples:
+ acl myexample dst_as 1241
+ acl password proxy_auth REQUIRED
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: client_side.cc,v 1.608 2002/11/15 13:12:36 hno Exp $
++ * $Id: client_side.cc,v 1.609 2002/12/06 23:19:14 hno Exp $
+  *
+  * DEBUG: section 33    Client-side Routines
+  * AUTHOR: Duane Wessels
+@@ -409,6 +409,9 @@ clientLogRequest(clientHttpRequest * http)
+ 	    clientPrepareLogWithRequestDetails(http->request, &http->al);
+ 	if (http->conn && http->conn->rfc931[0])
+ 	    http->al.cache.rfc931 = http->conn->rfc931;
++#if USE_SSL
++	http->al.cache.ssluser = sslGetUserEmail(fd_table[http->conn->fd].ssl);
++#endif
+ 	accessLogLog(&http->al);
+ 	accessLogFreeMemory(&http->al);
+ 	clientUpdateCounters(http);
+@@ -1838,21 +1841,25 @@ clientNegotiateSSL(int fd, void *data)
+ {
+     ConnStateData *conn = (ConnStateData *)data;
+     X509 *client_cert;
++    SSL *ssl = fd_table[fd].ssl;
+     int ret;
+ 
+-    if ((ret = SSL_accept(fd_table[fd].ssl)) <= 0) {
+-	if (BIO_sock_should_retry(ret)) {
++    if ((ret = SSL_accept(ssl)) <= 0) {
++	int ssl_error = SSL_get_error(ssl, ret);
++	switch (ssl_error) {
++	case SSL_ERROR_WANT_READ:
+ 	    commSetSelect(fd, COMM_SELECT_READ, clientNegotiateSSL, conn, 0);
+ 	    return;
++	case SSL_ERROR_WANT_WRITE:
++	    commSetSelect(fd, COMM_SELECT_WRITE, clientNegotiateSSL, conn, 0);
++	    return;
++	default:
++	    debug(81, 1) ("clientNegotiateSSL: Error negotiating SSL connection on FD %d: %s (%d/%d)\n",
++		    fd, ERR_error_string(ERR_get_error(), NULL), ssl_error, ret);
++	    comm_close(fd);
++	    return;
+ 	}
+-	ret = ERR_get_error();
+-	if (ret) {
+-	    debug(83, 1)
+-		("clientNegotiateSSL: Error negotiating SSL connection on FD %d: %s\n",
+-		fd, ERR_error_string(ret, NULL));
+-	}
+-	comm_close(fd);
+-	return;
++	/* NOTREACHED */
+     }
+     debug(83, 5) ("clientNegotiateSSL: FD %d negotiated cipher %s\n", fd,
+ 	SSL_get_cipher(fd_table[fd].ssl));
+@@ -2038,11 +2045,9 @@ clientHttpsConnectionsOpen(void)
+ 	    continue;
+ 	CBDATA_INIT_TYPE(https_port_data);
+ 	https_port = cbdataAlloc(https_port_data);
+-	https_port->sslContext =
+-	    sslCreateContext(s->cert, s->key, s->version, s->cipher,
+-	    s->options);
++	https_port->sslContext = s->sslContext;
+ 	comm_listen(fd);
+-	comm_accept(fd, httpsAccept, NULL);
++	comm_accept(fd, httpsAccept, https_port);
+ 	commSetDefer(fd, httpAcceptDefer, NULL);
+ 	debug(1, 1) ("Accepting HTTPS connections at %s, port %d, FD %d.\n",
+ 	    inet_ntoa(s->s.sin_addr), (int) ntohs(s->s.sin_port), fd);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: comm.cc,v 1.359 2002/10/28 11:27:47 robertc Exp $
++ * $Id: comm.cc,v 1.360 2002/12/06 23:19:15 hno Exp $
+  *
+  * DEBUG: section 5     Socket Functions
+  * AUTHOR: Harvest Derived
+@@ -1387,13 +1387,13 @@ _comm_close(int fd, char *file, int line)
+     commCallCloseHandlers(fd);
+     if (F->uses)		/* assume persistent connect count */
+ 	pconnHistCount(1, F->uses);
++    comm_empty_os_read_buffers(fd);
+ #if USE_SSL
+     if (F->ssl) {
+ 	SSL_free(F->ssl);
+ 	F->ssl = NULL;
+     }
+ #endif
+-    comm_empty_os_read_buffers(fd);
+     fd_close(fd);		/* update fdstat */
+     close(fd);
+     fdc_table[fd].active = 0;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: enums.h,v 1.217 2002/10/13 20:35:00 robertc Exp $
++ * $Id: enums.h,v 1.218 2002/12/06 23:19:15 hno Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -136,6 +136,10 @@ typedef enum {
+     ACL_REP_MIME_TYPE,
+     ACL_MAX_USER_IP,
+     ACL_EXTERNAL,
++#if USE_SSL
++    ACL_USER_CERT,
++    ACL_CA_CERT,
++#endif
+     ACL_ENUM_MAX
+ } squid_acl;
+ 
+@@ -247,6 +251,7 @@ typedef enum {
+ #if X_ACCELERATOR_VARY
+     HDR_X_ACCELERATOR_VARY,
+ #endif
++    HDR_FRONT_END_HTTPS,
+     HDR_OTHER,
+     HDR_ENUM_END
+ } http_hdr_type;
+@@ -629,6 +634,9 @@ typedef enum {
+     MEM_EVENT,
+     MEM_TLV,
+     MEM_SWAP_LOG_DATA,
++#if USE_SSL
++    MEM_ACL_CERT_DATA,
++#endif
+     MEM_MAX
+ } mem_type;
+ 
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: external_acl.cc,v 1.19 2002/11/15 14:54:50 hno Exp $
++ * $Id: external_acl.cc,v 1.20 2002/12/06 23:19:15 hno Exp $
+  *
+  * DEBUG: section 82    External ACL
+  * AUTHOR: Henrik Nordstrom, MARA Systems AB
+@@ -95,7 +95,8 @@ struct _external_acl {
+ 
+ struct _external_acl_format {
+     enum {
+-	EXT_ACL_LOGIN = 1,
++	EXT_ACL_UNKNOWN,
++	EXT_ACL_LOGIN,
+ #if USE_IDENT
+ 	EXT_ACL_IDENT,
+ #endif
+@@ -108,7 +109,12 @@ struct _external_acl_format {
+ 	EXT_ACL_HEADER,
+ 	EXT_ACL_HEADER_MEMBER,
+ 	EXT_ACL_HEADER_ID,
+-	EXT_ACL_HEADER_ID_MEMBER
++	EXT_ACL_HEADER_ID_MEMBER,
++#if USE_SSL
++	EXT_ACL_USER_CERT,
++	EXT_ACL_CA_CERT,
++#endif
++	EXT_ACL_END
+     } type;
+     external_acl_format *next;
+     char *header;
+@@ -256,6 +262,15 @@ parse_externalAclHelper(external_acl ** list)
+ 	    format->type = _external_acl_format::EXT_ACL_PATH;
+ 	else if (strcmp(token, "%METHOD") == 0)
+ 	    format->type = _external_acl_format::EXT_ACL_METHOD;
++#if USE_SSL
++	else if (strncmp(token, "%USER_CERT_", 11)) {
++	    format->type = _external_acl_format::EXT_ACL_USER_CERT;
++	    format->header = xstrdup(token + 11);
++	} else if (strncmp(token, "%CA_CERT_", 11)) {
++	    format->type = _external_acl_format::EXT_ACL_USER_CERT;
++	    format->header = xstrdup(token + 11);
++	}
++#endif
+ 	else {
+ 	    self_destruct();
+ 	}
+@@ -319,6 +334,16 @@ dump_externalAclHelper(StoreEntry * sentry, const char *name, const external_acl
+ 		DUMP_EXT_ACL_TYPE(PORT);
+ 		DUMP_EXT_ACL_TYPE(PATH);
+ 		DUMP_EXT_ACL_TYPE(METHOD);
++	    case _external_acl_format::EXT_ACL_USER_CERT:
++		storeAppendPrintf(sentry, " %%USER_CERT_%s", format->header);
++		break;
++	    case _external_acl_format::EXT_ACL_CA_CERT:
++		storeAppendPrintf(sentry, " %%USER_CERT_%s", format->header);
++		break;
++	    case _external_acl_format::EXT_ACL_UNKNOWN:
++	    case _external_acl_format::EXT_ACL_END:
++		fatal("unknown external_acl format error");
++		break;
+ 	    }
+ 	}
+ 	for (word = node->cmdline; word; word = word->next)
+@@ -542,6 +567,26 @@ makeExternalAclKey(aclCheck_t * ch, external_acl_data * acl_data)
+ 	    sb = httpHeaderGetListMember(&request->header, format->header_id, format->member, format->separator);
+ 	    str = strBuf(sb);
+ 	    break;
++#if USE_SSL
++	case _external_acl_format::EXT_ACL_USER_CERT:
++	    if (cbdataReferenceValid(ch->conn)) {
++		SSL *ssl = fd_table[ch->conn->fd].ssl;
++		if (ssl)
++		    str = sslGetUserAttribute(ssl, format->header);
++	    }
++	    break;
++	case _external_acl_format::EXT_ACL_CA_CERT:
++	    if (cbdataReferenceValid(ch->conn)) {
++		SSL *ssl = fd_table[ch->conn->fd].ssl;
++		if (ssl)
++		    str = sslGetCAAttribute(ssl, format->header);
++	    }
++	    break;
++#endif
++	case _external_acl_format::EXT_ACL_UNKNOWN:
++	case _external_acl_format::EXT_ACL_END:
++	    fatal("unknown external_acl format error");
++	    break;
+ 	}
+ 	if (str)
+ 	    if (!*str)
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: forward.cc,v 1.89 2002/11/29 22:02:32 hno Exp $
++ * $Id: forward.cc,v 1.90 2002/12/06 23:19:15 hno Exp $
+  *
+  * DEBUG: section 17    Request Forwarding
+  * AUTHOR: Duane Wessels
+@@ -178,6 +178,99 @@ fwdServerClosed(int fd, void *data)
+     }
+ }
+ 
++#if USE_SSL
++static void
++fwdNegotiateSSL(int fd, void *data)
++{
++    FwdState *fwdState = (FwdState *)data;
++    FwdServer *fs = fwdState->servers;
++    SSL *ssl = fd_table[fd].ssl;
++    int ret;
++    ErrorState *err;
++    request_t *request = fwdState->request;
++    if ((ret = SSL_connect(ssl)) <= 0) {
++	int ssl_error = SSL_get_error(ssl, ret);
++	switch (ssl_error) {
++	case SSL_ERROR_WANT_READ:
++	    commSetSelect(fd, COMM_SELECT_READ, fwdNegotiateSSL, fwdState, 0);
++	    return;
++	case SSL_ERROR_WANT_WRITE:
++	    commSetSelect(fd, COMM_SELECT_WRITE, fwdNegotiateSSL, fwdState, 0);
++	    return;
++	default:
++	    debug(81, 1) ("fwdNegotiateSSL: Error negotiating SSL connection on FD %d: %s (%d/%d)\n", fd, ERR_error_string(ERR_get_error(), NULL), ssl_error, ret);
++	    err = errorCon(ERR_CONNECT_FAIL, HTTP_SERVICE_UNAVAILABLE);
++#ifdef EPROTO
++	    err->xerrno = EPROTO;
++#else
++	    err->xerrno = EACCES;
++#endif
++	    if (fs->_peer) {
++		err->host = xstrdup(fs->_peer->host);
++		err->port = fs->_peer->http_port;
++	    } else {
++		err->host = xstrdup(request->host);
++		err->port = request->port;
++	    }
++	    err->request = requestLink(request);
++	    fwdFail(fwdState, err);
++	    if (fs->_peer) {
++		peerConnectFailed(fs->_peer);
++		fs->_peer->stats.conn_open--;
++	    }
++	    comm_close(fd);
++	    return;
++	}
++    }
++    fwdDispatch(fwdState);
++}
++
++static void
++fwdInitiateSSL(FwdState * fwdState)
++{
++    FwdServer *fs = fwdState->servers;
++    int fd = fwdState->server_fd;
++    SSL *ssl;
++    SSL_CTX *sslContext = NULL;
++    peer *peer = fs->_peer;
++    if (peer) {
++	assert(peer->use_ssl);
++	sslContext = peer->sslContext;
++    } else {
++	sslContext = Config.ssl_client.sslContext;
++    }
++    assert(sslContext);
++    if ((ssl = SSL_new(sslContext)) == NULL) {
++	ErrorState *err;
++	debug(83, 1) ("fwdInitiateSSL: Error allocating handle: %s\n",
++	    ERR_error_string(ERR_get_error(), NULL));
++	err = errorCon(ERR_SOCKET_FAILURE, HTTP_INTERNAL_SERVER_ERROR);
++	err->xerrno = errno;
++	err->request = requestLink(fwdState->request);
++	fwdFail(fwdState, err);
++	fwdStateFree(fwdState);
++	return;
++    }
++    SSL_set_fd(ssl, fd);
++    if (peer) {
++	if (peer->ssldomain)
++	    SSL_set_ex_data(ssl, ssl_ex_index_server, peer->ssldomain);
++#if NOT_YET
++	else if (peer->name)
++	    SSL_set_ex_data(ssl, ssl_ex_index_server, peer->name);
++#endif
++	else
++	    SSL_set_ex_data(ssl, ssl_ex_index_server, peer->host);
++    } else {
++	SSL_set_ex_data(ssl, ssl_ex_index_server, fwdState->request->host);
++    }
++    fd_table[fd].ssl = ssl;
++    fd_table[fd].read_method = &ssl_read_method;
++    fd_table[fd].write_method = &ssl_write_method;
++    fwdNegotiateSSL(fd, fwdState);
++}
++#endif
++
+ static void
+ fwdConnectDone(int server_fd, comm_err_t status, void *data)
+ {
+@@ -223,16 +316,15 @@ fwdConnectDone(int server_fd, comm_err_t status, void *data)
+ 	comm_close(server_fd);
+     } else {
+ 	debug(17, 3) ("fwdConnectDone: FD %d: '%s'\n", server_fd, storeUrl(fwdState->entry));
+-	if (fs->_peer)
+-	    hierarchyNote(&fwdState->request->hier, fs->code, fs->_peer->host);
+-	else if (Config.onoff.log_ip_on_direct)
+-	    hierarchyNote(&fwdState->request->hier, fs->code, fd_table[server_fd].ipaddr);
+-	else
+-	    hierarchyNote(&fwdState->request->hier, fs->code, request->host);
+-	fd_note(server_fd, storeUrl(fwdState->entry));
+-	fd_table[server_fd].uses++;
+ 	if (fs->_peer)
+ 	    peerConnectSucceded(fs->_peer);
++#if USE_SSL
++	if ((fs->_peer && fs->_peer->use_ssl) ||
++		(!fs->_peer && request->protocol == PROTO_HTTPS)) {
++	    fwdInitiateSSL(fwdState);
++	    return;
++	}
++#endif
+ 	fwdDispatch(fwdState);
+     }
+ }
+@@ -351,7 +443,7 @@ fwdConnectStart(void *data)
+ 	fwdState->server_fd = fd;
+ 	fwdState->n_tries++;
+ 	comm_add_close_handler(fd, fwdServerClosed, fwdState);
+-	fwdConnectDone(fd, COMM_OK, fwdState);
++	fwdDispatch(fwdState);
+ 	return;
+     }
+ #if URL_CHECKSUM_DEBUG
+@@ -428,28 +520,43 @@ fwdDispatch(FwdState * fwdState)
+     request_t *request = fwdState->request;
+     StoreEntry *entry = fwdState->entry;
+     ErrorState *err;
++    FwdServer *fs = fwdState->servers;
++    int server_fd = fwdState->server_fd;
+     debug(17, 3) ("fwdDispatch: FD %d: Fetching '%s %s'\n",
+ 	fwdState->client_fd,
+ 	RequestMethodStr[request->method],
+ 	storeUrl(entry));
+-    /*assert(!EBIT_TEST(entry->flags, ENTRY_DISPATCHED)); */
+-    assert(entry->ping_status != PING_WAITING);
+-    assert(entry->lock_count);
+-    EBIT_SET(entry->flags, ENTRY_DISPATCHED);
+-    netdbPingSite(request->host);
+     /*
+      * Assert that server_fd is set.  This is to guarantee that fwdState
+      * is attached to something and will be deallocated when server_fd
+      * is closed.
+      */
+-    assert(fwdState->server_fd > -1);
++    assert(server_fd > -1);
++    if (fs->_peer)
++	hierarchyNote(&fwdState->request->hier, fs->code, fs->_peer->host);
++    else if (Config.onoff.log_ip_on_direct)
++	hierarchyNote(&fwdState->request->hier, fs->code, fd_table[server_fd].ipaddr);
++    else
++	hierarchyNote(&fwdState->request->hier, fs->code, request->host);
++    fd_note(server_fd, storeUrl(fwdState->entry));
++    fd_table[server_fd].uses++;
++    /*assert(!EBIT_TEST(entry->flags, ENTRY_DISPATCHED)); */
++    assert(entry->ping_status != PING_WAITING);
++    assert(entry->lock_count);
++    EBIT_SET(entry->flags, ENTRY_DISPATCHED);
++    netdbPingSite(request->host);
+     if (fwdState->servers && (p = fwdState->servers->_peer)) {
+ 	p->stats.fetches++;
+ 	fwdState->request->peer_login = p->login;
+ 	httpStart(fwdState);
+     } else {
+ 	fwdState->request->peer_login = NULL;
+ 	switch (request->protocol) {
++#if USE_SSL
++	case PROTO_HTTPS:
++	    httpStart(fwdState);
++	    break;
++#endif
+ 	case PROTO_HTTP:
+ 	    httpStart(fwdState);
+ 	    break;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: globals.h,v 1.114 2002/10/25 07:36:32 robertc Exp $
++ * $Id: globals.h,v 1.115 2002/12/06 23:19:15 hno Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -162,4 +162,7 @@ extern unsigned int WIN32_OS_version;	/* 0 */
+ extern char *WIN32_OS_string;	/* NULL */
+ #endif
+ 
++extern int ssl_ex_index_server;	/* -1 */
++extern int ssl_ctx_ex_index_dont_verify_domain; /* -1 */
++
+ #endif /* SQUID_GLOBALS_H */
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: http.cc,v 1.402 2002/10/21 14:00:02 adrian Exp $
++ * $Id: http.cc,v 1.403 2002/12/06 23:19:15 hno Exp $
+  *
+  * DEBUG: section 11    Hypertext Transfer Protocol (HTTP)
+  * AUTHOR: Harvest Derived
+@@ -866,6 +866,10 @@ httpBuildRequestHeader(request_t * request,
+ 	case HDR_CACHE_CONTROL:
+ 	    /* append these after the loop if needed */
+ 	    break;
++	case HDR_FRONT_END_HTTPS:
++	    if (!flags.front_end_https)
++		httpHeaderAddEntry(hdr_out, httpHeaderEntryClone(e));
++	    break;
+ 	default:
+ 	    /* pass on all other header fields */
+ 	    httpHeaderAddEntry(hdr_out, httpHeaderEntryClone(e));
+@@ -950,6 +954,12 @@ httpBuildRequestHeader(request_t * request,
+ 	    httpHeaderPutStr(hdr_out, HDR_CONNECTION, "keep-alive");
+ 	}
+     }
++    /* append Front-End-Https */
++    if (flags.front_end_https) {
++	if (flags.front_end_https == 1 || request->protocol == PROTO_HTTPS)
++	    httpHeaderPutStr(hdr_out, HDR_FRONT_END_HTTPS, "On");
++    }
++
+     /* Now mangle the headers. */
+     httpHdrMangleList(hdr_out, request);
+     stringClean(&strConnection);
+@@ -1014,10 +1024,12 @@ httpSendRequest(HttpStateData * httpState)
+ 	httpState->flags.keepalive = 1;
+     else if ((double) p->stats.n_keepalives_recv / (double) p->stats.n_keepalives_sent > 0.50)
+ 	httpState->flags.keepalive = 1;
+-    if (httpState->_peer)
++    if (httpState->_peer) {
+ 	if (neighborType(httpState->_peer, httpState->request) == PEER_SIBLING &&
+ 	    !httpState->_peer->options.allow_miss)
+ 	    httpState->flags.only_if_cached = 1;
++	httpState->flags.front_end_https = httpState->_peer->front_end_https;
++    }
+     memBufDefInit(&mb);
+     httpBuildRequestPrefix(req,
+ 	httpState->orig_request,
+@@ -1048,7 +1060,7 @@ httpStart(FwdState * fwd)
+ 	httpState->_peer = fwd->servers->_peer;		/* might be NULL */
+     if (httpState->_peer) {
+ 	proxy_req = requestCreate(orig_req->method,
+-	    PROTO_NONE, storeUrl(httpState->entry));
++	    orig_req->protocol, storeUrl(httpState->entry));
+ 	xstrncpy(proxy_req->host, httpState->_peer->host, SQUIDHOSTNAMELEN);
+ 	proxy_req->port = httpState->_peer->http_port;
+ 	proxy_req->flags = orig_req->flags;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: mem.cc,v 1.68 2002/10/13 20:35:02 robertc Exp $
++ * $Id: mem.cc,v 1.69 2002/12/06 23:19:16 hno Exp $
+  *
+  * DEBUG: section 13    High Level Memory Pool Management
+  * AUTHOR: Harvest Derived
+@@ -349,6 +349,9 @@ memInit(void)
+     memDataInit(MEM_ACL_IP_DATA, "acl_ip_data", sizeof(acl_ip_data), 0);
+     memDataInit(MEM_ACL_LIST, "acl_list", sizeof(acl_list), 0);
+     memDataInit(MEM_ACL_NAME_LIST, "acl_name_list", sizeof(acl_name_list), 0);
++#if USE_SSL
++    memDataInit(MEM_ACL_CERT_DATA, "acl_cert_data", sizeof(acl_cert_data), 0);
++#endif
+     memDataInit(MEM_ACL_TIME_DATA, "acl_time_data", sizeof(acl_time_data), 0);
+     memDataInit(MEM_ACL_PROXY_AUTH_MATCH, "acl_proxy_auth_match_cache",
+ 	sizeof(acl_proxy_auth_match_cache), 0);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: ssl_support.cc,v 1.7 2002/10/13 20:35:03 robertc Exp $
++ * $Id: ssl_support.cc,v 1.8 2002/12/06 23:19:16 hno Exp $
+  *
+  * AUTHOR: Benno Rice
+  * DEBUG: section 83    SSL accelerator support
+@@ -55,12 +55,43 @@ static int
+ ssl_verify_cb(int ok, X509_STORE_CTX * ctx)
+ {
+     char buffer[256];
++    SSL *ssl = (SSL *)X509_STORE_CTX_get_ex_data(ctx, SSL_get_ex_data_X509_STORE_CTX_idx());
++    SSL_CTX *sslctx = SSL_get_SSL_CTX(ssl);
++    const char *server = (const char *)SSL_get_ex_data(ssl, ssl_ex_index_server);
++    void *dont_verify_domain = SSL_CTX_get_ex_data(sslctx, ssl_ctx_ex_index_dont_verify_domain);
++    X509 *peer_cert = ctx->cert;
+ 
+-    X509_NAME_oneline(X509_get_issuer_name(ctx->current_cert), buffer,
++    X509_NAME_oneline(X509_get_subject_name(peer_cert), buffer,
+ 	sizeof(buffer));
+-    if (ok)
+-	debug(83, 5) ("SSL Certificate OK: %s\n", buffer);
+-    else {
++
++    if (ok) {
++	debug(83, 5) ("SSL Certificate signature OK: %s\n", buffer);
++	if (server) {
++	    int i;
++	    int found = 0;
++	    char cn[1024];
++	    X509_NAME *name = X509_get_subject_name(peer_cert);
++	    debug(83, 3) ("Verifying server domain %s to certificate dn %s\n",
++		server, buffer);
++	    for (i = X509_NAME_get_index_by_NID(name, NID_commonName, -1); i >= 0; i = X509_NAME_get_index_by_NID(name, NID_commonName, i)) {
++		ASN1_STRING *data = X509_NAME_ENTRY_get_data(X509_NAME_get_entry(name, i));
++		if (data->length > (int)sizeof(cn) - 1)
++		    continue;
++		memcpy(cn, data->data, data->length);
++		cn[data->length] = '\0';
++		debug(83, 4) ("Verifying server domain %s to certificate cn %s\n",
++		    server, cn);
++		if (matchDomainName(server, cn[0] == '*' ? cn + 1 : cn) == 0) {
++		    found = 1;
++		    break;
++		}
++	    }
++	    if (!found) {
++		debug(83, 2) ("ERROR: Certificate %s does not match domainname %s\n", buffer, server);
++		ok = 0;
++	    }
++	}
++    } else {
+ 	switch (ctx->error) {
+ 	case X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT:
+ 	    debug(83, 5) ("SSL Certficate error: CA not known: %s\n", buffer);
+@@ -78,11 +109,13 @@ ssl_verify_cb(int ok, X509_STORE_CTX * ctx)
+ 	    debug(83, 5) ("SSL Certificate has invalid \'not after\' field: %s\n", buffer);
+ 	    break;
+ 	default:
+-	    debug(83, 5) ("SSL unknown certificate error %d in %s\n",
++	    debug(83, 1) ("SSL unknown certificate error %d in %s\n",
+ 		ctx->error, buffer);
+ 	    break;
+ 	}
+     }
++    if (!dont_verify_domain && server) {
++    }
+     return ok;
+ }
+ 
+@@ -225,22 +258,88 @@ ssl_parse_options(const char *options)
+     return op;
+ }
+ 
+-SSL_CTX *
+-sslCreateContext(const char *certfile, const char *keyfile, int version, const char *cipher, const char *options)
++#define SSL_FLAG_NO_DEFAULT_CA		(1<<0)
++#define SSL_FLAG_DELAYED_AUTH		(1<<1)
++#define SSL_FLAG_DONT_VERIFY_PEER	(1<<2)
++#define SSL_FLAG_DONT_VERIFY_DOMAIN	(1<<3)
++
++static long
++ssl_parse_flags(const char *flags)
++{
++    long fl = 0;
++    char *tmp;
++    char *flag;
++
++    if (!flags)
++	return 0;
++
++    tmp = xstrdup(flags);
++    flag = strtok(tmp, ":,");
++    while (flag) {
++	if (strcmp(flag, "NO_DEFAULT_CA") == 0)
++	    fl |= SSL_FLAG_NO_DEFAULT_CA;
++	else if (strcmp(flag, "DELAYED_AUTH") == 0)
++	    fl |= SSL_FLAG_DELAYED_AUTH;
++	else if (strcmp(flag, "DONT_VERIFY_PEER") == 0)
++	    fl |= SSL_FLAG_DONT_VERIFY_PEER;
++	else if (strcmp(flag, "DONT_VERIFY_DOMAIN") == 0)
++	    fl |= SSL_FLAG_DONT_VERIFY_DOMAIN;
++	else
++	    fatalf("Unknown ssl flag '%s'", flag);
++	flag = strtok(NULL, ":,");
++    }
++    safe_free(tmp);
++    return fl;
++}
++
++
++static void
++ssl_initialize(void)
+ {
+-    int ssl_error;
+-    SSL_METHOD *method;
+-    SSL_CTX *sslContext;
+     static int ssl_initialized = 0;
+     if (!ssl_initialized) {
+ 	ssl_initialized = 1;
+ 	SSL_load_error_strings();
+ 	SSLeay_add_ssl_algorithms();
++#ifdef HAVE_OPENSSL_ENGINE_H
++	if (Config.SSL.ssl_engine) {
++	    ENGINE *e;
++	    if (!(e = ENGINE_by_id(Config.SSL.ssl_engine))) {
++		fatalf("Unable to find SSL engine '%s'\n", Config.SSL.ssl_engine);
++	    }
++	    if (!ENGINE_set_default(e, ENGINE_METHOD_ALL)) {
++		int ssl_error = ERR_get_error();
++		fatalf("Failed to initialise SSL engine: %s\n",
++		    ERR_error_string(ssl_error, NULL));
++	    }
++	}
++#else
++	if (Config.SSL.ssl_engine) {
++	    fatalf("Your OpenSSL has no SSL engine support\n");
++	}
++#endif
+     }
++    ssl_ex_index_server = SSL_get_ex_new_index(0, (void *) "server", NULL, NULL, NULL);
++    ssl_ctx_ex_index_dont_verify_domain = SSL_CTX_get_ex_new_index(0, (void *) "dont_verify_domain", NULL, NULL, NULL);
++
++}
++
++SSL_CTX *
++sslCreateServerContext(const char *certfile, const char *keyfile, int version, const char *cipher, const char *options, const char *flags, const char *clientCA, const char *CAfile, const char *CApath)
++{
++    int ssl_error;
++    SSL_METHOD *method;
++    SSL_CTX *sslContext;
++    long fl = ssl_parse_flags(flags);
++
++    ssl_initialize();
++
+     if (!keyfile)
+ 	keyfile = certfile;
+     if (!certfile)
+ 	certfile = keyfile;
++    if (!CAfile)
++	CAfile = clientCA;
+ 
+     debug(83, 1) ("Initialising SSL.\n");
+     switch (version) {
+@@ -275,41 +374,168 @@ sslCreateContext(const char *certfile, const char *keyfile, int version, const c
+ 	debug(83, 5) ("Using chiper suite %s.\n", cipher);
+ 	if (!SSL_CTX_set_cipher_list(sslContext, cipher)) {
+ 	    ssl_error = ERR_get_error();
+-	    fatalf("Failed to set SSL cipher suite: %s\n",
+-		ERR_error_string(ssl_error, NULL));
++	    fatalf("Failed to set SSL cipher suite '%s': %s\n",
++		cipher, ERR_error_string(ssl_error, NULL));
+ 	}
+     }
+     debug(83, 1) ("Using certificate in %s\n", certfile);
+-    if (!SSL_CTX_use_certificate_file(sslContext, certfile, SSL_FILETYPE_PEM)) {
++    if (!SSL_CTX_use_certificate_chain_file(sslContext, certfile)) {
+ 	ssl_error = ERR_get_error();
+-	fatalf("Failed to acquire SSL certificate: %s\n",
+-	    ERR_error_string(ssl_error, NULL));
++	debug(83, 1) ("Failed to acquire SSL certificate '%s': %s\n",
++	    certfile, ERR_error_string(ssl_error, NULL));
++	goto error;
+     }
+     debug(83, 1) ("Using private key in %s\n", keyfile);
+     if (!SSL_CTX_use_PrivateKey_file(sslContext, keyfile, SSL_FILETYPE_PEM)) {
+ 	ssl_error = ERR_get_error();
+-	fatalf("Failed to acquire SSL private key: %s\n",
+-	    ERR_error_string(ssl_error, NULL));
++	debug(83, 1) ("Failed to acquire SSL private key '%s': %s\n",
++	    keyfile, ERR_error_string(ssl_error, NULL));
++	goto error;
+     }
+     debug(83, 5) ("Comparing private and public SSL keys.\n");
+-    if (!SSL_CTX_check_private_key(sslContext))
+-	fatal("SSL private key does not match public key: %s\n");
++    if (!SSL_CTX_check_private_key(sslContext)) {
++	ssl_error = ERR_get_error();
++	debug(83, 0) ("SSL private key '%s' does not match public key '%s': %s\n",
++	    certfile, keyfile, ERR_error_string(ssl_error, NULL));
++	goto error;
++    }
++    debug(83, 9) ("Setting RSA key generation callback.\n");
++    SSL_CTX_set_tmp_rsa_callback(sslContext, ssl_temp_rsa_cb);
++
++    debug(83, 9) ("Setting CA certificate locations.\n");
++    if ((!SSL_CTX_load_verify_locations(sslContext, CAfile, CApath))) {
++	ssl_error = ERR_get_error();
++	debug(83, 1) ("Error error setting CA certificate locations: %s\n",
++	    ERR_error_string(ssl_error, NULL));
++	debug(83, 1) ("continuing anyway...\n");
++    }
++    if (!(fl & SSL_FLAG_NO_DEFAULT_CA) &&
++	!SSL_CTX_set_default_verify_paths(sslContext)) {
++	ssl_error = ERR_get_error();
++	debug(83, 1) ("Error error setting default CA certificate location: %s\n",
++	    ERR_error_string(ssl_error, NULL));
++	debug(83, 1) ("continuing anyway...\n");
++    }
++    if (clientCA) {
++	debug(83, 9) ("Set client certifying authority list.\n");
++	SSL_CTX_set_client_CA_list(sslContext, SSL_load_client_CA_file(clientCA));
++	if (fl & SSL_FLAG_DELAYED_AUTH) {
++	    debug(83, 9) ("Not requesting client certificates until acl processing requires one\n");
++	    SSL_CTX_set_verify(sslContext, SSL_VERIFY_NONE, NULL);
++	} else {
++	    debug(83, 9) ("Requiring client certificates.\n");
++	    SSL_CTX_set_verify(sslContext, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, ssl_verify_cb);
++	}
++    } else {
++	debug(83, 9) ("Not requiring any client certificates\n");
++	SSL_CTX_set_verify(sslContext, SSL_VERIFY_NONE, NULL);
++    }
+ 
++    if (fl & SSL_FLAG_DONT_VERIFY_DOMAIN)
++	SSL_CTX_set_ex_data(sslContext, ssl_ctx_ex_index_dont_verify_domain, (void *) -1);
++    return sslContext;
++  error:
++    SSL_CTX_free(sslContext);
++    return NULL;
++}
++
++SSL_CTX *
++sslCreateClientContext(const char *certfile, const char *keyfile, int version, const char *cipher, const char *options, const char *flags, const char *CAfile, const char *CApath)
++{
++    int ssl_error;
++    SSL_METHOD *method;
++    SSL_CTX *sslContext;
++    long fl = ssl_parse_flags(flags);
++
++    ssl_initialize();
++
++    if (!keyfile)
++	keyfile = certfile;
++    if (!certfile)
++	certfile = keyfile;
++
++    debug(83, 1) ("Initialising SSL.\n");
++    switch (version) {
++    case 2:
++	debug(83, 5) ("Using SSLv2.\n");
++	method = SSLv2_client_method();
++	break;
++    case 3:
++	debug(83, 5) ("Using SSLv3.\n");
++	method = SSLv3_client_method();
++	break;
++    case 4:
++	debug(83, 5) ("Using TLSv1.\n");
++	method = TLSv1_client_method();
++	break;
++    case 1:
++    default:
++	debug(83, 5) ("Using SSLv2/SSLv3.\n");
++	method = SSLv23_client_method();
++	break;
++    }
++
++    sslContext = SSL_CTX_new(method);
++    if (sslContext == NULL) {
++	ssl_error = ERR_get_error();
++	fatalf("Failed to allocate SSL context: %s\n",
++	    ERR_error_string(ssl_error, NULL));
++    }
++    SSL_CTX_set_options(sslContext, ssl_parse_options(options));
++
++    if (cipher) {
++	debug(83, 5) ("Using chiper suite %s.\n", cipher);
++	if (!SSL_CTX_set_cipher_list(sslContext, cipher)) {
++	    ssl_error = ERR_get_error();
++	    fatalf("Failed to set SSL cipher suite '%s': %s\n",
++		cipher, ERR_error_string(ssl_error, NULL));
++	}
++    }
++    if (certfile) {
++	debug(83, 1) ("Using certificate in %s\n", certfile);
++	if (!SSL_CTX_use_certificate_chain_file(sslContext, certfile)) {
++	    ssl_error = ERR_get_error();
++	    fatalf("Failed to acquire SSL certificate '%s': %s\n",
++		certfile, ERR_error_string(ssl_error, NULL));
++	}
++	debug(83, 1) ("Using private key in %s\n", keyfile);
++	if (!SSL_CTX_use_PrivateKey_file(sslContext, keyfile, SSL_FILETYPE_PEM)) {
++	    ssl_error = ERR_get_error();
++	    fatalf("Failed to acquire SSL private key '%s': %s\n",
++		keyfile, ERR_error_string(ssl_error, NULL));
++	}
++	debug(83, 5) ("Comparing private and public SSL keys.\n");
++	if (!SSL_CTX_check_private_key(sslContext)) {
++	    ssl_error = ERR_get_error();
++	    fatalf("SSL private key '%s' does not match public key '%s': %s\n",
++		certfile, keyfile, ERR_error_string(ssl_error, NULL));
++	}
++    }
+     debug(83, 9) ("Setting RSA key generation callback.\n");
+     SSL_CTX_set_tmp_rsa_callback(sslContext, ssl_temp_rsa_cb);
+ 
+-    debug(83, 9) ("Setting certificate verification callback.\n");
+-    SSL_CTX_set_verify(sslContext, SSL_VERIFY_NONE, ssl_verify_cb);
++    if (fl & SSL_FLAG_DONT_VERIFY_PEER) {
++	debug(83, 1) ("NOTICE: Peer certificates are not verified for validity!\n");
++	SSL_CTX_set_verify(sslContext, SSL_VERIFY_NONE, NULL);
++    } else {
++	debug(83, 9) ("Setting certificate verification callback.\n");
++	SSL_CTX_set_verify(sslContext, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, ssl_verify_cb);
++    }
+ 
+-    debug(83, 9) ("Setting default CA certificate location.\n");
+-    if (!SSL_CTX_set_default_verify_paths(sslContext)) {
++    debug(83, 9) ("Setting CA certificate locations.\n");
++    if ((!SSL_CTX_load_verify_locations(sslContext, CAfile, CApath))) {
++	ssl_error = ERR_get_error();
++	debug(83, 1) ("Error error setting CA certificate locations: %s\n",
++	    ERR_error_string(ssl_error, NULL));
++	debug(83, 1) ("continuing anyway...\n");
++    }
++    if (!(fl & SSL_FLAG_NO_DEFAULT_CA) &&
++	!SSL_CTX_set_default_verify_paths(sslContext)) {
+ 	ssl_error = ERR_get_error();
+ 	debug(83, 1) ("Error error setting default CA certificate location: %s\n",
+ 	    ERR_error_string(ssl_error, NULL));
+ 	debug(83, 1) ("continuing anyway...\n");
+     }
+-    debug(83, 9) ("Set client certifying authority list.\n");
+-    SSL_CTX_set_client_CA_list(sslContext, SSL_load_client_CA_file(certfile));
+     return sslContext;
+ }
+ 
+@@ -348,3 +574,91 @@ ssl_shutdown_method(int fd)
+     }
+     SSL_shutdown(ssl);
+ }
++
++static const char *
++ssl_get_attribute(X509_NAME * name, const char *attribute_name)
++{
++    static char buffer[1024];
++    int nid;
++
++    buffer[0] = '\0';
++
++    if (strcmp(attribute_name, "DN") == 0) {
++	X509_NAME_oneline(name, buffer, sizeof(buffer));
++	goto done;
++    }
++    nid = OBJ_txt2nid((char *) attribute_name);
++    if (nid == 0) {
++	debug(83, 1) ("WARNING: Unknown SSL attribute name '%s'\n", attribute_name);
++	return NULL;
++    }
++    X509_NAME_get_text_by_NID(name, nid, buffer, sizeof(buffer));
++  done:
++    return *buffer ? buffer : NULL;
++}
++
++const char *
++sslGetUserAttribute(SSL * ssl, const char *attribute_name)
++{
++    X509 *cert;
++    X509_NAME *name;
++
++    if (!ssl)
++	return NULL;
++
++    cert = SSL_get_peer_certificate(ssl);
++    if (!cert)
++	return NULL;
++
++    name = X509_get_issuer_name(cert);
++
++    return ssl_get_attribute(name, attribute_name);
++}
++
++const char *
++sslGetCAAttribute(SSL * ssl, const char *attribute_name)
++{
++    X509 *cert;
++    X509_NAME *name;
++
++    if (!ssl)
++	return NULL;
++
++    cert = SSL_get_peer_certificate(ssl);
++    if (!cert)
++	return NULL;
++
++    name = X509_get_subject_name(cert);
++
++    return ssl_get_attribute(name, attribute_name);
++}
++
++#if 0
++char *
++sslGetUserEmail(SSL * ssl)
++{
++    X509 *cert;
++    X509_NAME *name;
++
++    static char email[128];
++
++    if (!ssl)
++	return NULL;
++    cert = SSL_get_peer_certificate(ssl);
++    if (!cert)
++	return NULL;
++
++    name = X509_get_subject_name(cert);
++
++    if (X509_NAME_get_text_by_NID(name, NID_pkcs9_emailAddress, email, sizeof(email)) > 0)
++	return email;
++    else
++	return NULL;
++}
++#endif
++
++const char *
++sslGetUserEmail(SSL * ssl)
++{
++    return sslGetUserAttribute(ssl, "Email");
++}
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: ssl_support.h,v 1.4 2001/10/19 22:34:49 hno Exp $
++ * $Id: ssl_support.h,v 1.5 2002/12/06 23:19:16 hno Exp $
+  *
+  * AUTHOR: Benno Rice
+  *
+@@ -42,10 +42,18 @@
+ #if HAVE_OPENSSL_ERR_H
+ #include <openssl/err.h>
+ #endif
++#if HAVE_OPENSSL_ENGINE_H
++#include <openssl/engine.h>
++#endif
+ 
+-SSL_CTX *sslCreateContext(const char *certfile, const char *keyfile, int version, const char *cipher, const char *options);
++SSL_CTX *sslCreateServerContext(const char *certfile, const char *keyfile, int version, const char *cipher, const char *options, const char *flags, const char *clientCA, const char *CAfile, const char *CApath);
++SSL_CTX *sslCreateClientContext(const char *certfile, const char *keyfile, int version, const char *cipher, const char *options, const char *flags, const char *CAfile, const char *CApath);
+ int ssl_read_method(int, char *, int);
+ int ssl_write_method(int, const char *, int);
+ void ssl_shutdown_method(int);
+ 
++const char *sslGetUserEmail(SSL *ssl);
++const char *sslGetUserAttribute(SSL *ssl, const char *attribute);
++const char *sslGetCAAttribute(SSL *ssl, const char *attribute);
++
+ #endif /* SQUID_SSL_SUPPORT_H */
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: structs.h,v 1.438 2002/11/15 13:12:36 hno Exp $
++ * $Id: structs.h,v 1.439 2002/12/06 23:19:16 hno Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -48,6 +48,13 @@ struct _dlink_list {
+     dlink_node *tail;
+ };
+ 
++#if USE_SSL
++struct _acl_cert_data {
++    splayNode *values;
++    char *attribute;
++};
++#endif
++
+ struct _acl_user_data {
+     splayNode *names;
+     struct {
+@@ -238,8 +245,12 @@ struct _https_port_list {
+     int version;
+     char *cipher;
+     char *options;
++    char *clientca;
++    char *cafile;
++    char *capath;
++    char *sslflags;
++    SSL_CTX *sslContext;
+ };
+-
+ #endif
+ 
+ #if DELAY_POOLS
+@@ -587,6 +598,7 @@ struct _SquidConfig {
+ #if USE_SSL
+     struct {
+ 	int unclean_shutdown;
++	char *ssl_engine;
+     } SSL;
+ #endif
+     wordlist *ext_methods;
+@@ -598,6 +610,19 @@ struct _SquidConfig {
+     char *store_dir_select_algorithm;
+     int sleep_after_fork;	/* microseconds */
+     external_acl *externalAclHelperList;
++#if USE_SSL
++    struct {
++	char *cert;
++	char *key;
++	int version;
++	char *options;
++	char *cipher;
++	char *cafile;
++	char *capath;
++	char *flags;
++	SSL_CTX *sslContext;
++    } ssl_client;
++#endif
+ };
+ 
+ struct _SquidConfig2 {
+@@ -868,6 +893,7 @@ struct _http_state_flags {
+     unsigned int proxying:1;
+     unsigned int keepalive:1;
+     unsigned int only_if_cached:1;
++    unsigned int front_end_https:2;
+ };
+ 
+ struct _ping_data {
+@@ -913,6 +939,9 @@ struct _AccessLogEntry {
+ 	int msec;
+ 	const char *rfc931;
+ 	const char *authuser;
++#if USE_SSL
++	const char *ssluser;
++#endif
+     } cache;
+     struct {
+ 	char *request;
+@@ -1186,6 +1215,20 @@ struct _peer {
+     char *login;		/* Proxy authorization */
+     time_t connect_timeout;
+     int max_conn;
++#if USE_SSL
++    int use_ssl;
++    char *sslcert;
++    char *sslkey;
++    int sslversion;
++    char *ssloptions;
++    char *sslcipher;
++    char *sslcafile;
++    char *sslcapath;
++    char *sslflags;
++    char *ssldomain;
++    SSL_CTX *sslContext;
++#endif
++    int front_end_https;
+ };
+ 
+ struct _net_db_name {
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: typedefs.h,v 1.142 2002/10/25 07:36:32 robertc Exp $
++ * $Id: typedefs.h,v 1.143 2002/12/06 23:19:16 hno Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -61,6 +61,9 @@ typedef struct AuthUserIP auth_user_ip_t;
+ typedef struct _acl_proxy_auth_match_cache acl_proxy_auth_match_cache;
+ typedef struct _authscheme_entry authscheme_entry_t;
+ typedef struct _authScheme authScheme;
++#if USE_SSL
++typedef struct _acl_cert_data acl_cert_data;
++#endif
+ typedef struct _acl_user_data acl_user_data;
+ typedef struct _acl_user_ip_data acl_user_ip_data;
+ typedef struct _acl_arp_data acl_arp_data;

@@ -1,0 +1,446 @@
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: cache_cf.cc,v 1.226 1997/10/25 17:22:34 wessels Exp $
++ * $Id: cache_cf.cc,v 1.227 1997/10/26 06:26:23 wessels Exp $
+  *
+  * DEBUG: section 3     Configuration File Parsing
+  * AUTHOR: Harvest Derived
+@@ -244,6 +244,14 @@ configDoConfigure(void)
+ 	Config.appendDomainLen = 0;
+     safe_free(debug_options)
+ 	debug_options = xstrdup(Config.debugOptions);
++    if (Config.retry.timeout < 5)
++	fatal("minimum_retry_timeout must be at least 5 seconds");
++    if (Config.retry.maxtries > 10)
++	fatal("maximum_single_addr_tries cannot be larger than 10");
++    if (Config.retry.maxtries < 1) {
++	Config.retry.maxtries = 1;
++	debug(3, 0) ("WARNING: resetting 'maximum_single_addr_tries to 1\n");
++    }
+ }
+ 
+ /* Parse a time specification from the config file.  Store the
+@@ -1917,3 +1917,43 @@ DOC_START
+ DOC_END
+ 
+ EOF
++
++NAME: minimum_retry_timeout
++COMMENT: (seconds)
++TYPE: time_t
++LOC: Config.retry.timeout
++DEFAULT: 5 seconds
++DOC_START
++	This specifies the minimum connect timeout, for when the
++	connect timeout is reduced to compensate for the availability
++	of multiple IP addresses.
++
++	When a connection to a host is initiated, and that host
++	has several IP addresses, the default connection timeout
++	is reduced by dividing it by the number of addresses.  So,
++	a site with 15 addresses would then have a timeout of 8
++	seconds for each address attempted.  To avoid having the
++	timeout reduced to the point where even a working host
++	would not have a chance to respond, this setting is provided.
++	The default, and the minimum value, is five seconds, and
++	the maximum value is sixty seconds, or half of connect_timeout,
++	whichever is greater and less than connect_timeout.
++
++minimum_retry_timeout 5
++DOC_END
++
++NAME: maximum_single_addr_tries
++TYPE: int
++LOC: Config.retry.maxtries
++DEFAULT: 3
++DOC_START
++	This sets the maximum number of connection attempts for a
++	host that only has one address (for multiple-address hosts,
++	each address is tried once).
++
++	The default value is three tries, the (not recommended)
++	maximum is 255 tries.  A warning message will be generated
++	if it is set to a value greater than ten.
++
++maximum_single_addr_tries 3
++DOC_END
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: comm.cc,v 1.196 1997/10/26 02:33:17 wessels Exp $
++ * $Id: comm.cc,v 1.197 1997/10/26 06:26:25 wessels Exp $
+  *
+  * DEBUG: section 5     Socket Functions
+  * AUTHOR: Harvest Derived
+@@ -124,10 +124,12 @@ typedef struct {
+     struct sockaddr_in S;
+     CNCB *callback;
+     void *data;
+-    int tries;
+     struct in_addr in_addr;
+     int locks;
+     int fd;
++    int tries;
++    int addrcount;
++    int connstart;
+ } ConnectStateData;
+ 
+ /* STATIC */
+@@ -157,6 +159,10 @@ static IPH commConnectDnsHandle;
+ static void commConnectCallback(ConnectStateData * cs, int status);
+ static int commDeferRead(int fd);
+ static int ignoreErrno(int errno);
++static void commSetConnectTimeout(int fd, time_t timeout);
++static int commResetFD(ConnectStateData * cs);
++static int commRetryConnect(ConnectStateData * cs);
++static time_t commBackoffTimeout(unsigned char numaddrs);
+ 
+ static struct timeval zero_tv;
+ 
+@@ -335,6 +341,10 @@ commConnectDnsHandle(const ipcache_addrs * ia, void *data)
+     }
+     assert(ia->cur < ia->count);
+     cs->in_addr = ia->in_addrs[ia->cur];
++    ipcacheCycleAddr(cs->host);
++    cs->addrcount = ia->count;
++    cs->connstart = squid_curtime;
++    commSetConnectTimeout(cs->fd, commBackoffTimeout(ia->count));
+     commConnectHandle(cs->fd, cs);
+ }
+ 
+@@ -361,28 +371,59 @@ commConnectFree(int fdunused, void *data)
+     cbdataFree(cs);
+ }
+ 
++/* Reset FD so that we can connect() again */
+ static int
+-commRetryConnect(int fd, ConnectStateData * cs)
++commResetFD(ConnectStateData * cs)
+ {
+     int fd2;
+-    if (++cs->tries == 4)
+-	return 0;
+     if (!cbdataValid(cs->data))
+ 	return 0;
+     fd2 = socket(AF_INET, SOCK_STREAM, 0);
+     if (fd2 < 0) {
+-	debug(5, 0) ("commRetryConnect: socket: %s\n", xstrerror());
++	debug(5, 0) ("commResetFD: socket: %s\n", xstrerror());
+ 	return 0;
+     }
+-    if (dup2(fd2, fd) < 0) {
+-	debug(5, 0) ("commRetryConnect: dup2: %s\n", xstrerror());
++    if (dup2(fd2, cs->fd) < 0) {
++	debug(5, 0) ("commResetFD: dup2: %s\n", xstrerror());
+ 	return 0;
+     }
+-    commSetNonBlocking(fd);
+     close(fd2);
++    commSetConnectTimeout(cs->fd, commBackoffTimeout(cs->addrcount));
++    commSetNonBlocking(cs->fd);
+     return 1;
+ }
+ 
++static int
++commRetryConnect(ConnectStateData * cs)
++{
++    assert(cs->addrcount > 0);
++    if (cs->addrcount == 1) {
++	if (cs->tries >= Config.retry.maxtries)
++	    return 0;
++	if (squid_curtime - cs->connstart > Config.Timeout.connect)
++	    return 0;
++	commSetConnectTimeout(cs->fd, commBackoffTimeout((unsigned char) 100));
++    } else {
++	if (cs->tries > cs->addrcount)
++	    return 0;
++    }
++    return commResetFD(cs);
++}
++
++/* Back off the socket timeout if there are several addresses available */
++static time_t
++commBackoffTimeout(unsigned char numaddrs)
++{
++    time_t timeout;
++    timeout = (time_t) Config.Timeout.connect;
++    if (numaddrs > 2) {
++	timeout = (time_t) (Config.Timeout.connect / numaddrs);
++	if (timeout < Config.retry.timeout)
++	    timeout = (time_t) Config.retry.timeout;
++    }
++    return timeout;
++}
++
+ /* Connect SOCK to specified DEST_PORT at DEST_HOST. */
+ static void
+ commConnectHandle(int fd, void *data)
+@@ -401,24 +442,22 @@ commConnectHandle(int fd, void *data)
+ 	commSetSelect(fd, COMM_SELECT_WRITE, commConnectHandle, cs, 0);
+ 	break;
+     case COMM_OK:
+-	ipcacheCycleAddr(cs->host);
++	ipcacheMarkGoodAddr(cs->host, cs->S.sin_addr);
+ 	commConnectCallback(cs, COMM_OK);
+ 	break;
+     default:
+-	if (commRetryConnect(fd, cs)) {
+-	    debug(5, 2) ("Retrying connection to %s: %s\n",
+-		cs->host, xstrerror());
+-	    cs->S.sin_addr.s_addr = 0;
+-	    ipcacheCycleAddr(cs->host);
++	cs->tries++;
++	ipcacheMarkBadAddr(cs->host, cs->S.sin_addr);
++	if (commRetryConnect(cs)) {
+ 	    cs->locks++;
+ 	    ipcache_nbgethostbyname(cs->host, commConnectDnsHandle, cs);
+ 	} else {
+-	    ipcacheRemoveBadAddr(cs->host, cs->S.sin_addr);
+ 	    commConnectCallback(cs, COMM_ERR_CONNECT);
+ 	}
+ 	break;
+     }
+ }
++
+ int
+ commSetTimeout(int fd, int timeout, PF * handler, void *data)
+ {
+@@ -1391,3 +1430,10 @@ ignoreErrno(int errno)
+ 	return 1;
+     return 0;
+ }
++
++static void
++commSetConnectTimeout(int fd, time_t timeout)
++{
++    fde *F = &fd_table[fd];
++    F->connect_timeout = timeout;
++}
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: ipcache.cc,v 1.135 1997/10/25 17:22:48 wessels Exp $
++ * $Id: ipcache.cc,v 1.136 1997/10/26 06:26:26 wessels Exp $
+  *
+  * DEBUG: section 14    IP Cache
+  * AUTHOR: Harvest Derived
+@@ -256,6 +256,7 @@ ipcache_release(ipcache_entry * i)
+     }
+     if (i->status == IP_CACHED) {
+ 	safe_free(i->addrs.in_addrs);
++	safe_free(i->addrs.bad_mask);
+ 	debug(14, 5) ("ipcache_release: Released IP cached record for '%s'.\n",
+ 	    i->name);
+     }
+@@ -417,10 +418,13 @@ ipcacheAddHostent(ipcache_entry * i, const struct hostent *hp)
+     int addr_count = 0;
+     int k;
+     safe_free(i->addrs.in_addrs);
++    safe_free(i->addrs.bad_mask);
+     while ((addr_count < 255) && *(hp->h_addr_list + addr_count))
+ 	++addr_count;
+     i->addrs.count = (unsigned char) addr_count;
+     i->addrs.in_addrs = xcalloc(addr_count, sizeof(struct in_addr));
++    i->addrs.bad_mask = xcalloc(addr_count, sizeof(unsigned char));
++    i->addrs.badcount = 0;
+     for (k = 0; k < addr_count; k++)
+ 	xmemcpy(&i->addrs.in_addrs[k].s_addr,
+ 	    *(hp->h_addr_list + k),
+@@ -517,8 +521,10 @@ ipcache_parsebuffer(const char *inbuf, dnsserver_t * dnsData)
+ 	    i.addrs.count = (unsigned char) ipcount;
+ 	    if (ipcount == 0) {
+ 		i.addrs.in_addrs = NULL;
++		i.addrs.bad_mask = NULL;
+ 	    } else {
+ 		i.addrs.in_addrs = xcalloc(ipcount, sizeof(struct in_addr));
++		i.addrs.bad_mask = xcalloc(ipcount, sizeof(unsigned char));
+ 	    }
+ 	    for (k = 0; k < ipcount; k++) {
+ 		if ((token = strtok(NULL, w_space)) == NULL)
+@@ -778,6 +784,7 @@ ipcache_init(void)
+     ip_table = hash_create(urlcmp, 229, hash4);		/* small hash table */
+     memset(&static_addrs, '\0', sizeof(ipcache_addrs));
+     static_addrs.in_addrs = xcalloc(1, sizeof(struct in_addr));
++    static_addrs.bad_mask = xcalloc(1, sizeof(unsigned char));
+ 
+     ipcache_high = (long) (((float) Config.ipcache.size *
+ 	    (float) Config.ipcache.high) / (float) 100);
+@@ -856,6 +863,8 @@ ipcache_gethostbyname(const char *name, int flags)
+ 		/* only dnsHandleRead() can change from DISPATCHED to CACHED */
+ 		static_addrs.count = 1;
+ 		static_addrs.cur = 0;
++		static_addrs.badcount = 0;
++		static_addrs.bad_mask[0] = FALSE;
+ 		xmemcpy(&static_addrs.in_addrs[0].s_addr,
+ 		    *(hp->h_addr_list),
+ 		    hp->h_length);
+@@ -887,15 +896,17 @@ static void
+ ipcacheStatPrint(ipcache_entry * i, StoreEntry * sentry)
+ {
+     int k;
+-    storeAppendPrintf(sentry, " {%-32.32s  %c%c %6d %6d %d",
++    storeAppendPrintf(sentry, " {%-32.32s  %c%c %6d %6d %2d(%2d)",
+ 	i->name,
+ 	ipcache_status_char[i->status],
+ 	i->locks ? 'L' : ' ',
+ 	(int) (squid_curtime - i->lastref),
+ 	(int) (i->expires - squid_curtime),
+-	(int) i->addrs.count);
++	(int) i->addrs.count,
++	(int) i->addrs.badcount);
+     for (k = 0; k < (int) i->addrs.count; k++)
+-	storeAppendPrintf(sentry, " %15s", inet_ntoa(i->addrs.in_addrs[k]));
++	storeAppendPrintf(sentry, " %15s-%3s", inet_ntoa(i->addrs.in_addrs[k]),
++	    i->addrs.bad_mask[k] ? "BAD" : "OK ");
+     storeAppendPrintf(sentry, close_bracket);
+ }
+ 
+@@ -1004,6 +1015,8 @@ ipcacheCheckNumeric(const char *name)
+     static_addrs.count = 1;
+     static_addrs.cur = 0;
+     static_addrs.in_addrs[0].s_addr = ip.s_addr;
++    static_addrs.bad_mask[0] = FALSE;
++    static_addrs.badcount = 0;
+     return &static_addrs;
+ }
+ 
+@@ -1035,17 +1048,35 @@ void
+ ipcacheCycleAddr(const char *name)
+ {
+     ipcache_entry *i;
++    ipcache_addrs *ia;
++    unsigned char fullcircle;
+     if ((i = ipcache_get(name)) == NULL)
+ 	return;
+     if (i->status != IP_CACHED)
+ 	return;
+     i->addrs.cur++;
+-    if (i->addrs.cur == i->addrs.count)
+-	i->addrs.cur = 0;
++    ia = &i->addrs;
++    fullcircle = ia->cur;
++    while (ia->bad_mask[ia->cur]) {
++	if (++ia->cur == ia->count)
++	    ia->cur = 0;
++	if (ia->cur == fullcircle) {	/* All bad, just use next one */
++	    if (++ia->cur == ia->count)
++		ia->cur = 0;
++	    break;
++	}
++    }
+ }
+ 
++/* "MarkBad" function must leave the "cur" pointer at the next
++ * available good address, or the next bad address, in the list.
++ * This simulates the functionality of RemoveBadAddr() which it
++ * replaces.  Marking, instead of removing, allows bad addresses
++ * to be retried as a last resort before returning an error to
++ * the user.
++ */
+ void
+-ipcacheRemoveBadAddr(const char *name, struct in_addr addr)
++ipcacheMarkBadAddr(const char *name, struct in_addr addr)
+ {
+     ipcache_entry *i;
+     ipcache_addrs *ia;
+@@ -1059,13 +1090,49 @@ ipcacheRemoveBadAddr(const char *name, struct in_addr addr)
+     }
+     if (k == (int) ia->count)
+ 	return;
+-    ia->in_addrs[k] = ia->in_addrs[--ia->count];
+-    if (ia->count == 0)
+-	i->expires = squid_curtime;
+-    if (ia->cur >= ia->count)
++    if (!ia->bad_mask[k]) {
++	ia->bad_mask[k] = TRUE;
++	ia->badcount++;
++	debug(14, 1) ("ipcacheMarkBad: %s [%s]\n",
++	    name, inet_ntoa(ia->in_addrs[k]));
++	if (ia->badcount != ia->count) {
++	    /* at least one good address left */
++	    i->expires = squid_curtime + Config.positiveDnsTtl;
++	    while (ia->bad_mask[ia->cur])
++		if (++ia->cur == ia->count)
++		    ia->cur = 0;
++	    return;
++	}
++    }
++    if (++ia->cur == ia->count)
+ 	ia->cur = 0;
+ }
+ 
++void
++ipcacheMarkGoodAddr(const char *name, struct in_addr addr)
++{
++    ipcache_entry *i;
++    ipcache_addrs *ia;
++    int k;
++    if ((i = ipcache_get(name)) == NULL)
++	return;
++    ia = &i->addrs;
++    for (k = 0; k < (int) ia->count; k++) {
++	if (ia->in_addrs[k].s_addr == addr.s_addr)
++	    break;
++    }
++    if (k == (int) ia->count)
++	return;
++    i->expires = squid_curtime + Config.positiveDnsTtl;
++    if (ia->bad_mask[k]) {
++	ia->bad_mask[k] = FALSE;
++	ia->badcount--;
++	i->expires = squid_curtime + Config.positiveDnsTtl;
++	debug(14, 1) ("ipcacheMarkGoodAddr: %s [%s]\n",
++	    name, inet_ntoa(ia->in_addrs[k]));
++    }
++}
++
+ void
+ ipcacheFreeMemory(void)
+ {
+@@ -1083,6 +1150,7 @@ ipcacheFreeMemory(void)
+     for (j = 0; j < k; j++) {
+ 	i = *(list + j);
+ 	safe_free(i->addrs.in_addrs);
++	safe_free(i->addrs.bad_mask);
+ 	safe_free(i->name);
+ 	safe_free(i->error_message);
+ 	safe_free(i);
+@@ -285,7 +285,8 @@ extern void ipcache_init(void);
+ extern void stat_ipcache_get(StoreEntry *);
+ extern int ipcacheQueueDrain(void);
+ extern void ipcacheCycleAddr(const char *name);
+-extern void ipcacheRemoveBadAddr(const char *name, struct in_addr);
++extern void ipcacheMarkBadAddr(const char *name, struct in_addr);
++extern void ipcacheMarkGoodAddr(const char *name, struct in_addr);
+ extern void ipcacheFreeMemory(void);
+ extern ipcache_addrs *ipcacheCheckNumeric(const char *name);
+ extern void ipcache_restart(void);
+@@ -247,6 +247,10 @@ struct _SquidConfig {
+ 	char *content_type;
+     } icons;
+     char *errorDirectory;
++    struct {
++	time_t timeout;
++	int maxtries;
++    } retry;
+ };
+ 
+ struct _SquidConfig2 {
+@@ -329,6 +333,7 @@ struct _fde {
+     DEFER *defer_check;		/* check if we should defer read */
+     void *defer_data;
+     CommWriteStateData *rwstate;	/* State data for comm_write */
++    time_t connect_timeout;
+ };
+ 
+ struct _fileMap {
+@@ -505,7 +510,9 @@ struct _ConnStateData {
+ struct _ipcache_addrs {
+     unsigned char count;
+     unsigned char cur;
++    unsigned char badcount;
+     struct in_addr *in_addrs;
++    unsigned char *bad_mask;
+ };
+ 
+ struct _ipcache_entry {

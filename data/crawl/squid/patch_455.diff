@@ -1,370 +1,1049 @@
-@@ -340,19 +340,21 @@ ServerStateData::sendCommand()
+@@ -36,7 +36,8 @@
+ 
+ #include "acl/Checklist.h"
+ 
+-class external_acl;
++/** \todo CLEANUP: kill this typedef. */
++typedef struct _external_acl_data external_acl_data;
+ 
+ class ExternalACLLookup : public ACLChecklist::AsyncState
+ {
+@@ -45,14 +46,15 @@ class ExternalACLLookup : public ACLChecklist::AsyncState
+     static ExternalACLLookup *Instance();
+     virtual void checkForAsync(ACLChecklist *)const;
+ 
++    // If possible, starts an asynchronous lookup of an external ACL.
++    // Otherwise, asserts (or bails if background refresh is requested).
++    static void Start(ACLChecklist *checklist, external_acl_data *acl, bool bg);
++
+ private:
+     static ExternalACLLookup instance_;
+     static void LookupDone(void *data, void *result);
+ };
+ 
+-/** \todo CLEANUP: kill this typedef. */
+-typedef struct _external_acl_data external_acl_data;
+-
+ #include "acl/Acl.h"
+ 
+ class ACLExternal : public ACL
+@@ -61,7 +63,7 @@ class ACLExternal : public ACL
+ public:
+     MEMPROXY_CLASS(ACLExternal);
+ 
+-    static void ExternalAclLookup(ACLChecklist * ch, ACLExternal *, EAH * callback, void *callback_data);
++    static void ExternalAclLookup(ACLChecklist * ch, ACLExternal *);
+ 
+ 
+     ACLExternal(char const *);
+@@ -322,16 +322,22 @@ bool
+ ACLList::matches (ACLChecklist *checklist) const
+ {
+     assert (_acl);
++    // XXX: AclMatchedName does not contain a matched ACL name when the acl
++    // does not match (or contains stale name if no ACLs are checked). In 
++    // either case, we get misleading debugging and possibly incorrect error
++    // messages. Unfortunately, deny_info's "when none http_access
++    // lines match" exception essentially requires this mess.
++    // TODO: Rework by using an acl-free deny_info for the no-match cases?
+     AclMatchedName = _acl->name;
+     debugs(28, 3, "ACLList::matches: checking " << (op ? null_string : "!") << _acl->name);
+ 
+     if (_acl->checklistMatches(checklist) != op) {
+         debugs(28, 4, "ACLList::matches: result is false");
+-        return checklist->lastACLResult(false);
++        return false;
+     }
+ 
+     debugs(28, 4, "ACLList::matches: result is true");
+-    return checklist->lastACLResult(true);
++    return true;
+ }
+ 
+ 
+@@ -42,11 +42,8 @@ ACLChecklist::matchNonBlocking()
+     if (checking())
+         return;
+ 
+-    /** Deny if no rules present. */
+-    currentAnswer(ACCESS_DENIED);
+-
+     if (callerGone()) {
+-        checkCallback(currentAnswer());
++        checkCallback(ACCESS_DUNNO); // the answer does not really matter
          return;
      }
  
--    String cmd = fwd->request->header.findEntry(HDR_FTP_COMMAND)->value;
--    const String *const params = fwd->request->header.has(HDR_FTP_ARGUMENTS) ?
--        &fwd->request->header.findEntry(HDR_FTP_ARGUMENTS)->value : NULL;
--
--    if (params != NULL)
--        debugs(9, 5, HERE << "command: " << cmd << ", parameters: " << *params);
-+    HttpHeader &header = fwd->request->header;
-+    assert(header.has(HDR_FTP_COMMAND));
-+    const String &cmd = header.findEntry(HDR_FTP_COMMAND)->value;
-+    assert(header.has(HDR_FTP_ARGUMENTS));
-+    const String &params = header.findEntry(HDR_FTP_ARGUMENTS)->value;
-+
-+    if (params.size() > 0)
-+        debugs(9, 5, HERE << "command: " << cmd << ", parameters: " << params);
-     else
-         debugs(9, 5, HERE << "command: " << cmd << ", no parameters");
- 
-     static MemBuf mb;
-     mb.reset();
--    if (params != NULL)
--        mb.Printf("%s %s%s", cmd.termedBuf(), params->termedBuf(), Ftp::crlf);
-+    if (params.size() > 0)
-+        mb.Printf("%s %s%s", cmd.termedBuf(), params.termedBuf(), Ftp::crlf);
-     else
-         mb.Printf("%s%s", cmd.termedBuf(), Ftp::crlf);
- 
-@@ -105,6 +105,7 @@
- #include "fqdncache.h"
- #include "globals.h"
- #include "http.h"
-+#include "HttpHdrCc.h"
- #include "HttpHdrContRange.h"
- #include "HttpHeaderTools.h"
- #include "HttpReply.h"
-@@ -253,6 +254,7 @@ static IOACB FtpAcceptDataConnection;
- static void FtpCloseDataConnection(ConnStateData *conn);
- static void FtpWriteGreeting(ConnStateData *conn);
- static ClientSocketContext *FtpParseRequest(ConnStateData *connState, HttpRequestMethod *method_p, Http::ProtocolVersion *http_ver);
-+static bool FtpHandleUserRequest(ConnStateData *connState, const String &cmd, String &params);
- 
- static void FtpHandleReply(ClientSocketContext *context, HttpReply *reply, StoreIOBuffer data);
- typedef void FtpReplyHandler(ClientSocketContext *context, const HttpReply *reply, StoreIOBuffer data);
-@@ -270,14 +272,14 @@ static IOCB FtpWroteEarlyReply;
- static IOCB FtpWroteReply;
- static IOCB FtpWroteReplyData;
- 
--typedef bool FtpRequestHandler(ConnStateData *connState, String &cmd, String &params);
-+typedef bool FtpRequestHandler(ClientSocketContext *context, String &cmd, String &params);
- static FtpRequestHandler FtpHandleRequest;
--static FtpRequestHandler FtpHandleUserRequest;
- static FtpRequestHandler FtpHandlePasvRequest;
- static FtpRequestHandler FtpHandlePortRequest;
- static FtpRequestHandler FtpHandleDataRequest;
- 
--static bool FtpCheckDataConnection(ConnStateData *connState);
-+static bool FtpCheckDataConnection(ClientSocketContext *context);
-+static void FtpSetReply(ClientSocketContext *context, const int code, const char *msg);
- 
- clientStreamNode *
- ClientSocketContext::getTail() const
-@@ -2649,7 +2651,8 @@ clientProcessRequest(ConnStateData *conn, HttpParser *hp, ClientSocketContext *c
- 
-     /* We have an initial client stream in place should it be needed */
-     /* setup our private context */
--    context->registerWithConn();
-+    if (!conn->isFtp)
-+        context->registerWithConn();
- 
-     if (context->flags.parsed_ok == 0) {
-         clientStreamNode *node = context->getClientReplyContext();
-@@ -2679,6 +2682,7 @@ clientProcessRequest(ConnStateData *conn, HttpParser *hp, ClientSocketContext *c
-     if (conn->isFtp) {
-         assert(http->request);
-         request = http->request;
-+        notedUseOfBuffer = true;
-     } else
-     if ((request = HttpRequest::CreateFromUrlAndMethod(http->uri, method)) == NULL) {
-         clientStreamNode *node = context->getClientReplyContext();
-@@ -2862,9 +2866,11 @@ clientProcessRequest(ConnStateData *conn, HttpParser *hp, ClientSocketContext *c
-         request->body_pipe = conn->expectRequestBody(
-                                  chunked ? -1 : request->content_length);
- 
--        // consume header early so that body pipe gets just the body
--        connNoteUseOfBuffer(conn, http->req_sz);
--        notedUseOfBuffer = true;
-+        if (!notedUseOfBuffer) {
-+            // consume header early so that body pipe gets just the body
-+            connNoteUseOfBuffer(conn, http->req_sz);
-+            notedUseOfBuffer = true;
-+        }
- 
-         /* Is it too large? */
-         if (!chunked && // if chunked, we will check as we accumulate
-@@ -2915,6 +2921,31 @@ clientProcessRequest(ConnStateData *conn, HttpParser *hp, ClientSocketContext *c
+@@ -55,25 +52,25 @@ ACLChecklist::matchNonBlocking()
+      * We cannot select a sensible default for all callers here. */
+     if (accessList == NULL) {
+         debugs(28, DBG_CRITICAL, "SECURITY ERROR: ACL " << this << " checked with nothing to match against!!");
+-        currentAnswer(ACCESS_DENIED);
+-        checkCallback(currentAnswer());
++        checkCallback(ACCESS_DUNNO);
+         return;
      }
- }
  
-+void
-+ConnStateData::processFtpRequest(ClientSocketContext *const context)
-+{
-+    ClientHttpRequest *const http = context->http;
-+    assert(http != NULL);
-+    HttpRequest *const request = http->request;
-+    assert(request != NULL);
-+    HttpHeader &header = request->header;
-+    assert(header.has(HDR_FTP_COMMAND));
-+    String &cmd = header.findEntry(HDR_FTP_COMMAND)->value;
-+    assert(header.has(HDR_FTP_ARGUMENTS));
-+    String &params = header.findEntry(HDR_FTP_ARGUMENTS)->value;
++    allow_t lastSeenKeyword = ACCESS_DUNNO;
+     /* NOTE: This holds a cbdata reference to the current access_list
+      * entry, not the whole list.
+      */
+     while (accessList != NULL) {
+         /** \par
+          * If the _acl_access is no longer valid (i.e. its been
+-         * freed because of a reconfigure), then bail on this
+-         * access check.  For now, return ACCESS_DENIED.
++         * freed because of a reconfigure), then bail with ACCESS_DUNNO.
+          */
+ 
+         if (!cbdataReferenceValid(accessList)) {
+             cbdataReferenceDone(accessList);
+             debugs(28, 4, "ACLChecklist::check: " << this << " accessList is invalid");
+-            continue;
++            checkCallback(ACCESS_DUNNO);
++            return;
+         }
+ 
+         checking (true);
+@@ -95,6 +92,8 @@ ACLChecklist::matchNonBlocking()
+             return;
+         }
+ 
++        lastSeenKeyword = accessList->allow;
 +
-+    if (!FtpHandleRequest(context, cmd, params)) {
-+        assert(http->storeEntry() != NULL);
-+        clientSetKeepaliveFlag(http);
-+        context->pullData();
-+        return;
-+    }
-+
-+    assert(http->storeEntry() == NULL);
-+    clientProcessRequest(this, &parser_, context, request->method,
-+                         request->http_ver);
+         /*
+          * Reference the next access entry
+          */
+@@ -107,11 +106,14 @@ ACLChecklist::matchNonBlocking()
+         cbdataReferenceDone(A);
+     }
+ 
+-    /** If dropped off the end of the list return inversion of last line allow/deny action. */
+-    debugs(28, 3, HERE << this << " NO match found, returning " <<
+-           (currentAnswer() != ACCESS_DENIED ? ACCESS_DENIED : ACCESS_ALLOWED));
++    calcImplicitAnswer(lastSeenKeyword);
++    checkCallback(currentAnswer());
 +}
-+
- static void
- connStripBufferWhitespace (ConnStateData * conn)
- {
-@@ -2997,7 +3028,14 @@ ConnStateData::clientParseRequests()
-                                              CommTimeoutCbPtrFun(clientLifetimeTimeout, context->http));
-             commSetConnTimeout(clientConnection, Config.Timeout.lifetime, timeoutCall);
  
--            clientProcessRequest(this, &parser_, context, method, http_ver);
-+            if (!isFtp)
-+                clientProcessRequest(this, &parser_, context, method, http_ver);
-+            else {
-+                // Process FTP request asynchronously to make sure FTP
-+                // data connection accept callback is fired first.
-+                CallJobHere1(33, 4, CbcPointer<ConnStateData>(this),
-+                    ConnStateData, ConnStateData::processFtpRequest, context);
-+            }
- 
-             parsed_req = true; // XXX: do we really need to parse everything right NOW ?
- 
-@@ -4820,6 +4858,7 @@ FtpParseRequest(ConnStateData *connState, HttpRequestMethod *method_p, Http::Pro
-     const char *const eor =
-         static_cast<const char *>(memchr(connState->in.buf, '\n',
-             min(connState->in.notYetUsed, Config.maxRequestHeaderSize)));
-+    const size_t req_sz = eor + 1 - connState->in.buf;
- 
-     if (eor == NULL && connState->in.notYetUsed >= Config.maxRequestHeaderSize) {
-         connState->ftp.state = ConnStateData::FTP_ERROR;
-@@ -4832,12 +4871,13 @@ FtpParseRequest(ConnStateData *connState, HttpRequestMethod *method_p, Http::Pro
-         return NULL;
-     }
- 
-+    connNoteUseOfBuffer(connState, req_sz);
-+
-     // skip leading whitespaces
-     const char *boc = connState->in.buf;
-     while (boc < eor && isspace(*boc)) ++boc;
-     if (boc >= eor) {
-         debugs(33, 5, HERE << "Empty request, ignoring");
--        connNoteUseOfBuffer(connState, eor + 1 - connState->in.buf);
-         return NULL;
-     }
- 
-@@ -4859,44 +4899,49 @@ FtpParseRequest(ConnStateData *connState, HttpRequestMethod *method_p, Http::Pro
-            (bop == NULL ? "no " : "") << "parameters" <<
-            (bop != NULL ? ": " : "") << bop);
- 
--    String cmd = boc;
-+    const String cmd = boc;
-     String params = bop;
- 
--    // the first command must be USER
--    if (connState->ftp.uri.size() == 0 && cmd.caseCmp("USER") != 0) {
--        debugs(33, 5, HERE << "Unexpected FTP command: expected USER, got " <<
--               boc);
--        FtpWriteEarlyReply(connState, 530, "Must login first");
--        connNoteUseOfBuffer(connState, eor + 1 - connState->in.buf);
--        return NULL;
-+    if (connState->ftp.uri.size() == 0) {
-+        // the first command must be USER
-+        if (cmd.caseCmp("USER") != 0) {
-+            FtpWriteEarlyReply(connState, 530, "Must login first");
-+            return NULL;
-+        }
-+
-+        if (params.size() == 0) {
-+            FtpWriteEarlyReply(connState, 501, "Missing username");
-+            return NULL;
-+        }
-     }
- 
--    if (!FtpHandleRequest(connState, cmd, params)) {
--        connNoteUseOfBuffer(connState, eor + 1 - connState->in.buf);
-+    // We need to process USER request now because it sets request URI.
-+    if (cmd.caseCmp("USER") == 0 &&
-+        !FtpHandleUserRequest(connState, cmd, params))
-         return NULL;
--    }
- 
-+    assert(connState->ftp.uri.size() > 0);
-     char *uri = xstrdup(connState->ftp.uri.termedBuf());
-     HttpRequest *const request =
-         HttpRequest::CreateFromUrlAndMethod(uri, *method_p);
-     if (request == NULL) {
-         debugs(33, 5, HERE << "Invalid FTP URL: " << connState->ftp.uri);
-         FtpWriteEarlyReply(connState, 501, "Invalid host");
-         connState->ftp.uri.clean();
--        connNoteUseOfBuffer(connState, eor + 1 - connState->in.buf);
-         safe_free(uri);
-         return NULL;
-     }
- 
-+    request->http_ver = *http_ver;
-     request->header.putStr(HDR_FTP_COMMAND, cmd.termedBuf());
--    if (params.size() > 0)
--        request->header.putStr(HDR_FTP_ARGUMENTS, params.termedBuf());
-+    request->header.putStr(HDR_FTP_ARGUMENTS, params.termedBuf() != NULL ?
-+                           params.termedBuf() : "");
- 
-     ClientHttpRequest *const http = new ClientHttpRequest(connState);
-     http->request = request;
-     HTTPMSGLOCK(http->request);
--    http->req_sz = eor - connState->in.buf + 1;
--    http->uri = xstrdup(connState->ftp.uri.termedBuf());
-+    http->req_sz = req_sz;
-+    http->uri = uri;
- 
-     ClientSocketContext *const result =
-         ClientSocketContextNew(connState->clientConnection, http);
-@@ -4911,6 +4956,7 @@ FtpParseRequest(ConnStateData *connState, HttpRequestMethod *method_p, Http::Pro
-                      clientReplyStatus, newServer, clientSocketRecipient,
-                      clientSocketDetach, newClient, tempBuffer);
- 
-+    result->registerWithConn();
-     result->flags.parsed_ok = 1;
-     connState->flags.readMore = false;
-     return result;
-@@ -5185,14 +5231,13 @@ FtpWroteReply(const Comm::ConnectionPointer &conn, char *bufnotused, size_t size
+-    checkCallback(currentAnswer() != ACCESS_DENIED ? ACCESS_DENIED : ACCESS_ALLOWED);
++bool
++ACLChecklist::asyncNeeded() const
++{
++    return state_ != NullState::Instance();
  }
  
  bool
--FtpHandleRequest(ConnStateData *connState, String &cmd, String &params) {
-+FtpHandleRequest(ClientSocketContext *context, String &cmd, String &params) {
-     static std::pair<const char *, FtpRequestHandler *> handlers[] = {
-         std::make_pair("PASV", FtpHandlePasvRequest),
-         std::make_pair("PORT", FtpHandlePortRequest),
-         std::make_pair("RETR", FtpHandleDataRequest),
-         std::make_pair("LIST", FtpHandleDataRequest),
--        std::make_pair("NLST", FtpHandleDataRequest),
--        std::make_pair("USER", FtpHandleUserRequest)
-+        std::make_pair("NLST", FtpHandleDataRequest)
-     };
+@@ -136,28 +138,32 @@ ACLChecklist::finished() const
+ }
  
-     FtpRequestHandler *handler = NULL;
-@@ -5203,11 +5248,11 @@ FtpHandleRequest(ConnStateData *connState, String &cmd, String &params) {
+ void
+-ACLChecklist::markFinished()
++ACLChecklist::markFinished(const allow_t &finalAnswer, const char *reason)
+ {
+     assert (!finished() && !asyncInProgress());
+     finished_ = true;
+-    debugs(28, 3, "ACLChecklist::markFinished: " << this <<
+-           " checklist processing finished");
++    allow_ = finalAnswer;
++    debugs(28, 3, HERE << this << " answer " << allow_ << " for " << reason);
+ }
+ 
++/// Called first (and once) by all checks to initialize their state
+ void
+-ACLChecklist::preCheck()
++ACLChecklist::preCheck(const char *what)
+ {
+-    debugs(28, 3, "ACLChecklist::preCheck: " << this << " checking '" << accessList->cfgline << "'");
+-    /* what is our result on a match? */
+-    currentAnswer(accessList->allow);
++    debugs(28, 3, HERE << this << " checking " << what);
++    finished_ = false;
+ }
+ 
+ void
+ ACLChecklist::checkAccessList()
+ {
+-    preCheck();
++    debugs(28, 3, HERE << this << " checking '" << accessList->cfgline << "'");
+     /* does the current AND clause match */
+-    matchAclList(accessList->aclList, false);
++    if (matchAclList(accessList->aclList, false))
++        markFinished(accessList->allow, "first matching rule won");
++
++    // If we are not finished() here, the caller must distinguish between
++    // slow async calls and pure rule mismatches using asyncInProgress().
+ }
+ 
+ void
+@@ -184,62 +190,128 @@ ACLChecklist::checkCallback(allow_t answer)
+     delete this;
+ }
+ 
+-void
++/// An ACLChecklist::matchNodes() wrapper to simplify profiling.
++bool
+ ACLChecklist::matchAclList(const ACLList * head, bool const fast)
+ {
++    // TODO: remove by using object con/destruction-based PROF_* macros.
+     PROF_start(aclMatchAclList);
+-    const ACLList *node = head;
++    const bool result = matchNodes(head, fast);
++    PROF_stop(aclMatchAclList);
++    return result;
++}
+ 
+-    finished_ = false;
++/** Returns true if and only if there was a match. If false is returned:
++    finished() indicates an error or exception of some kind, while
++    !finished() means there was a mismatch or an allowed slow async call.
++    If async calls are allowed (i.e. 'fast' was false), then those last
++    two cases can be distinguished using asyncInProgress().
++*/
++bool
++ACLChecklist::matchNodes(const ACLList * head, bool const fast)
++{
++    assert(!finished());
+ 
+-    while (node) {
+-        bool nodeMatched = node->matches(this);
++    for (const ACLList *node = head; node; node = node->next) {
+ 
+-        if (fast)
+-            changeState(NullState::Instance());
++        const NodeMatchingResult resultBeforeAsync = matchNode(*node, fast);
+ 
+-        if (finished()) {
+-            PROF_stop(aclMatchAclList);
+-            return;
+-        }
++        if (resultBeforeAsync == nmrMatch)
++            continue;
++        
++        if (resultBeforeAsync == nmrMismatch || resultBeforeAsync == nmrFinished)
++            return false;
++
++        assert(resultBeforeAsync == nmrNeedsAsync);
++
++        // Ideally, this should be inside match() itself, but that requires
++        // prohibiting slow ACLs in options that do not support them.
++        // TODO: rename to maybeStartAsync()?
++        checkForAsync();
++
++        // Some match() code claims that an async lookup is needed, but then
++        // fails to start an async lookup when given a chance. We catch such
++        // cases here and call matchNode() again, hoping that some cached data
++        // prevents us from going async again.
++        // This is inefficient and ugly, but fixing all match() code, including
++        // the code it calls, such as ipcache_nbgethostbyname(), takes time.
++        if (!asyncInProgress()) { // failed to start an async operation
++            
++            if (finished()) {
++                debugs(28, 3, HERE << this << " finished after failing to go async: " << currentAnswer());
++                return false; // an exceptional case
++            }
+ 
+-        if (!nodeMatched || state_ != NullState::Instance()) {
++            const NodeMatchingResult resultAfterAsync = matchNode(*node, true);
++            // the second call disables slow checks so we cannot go async again
++            assert(resultAfterAsync != nmrNeedsAsync);
++            if (resultAfterAsync == nmrMatch)
++                continue;
+ 
+-            bool async = state_ != NullState::Instance();
++            assert(resultAfterAsync == nmrMismatch || resultAfterAsync == nmrFinished);
++            return false;
++        }
+ 
+-            checkForAsync();
++        assert(!finished()); // async operation is truly asynchronous
++        debugs(28, 3, HERE << this << " awaiting async operation");
++        return false;
++    }
+ 
+-            bool async_in_progress = asyncInProgress();
+-            debugs(28, 3, "aclmatchAclList: async=" << (async ? 1 : 0) <<
+-                   " nodeMatched=" << (nodeMatched ? 1 : 0) <<
+-                   " async_in_progress=" << (async_in_progress ? 1 : 0) <<
+-                   " lastACLResult() = " << (lastACLResult() ? 1 : 0) <<
+-                   " finished() = " << finished());
++    debugs(28, 3, HERE << this << " success: all ACLs matched");
++    return true;
++}
+ 
+-            if (finished()) {
+-                debugs(28, 3, "aclmatchAclList: " << this << " returning (AND list entry failed to match)");
+-                PROF_stop(aclMatchAclList);
+-                return;
+-            }
+ 
+-            if (async && nodeMatched && !asyncInProgress() && lastACLResult()) {
+-                // async acl, but using cached response, and it was a match
+-                node = node->next;
+-                continue;
+-            }
++/// Check whether a single ACL matches, returning NodeMatchingResult
++ACLChecklist::NodeMatchingResult
++ACLChecklist::matchNode(const ACLList &node, bool const fast)
++{
++    const bool nodeMatched = node.matches(this);
++    const bool needsAsync = asyncNeeded();
++    const bool matchFinished = finished();
++
++    debugs(28, 3, HERE << this <<
++           " matched=" << nodeMatched <<
++           " async=" << needsAsync <<
++           " finished=" << matchFinished);
++
++    /* There are eight possible outcomes of the matches() call based on
++       (matched, async, finished) permutations. We support these four:
++       matched,!async,!finished: a match (must check next rule node)
++       !matched,!async,!finished: a mismatch (whole rule fails to match)
++       !matched,!async,finished: error or special condition (propagate)
++       !matched,async,!finished: ACL needs to make an async call (pause)
++     */
+ 
+-            debugs(28, 3, "aclmatchAclList: " << this << " returning (AND list entry awaiting an async lookup)");
+-            PROF_stop(aclMatchAclList);
+-            return;
+-        }
++    if (nodeMatched) {
++        // matches() should return false in all special cases
++        assert(!needsAsync && !matchFinished);
++        return nmrMatch;
++    }
++
++    if (matchFinished) {
++        // we cannot be done and need an async call at the same time
++        assert(!needsAsync);
++        debugs(28, 3, HERE << this << " exception: " << currentAnswer());
++        return nmrFinished;
++     }
+ 
+-        node = node->next;
++    if (!needsAsync) {
++        debugs(28, 3, HERE << this << " simple mismatch");
++        return nmrMismatch;
+     }
+ 
+-    debugs(28, 3, "aclmatchAclList: " << this << " returning true (AND list satisfied)");
++    /* we need an async call */
+ 
+-    markFinished();
+-    PROF_stop(aclMatchAclList);
++    if (fast) {
++        changeState(NullState::Instance()); // disable async checks
++        markFinished(ACCESS_DUNNO, "async required but prohibited");
++        debugs(28, 3, HERE << this << " DUNNO because cannot async");
++        return nmrFinished;
++    }
++
++    debugs(28, 3, HERE << this << " going async");
++    return nmrNeedsAsync;
+ }
+ 
+ ACLChecklist::ACLChecklist() :
+@@ -249,8 +321,7 @@ ACLChecklist::ACLChecklist() :
+         async_(false),
+         finished_(false),
+         allow_(ACCESS_DENIED),
+-        state_(NullState::Instance()),
+-        lastACLResult_(false)
++        state_(NullState::Instance())
+ {
+ }
+ 
+@@ -308,6 +379,7 @@ ACLChecklist::asyncState() const
+ void
+ ACLChecklist::nonBlockingCheck(ACLCB * callback_, void *callback_data_)
+ {
++    preCheck("nonBlocking");
+     callback = callback_;
+     callback_data = cbdataReference(callback_data_);
+     matchNonBlocking();
+@@ -317,11 +389,15 @@ allow_t const &
+ ACLChecklist::fastCheck(const ACLList * list)
+ {
+     PROF_start(aclCheckFast);
+-    currentAnswer(ACCESS_DUNNO);
+-    matchAclList(list, true);
+-    // assume ALLOWED on matches due to not having an acl_access object
+-    if (finished())
+-        currentAnswer(ACCESS_ALLOWED);
++
++    preCheck("fast single-rule");
++
++    // assume DENY/ALLOW on mis/matches due to not having acl_access object
++    if (matchAclList(list, true))
++        markFinished(ACCESS_ALLOWED, "all ACLs matched");
++    else
++    if (!finished())
++        markFinished(ACCESS_DENIED, "ACL mismatched");
+     PROF_stop(aclCheckFast);
+     return currentAnswer();
+ }
+@@ -333,33 +409,55 @@ allow_t const &
+ ACLChecklist::fastCheck()
+ {
+     PROF_start(aclCheckFast);
+-    currentAnswer(ACCESS_DUNNO);
+ 
++    preCheck("fast multi-rule");
++
++    allow_t lastSeenKeyword = ACCESS_DUNNO;
+     debugs(28, 5, "aclCheckFast: list: " << accessList);
+     const acl_access *acl = cbdataReference(accessList);
+     while (acl != NULL && cbdataReferenceValid(acl)) {
+-        matchAclList(acl->aclList, true);
++        // on a match, finish
++        if (matchAclList(acl->aclList, true))
++            markFinished(acl->allow, "first matching rule won");
++
++        // if finished (on a match or in exceptional cases), stop
+         if (finished()) {
+-            currentAnswer(acl->allow);
+-            PROF_stop(aclCheckFast);
+             cbdataReferenceDone(acl);
++            PROF_stop(aclCheckFast);
+             return currentAnswer();
+         }
+ 
+-        /*
+-         * Reference the next access entry
+-         */
++        // on a mismatch, try the next access rule
++        lastSeenKeyword = acl->allow;
+         const acl_access *A = acl;
+         acl = cbdataReference(acl->next);
+         cbdataReferenceDone(A);
+     }
+ 
+-    debugs(28, 5, "aclCheckFast: no matches, returning: " << currentAnswer());
++    // There were no rules to match or no rules matched
++    calcImplicitAnswer(lastSeenKeyword);
+     PROF_stop(aclCheckFast);
+ 
+     return currentAnswer();
+ }
+ 
++/// When no rules matched, the answer is the inversion of the last seen rule
++/// action (or ACCESS_DUNNO if the reversal is not possible). The caller 
++/// should set lastSeenAction to ACCESS_DUNNO if there were no rules to see.
++void
++ACLChecklist::calcImplicitAnswer(const allow_t &lastSeenAction)
++{
++    allow_t implicitRuleAnswer = ACCESS_DUNNO;
++    if (lastSeenAction == ACCESS_DENIED) // reverse last seen "deny"
++        implicitRuleAnswer = ACCESS_ALLOWED;
++    else if (lastSeenAction == ACCESS_ALLOWED) // reverse last seen "allow"
++        implicitRuleAnswer = ACCESS_DENIED;
++    // else we saw no rules and will respond with ACCESS_DUNNO
++
++    debugs(28, 3, HERE << this << " NO match found, last action " <<
++           lastSeenAction << " so returning " << implicitRuleAnswer);
++    markFinished(implicitRuleAnswer, "implicit rule won");
++}
+ 
+ bool
+ ACLChecklist::checking() const
+@@ -92,47 +92,85 @@ class ACLChecklist
+     virtual ~ACLChecklist();
+ 
+     /**
+-     * Trigger off a non-blocking access check for a set of *_access options..
+-     * The callback specified will be called with true/false
+-     * when the results of the ACL tests are known.
++     * Start a non-blocking (async) check for a list of allow/deny rules.
++     * Each rule comes with a list of ACLs.
++     *
++     * The callback specified will be called with the result of the check.
++     *
++     * The first rule where all ACLs match wins. If there is such a rule,
++     * the result becomes that rule keyword (ACCESS_ALLOWED or ACCESS_DENIED).
++     *
++     * If there are rules but all ACL lists mismatch, an implicit rule is used.
++     * Its result is the negation of the keyword of the last seen rule.
++     *
++     * Some ACLs may stop the check prematurely by setting an exceptional
++     * check result (e.g., ACCESS_AUTH_REQUIRED) instead of declaring a
++     * match or mismatch.
++     *
++     * If there are no rules to check at all, the result becomes ACCESS_DUNNO.
++     * Calling this method with no rules to check wastes a lot of CPU cycles
++     * and will result in a DBG_CRITICAL debugging message.
+      */
+     void nonBlockingCheck(ACLCB * callback, void *callback_data);
+ 
+     /**
+-     * Trigger a blocking access check for a set of *_access options.
++     * Perform a blocking (immediate) check for a list of allow/deny rules.
++     * Each rule comes with a list of ACLs.
++     *
++     * The first rule where all ACLs match wins. If there is such a rule,
++     * the result becomes that rule keyword (ACCESS_ALLOWED or ACCESS_DENIED).
+      *
+-     * ACLs which cannot be satisfied directly from available data are ignored.
+-     * This means any proxy_auth, external_acl, DNS lookups, Ident lookups etc
+-     * which have not already been performed and cached will not be checked.
++     * If there are rules but all ACL lists mismatch, an implicit rule is used
++     * Its result is the negation of the keyword of the last seen rule.
+      *
+-     * If there is no access list to check the default is to return ALLOWED.
+-     * However callers should perform their own check and default based on local
+-     * knowledge of the ACL usage rather than depend on this default.
+-     * That will also save on work setting up ACLChecklist fields for a no-op.
++     * Some ACLs may stop the check prematurely by setting an exceptional
++     * check result (e.g., ACCESS_AUTH_REQUIRED) instead of declaring a
++     * match or mismatch.
+      *
+-     * \retval ACCESS_DUNNO     Unable to determine any result
+-     * \retval ACCESS_ALLOWED   Access Allowed
+-     * \retval ACCESS_DENIED    Access Denied
++     * Some ACLs may require an async lookup which is prohibited by this
++     * method. In this case, the exceptional check result of ACCESS_DUNNO is
++     * immediately returned.
++     *
++     * If there are no rules to check at all, the result becomes ACCESS_DUNNO.
+      */
+     allow_t const & fastCheck();
+ 
+     /**
+-     * A version of fastCheck() for use when there is a one-line set of ACLs
+-     * to be tested and a match determins the result action to be done.
++     * Perform a blocking (immediate) check whether a list of ACLs matches.
++     * This method is meant to be used with squid.conf ACL-driven options that
++     * lack allow/deny keywords and are tested one ACL list at a time. Whether
++     * the checks for other occurrences of the same option continue after this
++     * call is up to the caller and option semantics.
++     *
++     * If all ACLs match, the result becomes ACCESS_ALLOWED.
+      *
+-     * \retval ACCESS_DUNNO     Unable to determine any result
+-     * \retval ACCESS_ALLOWED   ACLs all matched
++     * If all ACLs mismatch, the result becomes ACCESS_DENIED.
++     *
++     * Some ACLs may stop the check prematurely by setting an exceptional
++     * check result (e.g., ACCESS_AUTH_REQUIRED) instead of declaring a
++     * match or mismatch.
++     *
++     * Some ACLs may require an async lookup which is prohibited by this
++     * method. In this case, the exceptional check result of ACCESS_DUNNO is
++     * immediately returned.
++     *
++     * If there are no ACLs to check at all, the result becomes ACCESS_ALLOWED.
+      */
+     allow_t const & fastCheck(const ACLList * list);
+ 
++    // whether the last checked ACL of the current rule needs
++    // an async operation to determine whether there was a match
++    bool asyncNeeded() const;
+     bool asyncInProgress() const;
+     void asyncInProgress(bool const);
+ 
++    /// whether markFinished() was called
+     bool finished() const;
+-    void markFinished();
++    /// called when no more ACLs should be checked; sets the final answer and
++    /// prints a debugging message explaining the reason for that answer
++    void markFinished(const allow_t &newAnswer, const char *reason);
+ 
+     const allow_t &currentAnswer() const { return allow_; }
+-    void currentAnswer(const allow_t &newAnswer) { allow_ = newAnswer; }
+ 
+     void changeState(AsyncState *);
+     AsyncState *asyncState() const;
+@@ -156,20 +194,25 @@ class ACLChecklist
+     void *callback_data;
+ 
+     /**
+-     * Attempt to check the current checklist against current data.
+-     * This is the core routine behind all ACL test routines.
+-     * As much as possible of current tests are performed immediately
+-     * and the result is maybe delayed to wait for async lookups.
+-     *
+-     * When all tests are done callback is presented with one of:
+-     *  - ACCESS_ALLOWED     Access explicitly Allowed
+-     *  - ACCESS_DENIED      Access explicitly Denied
++     * Performs non-blocking check starting with the current rule.
++     * Used by nonBlockingCheck() to initiate the checks and by
++     * async operation callbacks to resume checks after the async
++     * operation updates the current Squid state. See nonBlockingCheck()
++     * for details on final result determination.
+      */
+     void matchNonBlocking();
+ 
+ private: /* internal methods */
+-    void preCheck();
+-    void matchAclList(const ACLList * list, bool const fast);
++    /// possible outcomes when trying to match a single ACL node in a list
++    typedef enum { nmrMatch, nmrMismatch, nmrFinished, nmrNeedsAsync }
++        NodeMatchingResult;
++
++    /// prepare for checking ACLs; called once per check
++    void preCheck(const char *what);
++    bool matchAclList(const ACLList * list, bool const fast);
++    bool matchNodes(const ACLList * head, bool const fast);
++    NodeMatchingResult matchNode(const ACLList &node, bool const fast);
++    void calcImplicitAnswer(const allow_t &lastSeenAction);
+ 
+     bool async_;
+     bool finished_;
+@@ -180,13 +223,7 @@ class ACLChecklist
+     bool checking() const;
+     void checking (bool const);
+ 
+-    bool lastACLResult_;
+     bool callerGone();
+-
+-public:
+-    bool lastACLResult(bool x) { return lastACLResult_ = x; }
+-
+-    bool lastACLResult() const { return lastACLResult_; }
+ };
+ 
+ #endif /* SQUID_ACLCHECKLIST_H */
+@@ -57,13 +57,16 @@ AuthenticateAcl(ACLChecklist *ch)
+         break;
+ 
+     case AUTH_ACL_HELPER:
+-        debugs(28, 4, HERE << "returning " << ACCESS_DENIED << " sending credentials to helper.");
++        debugs(28, 4, HERE << "returning " << ACCESS_DUNNO << " sending credentials to helper.");
+         checklist->changeState(ProxyAuthLookup::Instance());
+         return ACCESS_DUNNO; // XXX: break this down into DUNNO, EXPIRED_OK, EXPIRED_BAD states
+ 
+     case AUTH_ACL_CHALLENGE:
+-        debugs(28, 4, HERE << "returning " << ACCESS_DENIED << " sending authentication challenge.");
+-        checklist->changeState(ProxyAuthNeeded::Instance());
++        debugs(28, 4, HERE << "returning " << ACCESS_AUTH_REQUIRED << " sending authentication challenge.");
++        /* Client is required to resend the request with correct authentication
++         * credentials. (This may be part of a stateful auth protocol.)
++         * The request is denied.
++         */
+         return ACCESS_AUTH_REQUIRED;
+ 
+     default:
+@@ -151,13 +151,6 @@ ACLMaxUserIP::match(ACLChecklist *cl)
+ {
+     ACLFilledChecklist *checklist = Filled(cl);
+     allow_t answer = AuthenticateAcl(checklist);
+-    if (answer != ACCESS_DENIED && answer != ACCESS_ALLOWED) {
+-        // If the answer is not allowed or denied (matches/not matches), requires 
+-        // authentication (ACCESS_AUTH_*) or the authentication is in progress (ACCESS_DUNNO)
+-        // so change the state in the related checklist.
+-        checklist->currentAnswer(answer);
+-    }
+-
+     int ti;
+ 
+     // convert to tri-state ACL match 1,0,-1
+@@ -174,6 +167,10 @@ ACLMaxUserIP::match(ACLChecklist *cl)
+     case ACCESS_DUNNO:
+     case ACCESS_AUTH_REQUIRED:
+     default:
++        // If the answer is not allowed or denied (matches/not matches) and
++        // async authentication is not needed (asyncNeeded), then we are done.
++        if (!checklist->asyncNeeded())
++            checklist->markFinished(answer, "AuthenticateAcl exception");
+         return -1; // other
+     }
+ }
+@@ -80,13 +80,6 @@ int
+ ACLProxyAuth::match(ACLChecklist *checklist)
+ {
+     allow_t answer = AuthenticateAcl(checklist);
+-    if (answer != ACCESS_DENIED && answer != ACCESS_ALLOWED) {
+-        // If the answer is not allowed or denied (matches/not matches), requires 
+-        // authentication (ACCESS_AUTH_*) or the authentication is in progress (ACCESS_DUNNO)
+-        // so change the state in the related checklist.
+-        checklist->currentAnswer(answer);
+-    }
+-
+     // convert to tri-state ACL match 1,0,-1
+     switch (answer) {
+     case ACCESS_ALLOWED:
+@@ -99,6 +92,10 @@ ACLProxyAuth::match(ACLChecklist *checklist)
+     case ACCESS_DUNNO:
+     case ACCESS_AUTH_REQUIRED:
+     default:
++        // If the answer is not allowed or denied (matches/not matches) and
++        // async authentication is not needed (asyncNeeded), then we are done.
++        if (!checklist->asyncNeeded())
++            checklist->markFinished(answer, "AuthenticateAcl exception");
+         return -1; // other
+     }
+ }
+@@ -131,14 +128,6 @@ ACLProxyAuth::valid () const
+     return true;
+ }
+ 
+-ProxyAuthNeeded ProxyAuthNeeded::instance_;
+-
+-ProxyAuthNeeded *
+-ProxyAuthNeeded::Instance()
+-{
+-    return &instance_;
+-}
+-
+ ProxyAuthLookup ProxyAuthLookup::instance_;
+ 
+ ProxyAuthLookup *
+@@ -187,19 +176,6 @@ ProxyAuthLookup::LookupDone(void *data, char *result)
+     checklist->matchNonBlocking();
+ }
+ 
+-void
+-ProxyAuthNeeded::checkForAsync(ACLChecklist *checklist) const
+-{
+-    /* Client is required to resend the request with correct authentication
+-     * credentials. (This may be part of a stateful auth protocol.)
+-     * The request is denied.
+-     */
+-    debugs(28, 6, "ACLChecklist::checkForAsync: requiring Proxy Auth header.");
+-    checklist->currentAnswer(ACCESS_AUTH_REQUIRED);
+-    checklist->changeState (ACLChecklist::NullState::Instance());
+-    checklist->markFinished();
+-}
+-
+ ACL *
+ ACLProxyAuth::clone() const
+ {
+@@ -53,17 +53,6 @@ class ProxyAuthLookup : public ACLChecklist::AsyncState
+     static void LookupDone(void *data, char *result);
+ };
+ 
+-class ProxyAuthNeeded : public ACLChecklist::AsyncState
+-{
+-
+-public:
+-    static ProxyAuthNeeded *Instance();
+-    virtual void checkForAsync(ACLChecklist *)const;
+-
+-private:
+-    static ProxyAuthNeeded instance_;
+-};
+-
+ class ACLProxyAuth : public ACL
+ {
+ 
+@@ -805,12 +805,12 @@ aclMatchExternal(external_acl_data *acl, ACLFilledChecklist *ch)
+         debugs(82, 9, HERE << "No helper entry available");
+ #if USE_AUTH
+         if (acl->def->require_auth) {
+-            int ti = AuthenticateAcl(ch);
+             /* Make sure the user is authenticated */
+             debugs(82, 3, HERE << acl->def->name << " check user authenticated.");
+-            if (ti != 1) {
++            const allow_t ti = AuthenticateAcl(ch);
++            if (ti != ACCESS_ALLOWED) {
+                 debugs(82, 2, HERE << acl->def->name << " user not authenticated (" << ti << ")");
+-                return ACCESS_AUTH_REQUIRED;
++                return ti;
+             }
+             debugs(82, 3, HERE << acl->def->name << " user is authenticated.");
+         }
+@@ -824,7 +824,18 @@ aclMatchExternal(external_acl_data *acl, ACLFilledChecklist *ch)
+ 
+         entry = static_cast<external_acl_entry *>(hash_lookup(acl->def->cache, key));
+ 
+-        if (!entry || external_acl_grace_expired(acl->def, entry)) {
++        external_acl_entry *staleEntry = entry;
++        if (entry && external_acl_entry_expired(acl->def, entry))
++            entry = NULL;
++
++        if (entry && external_acl_grace_expired(acl->def, entry)) {
++            // refresh in the background
++            ExternalACLLookup::Start(ch, acl, true);
++            debugs(82, 4, HERE << "no need to wait for the refresh of '" <<
++                   key << "' in '" << acl->def->name << "' (ch=" << ch << ").");
++        }
++
++        if (!entry) {
+             debugs(82, 2, HERE << acl->def->name << "(\"" << key << "\") = lookup needed");
+             debugs(82, 2, HERE << "\"" << key << "\": entry=@" <<
+                    entry << ", age=" << (entry ? (long int) squid_curtime - entry->date : 0));
+@@ -833,22 +844,32 @@ aclMatchExternal(external_acl_data *acl, ACLFilledChecklist *ch)
+                 debugs(82, 2, HERE << "\"" << key << "\": queueing a call.");
+                 ch->changeState(ExternalACLLookup::Instance());
+                 debugs(82, 2, HERE << "\"" << key << "\": return -1.");
+-                return ACCESS_DUNNO; // to get here we have to have an expired cache entry. MUST not use.
++                return ACCESS_DUNNO; // expired cached or simply absent entry
+             } else {
+-                if (!entry) {
++                if (!staleEntry) {
+                     debugs(82, DBG_IMPORTANT, "WARNING: external ACL '" << acl->def->name <<
+                            "' queue overload. Request rejected '" << key << "'.");
+                     external_acl_message = "SYSTEM TOO BUSY, TRY AGAIN LATER";
+                     return ACCESS_DUNNO;
+                 } else {
+                     debugs(82, DBG_IMPORTANT, "WARNING: external ACL '" << acl->def->name <<
+                            "' queue overload. Using stale result. '" << key << "'.");
++                    entry = staleEntry;
+                     /* Fall thru to processing below */
+                 }
+             }
          }
      }
  
--    return handler != NULL ? (*handler)(connState, cmd, params) : true;
-+    return handler != NULL ? (*handler)(context, cmd, params) : true;
++    debugs(82, 4, HERE << "entry = { date=" <<
++           (long unsigned int) entry->date <<
++           ", result=" << entry->result <<
++           " tag=" << entry->tag <<
++           " log=" << entry->log << " }");
++#if USE_AUTH
++    debugs(82, 4, HERE << "entry user=" << entry->user);
++#endif
++
+     external_acl_cache_touch(acl->def, entry);
+     external_acl_message = entry->message.termedBuf();
+ 
+@@ -861,13 +882,6 @@ int
+ ACLExternal::match(ACLChecklist *checklist)
+ {
+     allow_t answer = aclMatchExternal(data, Filled(checklist));
+-    if (answer != ACCESS_DENIED && answer != ACCESS_ALLOWED) {
+-        // If the answer is not allowed or denied (matches/not matches), requires 
+-        // authentication (ACCESS_AUTH_*) or the authentication is in progress (ACCESS_DUNNO)
+-        // so change the state in the related checklist.
+-        checklist->currentAnswer(answer);
+-    }
+-
+     // convert to tri-state ACL match 1,0,-1
+     switch (answer) {
+     case ACCESS_ALLOWED:
+@@ -879,6 +893,10 @@ ACLExternal::match(ACLChecklist *checklist)
+     case ACCESS_DUNNO:
+     case ACCESS_AUTH_REQUIRED:
+     default:
++        // If the answer is not allowed or denied (matches/not matches) and
++        // async authentication is not needed (asyncNeeded), then we are done.
++        if (!checklist->asyncNeeded())
++            checklist->markFinished(answer, "aclMatchExternal exception");
+         return -1; // other
+     }
+ }
+@@ -1370,53 +1388,28 @@ externalAclHandleReply(void *data, char *reply)
  }
  
- bool
--FtpHandleUserRequest(ConnStateData *connState, String &cmd, String &params)
-+FtpHandleUserRequest(ConnStateData *connState, const String &cmd, String &params)
+ void
+-ACLExternal::ExternalAclLookup(ACLChecklist *checklist, ACLExternal * me, EAH * callback, void *callback_data)
++ACLExternal::ExternalAclLookup(ACLChecklist *checklist, ACLExternal * me)
  {
-     if (params.size() == 0) {
-         FtpWriteEarlyReply(connState, 501, "Missing username");
-@@ -5239,45 +5284,77 @@ FtpHandleUserRequest(ConnStateData *connState, String &cmd, String &params)
- }
+-    MemBuf buf;
+-    external_acl_data *acl = me->data;
+-    external_acl *def = acl->def;
+-    externalAclState *state;
+-    dlink_node *node;
+-    externalAclState *oldstate = NULL;
+-    bool graceful = 0;
++    ExternalACLLookup::Start(checklist, me->data, false);
++}
  
- bool
--FtpHandlePasvRequest(ConnStateData *connState, String &cmd, String &params)
-+FtpHandlePasvRequest(ClientSocketContext *context, String &cmd, String &params)
- {
-     if (params.size() > 0) {
--        FtpWriteEarlyReply(connState, 501, "Unexpected parameter");
-+        FtpSetReply(context, 501, "Unexpected parameter");
-         return false;
++void
++ExternalACLLookup::Start(ACLChecklist *checklist, external_acl_data *acl, bool inBackground)
++{
++    external_acl *def = acl->def;
++ 
+     ACLFilledChecklist *ch = Filled(checklist);
+-#if USE_AUTH
+-    if (acl->def->require_auth) {
+-        int ti;
+-        /* Make sure the user is authenticated */
+-        debugs(82, 3, HERE << acl->def->name << " check user authenticated.");
+-
+-        if ((ti = AuthenticateAcl(ch)) != 1) {
+-            debugs(82, DBG_IMPORTANT, "WARNING: " << acl->def->name <<
+-                   " user authentication failure (" << ti << ", ch=" << ch << ")");
+-            callback(callback_data, NULL);
+-            return;
+-        }
+-        debugs(82, 3, HERE << acl->def->name << " user is authenticated.");
+-    }
+-#endif
+-
+     const char *key = makeExternalAclKey(ch, acl);
++    assert(key);
+ 
+-    if (!key) {
+-        debugs(82, 1, "externalAclLookup: lookup in '" << def->name <<
+-               "', prerequisit failure (ch=" << ch << ")");
+-        callback(callback_data, NULL);
+-        return;
+-    }
+-
+-    debugs(82, 2, "externalAclLookup: lookup in '" << def->name << "' for '" << key << "'");
+-
+-    external_acl_entry *entry = static_cast<external_acl_entry *>(hash_lookup(def->cache, key));
+-
+-    if (entry && external_acl_entry_expired(def, entry))
+-        entry = NULL;
++    debugs(82, 2, HERE << (inBackground ? "bg" : "fg") << " lookup in '" <<
++           def->name << "' for '" << key << "'");
+ 
+     /* Check for a pending lookup to hook into */
+     // only possible if we are caching results.
++    externalAclState *oldstate = NULL;
+     if (def->cache_size > 0) {
+-        for (node = def->queue.head; node; node = node->next) {
++        for (dlink_node *node = def->queue.head; node; node = node->next) {
+             externalAclState *oldstatetmp = static_cast<externalAclState *>(node->data);
+ 
+             if (strcmp(key, oldstatetmp->key) == 0) {
+@@ -1426,52 +1419,41 @@ ACLExternal::ExternalAclLookup(ACLChecklist *checklist, ACLExternal * me, EAH *
+         }
      }
  
--    connState->ftp.state = ConnStateData::FTP_HANDLE_PASV;
-+    context->getConn()->ftp.state = ConnStateData::FTP_HANDLE_PASV;
+-    if (entry && external_acl_grace_expired(def, entry)) {
+-        if (oldstate) {
+-            debugs(82, 4, "externalAclLookup: in grace period, but already pending lookup ('" << key << "', ch=" << ch << ")");
+-            callback(callback_data, entry);
+-            return;
+-        } else {
+-            graceful = 1; // grace expired, (neg)ttl did not, and we must start a new lookup.
+-        }
+-    }
+-
+-    // The entry is in the cache, grace_ttl did not expired.
+-    if (!graceful && entry && !external_acl_grace_expired(def, entry)) {
+-        /* Should not really happen, but why not.. */
+-        callback(callback_data, entry);
+-        debugs(82, 4, "externalAclLookup: no lookup pending for '" << key << "', and grace not expired");
+-        debugs(82, 4, "externalAclLookup: (what tha' hell?)");
++    // A background refresh has no need to piggiback on a pending request:
++    // When the pending request completes, the cache will be refreshed anyway.
++    if (oldstate && inBackground) {
++        debugs(82, 7, HERE << "'" << def->name << "' queue is already being refreshed (ch=" << ch << ")");
+         return;
+     }
  
-     return true;
+-    /* No pending lookup found. Sumbit to helper */
+-    state = cbdataAlloc(externalAclState);
+-
++    externalAclState *state = cbdataAlloc(externalAclState);
+     state->def = cbdataReference(def);
+ 
+     state->key = xstrdup(key);
+ 
+-    if (!graceful) {
+-        state->callback = callback;
+-        state->callback_data = cbdataReference(callback_data);
++    if (!inBackground) {
++        state->callback = &ExternalACLLookup::LookupDone;
++        state->callback_data = cbdataReference(checklist);
+     }
+ 
+     if (oldstate) {
+         /* Hook into pending lookup */
+         state->queue = oldstate->queue;
+         oldstate->queue = state;
+     } else {
++        /* No pending lookup found. Sumbit to helper */
++
+         /* Check for queue overload */
+ 
+         if (def->theHelper->stats.queue_size >= (int)def->theHelper->childs.n_running) {
+-            debugs(82, 1, "externalAclLookup: '" << def->name << "' queue overload (ch=" << ch << ")");
++            debugs(82, 7, HERE << "'" << def->name << "' queue is too long");
++            assert(inBackground); // or the caller should have checked
+             cbdataFree(state);
+-            callback(callback_data, entry);
+             return;
+         }
+ 
+         /* Send it off to the helper */
++        MemBuf buf;
+         buf.init();
+ 
+         buf.Printf("%s\n", key);
+@@ -1485,28 +1467,6 @@ ACLExternal::ExternalAclLookup(ACLChecklist *checklist, ACLExternal * me, EAH *
+         buf.clean();
+     }
+ 
+-    if (graceful) {
+-        /* No need to wait during grace period */
+-        debugs(82, 4, "externalAclLookup: no need to wait for the result of '" <<
+-               key << "' in '" << def->name << "' (ch=" << ch << ").");
+-        debugs(82, 4, "externalAclLookup: using cached entry " << entry);
+-
+-        if (entry != NULL) {
+-            debugs(82, 4, "externalAclLookup: entry = { date=" <<
+-                   (long unsigned int) entry->date <<
+-                   ", result=" << entry->result <<
+-                   " tag=" << entry->tag <<
+-                   " log=" << entry->log << " }");
+-#if USE_AUTH
+-            debugs(82, 4, "externalAclLookup: user=" << entry->user);
+-#endif
+-            copyResultsFromEntry(ch->request, entry);
+-        }
+-
+-        callback(callback_data, entry);
+-        return;
+-    }
+-
+     debugs(82, 4, "externalAclLookup: will wait for the result of '" << key <<
+            "' in '" << def->name << "' (ch=" << ch << ").");
+ }
+@@ -1591,9 +1551,10 @@ ExternalACLLookup::checkForAsync(ACLChecklist *checklist)const
+     ACLExternal *me = dynamic_cast<ACLExternal *> (acl);
+     assert (me);
+     checklist->asyncInProgress(true);
+-    ACLExternal::ExternalAclLookup(checklist, me, LookupDone, checklist);
++    ACLExternal::ExternalAclLookup(checklist, me);
  }
  
- bool
--FtpHandlePortRequest(ConnStateData *connState, String &cmd, String &params)
-+FtpHandlePortRequest(ClientSocketContext *context, String &cmd, String &params)
++/// Called when an async lookup returns
+ void
+ ExternalACLLookup::LookupDone(void *data, void *result)
  {
--    FtpWriteEarlyReply(connState, 502, "Command not supported");
-+    FtpSetReply(context, 502, "Command not supported");
-     return false;
- }
+@@ -745,7 +745,7 @@ HttpStateData::handle1xx(HttpReply *reply)
+     if (Config.accessList.reply) {
+         ACLFilledChecklist ch(Config.accessList.reply, originalRequest(), NULL);
+         ch.reply = HTTPMSGLOCK(reply);
+-        if (!ch.fastCheck()) { // TODO: support slow lookups?
++        if (ch.fastCheck() != ACCESS_ALLOWED) { // TODO: support slow lookups?
+             debugs(11, 3, HERE << "ignoring denied 1xx");
+             proceedAfter1xx();
+             return;
+@@ -2191,7 +2191,7 @@ HttpStateData::finishingBrokenPost()
+     }
  
- bool
--FtpHandleDataRequest(ConnStateData *connState, String &cmd, String &params)
-+FtpHandleDataRequest(ClientSocketContext *context, String &cmd, String &params)
- {
--    if (!FtpCheckDataConnection(connState))
-+    if (!FtpCheckDataConnection(context))
+     ACLFilledChecklist ch(Config.accessList.brokenPosts, originalRequest(), NULL);
+-    if (!ch.fastCheck()) {
++    if (ch.fastCheck() != ACCESS_ALLOWED) {
+         debugs(11, 5, HERE << "didn't match brokenPosts");
          return false;
- 
--    connState->ftp.state = ConnStateData::FTP_HANDLE_DATA_REQUEST;
-+    context->getConn()->ftp.state = ConnStateData::FTP_HANDLE_DATA_REQUEST;
- 
-     return true;
+     }
+@@ -89,10 +89,14 @@ ACLIdent::match(ACLChecklist *cl)
+         return data->match(checklist->rfc931);
+     } else if (checklist->conn() != NULL && checklist->conn()->clientConnection != NULL && checklist->conn()->clientConnection->rfc931[0]) {
+         return data->match(checklist->conn()->clientConnection->rfc931);
+-    } else {
++    } else if (checklist->conn() != NULL && Comm::IsConnOpen(checklist->conn()->clientConnection)) {
+         debugs(28, 3, HERE << "switching to ident lookup state");
+         checklist->changeState(IdentLookup::Instance());
+         return 0;
++    } else {
++        debugs(28, DBG_IMPORTANT, HERE << "Can't start ident lookup. No client connection" );
++        checklist->markFinished(ACCESS_DUNNO, "cannot start ident lookup");
++        return -1;
+     }
  }
  
- bool
--FtpCheckDataConnection(ConnStateData *connState)
-+FtpCheckDataConnection(ClientSocketContext *context)
+@@ -127,15 +131,12 @@ void
+ IdentLookup::checkForAsync(ACLChecklist *cl)const
  {
-+    const ConnStateData *const connState = context->getConn();
-     if (Comm::IsConnOpen(connState->ftp.dataConn))
-         return true;
- 
-     if (!Comm::IsConnOpen(connState->ftp.dataListenConn))
--        FtpWriteEarlyReply(connState, 425, "Use PASV first");
-+        FtpSetReply(context, 425, "Use PASV first");
-     else
--        FtpWriteEarlyReply(connState, 425, "Data connection is not established");
-+        FtpSetReply(context, 425, "Data connection is not established");
-     return false;
+     ACLFilledChecklist *checklist = Filled(cl);
+-    if (checklist->conn() != NULL && Comm::IsConnOpen(checklist->conn()->clientConnection)) {
++    const ConnStateData *conn = checklist->conn();
++    // check that ACLIdent::match() tested this lookup precondition
++    assert(conn && Comm::IsConnOpen(conn->clientConnection));
+         debugs(28, 3, HERE << "Doing ident lookup" );
+         checklist->asyncInProgress(true);
+         Ident::Start(checklist->conn()->clientConnection, LookupDone, checklist);
+-    } else {
+-        debugs(28, DBG_IMPORTANT, "IdentLookup::checkForAsync: Can't start ident lookup. No client connection" );
+-        checklist->currentAnswer(ACCESS_DENIED);
+-        checklist->markFinished();
+-    }
  }
-+
-+void
-+FtpSetReply(ClientSocketContext *context, const int code, const char *msg)
-+{
-+    ClientHttpRequest *const http = context->http;
-+    assert(http != NULL);
-+    assert(http->storeEntry() == NULL);
-+
-+    HttpReply *const reply = new HttpReply;
-+    reply->sline.set(Http::ProtocolVersion(1, 1), Http::scNoContent);
-+    HttpHeader &header = reply->header;
-+    header.putTime(HDR_DATE, squid_curtime);
-+    {
-+        HttpHdrCc cc;
-+        cc.Private();
-+        header.putCc(&cc);
-+    }
-+    header.putInt64(HDR_CONTENT_LENGTH, 0);
-+    header.putInt(HDR_FTP_STATUS, code);
-+    header.putStr(HDR_FTP_REASON, msg);
-+    reply->hdrCacheInit();
-+
-+    setLogUri(http, http->uri,  true);
-+
-+    clientStreamNode *const node = context->getClientReplyContext();
-+    clientReplyContext *const repContext =
-+        dynamic_cast<clientReplyContext *>(node->data.getRaw());
-+    assert(repContext != NULL);
-+    repContext->createStoreEntry(http->request->method, RequestFlags());
-+    http->storeEntry()->replaceHttpReply(reply);
-+}
-@@ -399,6 +399,7 @@ class ConnStateData : public BodyProducer, public HttpControlMsgSink
-     int connReadWasError(comm_err_t flag, int size, int xerrno);
-     int connFinishedWithConn(int size);
-     void clientAfterReadingRequests();
-+    void processFtpRequest(ClientSocketContext *const context);
  
- private:
-     HttpParser parser_;
+ void

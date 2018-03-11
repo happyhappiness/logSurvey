@@ -1,9 +1,654 @@
-@@ -962,7 +962,7 @@ mainSetCwd(void)
-         chrooted = true;
+@@ -41,6 +41,9 @@
+ #include "adaptation/icap/Elements.h"
+ #endif
+ #include "RefCount.h"
++#if USE_SSL
++#include "ssl/gadgets.h"
++#endif
  
-         if (chroot(Config.chroot_dir) != 0);
--            fatal("failed to chroot");
-+        fatal("failed to chroot");
+ /* forward decls */
+ class HttpReply;
+@@ -158,6 +161,7 @@ class AccessLogEntry: public RefCountable
+ #if USE_SSL
  
-         strncpy(pathbuf, "/", sizeof(pathbuf)-1);
+         const char *ssluser;
++        Ssl::X509_Pointer sslClientCert; ///< cert received from the client
+ #endif
+         AnyP::PortCfg *port;
+ 
+@@ -116,15 +116,15 @@ ConfigParser::strtokFile(void)
+ }
+ 
+ void
+-ConfigParser::ParseQuotedString(char **var)
++ConfigParser::ParseQuotedString(char **var, bool *wasQuoted)
+ {
+     String sVar;
+-    ParseQuotedString(&sVar);
++    ParseQuotedString(&sVar, wasQuoted);
+     *var = xstrdup(sVar.termedBuf());
+ }
+ 
+ void
+-ConfigParser::ParseQuotedString(String *var)
++ConfigParser::ParseQuotedString(String *var, bool *wasQuoted)
+ {
+     // Get all of the remaining string
+     char *token = strtok(NULL, "");
+@@ -134,8 +134,11 @@ ConfigParser::ParseQuotedString(String *var)
+     if (*token != '"') {
+         token = strtok(token, w_space);
+         var->reset(token);
++        if (wasQuoted)
++            *wasQuoted = false;
+         return;
+-    }
++    } else if (wasQuoted)
++        *wasQuoted = true;
+ 
+     char  *s = token + 1;
+     /* scan until the end of the quoted string, unescaping " and \  */
+@@ -67,8 +67,13 @@ class ConfigParser
+     static void ParseBool(bool *var);
+     static void ParseString(char **var);
+     static void ParseString(String *var);
+-    static void ParseQuotedString(char **var);
+-    static void ParseQuotedString(String *var);
++    /// Parse an unquoted token (no spaces) or a "quoted string" that
++    /// may include spaces. In some contexts, quotes strings may also
++    /// include macros. Quoted strings may escape any character with
++    /// a backslash (\), which is currently only useful for inner
++    /// quotes. TODO: support quoted strings anywhere a token is accepted.
++    static void ParseQuotedString(char **var, bool *wasQuoted = NULL);
++    static void ParseQuotedString(String *var, bool *wasQuoted = NULL);
+     static const char *QuoteString(String &var);
+     static void ParseWordList(wordlist **list);
+     static char * strtokFile();
+@@ -35,13 +35,24 @@
+ #include "squid-old.h"
+ #include "acl/FilledChecklist.h"
+ #include "acl/Gadgets.h"
++#include "client_side.h"
++#include "client_side_request.h"
++#include "comm/Connection.h"
+ #include "compat/strtoll.h"
++#include "fde.h"
+ #include "HttpHdrContRange.h"
+ #include "HttpHeader.h"
+ #include "HttpHeaderTools.h"
+ #include "HttpRequest.h"
+ #include "MemBuf.h"
++#if USE_SSL
++#include "ssl/support.h"
++#endif
+ #include "Store.h"
++#include <algorithm>
++#if HAVE_STRING
++#include <string>
++#endif
+ 
+ static void httpHeaderPutStrvf(HttpHeader * hdr, http_hdr_type id, const char *fmt, va_list vargs);
+ 
+@@ -616,3 +627,31 @@ HeaderManglers::find(const HttpHeaderEntry &e) const
+     return NULL;
+ }
+ 
++void
++httpHdrAdd(HttpHeader *heads, HttpRequest *request, HeaderWithAclList &headersAdd)
++{
++    ACLFilledChecklist checklist(NULL, request, NULL);
++
++    for (HeaderWithAclList::const_iterator hwa = headersAdd.begin(); hwa != headersAdd.end(); ++hwa) {
++        if (!hwa->aclList || checklist.fastCheck(hwa->aclList) == ACCESS_ALLOWED) {
++            const char *fieldValue = NULL;
++            MemBuf mb;
++            if (hwa->quoted) {
++                if (request->al != NULL) {
++                    mb.init();
++                    hwa->valueFormat->assemble(mb, request->al, 0);
++                    fieldValue = mb.content();
++                }
++            } else {
++                fieldValue = hwa->fieldValue.c_str();
++            }
++
++            if (!fieldValue || fieldValue[0] == '\0')
++                fieldValue = "-";
++
++            HttpHeaderEntry *e = new HttpHeaderEntry(hwa->fieldId, hwa->fieldName.c_str(), 
++                                                     fieldValue);
++            heads->addEntry(e);
++        }
++    }
++}
+@@ -1,13 +1,21 @@
+ #ifndef SQUID_HTTPHEADERTOOLS_H
+ #define SQUID_HTTPHEADERTOOLS_H
+ 
++#include "format/Format.h"
++
++#if HAVE_LIST
++#include <list>
++#endif
+ #if HAVE_MAP
+ #include <map>
+ #endif
+ #if HAVE_STRING
+ #include <string>
+ #endif
+ 
++class HeaderWithAcl;
++typedef std::list<HeaderWithAcl> HeaderWithAclList;
++
+ class acl_access;
+ struct _header_mangler {
+     acl_access *access_list;
+@@ -56,4 +64,29 @@ class HeaderManglers
+     HeaderManglers(const HeaderManglers &);
+     HeaderManglers &operator =(const HeaderManglers &);
+ };
++
++class ACLList;
++class HeaderWithAcl
++{
++public:
++    HeaderWithAcl() :  aclList(NULL), fieldId (HDR_BAD_HDR), quoted(false) {}
++
++    /// HTTP header field name
++    std::string fieldName;
++
++    /// HTTP header field value, possibly with macros
++    std::string fieldValue;
++
++    /// when the header field should be added (always if nil)
++    ACLList *aclList;
++
++    /// compiled HTTP header field value (no macros)
++    Format::Format *valueFormat;
++
++    /// internal ID for "known" headers or HDR_OTHER
++    http_hdr_type fieldId;
++
++    /// whether fieldValue may contain macros
++    bool quoted;
++};
+ #endif
+@@ -35,6 +35,7 @@
+  */
+ 
+ #include "squid-old.h"
++#include "AccessLogEntry.h"
+ #include "DnsLookupDetails.h"
+ #include "HttpRequest.h"
+ #include "HttpHdrCc.h"
+@@ -262,6 +263,8 @@ HttpRequest::inheritProperties(const HttpMsg *aMsg)
+ 
+     // main property is which connection the request was received on (if any)
+     clientConnectionManager = aReq->clientConnectionManager;
++
++    al = aReq->al;
+     return true;
+ }
+ 
+@@ -55,6 +55,8 @@ extern void httpRequestPack(void *obj, Packer *p);
+ 
+ class HttpHdrRange;
+ class DnsLookupDetails;
++class AccessLogEntry;
++typedef RefCount<AccessLogEntry> AccessLogEntryPointer;
+ 
+ class HttpRequest: public HttpMsg
+ {
+@@ -239,6 +241,12 @@ class HttpRequest: public HttpMsg
+      */
+     CbcPointer<ConnStateData> clientConnectionManager;
+ 
++    /**
++     * The AccessLogEntry for the current ClientHttpRequest/Server HttpRequest 
++     * pair, if known;
++     */
++    AccessLogEntryPointer al;
++
+     int64_t getRangeOffsetLimit(); /* the result of this function gets cached in rangeOffsetLimit */
+ 
+ private:
+@@ -1098,6 +1098,7 @@ tests_testHttpReply_SOURCES=\
+ 	tests/stub_debug.cc \
+ 	tests/stub_errorpage.cc \
+ 	tests/stub_HelperChildConfig.cc \
++	tests/stub_libformat.cc \
+ 	StatCounters.h \
+ 	StatCounters.cc \
+ 	StatHist.h \
+@@ -1195,6 +1196,7 @@ tests_testACLMaxUserIP_SOURCES= \
+ 	tests/stub_errorpage.cc \
+ 	tests/stub_fd.cc \
+ 	tests/stub_HttpRequest.cc \
++	tests/stub_libformat.cc \
+ 	tests/stub_MemObject.cc \
+ 	tests/stub_MemStore.cc \
+ 	tests/stub_mime.cc \
+@@ -1529,6 +1531,7 @@ tests_testDiskIO_SOURCES = \
+ 	tests/stub_internal.cc \
+ 	tests/stub_ipc.cc \
+ 	tests/stub_ipcache.cc \
++	tests/stub_libformat.cc \
+ 	tests/stub_libicmp.cc \
+ 	tests/stub_MemStore.cc \
+ 	tests/stub_mime.cc \
+@@ -2457,6 +2460,7 @@ tests_testStore_SOURCES= \
+ 	tests/stub_helper.cc \
+ 	tests/stub_HelperChildConfig.cc \
+ 	tests/stub_http.cc \
++	tests/stub_libformat.cc \
+ 	HttpBody.h \
+ 	HttpBody.cc \
+ 	tests/stub_HttpReply.cc \
+@@ -2592,6 +2596,7 @@ tests_testUfs_SOURCES = \
+ 	tests/stub_Port.cc \
+ 	tests/stub_UdsOp.cc \
+ 	tests/stub_internal.cc \
++	tests/stub_libformat.cc \
+ 	tests/stub_store_rebuild.cc \
+ 	tests/stub_store_stats.cc \
+ 	fd.cc \
+@@ -2795,6 +2800,7 @@ tests_testRock_SOURCES = \
+ 	tests/stub_icp.cc \
+ 	tests/stub_ipc.cc \
+ 	tests/stub_ipcache.cc \
++	tests/stub_libformat.cc \
+ 	tests/stub_libicmp.cc \
+ 	tests/stub_MemStore.cc \
+ 	tests/stub_mime.cc \
+@@ -90,6 +90,10 @@
+ #include <limits>
+ #endif
+ 
++#if HAVE_LIST
++#include <list>
++#endif
++
+ #if USE_SSL
+ #include "ssl/gadgets.h"
+ #endif
+@@ -177,6 +181,9 @@ static void dump_http_header_replace(StoreEntry * entry, const char *name, const
+ static void parse_http_header_replace(HeaderManglers **manglers);
+ #define free_http_header_replace free_HeaderManglers
+ #endif
++static void dump_HeaderWithAclList(StoreEntry * entry, const char *name, HeaderWithAclList *headers);
++static void parse_HeaderWithAclList(HeaderWithAclList **header);
++static void free_HeaderWithAclList(HeaderWithAclList **header);
+ static void parse_denyinfo(acl_deny_info_list ** var);
+ static void dump_denyinfo(StoreEntry * entry, const char *name, acl_deny_info_list * var);
+ static void free_denyinfo(acl_deny_info_list ** var);
+@@ -4314,3 +4321,68 @@ static void free_icap_service_failure_limit(Adaptation::Icap::Config *cfg)
+ }
+ 
+ #endif
++
++static void dump_HeaderWithAclList(StoreEntry * entry, const char *name, HeaderWithAclList *headers)
++{
++    if (!headers)
++        return;
++
++    for (HeaderWithAclList::iterator hwa = headers->begin(); hwa != headers->end(); ++hwa) {
++        storeAppendPrintf(entry, "%s ", hwa->fieldName.c_str());
++        storeAppendPrintf(entry, "%s ", hwa->fieldValue.c_str());
++        if (hwa->aclList)
++            dump_acl_list(entry, hwa->aclList);
++        storeAppendPrintf(entry, "\n");
++    }
++}
++
++static void parse_HeaderWithAclList(HeaderWithAclList **headers)
++{
++    char *fn;
++    if (!*headers) {
++        *headers = new HeaderWithAclList;
++    }
++    if ((fn = strtok(NULL, w_space)) == NULL) {
++        self_destruct();
++        return;
++    }
++    HeaderWithAcl hwa;
++    hwa.fieldName = fn;
++    hwa.fieldId = httpHeaderIdByNameDef(fn, strlen(fn));
++    if (hwa.fieldId == HDR_BAD_HDR)
++        hwa.fieldId = HDR_OTHER;
++
++    String buf;
++    bool wasQuoted;
++    ConfigParser::ParseQuotedString(&buf, &wasQuoted);
++    hwa.fieldValue = buf.termedBuf();
++    hwa.quoted = wasQuoted;
++    if (hwa.quoted) {
++        Format::Format *nlf =  new ::Format::Format("hdrWithAcl");
++        if (!nlf->parse(hwa.fieldValue.c_str())) {
++            self_destruct();
++            return;
++        }
++        hwa.valueFormat = nlf;
++    }
++    aclParseAclList(LegacyParser, &hwa.aclList);
++    (*headers)->push_back(hwa);
++}
++
++static void free_HeaderWithAclList(HeaderWithAclList **header)
++{
++    if (!(*header))
++        return;
++
++    for (HeaderWithAclList::iterator hwa = (*header)->begin(); hwa != (*header)->end(); ++hwa) {
++        if (hwa->aclList)
++            aclDestroyAclList(&hwa->aclList);
++
++        if (hwa->valueFormat) {
++            delete hwa->valueFormat;
++            hwa->valueFormat = NULL;
++        }
++    }
++    delete *header;
++    *header = NULL;
++}
+@@ -31,6 +31,7 @@ hostdomain		cache_peer
+ hostdomaintype		cache_peer
+ http_header_access	acl
+ http_header_replace
++HeaderWithAclList	acl
+ adaptation_access_type	adaptation_service_set adaptation_service_chain acl icap_service icap_class
+ adaptation_service_set_type	icap_service ecap_service
+ adaptation_service_chain_type	icap_service ecap_service
+@@ -3129,6 +3129,20 @@ DOC_START
+ 	service name in curly braces to record response time(s) specific
+ 	to that service. For example: %{my_service}adapt::sum_trs
+ 
++	If SSL is enabled, the following formating codes become available:
++
++		%ssl::>cert_subject The Subject field of the received client
++				SSL certificate or a dash ('-') if Squid has
++				received an invalid/malformed certificate or
++				no certificate at all. Consider encoding the
++				logged value because Subject often has spaces.
++
++		%ssl::>cert_issuer The Issuer field of the received client
++				SSL certificate or a dash ('-') if Squid has
++				received an invalid/malformed certificate or
++				no certificate at all. Consider encoding the
++				logged value because Issuer often has spaces.
++
+ 	The default formats available (which do not need re-defining) are:
+ 
+ logformat squid      %ts.%03tu %6tr %>a %Ss/%03>Hs %<st %rm %ru %[un %Sh/%<a %mt
+@@ -4579,6 +4593,47 @@ DOC_START
+         By default, headers are removed if denied.
+ DOC_END
+ 
++NAME: request_header_add
++TYPE: HeaderWithAclList
++LOC: Config.request_header_add
++DEFAULT: none
++DOC_START
++	Usage:   request_header_add field-name field-value acl1 [acl2] ...
++	Example: request_header_add X-Client-CA "CA=%ssl::>cert_issuer" all
++
++	This option adds header fields to outgoing HTTP requests (i.e.,
++	request headers sent by Squid to the next HTTP hop such as a
++	cache peer or an origin server). The option has no effect during
++	cache hit detection. The equivalent adaptation vectoring point
++	in ICAP terminology is post-cache REQMOD.
++
++	Field-name is a token specifying an HTTP header name. If a
++	standard HTTP header name is used, Squid does not check whether
++	the new header conflicts with any existing headers or violates
++	HTTP rules. If the request to be modified already contains a
++	field with the same name, the old field is preserved but the
++	header field values are not merged.
++
++	Field-value is either a token or a quoted string. If quoted
++	string format is used, then the surrounding quotes are removed
++	while escape sequences and %macros are processed.
++
++	In theory, all of the logformat codes can be used as %macros.
++	However, unlike logging (which happens at the very end of
++	transaction lifetime), the transaction may not yet have enough
++	information to expand a macro when the new header value is needed.
++	And some information may already be available to Squid but not yet
++	committed where the macro expansion code can access it (report
++	such instances!). The macro will be expanded into a single dash
++	('-') in such cases. Not all macros have been tested.
++
++	One or more Squid ACLs may be specified to restrict header
++	injection to matching requests. As always in squid.conf, all
++	ACLs in an option ACL list must be satisfied for the insertion
++	to happen. The request_header_add option supports fast ACLs
++	only.
++DOC_END
++
+ NAME: relaxed_header_parser
+ COMMENT: on|off|warn
+ TYPE: tristate
+@@ -2533,6 +2533,7 @@ clientProcessRequest(ConnStateData *conn, HttpParser *hp, ClientSocketContext *c
      }
+ 
+     request->clientConnectionManager = conn;
++    request->al = http->al;
+ 
+     request->flags.accelerated = http->flags.accel;
+     request->flags.sslBumped = conn->switchedToHttps();
+@@ -178,6 +178,12 @@ ClientHttpRequest::ClientHttpRequest(ConnStateData * aConn) :
+     setConn(aConn);
+     al = new AccessLogEntry;
+     al->tcpClient = clientConnection = aConn->clientConnection;
++#if USE_SSL
++    if (aConn->clientConnection != NULL && aConn->clientConnection->isOpen()) {
++        if (SSL *ssl = fd_table[aConn->clientConnection->fd].ssl)
++            al->cache.sslClientCert.reset(SSL_get_peer_certificate(ssl));
++    }
++#endif
+     dlinkAdd(this, &active, &ClientActiveRequests);
+ #if USE_ADAPTATION
+     request_satisfaction_mode = false;
+@@ -190,6 +190,11 @@ typedef enum {
+     LFT_ICAP_STATUS_CODE,
+ #endif
+ 
++#if USE_SSL
++    LFT_SSL_USER_CERT_SUBJECT,
++    LFT_SSL_USER_CERT_ISSUER,
++#endif
++
+     LFT_PERCENT			/* special string cases for escaped chars */
+ } ByteCode_t;
+ 
+@@ -3,6 +3,7 @@
+ #include "comm/Connection.h"
+ #include "err_detail_type.h"
+ #include "errorpage.h"
++#include "fde.h"
+ #include "format/Format.h"
+ #include "format/Quoting.h"
+ #include "format/Token.h"
+@@ -43,9 +44,9 @@ Format::Format::~Format()
+ }
+ 
+ bool
+-Format::Format::parse(char *def)
++Format::Format::parse(const char *def)
+ {
+-    char *cur, *eos;
++    const char *cur, *eos;
+     Token *new_lt, *last_lt;
+     enum Quoting quote = LOG_QUOTE_NONE;
+ 
+@@ -290,7 +291,7 @@ log_quoted_string(const char *str, char *out)
+ }
+ 
+ void
+-Format::Format::assemble(MemBuf &mb, const AccessLogEntryPointer &al, int logSequenceNumber) const
++Format::Format::assemble(MemBuf &mb, const AccessLogEntry::Pointer &al, int logSequenceNumber) const
+ {
+     char tmp[1024];
+     String sb;
+@@ -1004,6 +1005,26 @@ Format::Format::assemble(MemBuf &mb, const AccessLogEntryPointer &al, int logSeq
+             dooff = 1;
+             break;
+ 
++#if USE_SSL
++        case LFT_SSL_USER_CERT_SUBJECT:
++            if (X509 *cert = al->cache.sslClientCert.get()) {
++                if (X509_NAME *subject = X509_get_subject_name(cert)) {
++                    X509_NAME_oneline(subject, tmp, sizeof(tmp));
++                    out = tmp;
++                }
++            }
++            break;
++
++        case LFT_SSL_USER_CERT_ISSUER:
++            if (X509 *cert = al->cache.sslClientCert.get()) {
++                if (X509_NAME *issuer = X509_get_issuer_name(cert)) {
++                    X509_NAME_oneline(issuer, tmp, sizeof(tmp));
++                    out = tmp;
++                }
++            }
++            break;
++#endif
++
+         case LFT_PERCENT:
+             out = "%";
+ 
+@@ -35,7 +35,7 @@ class Format
+     /* First off, let's tokenize, we'll optimize in a second pass.
+      * A token can either be a %-prefixed sequence (usually a dynamic
+      * token but it can be an escaped sequence), or a string. */
+-    bool parse(char *def);
++    bool parse(const char *def);
+ 
+     /// assemble the state information into a formatted line.
+     void assemble(MemBuf &mb, const AccessLogEntryPointer &al, int logSequenceNumber) const;
+@@ -186,6 +186,14 @@ static TokenTableEntry TokenTableIcap[] = {
+ };
+ #endif
+ 
++#if USE_SSL
++// SSL (ssl::) tokens
++static TokenTableEntry TokenTableSsl[] = {
++    {">cert_subject", LFT_SSL_USER_CERT_SUBJECT},
++    {">cert_issuer", LFT_SSL_USER_CERT_ISSUER},
++    {NULL, LFT_NONE}
++};
++#endif
+ } // namespace Format
+ 
+ /// Register all components custom format tokens
+@@ -202,13 +210,15 @@ Format::Token::Init()
+     TheConfig.registerTokens(String("icap"),::Format::TokenTableIcap);
+ #endif
+ 
+-    // TODO tokens for OpenSSL errors in "ssl::"
++#if USE_SSL
++    TheConfig.registerTokens(String("ssl"),::Format::TokenTableSsl);
++#endif
+ }
+ 
+ /// Scans a token table to see if the next token exists there
+ /// returns a pointer to next unparsed byte and updates type member if found
+-char *
+-Format::Token::scanForToken(TokenTableEntry const table[], char *cur)
++const char *
++Format::Token::scanForToken(TokenTableEntry const table[], const char *cur)
+ {
+     for (TokenTableEntry const *lte = table; lte->configTag != NULL; lte++) {
+         debugs(46, 8, HERE << "compare tokens '" << lte->configTag << "' with '" << cur << "'");
+@@ -227,9 +237,9 @@ Format::Token::scanForToken(TokenTableEntry const table[], char *cur)
+  * def is for sure null-terminated
+  */
+ int
+-Format::Token::parse(char *def, Quoting *quoting)
++Format::Token::parse(const char *def, Quoting *quoting)
+ {
+-    char *cur = def;
++    const char *cur = def;
+ 
+     int l;
+ 
+@@ -318,11 +328,16 @@ Format::Token::parse(char *def, Quoting *quoting)
+         cur++;
+     }
+ 
+-    if (xisdigit(*cur))
+-        widthMin = strtol(cur, &cur, 10);
++    char *endp;
++    if (xisdigit(*cur)) {
++        widthMin = strtol(cur, &endp, 10);
++        cur = endp;
++    }
+ 
+-    if (*cur == '.' && xisdigit(*(++cur)))
+-        widthMax = strtol(cur, &cur, 10);
++    if (*cur == '.' && xisdigit(*(++cur))) {
++        widthMax = strtol(cur, &endp, 10);
++        cur = endp;
++    }
+ 
+     if (*cur == '{') {
+         char *cp;
+@@ -48,7 +48,7 @@ class Token
+      * and fills in this item with the token information.
+      * def is for sure null-terminated.
+      */
+-    int parse(char *def, enum Quoting *quote);
++    int parse(const char *def, enum Quoting *quote);
+ 
+     ByteCode_t type;
+     const char *label;
+@@ -72,7 +72,7 @@ class Token
+     Token *next;	/* todo: move from linked list to array */
+ 
+ private:
+-    char *scanForToken(TokenTableEntry const table[], char *cur);
++    const char *scanForToken(TokenTableEntry const table[], const char *cur);
+ };
+ 
+ extern const char *log_tags[];
+@@ -88,6 +88,8 @@ static const char *const crlf = "\r\n";
+ static void httpMaybeRemovePublic(StoreEntry *, http_status);
+ static void copyOneHeaderFromClientsideRequestToUpstreamRequest(const HttpHeaderEntry *e, const String strConnection, const HttpRequest * request,
+         HttpHeader * hdr_out, const int we_do_ranges, const http_state_flags);
++//Declared in HttpHeaderTools.cc
++void httpHdrAdd(HttpHeader *heads, HttpRequest *request, HeaderWithAclList &headers_add);
+ 
+ HttpStateData::HttpStateData(FwdState *theFwdState) : AsyncJob("HttpStateData"), ServerStateData(theFwdState),
+         lastChunk(0), header_bytes_read(0), reply_bytes_read(0),
+@@ -1782,6 +1784,9 @@ HttpStateData::httpBuildRequestHeader(HttpRequest * request,
+     if (Config2.onoff.mangle_request_headers)
+         httpHdrMangleList(hdr_out, request, ROR_REQUEST);
+ 
++    if (Config.request_header_add && !Config.request_header_add->empty())
++        httpHdrAdd(hdr_out, request, *Config.request_header_add);
++
+     strConnection.clean();
+ }
+ 
+@@ -574,6 +574,8 @@ struct SquidConfig {
+     HeaderManglers *request_header_access;
+     /// reply_header_access and reply_header_replace
+     HeaderManglers *reply_header_access;
++    ///request_header_add access list
++    HeaderWithAclList *request_header_add;
+     char *coredump_dir;
+     char *chroot_dir;
+ #if USE_CACHE_DIGESTS
+@@ -30,6 +30,7 @@ STUB_SOURCE= tests/STUB.h \
+ 	tests/stub_ipc_TypedMsgHdr.cc \
+ 	tests/stub_ipcache.cc \
+ 	tests/stub_libcomm.cc \
++	tests/stub_libformat.cc \
+ 	tests/stub_libicmp.cc \
+ 	tests/stub_main_cc.cc \
+ 	tests/stub_mem.cc \
+@@ -1,4 +1,5 @@
+ #include "squid.h"
++#include "AccessLogEntry.h"
+ #include "HttpRequest.h"
+ 
+ #define STUB_API "HttpRequest.cc"

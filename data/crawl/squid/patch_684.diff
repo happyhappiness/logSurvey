@@ -1,22 +1,1874 @@
-@@ -571,14 +571,18 @@ main(int argc, char **argv)
-         user = strtok(buf, " \r\n");
-         passwd = strtok(NULL, "\r\n");
+@@ -3816,7 +3816,7 @@ AC_CONFIG_FILES([\
+ 	helpers/digest_auth/file/Makefile \
+ 	helpers/digest_auth/ldap/Makefile \
+ 	helpers/ntlm_auth/Makefile \
+-	helpers/ntlm_auth/fakeauth/Makefile \
++	helpers/ntlm_auth/fake/Makefile \
+ 	helpers/ntlm_auth/no_check/Makefile \
+ 	helpers/ntlm_auth/smb_lm/Makefile \
+ 	helpers/ntlm_auth/smb_lm/smbval/Makefile \
+@@ -123,6 +123,7 @@ Most user-facing changes are reflected in squid.conf (see below).
  
--        if (!user || !passwd || !passwd[0]) {
--            printf("ERR\n");
-+        if (!user) {
-+            printf("ERR Missing username\n");
-+            continue;
+ <sect2>NTLM Authentication protocol helpers
+ <p><itemize>
++	<item>fakeauth_auth - ntlm_fake_auth - Perform NTLMSSP to recover the username but don't verify the password.
+ 	<item>ntlm_auth - ntlm_smb_lm_auth - Perform SMB LanManager domain-less authentication over NTLM protocol.
+ </itemize>
+ 
+@@ -3,5 +3,5 @@
+ #  $Id$
+ #
+ 
+-DIST_SUBDIRS	= fakeauth no_check smb_lm mswin_sspi
++DIST_SUBDIRS	= fake no_check smb_lm mswin_sspi
+ SUBDIRS		= $(NTLM_AUTH_HELPERS)
+@@ -0,0 +1,14 @@
++include $(top_srcdir)/src/Common.am
++
++libexec_PROGRAMS = ntlm_fake_auth
++ntlm_fake_auth_SOURCES	= ntlm_fake_auth.cc
++
++ntlm_fake_auth_LDADD = \
++	-L$(top_builddir)/lib -lntlmauth \
++	$(COMPAT_LIB) \
++	$(CRYPTLIB) \
++	$(XTRA_LIBS)
++
++ntlm_fake_auth_DEPENDENCIES = $(top_builddir)/lib/libntlmauth.a
++
++EXTRA_DIST = config.test
+@@ -0,0 +1,305 @@
++/*
++ * $Id$
++ *
++ * AUTHOR: Andrew Doran <ad@interlude.eu.org>
++ * AUTHOR: Robert Collins <rbtcollins@hotmail.com>
++ * AUTHOR: Guido Serassio: <guido.serassio@acmeconsulting.it>
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sources; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ */
++/*
++ * Example ntlm authentication program for Squid, based on the
++ * original proxy_auth code from client_side.c, written by
++ * Jon Thackray <jrmt@uk.gdscorp.com>. Initial ntlm code by
++ * Andrew Doran <ad@interlude.eu.org>.
++ *
++ * This code gets the username and returns it. No validation is done.
++ * and by the way: it is a complete patch-up. Use the "real thing" NTLMSSP
++ * if you can.
++ *
++ * Revised by Guido Serassio: <guido.serassio@acmeconsulting.it>
++ *
++ * - Added negotiation of UNICODE char support
++ * - More detailed debugging info
++ *
++ */
++
++/* undefine this to have strict protocol adherence. You don't really need
++ * that though */
++#define IGNORANCE_IS_BLISS
++
++#include "config.h"
++#include "ntlmauth.h"
++#include "util.h"
++
++#if HAVE_CTYPE_H
++#include <ctype.h>
++#endif
++#if HAVE_STRING_H
++#include <string.h>
++#endif
++#if HAVE_CRYPT_H
++#include <crypt.h>
++#endif
++#if HAVE_PWD_H
++#include <pwd.h>
++#endif
++#if HAVE_GETOPT_H
++#include <getopt.h>
++#endif
++
++
++#define safe_free(x)	if (x) { free(x); x = NULL; }
++
++/* A couple of harmless helper macros */
++#define SEND(X) debug("sending '%s' to squid\n",X); printf(X "\n");
++#ifdef __GNUC__
++#define SEND2(X,Y...) debug("sending '" X "' to squid\n",Y); printf(X "\n",Y);
++#define SEND3(X,Y...) debug("sending '" X "' to squid\n",Y); printf(X "\n",Y);
++#else
++/* no gcc, no debugging. varargs macros are a gcc extension */
++#define SEND2(X,Y) debug("sending '" X "' to squid\n",Y); printf(X "\n",Y);
++#define SEND3(X,Y,Z) debug("sending '" X "' to squid\n",Y,Z); printf(X "\n",Y,Z);
++#endif
++
++#define ERR    "ERR\n"
++#define OK     "OK\n"
++
++#define BUFFER_SIZE 10240
++
++const char *authenticate_ntlm_domain = "WORKGROUP";
++int strip_domain_enabled = 0;
++int NTLM_packet_debug_enabled = 0;
++
++static void
++hex_dump(unsigned char *data, int size)
++{
++    /* dumps size bytes of *data to stdout. Looks like:
++     * [0000] 75 6E 6B 6E 6F 77 6E 20
++     *                  30 FF 00 00 00 00 39 00 unknown 0.....9.
++     * (in a single line of course)
++     */
++
++    if (!data)
++        return;
++
++    if (debug_enabled) {
++        unsigned char *p = data;
++        unsigned char c;
++        int n;
++        char bytestr[4] = {0};
++        char addrstr[10] = {0};
++        char hexstr[16 * 3 + 5] = {0};
++        char charstr[16 * 1 + 5] = {0};
++        for (n = 1; n <= size; n++) {
++            if (n % 16 == 1) {
++                /* store address for this line */
++                snprintf(addrstr, sizeof(addrstr), "%.4x",
++                         (int) (p - data));
++            }
++            c = *p;
++            if (xisalnum(c) == 0) {
++                c = '.';
++            }
++            /* store hex str (for left side) */
++            snprintf(bytestr, sizeof(bytestr), "%02X ", *p);
++            strncat(hexstr, bytestr, sizeof(hexstr) - strlen(hexstr) - 1);
++
++            /* store char str (for right side) */
++            snprintf(bytestr, sizeof(bytestr), "%c", c);
++            strncat(charstr, bytestr, sizeof(charstr) - strlen(charstr) - 1);
++
++            if (n % 16 == 0) {
++                /* line completed */
++                fprintf(stderr, "[%4.4s]   %-50.50s  %s\n", addrstr, hexstr, charstr);
++                hexstr[0] = 0;
++                charstr[0] = 0;
++            } else if (n % 8 == 0) {
++                /* half line: add whitespaces */
++                strncat(hexstr, "  ", sizeof(hexstr) - strlen(hexstr) - 1);
++                strncat(charstr, " ", sizeof(charstr) - strlen(charstr) - 1);
++            }
++            p++;		/* next byte */
 +        }
-+        if (!passwd || !passwd[0]) {
-+            printf("ERR Missing password '%s'\n", user);
-             continue;
++
++        if (strlen(hexstr) > 0) {
++            /* print rest of buffer if not empty */
++            fprintf(stderr, "[%4.4s]   %-50.50s  %s\n", addrstr, hexstr, charstr);
++        }
++    }
++}
++
++
++/* makes a null-terminated string lower-case. Changes CONTENTS! */
++static void
++lc(char *string)
++{
++    char *p = string, c;
++    while ((c = *p)) {
++        *p = xtolower(c);
++        p++;
++    }
++}
++
++/*
++ * options:
++ * -d enable debugging.
++ * -v enable verbose NTLM packet debugging.
++ * -l if specified, changes behavior on failures to last-ditch.
++ */
++char *my_program_name = NULL;
++
++static void
++usage(void)
++{
++    fprintf(stderr,
++            "Usage: %s [-d] [-v] [-h]\n"
++            " -d  enable debugging.\n"
++            " -S  strip domain from username.\n"
++            " -v  enable verbose NTLM packet debugging.\n"
++            " -h  this message\n\n",
++            my_program_name);
++}
++
++static void
++process_options(int argc, char *argv[])
++{
++    int opt, had_error = 0;
++
++    opterr = 0;
++    while (-1 != (opt = getopt(argc, argv, "hdvS"))) {
++        switch (opt) {
++        case 'd':
++            debug_enabled = 1;
++            break;
++        case 'v':
++            debug_enabled = 1;
++            NTLM_packet_debug_enabled = 1;
++            break;
++        case 'S':
++            strip_domain_enabled = 1;
++            break;
++        case 'h':
++            usage();
++            exit(0);
++        case '?':
++            opt = optopt;
++            /* fall thru to default */
++        default:
++            fprintf(stderr, "unknown option: -%c. Exiting\n", opt);
++            usage();
++            had_error = 1;
++        }
++    }
++    if (had_error)
++        exit(1);
++}
++
++int
++main(int argc, char *argv[])
++{
++    char buf[BUFFER_SIZE];
++    int buflen = 0;
++    char user[NTLM_MAX_FIELD_LENGTH], domain[NTLM_MAX_FIELD_LENGTH];
++    char *p, *decoded = NULL;
++    ntlmhdr *packet = NULL;
++    char helper_command[3];
++    int len;
++    char *data = NULL;
++
++    setbuf(stdout, NULL);
++    setbuf(stderr, NULL);
++
++    my_program_name = argv[0];
++
++    process_options(argc, argv);
++
++    debug("%s build " __DATE__ ", " __TIME__ " starting up...\n", my_program_name);
++
++    while (fgets(buf, BUFFER_SIZE, stdin) != NULL) {
++        user[0] = '\0';		/*no user code */
++        domain[0] = '\0';		/*no domain code */
++
++        if ((p = strchr(buf, '\n')) != NULL)
++            *p = '\0';		/* strip \n */
++        buflen = strlen(buf);   /* keep this so we only scan the buffer for \0 once per loop */
++        if (buflen > 3)
++            packet = (ntlmhdr*)base64_decode(buf + 3);
++        if (buflen > 3 && NTLM_packet_debug_enabled) {
++            strncpy(helper_command, buf, 2);
++            helper_command[2] = '\0';
++            debug("Got '%s' from Squid with data:\n", helper_command);
++            hex_dump((unsigned char*)packet, ((buflen - 3) * 3) / 4);
++        } else
++            debug("Got '%s' from Squid\n", buf);
++
++        if (strncasecmp(buf, "YR", 2) == 0) {
++            char nonce[NTLM_NONCE_LEN];
++            ntlm_challenge chal;
++            ntlm_make_nonce(nonce);
++            if (buflen > 3) {
++                ntlm_negotiate *nego = (ntlm_negotiate *)packet;
++                ntlm_make_challenge(&chal, authenticate_ntlm_domain, NULL, nonce, NTLM_NONCE_LEN, nego->flags);
++            } else {
++                ntlm_make_challenge(&chal, authenticate_ntlm_domain, NULL, nonce, NTLM_NONCE_LEN, NEGOTIATE_ASCII);
++            }
++            // TODO: find out what this context means, and why only the fake auth helper contains it.
++            chal.context_high = htole32(0x003a<<16);
++
++            len = sizeof(chal) - sizeof(chal.payload) + le16toh(chal.target.maxlen);
++            data = (char *) base64_encode_bin((char *) &chal, len);
++            if (NTLM_packet_debug_enabled) {
++                printf("TT %s\n", data);
++                debug("sending 'TT' to squid with data:\n");
++                hex_dump((unsigned char *)&chal, len);
++            } else
++                SEND2("TT %s", data);
++        } else if (strncasecmp(buf, "KK ", 3) == 0) {
++            if (!packet) {
++                SEND("BH received KK with no data! user=");
++            } else if (!ntlm_validate_packet(packet, NTLM_AUTHENTICATE)) {
++                if (ntlm_unpack_auth((ntlm_authenticate *)packet, user, domain, (buflen-3)) == 0) {
++                    lc(user);
++                    lc(domain);
++                    if (strip_domain_enabled) {
++                        SEND2("AF %s", user);
++                    } else {
++                        SEND3("AF %s%s%s", domain, (*domain?"\\":""), user);
++                    }
++                } else {
++                    lc(user);
++                    lc(domain);
++                    SEND3("NA invalid credentials, user=%s%s%s", domain, (*domain?"\\":""), user);
++                }
++            } else {
++                SEND("BH wrong packet type! user=");
++            }
++        }
++    }
++    exit(0);
++}
+@@ -1,15 +0,0 @@
+-include $(top_srcdir)/src/Common.am
+-
+-libexec_PROGRAMS = fakeauth_auth
+-fakeauth_auth_SOURCES	= fakeauth_auth.c ntlm.h
+-
+-## we need our local files too (but avoid -I. at all costs)
+-INCLUDES += -I$(srcdir)
+-
+-LDADD = \
+-	$(top_builddir)/compat/libcompat.la \
+-	-L$(top_builddir)/lib -lmiscutil \
+-	$(CRYPTLIB) \
+-	$(XTRA_LIBS)
+-
+-EXTRA_DIST = config.test
+@@ -1,453 +0,0 @@
+-/*
+- *
+- * AUTHOR: Robert Collins <rbtcollins@hotmail.com>
+- *
+- * Example ntlm authentication program for Squid, based on the
+- * original proxy_auth code from client_side.c, written by
+- * Jon Thackray <jrmt@uk.gdscorp.com>. Initial ntlm code by
+- * Andrew Doran <ad@interlude.eu.org>.
+- *
+- * This code gets the username and returns it. No validation is done.
+- * and by the way: it is a complete patch-up. Use the "real thing" NTLMSSP
+- * if you can.
+- *
+- * Revised by Guido Serassio: <guido.serassio@acmeconsulting.it>
+- *
+- * - Added negotiation of UNICODE char support
+- * - More detailed debugging info
+- *
+- */
+-
+-#include "config.h"
+-#include "ntlmauth.h"
+-#include "squid_endian.h"
+-
+-#include "util.h"
+-#include <ctype.h>
+-
+-#if HAVE_STDIO_H
+-#include <stdio.h>
+-#endif
+-#if HAVE_STDLIB_H
+-#include <stdlib.h>
+-#endif
+-#if HAVE_UNISTD_H
+-#include <unistd.h>
+-#endif
+-#if HAVE_STRING_H
+-#include <string.h>
+-#endif
+-#if HAVE_CRYPT_H
+-#include <crypt.h>
+-#endif
+-#if HAVE_PWD_H
+-#include <pwd.h>
+-#endif
+-#if HAVE_GETOPT_H
+-#include <getopt.h>
+-#endif
+-#include "ntlm.h"
+-
+-#define ERR    "ERR\n"
+-#define OK     "OK\n"
+-
+-#define BUFFER_SIZE 10240
+-
+-const char *authenticate_ntlm_domain = "WORKGROUP";
+-int debug_enabled = 0;
+-int strip_domain_enabled = 0;
+-int NTLM_packet_debug_enabled = 0;
+-
+-/* NTLM authentication by ad@interlude.eu.org - 07/1999 */
+-/* XXX this is not done cleanly... */
+-
+-static void
+-hex_dump(void *data, int size)
+-{
+-    /* dumps size bytes of *data to stdout. Looks like:
+-     * [0000] 75 6E 6B 6E 6F 77 6E 20
+-     *                  30 FF 00 00 00 00 39 00 unknown 0.....9.
+-     * (in a single line of course)
+-     */
+-
+-    if (!data)
+-        return;
+-
+-    if (debug_enabled) {
+-        unsigned char *p = data;
+-        unsigned char c;
+-        int n;
+-        char bytestr[4] = {0};
+-        char addrstr[10] = {0};
+-        char hexstr[16 * 3 + 5] = {0};
+-        char charstr[16 * 1 + 5] = {0};
+-        for (n = 1; n <= size; n++) {
+-            if (n % 16 == 1) {
+-                /* store address for this line */
+-                snprintf(addrstr, sizeof(addrstr), "%.4x",
+-                         (int) (p - (unsigned char *) data));
+-            }
+-            c = *p;
+-            if (xisalnum(c) == 0) {
+-                c = '.';
+-            }
+-            /* store hex str (for left side) */
+-            snprintf(bytestr, sizeof(bytestr), "%02X ", *p);
+-            strncat(hexstr, bytestr, sizeof(hexstr) - strlen(hexstr) - 1);
+-
+-            /* store char str (for right side) */
+-            snprintf(bytestr, sizeof(bytestr), "%c", c);
+-            strncat(charstr, bytestr, sizeof(charstr) - strlen(charstr) - 1);
+-
+-            if (n % 16 == 0) {
+-                /* line completed */
+-                fprintf(stderr, "[%4.4s]   %-50.50s  %s\n", addrstr, hexstr, charstr);
+-                hexstr[0] = 0;
+-                charstr[0] = 0;
+-            } else if (n % 8 == 0) {
+-                /* half line: add whitespaces */
+-                strncat(hexstr, "  ", sizeof(hexstr) - strlen(hexstr) - 1);
+-                strncat(charstr, " ", sizeof(charstr) - strlen(charstr) - 1);
+-            }
+-            p++;		/* next byte */
+-        }
+-
+-        if (strlen(hexstr) > 0) {
+-            /* print rest of buffer if not empty */
+-            fprintf(stderr, "[%4.4s]   %-50.50s  %s\n", addrstr, hexstr, charstr);
+-        }
+-    }
+-}
+-
+-
+-/* makes a null-terminated string lower-case. Changes CONTENTS! */
+-static void
+-lc(char *string)
+-{
+-    char *p = string, c;
+-    while ((c = *p)) {
+-        *p = xtolower(c);
+-        p++;
+-    }
+-}
+-
+-
+-/*
+- * Generates a challenge request. The randomness of the 8 byte
+- * challenge strings can be guarenteed to be poor at best.
+- */
+-void
+-ntlmMakeChallenge(struct ntlm_challenge *chal, int32_t flags)
+-{
+-    static unsigned hash;
+-    int r;
+-    char *d;
+-    int i;
+-
+-    debug("ntlmMakeChallenge: flg %08x\n", flags);
+-
+-    memset(chal, 0, sizeof(*chal));
+-    memcpy(chal->hdr.signature, "NTLMSSP", 8);
+-    chal->flags = htole32(CHALLENGE_TARGET_IS_DOMAIN |
+-                          NEGOTIATE_ALWAYS_SIGN |
+-                          NEGOTIATE_USE_NTLM |
+-                          NEGOTIATE_REQUEST_TARGET |
+-                          (NEGOTIATE_UNICODE & flags ? NEGOTIATE_UNICODE : NEGOTIATE_ASCII)
+-                         );
+-    chal->hdr.type = htole32(NTLM_CHALLENGE);
+-    chal->flags = flags;
+-    chal->unknown[6] = htole16(0x003a);
+-
+-    d = (char *) chal + 48;
+-    i = 0;
+-
+-    if (authenticate_ntlm_domain != NULL)
+-        while (authenticate_ntlm_domain[i++]);
+-
+-    chal->flags = flags;
+-    chal->target.offset = htole32(48);
+-    chal->target.maxlen = htole16(i);
+-    chal->target.len = chal->target.maxlen;
+-
+-    r = (int) rand();
+-    r = (hash ^ r) + r;
+-
+-    for (i = 0; i < 8; i++) {
+-        chal->challenge[i] = r;
+-        r = (r >> 2) ^ r;
+-    }
+-
+-    hash = r;
+-}
+-
+-/*
+- * Check the vailidity of a request header. Return -1 on error.
+- */
+-int
+-ntlmCheckHeader(ntlmhdr * hdr, int type)
+-{
+-    /*
+-     * Must be the correct security package and request type. The
+-     * 8 bytes compared includes the ASCII 'NUL'.
+-     */
+-    if (memcmp(hdr->signature, "NTLMSSP", 8) != 0) {
+-        fprintf(stderr, "ntlmCheckHeader: bad header signature\n");
+-        return (-1);
+-    }
+-    if (type == NTLM_ANY)
+-        return 0;
+-
+-    if (le32toh(hdr->type) != type) {
+-        /* don't report this error - it's ok as we do a if() around this function */
+-//      fprintf(stderr, "ntlmCheckHeader: type is %d, wanted %d\n",
+-        //          le32toh(hdr->type), type);
+-        return (-1);
+-    }
+-    return (0);
+-}
+-
+-/*
+- * Extract a string from an NTLM request and return as ASCII.
+- */
+-char *
+-ntlmGetString(ntlmhdr * hdr, strhdr * str, int flags)
+-{
+-    static char buf[512];
+-    u_short *s, c;
+-    char *d, *sc;
+-    int l, o;
+-
+-    l = le16toh(str->len);
+-    o = le32toh(str->offset);
+-
+-    /* Sanity checks. XXX values arbitrarialy chosen */
+-    if (l <= 0 || l >= 32 || o >= 256) {
+-        fprintf(stderr, "ntlmGetString: insane: l:%d o:%d\n", l, o);
+-        return (NULL);
+-    }
+-    if ((flags & NEGOTIATE_ASCII) == 0) {
+-        /* UNICODE string */
+-        s = (u_short *) ((char *) hdr + o);
+-        d = buf;
+-
+-        for (l >>= 1; l; s++, l--) {
+-            c = le16toh(*s);
+-            if (c > 254 || c == '\0') {
+-                fprintf(stderr, "ntlmGetString: bad uni: %04x\n", c);
+-                return (NULL);
+-            }
+-            *d++ = c;
+-        }
+-
+-        *d = 0;
+-    } else {
+-        /* ASCII/OEM string */
+-        sc = (char *) hdr + o;
+-        d = buf;
+-
+-        for (; l; l--) {
+-            if (*sc == '\0' || !xisprint(*sc)) {
+-                fprintf(stderr, "ntlmGetString: bad ascii: %04x\n", *sc);
+-                return (NULL);
+-            }
+-            *d++ = *sc++;
+-        }
+-
+-        *d = 0;
+-    }
+-
+-    return (buf);
+-}
+-
+-/*
+- * Decode the strings in an NTLM authentication request
+- */
+-static int
+-ntlmDecodeAuth(struct ntlm_authenticate *auth, char *buf, size_t size)
+-{
+-    const char *p;
+-    char *origbuf;
+-    int s;
+-
+-    if (!buf) {
+-        return 1;
+-    }
+-    origbuf = buf;
+-    if (ntlmCheckHeader(&auth->hdr, NTLM_AUTHENTICATE)) {
+-        fprintf(stderr, "ntlmDecodeAuth: header check fails\n");
+-        return -1;
+-    }
+-    debug("ntlmDecodeAuth: size of %d\n", (int) size);
+-    debug("ntlmDecodeAuth: flg %08x\n", auth->flags);
+-    debug("ntlmDecodeAuth: usr o(%d) l(%d)\n", auth->user.offset, auth->user.len);
+-
+-    if ((p = ntlmGetString(&auth->hdr, &auth->domain, auth->flags)) == NULL)
+-        p = authenticate_ntlm_domain;
+-
+-    debug("ntlmDecodeAuth: Domain '%s'.\n", p);
+-
+-    if ((s = strlen(p) + 1) >= size)
+-        return 1;
+-    strcpy(buf, p);
+-
+-    debug("ntlmDecodeAuth: Domain '%s'.\n", buf);
+-
+-    size -= s;
+-    buf += (s - 1);
+-    *buf++ = '\\';		/* Using \ is more consistent with MS-proxy */
+-
+-    if ( (p = ntlmGetString(&auth->hdr, &auth->user, auth->flags)) == NULL)
+-        return 1;
+-
+-    if ((s = strlen(p) + 1) >= size)
+-        return 1;
+-
+-    while (*p)
+-        *buf++ = (*p++);	//tolower
+-
+-    *buf++ = '\0';
+-    size -= s;
+-
+-    debug("ntlmDecodeAuth: user: %s%s\n", origbuf, p);
+-
+-    return 0;
+-}
+-
+-
+-/*
+- * options:
+- * -d enable debugging.
+- * -v enable verbose NTLM packet debugging.
+- * -l if specified, changes behavior on failures to last-ditch.
+- */
+-char *my_program_name = NULL;
+-
+-static void
+-usage(void)
+-{
+-    fprintf(stderr,
+-            "Usage: %s [-d] [-v] [-h]\n"
+-            " -d  enable debugging.\n"
+-            " -S  strip domain from username.\n"
+-            " -v  enable verbose NTLM packet debugging.\n"
+-            " -h  this message\n\n",
+-            my_program_name);
+-}
+-
+-
+-static void
+-process_options(int argc, char *argv[])
+-{
+-    int opt, had_error = 0;
+-
+-    opterr = 0;
+-    while (-1 != (opt = getopt(argc, argv, "hdvS"))) {
+-        switch (opt) {
+-        case 'd':
+-            debug_enabled = 1;
+-            break;
+-        case 'v':
+-            debug_enabled = 1;
+-            NTLM_packet_debug_enabled = 1;
+-            break;
+-        case 'S':
+-            strip_domain_enabled = 1;
+-            break;
+-        case 'h':
+-            usage();
+-            exit(0);
+-        case '?':
+-            opt = optopt;
+-            /* fall thru to default */
+-        default:
+-            fprintf(stderr, "unknown option: -%c. Exiting\n", opt);
+-            usage();
+-            had_error = 1;
+-        }
+-    }
+-    if (had_error)
+-        exit(1);
+-}
+-
+-
+-int
+-main(int argc, char *argv[])
+-{
+-    char buf[BUFFER_SIZE];
+-    int buflen = 0;
+-    char user[256], *p, *decoded = NULL;
+-    struct ntlm_challenge chal;
+-    struct ntlm_negotiate *nego;
+-    char helper_command[3];
+-    int len;
+-    char *data = NULL;
+-
+-    setbuf(stdout, NULL);
+-    setbuf(stderr, NULL);
+-
+-    my_program_name = argv[0];
+-
+-    process_options(argc, argv);
+-
+-    debug("%s build " __DATE__ ", " __TIME__ " starting up...\n", my_program_name);
+-
+-    while (fgets(buf, BUFFER_SIZE, stdin) != NULL) {
+-        user[0] = '\0';		/*no usercode */
+-
+-        if ((p = strchr(buf, '\n')) != NULL)
+-            *p = '\0';		/* strip \n */
+-        buflen = strlen(buf);   /* keep this so we only scan the buffer for \0 once per loop */
+-        if (buflen > 3)
+-            decoded = base64_decode(buf + 3);
+-        if (buflen > 3 && NTLM_packet_debug_enabled) {
+-            strncpy(helper_command, buf, 2);
+-            helper_command[2] = '\0';
+-            debug("Got '%s' from Squid with data:\n", helper_command);
+-            hex_dump(decoded, ((strlen(buf) - 3) * 3) / 4);
+-        } else
+-            debug("Got '%s' from Squid\n", buf);
+-
+-        if (strncasecmp(buf, "YR", 2) == 0) {
+-            if (buflen > 3) {
+-                nego = (struct ntlm_negotiate *) decoded;
+-                ntlmMakeChallenge(&chal, nego->flags);
+-            } else
+-                ntlmMakeChallenge(&chal, NEGOTIATE_ASCII);
+-            len =
+-                sizeof(chal) - sizeof(chal.pad) +
+-                le16toh(chal.target.maxlen);
+-            data = (char *) base64_encode_bin((char *) &chal, len);
+-            if (NTLM_packet_debug_enabled) {
+-                printf("TT %s\n", data);
+-                decoded = base64_decode(data);
+-                debug("sending 'TT' to squid with data:\n");
+-                hex_dump(decoded, (strlen(data) * 3) / 4);
+-            } else
+-                SEND2("TT %s", data);
+-        } else if (strncasecmp(buf, "KK ", 3) == 0) {
+-            if (!decoded) {
+-                SEND2("BH received KK with no data! user=%s", user);
+-            } else if (!ntlmCheckHeader((ntlmhdr *) decoded, NTLM_AUTHENTICATE)) {
+-                if (!ntlmDecodeAuth((struct ntlm_authenticate *) decoded, user, 256)) {
+-                    lc(user);
+-                    if (strip_domain_enabled) {
+-                        strtok(user, "\\");
+-                        p = strtok(NULL, "\\");
+-                        if (!p)
+-                            p = user;
+-                        SEND2("AF %s", p);
+-                    } else {
+-                        SEND2("AF %s", user);
+-                    }
+-                } else {
+-                    lc(user);
+-                    SEND2("NA invalid credentials, user=%s", user);
+-                }
+-            } else {
+-                lc(user);
+-                SEND2("BH wrong packet type! user=%s", user);
+-            }
+-        }
+-    }
+-    exit(0);
+-}
+@@ -1,161 +0,0 @@
+-/*
+- * $Id$
+- *
+- * AUTHOR: Andrew Doran <ad@interlude.eu.org>
+- *
+- * SQUID Web Proxy Cache          http://www.squid-cache.org/
+- * ----------------------------------------------------------
+- *
+- *  Squid is the result of efforts by numerous individuals from
+- *  the Internet community; see the CONTRIBUTORS file for full
+- *  details.   Many organizations have provided support for Squid's
+- *  development; see the SPONSORS file for full details.  Squid is
+- *  Copyrighted (C) 2001 by the Regents of the University of
+- *  California; see the COPYRIGHT file for full details.  Squid
+- *  incorporates software developed and/or copyrighted by other
+- *  sources; see the CREDITS file for full details.
+- *
+- *  This program is free software; you can redistribute it and/or modify
+- *  it under the terms of the GNU General Public License as published by
+- *  the Free Software Foundation; either version 2 of the License, or
+- *  (at your option) any later version.
+- *
+- *  This program is distributed in the hope that it will be useful,
+- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- *  GNU General Public License for more details.
+- *
+- *  You should have received a copy of the GNU General Public License
+- *  along with this program; if not, write to the Free Software
+- *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
+- *
+- */
+-
+-#ifndef _NTLM_H_
+-#define _NTLM_H_
+-
+-/* undefine this to have strict protocol adherence. You don't really need
+- * that though */
+-#define IGNORANCE_IS_BLISS
+-
+-#include <sys/types.h>
+-
+-/* All of this cruft is little endian */
+-#include "squid_endian.h"
+-
+-/* NTLM request types that we know about */
+-#define NTLM_ANY          0
+-
+-/* Negotiation request sent by client */
+-struct ntlm_negotiate {
+-    ntlmhdr hdr;		/* NTLM header */
+-    int32_t flags;		/* Request flags */
+-    strhdr domain;		/* Domain we wish to authenticate in */
+-    strhdr workstation;		/* Client workstation name */
+-    char pad[256];		/* String data */
+-};
+-
+-/* Challenge request sent by server. */
+-struct ntlm_challenge {
+-    ntlmhdr hdr;		/* NTLM header */
+-    strhdr target;		/* Authentication target (domain/server ...) */
+-    int32_t flags;		/* Request flags */
+-    u_char challenge[8];	/* Challenge string */
+-    int16_t unknown[8];		/* Some sort of context data */
+-    char pad[256];		/* String data */
+-};
+-
+-/* Authentication request sent by client in response to challenge */
+-struct ntlm_authenticate {
+-    ntlmhdr hdr;		/* NTLM header */
+-    strhdr lmresponse;		/* LANMAN challenge response */
+-    strhdr ntresponse;		/* NT challenge response */
+-    strhdr domain;		/* Domain to authenticate against */
+-    strhdr user;		/* Username */
+-    strhdr workstation;		/* Workstation name */
+-    strhdr sessionkey;		/* Session key for server's use */
+-    int32_t flags;		/* Request flags */
+-    char pad[256 * 6];		/* String data */
+-};
+-
+-char *ntlmGetString(ntlmhdr * hdr, strhdr * str, int flags);
+-void ntlmMakeChallenge(struct ntlm_challenge *chal, int32_t flags);
+-int ntlmCheckHeader(ntlmhdr * hdr, int type);
+-int ntlmCheckNegotiation(struct ntlm_negotiate *neg);
+-int ntlmAuthenticate(struct ntlm_authenticate *neg);
+-
+-#define safe_free(x)	if (x) { free(x); x = NULL; }
+-
+-#undef debug
+-
+-/************* CONFIGURATION ***************/
+-/*
+- * define this if you want debugging
+- */
+-#ifndef DEBUG
+-#define DEBUG
+-#endif
+-
+-#define FAIL_DEBUG 0
+-
+-/************* END CONFIGURATION ***************/
+-
+-#include <sys/types.h>
+-
+-extern int debug_enabled;
+-#if FAIL_DEBUG
+-extern int fail_debug_enabled;
+-#endif
+-
+-/* Debugging stuff */
+-
+-#ifdef __GNUC__			/* this is really a gcc-ism */
+-#ifdef DEBUG
+-#include <stdio.h>
+-#include <unistd.h>
+-static const char *__foo;
+-#define debug(X...) if (debug_enabled) { \
+-                    fprintf(stderr,"ntlm-auth[%ld](%s:%d): ", (long)getpid(), \
+-                    ((__foo=strrchr(__FILE__,'/'))==NULL?__FILE__:__foo+1),\
+-                    __LINE__);\
+-                    fprintf(stderr,X); }
+-#else /* DEBUG */
+-#define debug(X...)		/* */
+-#endif /* DEBUG */
+-#else /* __GNUC__ */
+-static void
+-debug(char *format,...)
+-{
+-#ifdef DEBUG
+-#ifdef _SQUID_MSWIN_
+-#if FAIL_DEBUG
+-    if (debug_enabled || fail_debug_enabled) {
+-#else
+-if (debug_enabled) {
+-#endif
+-        va_list args;
+-
+-        va_start(args, format);
+-        fprintf(stderr, "ntlm-auth[%ld]: ", (long)getpid());
+-        vfprintf(stderr, format, args);
+-        va_end(args);
+-#if FAIL_DEBUG
+-        fail_debug_enabled = 0;
+-#endif
+-    }
+-#endif /* _SQUID_MSWIN_ */
+-#endif /* DEBUG */
+-}
+-#endif /* __GNUC__ */
+-
+-
+-/* A couple of harmless helper macros */
+-#define SEND(X) debug("sending '%s' to squid\n",X); printf(X "\n");
+-#ifdef __GNUC__
+-#define SEND2(X,Y...) debug("sending '" X "' to squid\n",Y); printf(X "\n",Y);
+-#else
+-/* no gcc, no debugging. varargs macros are a gcc extension */
+-#define SEND2(X,Y) debug("sending '" X "' to squid\n",Y); printf(X "\n",Y);
+-#endif
+-
+-#endif /* _NTLM_H_ */
+@@ -10,11 +10,13 @@ INCLUDES += \
+ 	-I$(srcdir) \
+ 	-I$(srcdir)/smbval
+ 
+-LDADD = \
+-	$(top_builddir)/compat/libcompat.la \
+-	-L$(top_builddir)/lib -lntlmauth -lmiscutil \
++ntlm_smb_lm_auth_LDADD = \
++	-L$(top_builddir)/lib -lntlmauth \
+ 	smbval/libsmbvalid.a \
++	$(COMPAT_LIB) \
+ 	$(CRYPTLIB) \
+ 	$(XTRA_LIBS)
+ 
++ntlm_smb_lm_auth_DEPENDENCIES = $(top_builddir)/lib/libntlmauth.a
++
+ EXTRA_DIST = config.test
+@@ -68,20 +68,8 @@ int SMB_Logon_Server(SMB_Handle_Type Con_Handle, char *UserName, char *PassWord,
+ #define debug_dump_ntlmssp_flags(X)	/* empty */
+ #endif /* DEBUG */
+ 
+-void
+-print_debug (char *format,...)
+-{
+-#if DEBUG
+-    va_list args;
+-    va_start(args,format);
+-    vfprintf(stderr, format, args);
+-    va_end(args);
+-#endif /* DEBUG */
+-    return;
+-}
+-
+ #define ENCODED_PASS_LEN 24
+-static unsigned char challenge[NONCE_LEN];
++static unsigned char challenge[NTLM_NONCE_LEN];
+ static unsigned char lmencoded_empty_pass[ENCODED_PASS_LEN],
+ ntencoded_empty_pass[ENCODED_PASS_LEN];
+ SMB_Handle_Type handle = NULL;
+@@ -125,29 +113,29 @@ init_challenge(char *domain, char *domain_controller)
+     if (handle != NULL) {
+         return 0;
+     }
+-    print_debug("Connecting to server %s domain %s\n", domain_controller, domain);
++    debug("Connecting to server %s domain %s\n", domain_controller, domain);
+     handle = SMB_Connect_Server(NULL, domain_controller, domain);
+     smberr = SMB_Get_Last_Error();
+     SMB_Get_Error_Msg(smberr, errstr, 1000);
+ 
+ 
+     if (handle == NULL) {	/* couldn't connect */
+-        print_debug("Couldn't connect to SMB Server. Error:%s\n", errstr);
++        debug("Couldn't connect to SMB Server. Error:%s\n", errstr);
+         return 1;
+     }
+     if (SMB_Negotiate(handle, SMB_Prots) < 0) {		/* An error */
+-        print_debug("Error negotiating protocol with SMB Server\n");
++        debug("Error negotiating protocol with SMB Server\n");
+         SMB_Discon(handle, 0);
+         handle = NULL;
+         return 2;
+     }
+     if (handle->Security == 0) {	/* share-level security, unuseable */
+-        print_debug("SMB Server uses share-level security .. we need user security.\n");
++        debug("SMB Server uses share-level security .. we need user security.\n");
+         SMB_Discon(handle, 0);
+         handle = NULL;
+         return 3;
+     }
+-    memcpy(challenge, handle->Encrypt_Key, NONCE_LEN);
++    memcpy(challenge, handle->Encrypt_Key, NTLM_NONCE_LEN);
+     SMBencrypt((unsigned char *)"",challenge,lmencoded_empty_pass);
+     SMBNTencrypt((unsigned char *)"",challenge,ntencoded_empty_pass);
+     return 0;
+@@ -164,7 +152,16 @@ make_challenge(char *domain, char *domain_controller)
+     if (init_challenge(my_domain, my_domain_controller) > 0) {
+         return NULL;
+     }
+-    return ntlm_make_challenge(my_domain, my_domain_controller, (char *)challenge, NONCE_LEN);
++    ntlm_challenge chal;
++    u_int32_t flags = REQUEST_NON_NT_SESSION_KEY |
++                   CHALLENGE_TARGET_IS_DOMAIN |
++                   NEGOTIATE_ALWAYS_SIGN |
++                   NEGOTIATE_USE_NTLM |
++                   NEGOTIATE_USE_LM |
++                   NEGOTIATE_ASCII;
++    ntlm_make_challenge(&chal, my_domain, my_domain_controller, (char *)challenge, NTLM_NONCE_LEN, flags);
++    int len = sizeof(chal) - sizeof(chal.payload) + le16toh(chal.target.maxlen);
++    return base64_encode_bin((char *)&chal, len);
+ }
+ 
+ int ntlm_errno;
+@@ -184,15 +181,15 @@ fetch_credentials(ntlm_authenticate * auth, int auth_length)
+ {
+     char *p = credentials;
+     lstring tmp;
+-    tmp = ntlm_fetch_string((char *) auth, auth_length, &auth->domain);
++    tmp = ntlm_fetch_string(&(auth->hdr), auth_length, &auth->domain, auth->flags);
+     *p = '\0';
+     if (tmp.str == NULL)
+         return NULL;
+     memcpy(p, tmp.str, tmp.l);
+     p += tmp.l;
+     *p++ = '\\';
+     *p = '\0';
+-    tmp = ntlm_fetch_string((char *) auth, auth_length, &auth->user);
++    tmp = ntlm_fetch_string(&(auth->hdr), auth_length, &auth->user, auth->flags);
+     if (tmp.str == NULL)
+         return NULL;
+     memcpy(p, tmp.str, tmp.l);
+@@ -216,36 +213,36 @@ ntlm_check_auth(ntlm_authenticate * auth, int auth_length)
+     lstring tmp;
+ 
+     if (handle == NULL) {	/*if null we aren't connected, but it shouldn't happen */
+-        print_debug("Weird, we've been disconnected\n");
++        debug("Weird, we've been disconnected\n");
+         ntlm_errno = NTLM_NOT_CONNECTED;
+         return NULL;
+     }
+ 
+-    /*      print_debug("fetching domain\n"); */
+-    tmp = ntlm_fetch_string((char *) auth, auth_length, &auth->domain);
++    /*      debug("fetching domain\n"); */
++    tmp = ntlm_fetch_string(&(auth->hdr), auth_length, &auth->domain, auth->flags);
+     if (tmp.str == NULL || tmp.l == 0) {
+-        print_debug("No domain supplied. Returning no-auth\n");
++        debug("No domain supplied. Returning no-auth\n");
+         ntlm_errno = NTLM_LOGON_ERROR;
+         return NULL;
+     }
+     if (tmp.l > MAX_DOMAIN_LEN) {
+-        print_debug("Domain string exceeds %d bytes, rejecting\n", MAX_DOMAIN_LEN);
++        debug("Domain string exceeds %d bytes, rejecting\n", MAX_DOMAIN_LEN);
+         ntlm_errno = NTLM_LOGON_ERROR;
+         return NULL;
+     }
+     memcpy(domain, tmp.str, tmp.l);
+     user = domain + tmp.l;
+     *user++ = '\0';
+ 
+-    /*      print_debug("fetching user name\n"); */
+-    tmp = ntlm_fetch_string((char *) auth, auth_length, &auth->user);
++    /*      debug("fetching user name\n"); */
++    tmp = ntlm_fetch_string(&(auth->hdr), auth_length, &auth->user, auth->flags);
+     if (tmp.str == NULL || tmp.l == 0) {
+-        print_debug("No username supplied. Returning no-auth\n");
++        debug("No username supplied. Returning no-auth\n");
+         ntlm_errno = NTLM_LOGON_ERROR;
+         return NULL;
+     }
+     if (tmp.l > MAX_USERNAME_LEN) {
+-        print_debug("Username string exceeds %d bytes, rejecting\n", MAX_USERNAME_LEN);
++        debug("Username string exceeds %d bytes, rejecting\n", MAX_USERNAME_LEN);
+         ntlm_errno = NTLM_LOGON_ERROR;
+         return NULL;
+     }
+@@ -254,14 +251,14 @@ ntlm_check_auth(ntlm_authenticate * auth, int auth_length)
+ 
+ 
+     /* Authenticating against the NT response doesn't seem to work... */
+-    tmp = ntlm_fetch_string((char *) auth, auth_length, &auth->lmresponse);
++    tmp = ntlm_fetch_string(&(auth->hdr), auth_length, &auth->lmresponse, auth->flags);
+     if (tmp.str == NULL || tmp.l == 0) {
+         fprintf(stderr, "No auth at all. Returning no-auth\n");
+         ntlm_errno = NTLM_LOGON_ERROR;
+         return NULL;
+     }
+     if (tmp.l > MAX_PASSWD_LEN) {
+-        print_debug("Password string exceeds %d bytes, rejecting\n", MAX_PASSWD_LEN);
++        debug("Password string exceeds %d bytes, rejecting\n", MAX_PASSWD_LEN);
+         ntlm_errno = NTLM_LOGON_ERROR;
+         return NULL;
+     }
+@@ -270,7 +267,7 @@ ntlm_check_auth(ntlm_authenticate * auth, int auth_length)
+     pass[min(MAX_PASSWD_LEN,tmp.l)] = '\0';
+ 
+ #if 1
+-    print_debug("Empty LM pass detection: user: '%s', ours:'%s', his: '%s'"
++    debug("Empty LM pass detection: user: '%s', ours:'%s', his: '%s'"
+                 "(length: %d)\n",
+                 user,lmencoded_empty_pass,tmp.str,tmp.l);
+     if (memcmp(tmp.str,lmencoded_empty_pass,ENCODED_PASS_LEN)==0) {
+@@ -280,9 +277,9 @@ ntlm_check_auth(ntlm_authenticate * auth, int auth_length)
+         return NULL;
+     }
+ 
+-    tmp = ntlm_fetch_string ((char *) auth, auth_length, &auth->ntresponse);
++    tmp = ntlm_fetch_string(&(auth->hdr), auth_length, &auth->ntresponse, auth->flags);
+     if (tmp.str != NULL && tmp.l != 0) {
+-        print_debug("Empty NT pass detection: user: '%s', ours:'%s', his: '%s'"
++        debug("Empty NT pass detection: user: '%s', ours:'%s', his: '%s'"
+                     "(length: %d)\n",
+                     user,ntencoded_empty_pass,tmp.str,tmp.l);
+         if (memcmp(tmp.str,lmencoded_empty_pass,ENCODED_PASS_LEN)==0) {
+@@ -297,18 +294,17 @@ ntlm_check_auth(ntlm_authenticate * auth, int auth_length)
+     /* TODO: check against empty password!!!!! */
+ 
+ 
+-
+-    print_debug("checking domain: '%s', user: '%s', pass='%s'\n", domain, user, pass);
++    debug("checking domain: '%s', user: '%s', pass='%s'\n", domain, user, pass);
+ 
+     rv = SMB_Logon_Server(handle, user, pass, domain, 1);
+-    print_debug("Login attempt had result %d\n", rv);
++    debug("Login attempt had result %d\n", rv);
+ 
+     if (rv != NTV_NO_ERROR) {	/* failed */
+         ntlm_errno = rv;
+         return NULL;
+     }
+     *(user - 1) = '\\';		/* hack. Performing, but ugly. */
+ 
+-    print_debug("credentials: %s\n", credentials);
++    debug("credentials: %s\n", credentials);
+     return credentials;
+ }
+@@ -195,7 +195,7 @@ process_options(int argc, char *argv[])
+          * it's going to live as long as the process anyways */
+         d = malloc(strlen(argv[j]) + 1);
+         strcpy(d, argv[j]);
+-        print_debug("Adding domain-controller %s\n", d);
++        debug("Adding domain-controller %s\n", d);
+         if (NULL == (c = strchr(d, '\\')) && NULL == (c = strchr(d, '/'))) {
+             fprintf(stderr, "Couldn't grok domain-controller %s\n", d);
+             free(d);
+@@ -247,31 +247,31 @@ obtain_challenge()
+     int j = 0;
+     const char *ch = NULL;
+     for (j = 0; j < numcontrollers; j++) {
+-        print_debug("obtain_challenge: selecting %s\\%s (attempt #%d)\n",
++        debug("obtain_challenge: selecting %s\\%s (attempt #%d)\n",
+                     current_dc->domain, current_dc->controller, j + 1);
+         if (current_dc->dead != 0) {
+             if (time(NULL) - current_dc->dead >= DEAD_DC_RETRY_INTERVAL) {
+                 /* mark helper as retry-worthy if it's so. */
+-                print_debug("Reviving DC\n");
++                debug("Reviving DC\n");
+                 current_dc->dead = 0;
+             } else {		/* skip it */
+-                print_debug("Skipping it\n");
++                debug("Skipping it\n");
+                 continue;
+             }
          }
-         rfc1738_unescape(user);
-         rfc1738_unescape(passwd);
-         if (!validUsername(user)) {
--            printf("ERR No such user\n");
-+            printf("ERR No such user '%s':'%s'\n",user, passwd);
-             continue;
+         /* else branch. Here we KNOW that the DC is fine */
+-        print_debug("attempting challenge retrieval\n");
++        debug("attempting challenge retrieval\n");
+         ch = make_challenge(current_dc->domain, current_dc->controller);
+-        print_debug("make_challenge retuned %p\n", ch);
++        debug("make_challenge retuned %p\n", ch);
+         if (ch) {
+-            print_debug("Got it\n");
++            debug("Got it\n");
+             return ch;		/* All went OK, returning */
          }
-         tryagain = (ld != NULL);
+         /* Huston, we've got a problem. Take this DC out of the loop */
+-        print_debug("Marking DC as DEAD\n");
++        debug("Marking DC as DEAD\n");
+         current_dc->dead = time(NULL);
+         /* Try with the next */
+-        print_debug("moving on to next controller\n");
++        debug("moving on to next controller\n");
+         current_dc = current_dc->next;
+     }
+     /* all DCs failed. */
+@@ -293,13 +293,13 @@ manage_request()
+                 strerror(errno));
+         exit(1);		/* BIIG buffer */
+     }
+-    print_debug("managing request\n");
++    debug("managing request\n");
+     ch2 = memchr(buf, '\n', BUFFER_SIZE);	/* safer against overrun than strchr */
+     if (ch2) {
+         *ch2 = '\0';		/* terminate the string at newline. */
+         ch = ch2;
+     }
+-    print_debug("ntlm authenticator. Got '%s' from Squid\n", buf);
++    debug("ntlm authenticator. Got '%s' from Squid\n", buf);
+ 
+     if (memcmp(buf, "KK ", 3) == 0) {	/* authenticate-request */
+         /* figure out what we got */
+@@ -357,8 +357,8 @@ manage_request()
+                 smb_errorclass = SMBlib_Error_Class(SMB_Get_Last_SMB_Err());
+                 smb_errorcode = SMBlib_Error_Code(SMB_Get_Last_SMB_Err());
+                 nb_error = RFCNB_Get_Last_Error();
+-                print_debug("No creds. SMBlib error %d, SMB error class %d, SMB error code %d, NB error %d\n",
+-                            smblib_err, smb_errorclass, smb_errorcode, nb_error);
++                debug("No creds. SMBlib error %d, SMB error class %d, SMB error code %d, NB error %d\n",
++                      smblib_err, smb_errorclass, smb_errorcode, nb_error);
+                 /* Should I use smblib_err? Actually it seems I can do as well
+                  * without it.. */
+                 if (nb_error != 0) {	/* netbios-level error */
+@@ -370,7 +370,7 @@ manage_request()
+                 }
+                 switch (smb_errorclass) {
+                 case SMBC_SUCCESS:
+-                    print_debug("Huh? Got a SMB success code but could check auth..");
++                    debug("Huh? Got a SMB success code but could check auth..");
+                     SEND("NA Authentication failed");
+                     /*
+                      * send_bh_or_ld("SMB success, but no creds. Internal error?",
+@@ -379,7 +379,7 @@ manage_request()
+                     return;
+                 case SMBC_ERRDOS:
+                     /*this is the most important one for errors */
+-                    print_debug("DOS error\n");
++                    debug("DOS error\n");
+                     switch (smb_errorcode) {
+                         /* two categories matter to us: those which could be
+                          * server errors, and those which are auth errors */
+@@ -401,7 +401,7 @@ manage_request()
+                         return;
+                     }
+                 case SMBC_ERRSRV:	/* server errors */
+-                    print_debug("Server error");
++                    debug("Server error");
+                     switch (smb_errorcode) {
+                         /* mostly same as above */
+                     case SMBV_badpw:
+@@ -460,19 +460,19 @@ manage_request()
+ int
+ main(int argc, char *argv[])
+ {
+-    print_debug("ntlm_auth build " __DATE__ ", " __TIME__ " starting up...\n");
++    debug("ntlm_auth build " __DATE__ ", " __TIME__ " starting up...\n");
+ #if DEBUG
+-    print_debug("changing dir to /tmp\n");
++    debug("changing dir to /tmp\n");
+     if (chdir("/tmp") != 0) {
+-        print_debug("ERROR: (%d) failed.\n",errno);
++        debug("ERROR: (%d) failed.\n",errno);
+         return 2;
+     }
+ #endif
+ 
+     my_program_name = argv[0];
+     process_options(argc, argv);
+ 
+-    print_debug("options processed OK\n");
++    debug("options processed OK\n");
+ 
+     /* initialize FDescs */
+     setbuf(stdout, NULL);
+@@ -484,7 +484,7 @@ main(int argc, char *argv[])
+         int n;
+         pid_t pid = getpid();
+         n = pid % numcontrollers;
+-        print_debug("load balancing. Selected controller #%d\n", n);
++        debug("load balancing. Selected controller #%d\n", n);
+         while (n > 0) {
+             current_dc = current_dc->next;
+             n--;
+@@ -40,9 +40,9 @@
+ 
+ 
+ /* A couple of harmless helper macros */
+-#define SEND(X) print_debug("sending '%s' to squid\n",X); printf(X "\n");
++#define SEND(X) debug("sending '%s' to squid\n",X); printf(X "\n");
+ #ifdef __GNUC__
+-#define SEND2(X,Y...) print_debug("sending '" X "' to squid\n",Y); printf(X "\n",Y);
++#define SEND2(X,Y...) debug("sending '" X "' to squid\n",Y); printf(X "\n",Y);
+ #else
+ /* no gcc, no debugging. varargs macros are a gcc extension */
+ #define SEND2 printf
+@@ -95,6 +95,9 @@
+ #define xmemmove(d,s,n) bcopy((s),(d),(n))
+ #endif
+ 
++#if HAVE_CTYPE_H
++#include <ctype.h>
++#endif
+ #define xisspace(x) isspace((unsigned char)x)
+ #define xtoupper(x) toupper((unsigned char)x)
+ #define xtolower(x) tolower((unsigned char)x)
+@@ -17,6 +17,8 @@
+  *
+  *  You should have received a copy of the GNU General Public License
+  *  along with this program; if not, write to the Free Software
++ *
++ *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+  * ----------------------------------------------------------
+  *
+@@ -57,39 +59,16 @@
+ 
+ /* NP: All of this cruft is little endian */
+ 
++#ifdef __cplusplus
++extern "C" {
++#endif
++
+ /* Used internally. Microsoft seems to think this is right, I believe them.
+  * Right. */
+-#define MAX_FIELD_LENGTH 300	/* max length of an NTLMSSP field */
++#define NTLM_MAX_FIELD_LENGTH 300	/* max length of an NTLMSSP field */
+ 
+ 
+ /* Here start the NTLMSSP definitions */
+-/* NTLM request types that we know about */
+-#define NTLM_NEGOTIATE		1
+-#define NTLM_CHALLENGE		2
+-#define NTLM_CHALLENGE_HEADER_OFFSET 40
+-#define NTLM_AUTHENTICATE	3
+-
+-#define NONCE_LEN 8
+-
+-/* negotiate request flags */
+-#define NEGOTIATE_UNICODE              0x0001
+-#define NEGOTIATE_ASCII                0x0002
+-#define NEGOTIATE_REQUEST_TARGET       0x0004
+-#define NEGOTIATE_REQUEST_SIGN         0x0010
+-#define NEGOTIATE_REQUEST_SEAL         0x0020
+-#define NEGOTIATE_DATAGRAM_STYLE       0x0040
+-#define NEGOTIATE_USE_LM               0x0080
+-#define NEGOTIATE_USE_NETWARE          0x0100
+-#define NEGOTIATE_USE_NTLM             0x0200
+-#define NEGOTIATE_DOMAIN_SUPPLIED      0x1000
+-#define NEGOTIATE_WORKSTATION_SUPPLIED 0x2000
+-#define NEGOTIATE_THIS_IS_LOCAL_CALL   0x4000
+-#define NEGOTIATE_ALWAYS_SIGN          0x8000
+-
+-/* challenge request flags */
+-#define CHALLENGE_TARGET_IS_DOMAIN     0x10000
+-#define CHALLENGE_TARGET_IS_SERVER     0x20000
+-#define CHALLENGE_TARGET_IS_SHARE      0x40000
+ 
+ /* these are marked as "extra" fields */
+ #define REQUEST_INIT_RESPONSE          0x100000
+@@ -104,20 +83,71 @@ typedef struct _strhdr {
+     int32_t offset;		/**< Offset from start of request */
+ } strhdr;
+ 
+-/** We use this to keep data/lenght couples. Only used internally. */
++/** We use this to keep data/length couples. */
+ typedef struct _lstring {
+     int32_t l;			/**< length, -1 if empty */
+     char *str;			/**< the string. NULL if not initialized */
+ } lstring;
+ 
+-/** This is an header common to all signatures, it's used to discriminate
+- * among the different signature types.
++/** Debug dump the given flags field to stderr */
++void ntlm_dump_ntlmssp_flags(const u_int32_t flags);
++
++
++/* ************************************************************************* */
++/* Packet and Payload structures and handling functions */
++/* ************************************************************************* */
++
++/* NTLM request types that we know about */
++#define NTLM_ANY			0
++#define NTLM_NEGOTIATE			1
++#define NTLM_CHALLENGE			2
++#define NTLM_AUTHENTICATE		3
++
++/** This is an header common to all packets, it's used to discriminate
++ * among the different packet signature types.
+  */
+ typedef struct _ntlmhdr {
+     char signature[8];		/**< "NTLMSSP" */
+     int32_t type;		/**< One of the NTLM_* types above. */
+ } ntlmhdr;
+ 
++/** Validate the packet type matches one we want. */
++int ntlm_validate_packet(const ntlmhdr *packet, const int type);
++
++/** Retrieve a string from the NTLM packet payload. */
++lstring ntlm_fetch_string(const ntlmhdr *packet,
++                          const int32_t packet_length,
++                          const strhdr *str,
++                          const u_int32_t flags);
++
++/** Append a string to the NTLM packet payload. */
++void ntlm_add_to_payload(const ntlmhdr *packet_hdr,
++                         char *payload,
++                         int *payload_length,
++                         strhdr * hdr,
++                         const char *toadd,
++                         const int toadd_length);
++
++
++/* ************************************************************************* */
++/* Negotiate Packet structures and functions */
++/* ************************************************************************* */
++
++/* negotiate request flags */
++#define NEGOTIATE_UNICODE              0x0001
++#define NEGOTIATE_ASCII                0x0002
++#define NEGOTIATE_REQUEST_TARGET       0x0004
++#define NEGOTIATE_REQUEST_SIGN         0x0010
++#define NEGOTIATE_REQUEST_SEAL         0x0020
++#define NEGOTIATE_DATAGRAM_STYLE       0x0040
++#define NEGOTIATE_USE_LM               0x0080
++#define NEGOTIATE_USE_NETWARE          0x0100
++#define NEGOTIATE_USE_NTLM             0x0200
++#define NEGOTIATE_DOMAIN_SUPPLIED      0x1000
++#define NEGOTIATE_WORKSTATION_SUPPLIED 0x2000
++#define NEGOTIATE_THIS_IS_LOCAL_CALL   0x4000
++#define NEGOTIATE_ALWAYS_SIGN          0x8000
++
+ /** Negotiation request sent by client */
+ typedef struct _ntlm_negotiate {
+     ntlmhdr hdr;		/**< "NTLMSSP" , LSWAP(0x1) */
+@@ -127,17 +157,48 @@ typedef struct _ntlm_negotiate {
+     char payload[256];		/**< String data */
+ } ntlm_negotiate;
+ 
++
++/* ************************************************************************* */
++/* Challenge Packet structures and functions */
++/* ************************************************************************* */
++
++#define NTLM_NONCE_LEN 8
++
++/* challenge request flags */
++#define CHALLENGE_TARGET_IS_DOMAIN     0x10000
++#define CHALLENGE_TARGET_IS_SERVER     0x20000
++#define CHALLENGE_TARGET_IS_SHARE      0x40000
++
+ /** Challenge request sent by server. */
+ typedef struct _ntlm_challenge {
+     ntlmhdr hdr;		/**< "NTLMSSP" , LSWAP(0x2) */
+     strhdr target;		/**< Authentication target (domain/server ...) */
+     u_int32_t flags;		/**< Request flags */
+-    u_char challenge[NONCE_LEN];	/**< Challenge string */
++    u_char challenge[NTLM_NONCE_LEN];	/**< Challenge string */
+     u_int32_t context_low;	/**< LS part of the server context handle */
+     u_int32_t context_high;	/**< MS part of the server context handle */
+     char payload[256];		/**< String data */
+ } ntlm_challenge;
+ 
++/* Size of the ntlm_challenge structures formatted fields (excluding payload) */
++#define NTLM_CHALLENGE_HEADER_OFFSET	(sizeof(ntlm_challenge)-256)
++
++/** Generate a challenge request nonce. */
++void ntlm_make_nonce(char *nonce);
++
++/** Generate a challenge request Blob to be sent to the client. */
++void ntlm_make_challenge(ntlm_challenge *ch,
++                         const char *domain,
++                         const char *domain_controller,
++                         const char *challenge_nonce,
++                         const int challenge_nonce_len,
++                         const u_int32_t flags);
++
++
++/* ************************************************************************* */
++/* Authenticate Packet structures and functions */
++/* ************************************************************************* */
++
+ /** Authentication request sent by client in response to challenge */
+ typedef struct _ntlm_authenticate {
+     ntlmhdr hdr;		/**< "NTLMSSP" , LSWAP(0x3) */
+@@ -151,11 +212,15 @@ typedef struct _ntlm_authenticate {
+     char payload[256 * 6];	/**< String data */
+ } ntlm_authenticate;
+ 
+-const char *ntlm_make_challenge(char *domain, char *domain_controller,
+-                                char *challenge_nonce, int challenge_nonce_len);
+-lstring ntlm_fetch_string(char *packet, int32_t length, strhdr * str);
+-void ntlm_add_to_payload(char *payload, int *payload_length,
+-                         strhdr * hdr, char *toadd,
+-                         int toadd_length, int base_offset);
++/** Unpack username and domain out of a packet payload. */
++int ntlm_unpack_auth(const ntlm_authenticate *auth,
++                     char *user,
++                     char *domain,
++                     const int32_t size);
++
++
++#if __cplusplus
++}
++#endif
+ 
+ #endif /* SQUID_NTLMAUTH_H */
+@@ -78,7 +78,8 @@ libmiscutil_a_LIBADD = $(LIBOBJS)
+ 
+ # $(top_srcdir)/include/version.h should be a dependency
+ libntlmauth_a_SOURCES = \
+-	ntlmauth.c
++	ntlmauth.c \
++	$(top_srcdir)/include/ntlmauth.h
+ libntlmauth_a_LIBADD = \
+ 	$(LIBOBJS)
+ libsspwin32_a_SOURCES = \
+@@ -1,6 +1,10 @@
+ /*
+  * $Id$
+  *
++ * AUTHOR: Francesco Chemolli <kinkie@kame.usr.dsi.unimi.it>
++ * AUTHOR: Guido Serassio: <guido.serassio@acmeconsulting.it>
++ * AUTHOR: Amos Jeffries <squid3@treenet.co.nz>
++ *
+  * * * * * * * * Legal stuff * * * * * * *
+  *
+  * (C) 2000 Francesco Chemolli <kinkie@kame.usr.dsi.unimi.it>,
+@@ -33,7 +37,10 @@
+ #include "ntlmauth.h"
+ #include "util.h"		/* for base64-related stuff */
+ 
+-#if UNUSED_CODE
++/* ************************************************************************* */
++/* DEBUG functions */
++/* ************************************************************************* */
++
+ /** Dumps NTLM flags to standard error for debugging purposes */
+ void
+ ntlm_dump_ntlmssp_flags(u_int32_t flags)
+@@ -60,36 +67,94 @@ ntlm_dump_ntlmssp_flags(u_int32_t flags)
+             (flags & REQUEST_NON_NT_SESSION_KEY ? "Req_nonnt_sesskey " : "")
+            );
+ }
+-#endif
++
++/* ************************************************************************* */
++/* Packet and Payload handling functions */
++/* ************************************************************************* */
++
++/**
++ * Check the validity of a decoded NTLM packet. Return -1 on error.
++ */
++int
++ntlm_validate_packet(const ntlmhdr * hdr, const int type)
++{
++    /*
++     * Must be the correct security package and request type.
++     * The 8 bytes compared includes the ASCII 'NUL'.
++     */
++    if (memcmp(hdr->signature, "NTLMSSP", 8) != 0) {
++        fprintf(stderr, "ntlmCheckHeader: bad header signature\n");
++        return (-1);
++    }
++    if (type == NTLM_ANY)
++        return 0;
++
++    if (le32toh(hdr->type) != type) {
++        /* don't report this error - it's ok as we do a if() around this function */
++//      fprintf(stderr, "ntlmCheckHeader: type is %d, wanted %d\n", le32toh(hdr->type), type);
++        return (-1);
++    }
++    return (0);
++}
+ 
+ #define lstring_zero(s) s.str=NULL; s.l=-1;
+ 
+ /**
+  * Fetches a string from the authentication packet.
+- * The lstring data-part points to inside the packet itself.
++ * The lstring data-part may point to inside the packet itself or a temporary static buffer.
+  * It's up to the user to memcpy() that if the value needs to
+  * be used in any way that requires a tailing \0. (can check whether the
+  * value is there though, in that case lstring.length == -1).
++ *
++ * String may be either ASCII or UNICODE depending on whether flags contains NEGOTIATE_ASCII
+  */
+ lstring
+-ntlm_fetch_string(char *packet, int32_t length, strhdr * str)
++ntlm_fetch_string(const ntlmhdr *packet, const int32_t packet_size, const strhdr * str, const u_int32_t flags)
+ {
+     int16_t l;			/* length */
+     int32_t o;			/* offset */
++    static char buf[NTLM_MAX_FIELD_LENGTH];
+     lstring rv;
++    u_short *s, c;
++    char *d, *sc;
+ 
+     lstring_zero(rv);
+ 
+     l = le16toh(str->len);
+     o = le32toh(str->offset);
+-    /* debug("fetch_string(plength=%d,l=%d,o=%d)\n",length,l,o); */
++    /* debug("fetch_string(plength=%d,l=%d,o=%d)\n",packet_size,l,o); */
+ 
+-    if (l < 0 || l > MAX_FIELD_LENGTH || o + l > length || o == 0) {
++    if (l < 0 || l > NTLM_MAX_FIELD_LENGTH || o + l > packet_size || o == 0) {
+         /* debug("ntlmssp: insane data (l: %d, o: %d)\n", l,o); */
+         return rv;
+     }
+-    rv.str = packet + o;
+-    rv.l = l;
++    rv.str = (char *)packet + o;
++    if ((flags & NEGOTIATE_ASCII) == 0) {
++        /* UNICODE string */
++        s = (u_short *) ((char *) packet + o);
++        rv.str = d = buf;
++
++        for (l >>= 1; l; s++, l--) {
++            c = le16toh(*s);
++            if (c > 254 || c == '\0') {
++                fprintf(stderr, "ntlmssp: bad unicode: %04x\n", c);
++                return rv;
++            }
++            *d++ = c;
++            rv.l++;
++        }
++    } else {
++        /* ASCII/OEM string */
++        sc = (char *) packet + o;
++
++        for (; l; l--) {
++            if (*sc == '\0' || !xisprint(*sc)) {
++                fprintf(stderr, "ntlmssp: bad ascii: %04x\n", *sc);
++                return rv;
++            }
++            rv.l++;
++        }
++    }
+ 
+     return rv;
+ }
+@@ -99,54 +164,156 @@ ntlm_fetch_string(char *packet, int32_t length, strhdr * str)
+  * there is enough space in the payload string to accommodate the
+  * added value.
+  * payload_length and hdr will be modified as a side-effect.
+- * base_offset is the payload offset from the packet's beginning, and is
+  */
+ void
+-ntlm_add_to_payload(char *payload, int *payload_length,
+-                    strhdr * hdr, char *toadd,
+-                    int toadd_length, int base_offset)
++ntlm_add_to_payload(const ntlmhdr *packet_hdr,
++                    char *payload,
++                    int *payload_length,
++                    strhdr * hdr,
++                    const char *toadd,
++                    const int toadd_length)
+ {
+-
+     int l = (*payload_length);
+     memcpy(payload + l, toadd, toadd_length);
+ 
+     hdr->len = htole16(toadd_length);
+     hdr->maxlen = htole16(toadd_length);
+-    hdr->offset = htole32(l + base_offset);	/* 48 is the base offset of the payload */
++    hdr->offset = htole32(l + payload - (char*)packet_hdr);
+     (*payload_length) += toadd_length;
+ }
+ 
+ 
++/* ************************************************************************* */
++/* Negotiate Packet functions */
++/* ************************************************************************* */
++
++// ??
++
++
++/* ************************************************************************* */
++/* Challenge Packet functions */
++/* ************************************************************************* */
++
++/* 
++ * Generates a challenge request nonce. The randomness of the 8 byte
++ * challenge strings can be guarenteed to be poor at best.
++ */
++void
++ntlm_make_nonce(char *nonce)
++{
++    static unsigned hash;
++    int i;
++    int r = (int) rand();
++    r = (hash ^ r) + r;
++
++    for (i = 0; i < NTLM_NONCE_LEN; i++) {
++        nonce[i] = r;
++        r = (r >> 2) ^ r;
++    }
++    hash = r;
++}
++
++#if DEAD_API
+ /**
+  * Prepares a base64-encode challenge packet to be sent to the client
+  * \note domain should be upper_case
+  * \note the storage type for the returned value depends on
+  *    base64_encode_bin. Currently this means static storage.
+  */
+-const char *
+-ntlm_make_challenge(char *domain, char *domain_controller,
+-                    char *challenge_nonce, int challenge_nonce_len)
++void
++ntlm_make_challenge(const char *domain, const char *dc_UNUSED,
++                    const char *cn, const int cnl)
++{
++    /* This function API has changes somewhat, and not all user helpers */
++    ntlm_challenge chal;
++
++    /*  ORIGINAL flags was HARD-CODED set to these:
++        TODO: find all old callers (without flags field) and have them send these in manually now...
++    */
++    u_int32_t flags = REQUEST_NON_NT_SESSION_KEY |
++                      CHALLENGE_TARGET_IS_DOMAIN |
++                      NEGOTIATE_ALWAYS_SIGN |
++                      NEGOTIATE_USE_NTLM |
++                      NEGOTIATE_USE_LM |
++                      NEGOTIATE_ASCII;
++
++    ntlm_make_challenge(&chal, domain, dc_UNUSED, cn, cnl, flags);
++
++/*  ORIGINAL handling of ntlm_challenge object was to encode it like this:
++    TODO: find all old callers and have them do teh decode themselves now.
++*/
++    return base64_encode_bin((char *)&chal, NTLM_CHALLENGE_HEADER_OFFSET + pl);
++}
++#endif
++
++/**
++ * Prepares a challenge packet to be sent to the client
++ * \note domain should be upper_case
++ */
++void
++ntlm_make_challenge(ntlm_challenge *ch,
++                    const char *domain, const char *domain_controller_UNUSED,
++                    const char *challenge_nonce, const int challenge_nonce_len,
++                    const u_int32_t flags)
+ {
+-    ntlm_challenge ch;
+     int pl = 0;
+-    const char *encoded;
+-    memset(&ch, 0, sizeof(ntlm_challenge));	/* reset */
+-    memcpy(ch.hdr.signature, "NTLMSSP", 8);		/* set the signature */
+-    ch.hdr.type = htole32(NTLM_CHALLENGE);	/* this is a challenge */
+-    ntlm_add_to_payload(ch.payload, &pl, &ch.target, domain, strlen(domain),
+-                        NTLM_CHALLENGE_HEADER_OFFSET);
+-    ch.flags = htole32(
+-                   REQUEST_NON_NT_SESSION_KEY |
+-                   CHALLENGE_TARGET_IS_DOMAIN |
+-                   NEGOTIATE_ALWAYS_SIGN |
+-                   NEGOTIATE_USE_NTLM |
+-                   NEGOTIATE_USE_LM |
+-                   NEGOTIATE_ASCII |
+-                   0
+-               );
+-    ch.context_low = 0;		/* check this out */
+-    ch.context_high = 0;
+-    memcpy(ch.challenge, challenge_nonce, challenge_nonce_len);
+-    encoded = base64_encode_bin((char *) &ch, NTLM_CHALLENGE_HEADER_OFFSET + pl);
+-    return encoded;
++    memset(ch, 0, sizeof(ntlm_challenge));	/* reset */
++    memcpy(ch->hdr.signature, "NTLMSSP", 8);		/* set the signature */
++    ch->hdr.type = htole32(NTLM_CHALLENGE);	/* this is a challenge */
++    if (domain != NULL) {
++        ntlm_add_to_payload(&ch->hdr, ch->payload, &pl, &ch->target, domain, strlen(domain));
++    }
++    ch->flags = htole32(flags);
++    ch->context_low = 0;		/* check this out */
++    ch->context_high = 0;
++    memcpy(ch->challenge, challenge_nonce, challenge_nonce_len);
++}
++
++/* ************************************************************************* */
++/* Authenticate Packet functions */
++/* ************************************************************************* */
++
++/**
++ * Unpack the strings in an NTLM authentication response from client.
++ * The caller is responsible for initializing the user and domain buffers
++ * this function will only insert data if the packet contains any. Otherwise
++ * the buffers will be left untouched.
++ *
++ * \retval -1	packet type is not an authentication packet.
++ * \retval  0	username present and maybe also domain.
++ * \retval  1	no username.
++ */
++int
++ntlm_unpack_auth(const ntlm_authenticate *auth, char *user, char *domain, const int32_t size)
++{
++    const char *p;
++    unsigned int s;
++    lstring rv;
++
++    if (ntlm_validate_packet(&auth->hdr, NTLM_AUTHENTICATE)) {
++        fprintf(stderr, "ntlmDecodeAuth: header check fails\n");
++        return -1;
++    }
++    debug("ntlmDecodeAuth: size of %d\n", size);
++    debug("ntlmDecodeAuth: flg %08x\n", auth->flags);
++    debug("ntlmDecodeAuth: usr o(%d) l(%d)\n", auth->user.offset, auth->user.len);
++
++    rv = ntlm_fetch_string(&auth->hdr, size, &auth->domain, auth->flags);
++    if (rv.l > 0) {
++        memcpy(rv.str, domain, rv.l);
++        domain[rv.l] = '\0';
++        debug("ntlm_unpack_auth: Domain '%s'.\n", domain);
++    }
++    if (rv.l >= size)
++        return 1;
++
++    rv = ntlm_fetch_string(&auth->hdr, size, &auth->user, auth->flags);
++    if (rv.l > 0) {
++        memcpy(rv.str, user, rv.l);
++        user[rv.l] = '\0';
++        debug("ntlm_unpack_auth: Username '%s'.\n", user);
++    } else
++        return 1;
++
++    return 0;
+ }

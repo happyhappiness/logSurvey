@@ -1,0 +1,576 @@
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: ICP.h,v 1.1 2002/10/13 20:34:57 robertc Exp $
++ * $Id: ICP.h,v 1.2 2002/10/21 14:00:01 adrian Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -82,6 +82,20 @@ class ICPState {
+ 
+ #endif
+ 
++typedef struct _icpUdpData icpUdpData;
++struct _icpUdpData {
++    struct sockaddr_in address;
++    void *msg;
++    size_t len;
++    icpUdpData *next;
++#ifndef LESS_TIMING
++    struct timeval start;
++#endif
++    log_type logcode;
++    struct timeval queue_time;
++};
++
++
+ request_t *
+           icpGetRequest(char *url, int reqnum, int fd, struct sockaddr_in *from);
+ int icpAccessAllowed(struct sockaddr_in *from, request_t * icp_request);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: client_side.cc,v 1.603 2002/10/18 22:46:46 hno Exp $
++ * $Id: client_side.cc,v 1.604 2002/10/21 14:00:01 adrian Exp $
+  *
+  * DEBUG: section 33    Client-side Routines
+  * AUTHOR: Duane Wessels
+@@ -608,7 +608,7 @@ contextSendBody(clientSocketContext * context, HttpReply * rep, StoreIOBuffer bo
+ {
+     assert(rep == NULL);
+     context->http->out.offset += bodyData.length;
+-    comm_write(context->http->conn->fd, bodyData.data, bodyData.length,
++    comm_old_write(context->http->conn->fd, bodyData.data, bodyData.length,
+ 	clientWriteBodyComplete, context, NULL);
+     return;
+ }
+@@ -637,7 +637,7 @@ contextSendStartOfMessage(clientSocketContext * context, HttpReply * rep, StoreI
+ 	memBufAppend(&mb, bodyData.data, bodyData.length);
+     }
+     /* write */
+-    comm_write_mbuf(context->http->conn->fd, mb, clientWriteComplete, context);
++    comm_old_write_mbuf(context->http->conn->fd, mb, clientWriteComplete, context);
+     /* if we don't do it, who will? */
+ }
+ 
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: comm.cc,v 1.344 2002/10/21 06:43:07 adrian Exp $
++ * $Id: comm.cc,v 1.345 2002/10/21 14:00:02 adrian Exp $
+  *
+  * DEBUG: section 5     Socket Functions
+  * AUTHOR: Harvest Derived
+@@ -86,6 +86,13 @@ struct _fdc_t {
+ 		IOCB *handler;
+ 		void *handler_data;
+ 	} read;
++	struct {
++		char *buf;
++		int size;
++		int curofs;
++		IOCB *handler;
++		void *handler_data;
++	} write;
+ 	struct {
+ 		struct sockaddr_in me;
+ 		struct sockaddr_in pn;
+@@ -121,6 +128,7 @@ struct _CommCallbackData {
+ 	    IOCB *r_callback;
+ 	    IOACB *a_callback;
+ 	    IOFCB *f_callback;
++	    IOWCB *w_callback;
+ 	} c;
+ 	void *callback_data;
+ 	comm_err_t errcode;
+@@ -260,6 +268,36 @@ comm_add_fill_callback(int fd, size_t retval, comm_err_t errcode, int xerrno)
+ 	dlinkAddTail(cio, &(cio->fd_node), &(fdc_table[fd].CommCallbackList));
+ }
+ 
++static void
++comm_add_write_callback(int fd, size_t retval, comm_err_t errcode, int xerrno)
++{
++	CommCallbackData *cio;
++
++	assert(fdc_table[fd].active == 1);
++
++	/* Allocate a new struct */
++	cio = (CommCallbackData *)memPoolAlloc(comm_callback_pool);
++
++	/* Throw our data into it */
++	cio->fd = fd;
++	cio->xerrno = xerrno;
++	cio->errcode = errcode;
++	cio->c.w_callback = fdc_table[fd].write.handler;
++	cio->callback_data = fdc_table[fd].fill.handler_data;
++	cio->seqnum = CommCallbackSeqnum;
++	cio->type = COMM_CB_WRITE;
++	cio->retval = retval;
++
++	/* Clear out fd state */
++	fdc_table[fd].write.handler = NULL;
++	fdc_table[fd].write.handler_data = NULL;
++
++	/* Add it to the end of the list */
++	dlinkAddTail(cio, &(cio->h_node), &CommCallbackList);
++
++	/* and add it to the end of the fd list */
++	dlinkAddTail(cio, &(cio->fd_node), &(fdc_table[fd].CommCallbackList));
++}
+ 
+ 
+ 
+@@ -272,7 +310,8 @@ comm_call_io_callback(CommCallbackData *cio)
+ 		          cio->callback_data);
+ 			break;
+ 		    case COMM_CB_WRITE:
+-			fatal("write comm hasn't been implemented yet!");
++			cio->c.w_callback(cio->fd, cio->buf, cio->retval, cio->errcode, cio->xerrno,
++			  cio->callback_data);
+ 		        break;
+ 		    case COMM_CB_ACCEPT:
+                         cio->c.a_callback(cio->fd, cio->newfd, &cio->me, &cio->pn, cio->errcode,
+@@ -574,6 +613,55 @@ comm_udp_send(int s, const void *buf, size_t len, int flags)
+ }
+ 
+ 
++/*
++ * The new-style comm_write magic
++ */
++/*
++ * Attempt a write
++ *
++ * If the write attempt succeeds or fails, call the callback.
++ * Else, wait for another IO notification.
++ */
++static void
++comm_write_try(int fd, void *data)
++{
++	fdc_t *Fc = &fdc_table[fd];
++	int retval;
++
++	/* make sure we actually have a callback */
++	assert(Fc->write.handler != NULL);
++
++	/* Attempt a write */
++        statCounter.syscalls.sock.reads++;
++	retval = FD_WRITE_METHOD(fd, Fc->write.buf + Fc->write.curofs, Fc->write.size - Fc->write.curofs);
++	if (retval < 0 && !ignoreErrno(errno)) {
++		comm_add_write_callback(fd, 0, COMM_ERROR, errno);
++		return;
++	};
++
++	/* See if we wrote it all */
++	/* Note - write 0 == socket EOF, which is a valid read */
++	if (retval == 0) {
++		comm_add_write_callback(fd, retval, COMM_OK, 0);
++		return;
++	}
++	if (retval >= 0) {
++                fd_bytes(fd, retval, FD_WRITE);
++		Fc->write.curofs += retval;
++		assert(Fc->write.curofs <= Fc->write.size);
++		/* All? */
++		if (Fc->write.curofs == Fc->write.size) {
++			comm_add_write_callback(fd, retval, COMM_OK, 0);
++			return;
++		}
++	}
++
++	/* if we get here, we need to write more! */
++        commSetSelect(fd, COMM_SELECT_WRITE, comm_write_try, NULL, 0);
++}
++
++
++
+ /* Older stuff */
+ 
+ static void
+@@ -1470,7 +1558,7 @@ commHandleWrite(int fd, void *data)
+  * free_func is used to free the passed buffer when the write has completed.
+  */
+ void
+-comm_write(int fd, const char *buf, int size, CWCB * handler, void *handler_data, FREE * free_func)
++comm_old_write(int fd, const char *buf, int size, CWCB * handler, void *handler_data, FREE * free_func)
+ {
+     CommWriteStateData *state = fd_table[fd].rwstate;
+ 
+@@ -1495,9 +1583,9 @@ comm_write(int fd, const char *buf, int size, CWCB * handler, void *handler_data
+ 
+ /* a wrapper around comm_write to allow for MemBuf to be comm_written in a snap */
+ void
+-comm_write_mbuf(int fd, MemBuf mb, CWCB * handler, void *handler_data)
++comm_old_write_mbuf(int fd, MemBuf mb, CWCB * handler, void *handler_data)
+ {
+-    comm_write(fd, mb.buf, mb.size, handler, handler_data, memBufFreeFunc(&mb));
++    comm_old_write(fd, mb.buf, mb.size, handler, handler_data, memBufFreeFunc(&mb));
+ }
+ 
+ 
+@@ -4,6 +4,7 @@
+ #include "StoreIOBuffer.h"
+ 
+ typedef void IOFCB(int fd, StoreIOBuffer recievedData, comm_err_t flag, int xerrno, void *data);
++typedef void IOWCB(int fd, char *data, size_t len, comm_err_t flag, int xerrno, void *data);
+ /* fill sb with up to length data from fd */
+ extern void comm_fill_immediate(int fd, StoreIOBuffer sb, IOFCB *callback, void *data);
+ 
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: errorpage.cc,v 1.178 2002/10/13 20:35:00 robertc Exp $
++ * $Id: errorpage.cc,v 1.179 2002/10/21 14:00:02 adrian Exp $
+  *
+  * DEBUG: section 4     Error Generation
+  * AUTHOR: Duane Wessels
+@@ -369,7 +369,7 @@ errorSend(int fd, ErrorState * err)
+     /* moved in front of errorBuildBuf @?@ */
+     err->flags.flag_cbdata = 1;
+     rep = errorBuildReply(err);
+-    comm_write_mbuf(fd, httpReplyPack(rep), errorSendComplete, err);
++    comm_old_write_mbuf(fd, httpReplyPack(rep), errorSendComplete, err);
+     httpReplyDestroy(rep);
+ }
+ 
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: ftp.cc,v 1.335 2002/10/15 01:00:22 adrian Exp $
++ * $Id: ftp.cc,v 1.336 2002/10/21 14:00:02 adrian Exp $
+  *
+  * DEBUG: section 9     File Transfer Protocol (FTP)
+  * AUTHOR: Harvest Derived
+@@ -1118,7 +1118,7 @@ ftpWriteCommand(const char *buf, FtpStateData * ftpState)
+     safe_free(ftpState->ctrl.last_command);
+     safe_free(ftpState->ctrl.last_reply);
+     ftpState->ctrl.last_command = xstrdup(buf);
+-    comm_write(ftpState->ctrl.fd,
++    comm_old_write(ftpState->ctrl.fd,
+ 	xstrdup(buf),
+ 	strlen(buf),
+ 	ftpWriteCommandCallback,
+@@ -2208,7 +2208,7 @@ ftpRequestBody(char *buf, ssize_t size, void *data)
+     ftpState->data.offset = size;
+     if (size > 0) {
+ 	/* DataWrite */
+-	comm_write(ftpState->data.fd, buf, size, ftpDataWriteCallback, ftpState, NULL);
++	comm_old_write(ftpState->data.fd, buf, size, ftpDataWriteCallback, ftpState, NULL);
+     } else if (size < 0) {
+ 	/* Error */
+ 	debug(9, 1) ("ftpRequestBody: request aborted");
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: globals.h,v 1.112 2002/10/13 20:35:01 robertc Exp $
++ * $Id: globals.h,v 1.113 2002/10/21 14:00:02 adrian Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -142,7 +142,6 @@ extern const char *StoreDigestMimeStr;	/* "application/cache-digest" */
+ extern const Version CacheDigestVer;	/* { 5, 3 } */
+ #endif
+ extern const char *MultipartMsgBoundaryStr;	/* "Unique-Squid-Separator" */
+-extern icpUdpData *IcpQueueHead;	/* NULL */
+ #if HTTP_VIOLATIONS
+ extern int refresh_nocache_hack;	/* 0 */
+ #endif
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: gopher.cc,v 1.175 2002/10/14 08:16:58 robertc Exp $
++ * $Id: gopher.cc,v 1.176 2002/10/21 14:00:02 adrian Exp $
+  *
+  * DEBUG: section 10    Gopher
+  * AUTHOR: Harvest Derived
+@@ -792,7 +792,7 @@ gopherSendRequest(int fd, void *data)
+ 	snprintf(buf, 4096, "%s\r\n", gopherState->request);
+     }
+     debug(10, 5) ("gopherSendRequest: FD %d\n", fd);
+-    comm_write(fd,
++    comm_old_write(fd,
+ 	buf,
+ 	strlen(buf),
+ 	gopherSendComplete,
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: helper.cc,v 1.49 2002/10/14 08:16:58 robertc Exp $
++ * $Id: helper.cc,v 1.50 2002/10/21 14:00:02 adrian Exp $
+  *
+  * DEBUG: section 84    Helper process maintenance
+  * AUTHOR: Harvest Derived?
+@@ -1023,7 +1023,7 @@ helperDispatch(helper_server * srv, helper_request * r)
+     srv->flags.busy = 1;
+     srv->request = r;
+     srv->dispatch_time = current_time;
+-    comm_write(srv->wfd,
++    comm_old_write(srv->wfd,
+ 	r->buf,
+ 	strlen(r->buf),
+ 	NULL,			/* Handler */
+@@ -1074,7 +1074,7 @@ helperStatefulDispatch(helper_stateful_server * srv, helper_stateful_request * r
+     srv->flags.busy = 1;
+     srv->request = r;
+     srv->dispatch_time = current_time;
+-    comm_write(srv->wfd,
++    comm_old_write(srv->wfd,
+ 	r->buf,
+ 	strlen(r->buf),
+ 	NULL,			/* Handler */
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: http.cc,v 1.401 2002/10/15 13:36:47 robertc Exp $
++ * $Id: http.cc,v 1.402 2002/10/21 14:00:02 adrian Exp $
+  *
+  * DEBUG: section 11    Hypertext Transfer Protocol (HTTP)
+  * AUTHOR: Harvest Derived
+@@ -1025,7 +1025,7 @@ httpSendRequest(HttpStateData * httpState)
+ 	&mb,
+ 	httpState->flags);
+     debug(11, 6) ("httpSendRequest: FD %d:\n%s\n", httpState->fd, mb.buf);
+-    comm_write_mbuf(httpState->fd, mb, sendHeaderDone, httpState);
++    comm_old_write_mbuf(httpState->fd, mb, sendHeaderDone, httpState);
+ }
+ 
+ void
+@@ -1103,7 +1103,7 @@ httpSendRequestEntityDone(int fd, void *data)
+ 	httpSendComplete(fd, NULL, 0, COMM_OK, data);
+     } else {
+ 	debug(11, 2) ("httpSendRequestEntityDone: matched brokenPosts\n");
+-	comm_write(fd, "\r\n", 2, httpSendComplete, data, NULL);
++	comm_old_write(fd, "\r\n", 2, httpSendComplete, data, NULL);
+     }
+ }
+ 
+@@ -1112,7 +1112,7 @@ httpRequestBodyHandler(char *buf, ssize_t size, void *data)
+ {
+     HttpStateData *httpState = (HttpStateData *) data;
+     if (size > 0) {
+-	comm_write(httpState->fd, buf, size, httpSendRequestEntity, data, memFree8K);
++	comm_old_write(httpState->fd, buf, size, httpSendRequestEntity, data, memFree8K);
+     } else if (size == 0) {
+ 	/* End of body */
+ 	memFree8K(buf);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: icp_v2.cc,v 1.71 2002/10/21 09:18:40 adrian Exp $
++ * $Id: icp_v2.cc,v 1.72 2002/10/21 14:00:02 adrian Exp $
+  *
+  * DEBUG: section 12    Internet Cache Protocol
+  * AUTHOR: Duane Wessels
+@@ -47,6 +47,7 @@ static void icpCount(void *, int, size_t, int);
+  * to call icpUdpSendQueue.
+  */
+ static icpUdpData *IcpQueueTail = NULL;
++static icpUdpData *IcpQueueHead = NULL;
+ 
+ /* icp_common_t */
+ _icp_common_t::_icp_common_t() : opcode(ICP_INVALID), version(0), length(0), reqnum(0), flags(0), pad(0), shostid(0)
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: ident.cc,v 1.61 2002/10/14 08:16:58 robertc Exp $
++ * $Id: ident.cc,v 1.62 2002/10/21 14:00:02 adrian Exp $
+  *
+  * DEBUG: section 30    Ident (RFC 931)
+  * AUTHOR: Duane Wessels
+@@ -125,7 +125,7 @@ identConnectDone(int fd, comm_err_t status, void *data)
+     memBufPrintf(&mb, "%d, %d\r\n",
+ 	ntohs(state->my_peer.sin_port),
+ 	ntohs(state->me.sin_port));
+-    comm_write_mbuf(fd, mb, NULL, state);
++    comm_old_write_mbuf(fd, mb, NULL, state);
+     comm_read(fd, state->buf, BUFSIZ, identReadReply, state);
+     commSetTimeout(fd, Config.Timeout.ident, identTimeout, state);
+ }
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: protos.h,v 1.455 2002/10/18 22:43:23 hno Exp $
++ * $Id: protos.h,v 1.456 2002/10/21 14:00:02 adrian Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -180,13 +180,13 @@ SQUIDCEXTERN void commSetSelect(int, unsigned int, PF *, void *, time_t);
+ SQUIDCEXTERN void comm_add_close_handler(int fd, PF *, void *);
+ SQUIDCEXTERN void comm_remove_close_handler(int fd, PF *, void *);
+ SQUIDCEXTERN int comm_udp_sendto(int, const struct sockaddr_in *, int, const void *, int);
+-SQUIDCEXTERN void comm_write(int fd,
++SQUIDCEXTERN void comm_old_write(int fd,
+     const char *buf,
+     int size,
+     CWCB * handler,
+     void *handler_data,
+     FREE *);
+-SQUIDCEXTERN void comm_write_mbuf(int fd, MemBuf mb, CWCB * handler, void *handler_data);
++SQUIDCEXTERN void comm_old_write_mbuf(int fd, MemBuf mb, CWCB * handler, void *handler_data);
+ SQUIDCEXTERN void commCallCloseHandlers(int fd);
+ SQUIDCEXTERN int commSetTimeout(int fd, int, PF *, void *);
+ SQUIDCEXTERN void commSetDefer(int fd, DEFER * func, void *);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: ssl.cc,v 1.127 2002/10/14 08:51:03 robertc Exp $
++ * $Id: ssl.cc,v 1.128 2002/10/21 14:00:03 adrian Exp $
+  *
+  * DEBUG: section 26    Secure Sockets Layer Proxy
+  * AUTHOR: Duane Wessels
+@@ -166,7 +166,7 @@ sslReadServer(int fd, char *buf, size_t len, comm_err_t errcode, int xerrno, voi
+ 	    comm_close(sslState->client.fd);
+         }
+     } else if (cbdataReferenceValid(sslState))
+-	comm_write(sslState->client.fd, sslState->server.buf, len, sslWriteClientDone, sslState, NULL);
++	comm_old_write(sslState->client.fd, sslState->server.buf, len, sslWriteClientDone, sslState, NULL);
+     cbdataInternalUnlock(sslState);	/* ??? */
+ }
+ 
+@@ -209,7 +209,7 @@ sslReadClient(int fd, char *buf, size_t len, comm_err_t errcode, int xerrno, voi
+ 	    comm_close(sslState->server.fd);
+         }
+     } else if (cbdataReferenceValid(sslState))
+-	comm_write(sslState->server.fd, sslState->client.buf, len, sslWriteServerDone, sslState, NULL);
++	comm_old_write(sslState->server.fd, sslState->client.buf, len, sslWriteServerDone, sslState, NULL);
+     cbdataInternalUnlock(sslState);	/* ??? */
+ }
+ 
+@@ -349,7 +349,7 @@ sslConnected(int fd, void *data)
+     SslStateData *sslState = (SslStateData *)data;
+     debug(26, 3) ("sslConnected: FD %d sslState=%p\n", fd, sslState);
+     *sslState->status_ptr = HTTP_OK;
+-    comm_write(sslState->client.fd, conn_established, strlen(conn_established),
++    comm_old_write(sslState->client.fd, conn_established, strlen(conn_established),
+       sslConnectedWriteDone, sslState, NULL);
+ }
+ 
+@@ -536,7 +536,7 @@ sslProxyConnected(int fd, void *data)
+     packerClean(&p);
+     memBufAppend(&mb, "\r\n", 2);
+ 
+-    comm_write_mbuf(sslState->server.fd, mb, sslProxyConnectedWriteDone, sslState);
++    comm_old_write_mbuf(sslState->server.fd, mb, sslProxyConnectedWriteDone, sslState);
+ 
+     commSetTimeout(sslState->server.fd,
+ 	Config.Timeout.read,
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: structs.h,v 1.435 2002/10/14 08:16:59 robertc Exp $
++ * $Id: structs.h,v 1.436 2002/10/21 14:00:03 adrian Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -869,18 +869,6 @@ struct _http_state_flags {
+     unsigned int only_if_cached:1;
+ };
+ 
+-struct _icpUdpData {
+-    struct sockaddr_in address;
+-    void *msg;
+-    size_t len;
+-    icpUdpData *next;
+-#ifndef LESS_TIMING
+-    struct timeval start;
+-#endif
+-    log_type logcode;
+-    struct timeval queue_time;
+-};
+-
+ struct _ping_data {
+     struct timeval start;
+     struct timeval stop;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: tunnel.cc,v 1.127 2002/10/14 08:51:03 robertc Exp $
++ * $Id: tunnel.cc,v 1.128 2002/10/21 14:00:03 adrian Exp $
+  *
+  * DEBUG: section 26    Secure Sockets Layer Proxy
+  * AUTHOR: Duane Wessels
+@@ -166,7 +166,7 @@ sslReadServer(int fd, char *buf, size_t len, comm_err_t errcode, int xerrno, voi
+ 	    comm_close(sslState->client.fd);
+         }
+     } else if (cbdataReferenceValid(sslState))
+-	comm_write(sslState->client.fd, sslState->server.buf, len, sslWriteClientDone, sslState, NULL);
++	comm_old_write(sslState->client.fd, sslState->server.buf, len, sslWriteClientDone, sslState, NULL);
+     cbdataInternalUnlock(sslState);	/* ??? */
+ }
+ 
+@@ -209,7 +209,7 @@ sslReadClient(int fd, char *buf, size_t len, comm_err_t errcode, int xerrno, voi
+ 	    comm_close(sslState->server.fd);
+         }
+     } else if (cbdataReferenceValid(sslState))
+-	comm_write(sslState->server.fd, sslState->client.buf, len, sslWriteServerDone, sslState, NULL);
++	comm_old_write(sslState->server.fd, sslState->client.buf, len, sslWriteServerDone, sslState, NULL);
+     cbdataInternalUnlock(sslState);	/* ??? */
+ }
+ 
+@@ -349,7 +349,7 @@ sslConnected(int fd, void *data)
+     SslStateData *sslState = (SslStateData *)data;
+     debug(26, 3) ("sslConnected: FD %d sslState=%p\n", fd, sslState);
+     *sslState->status_ptr = HTTP_OK;
+-    comm_write(sslState->client.fd, conn_established, strlen(conn_established),
++    comm_old_write(sslState->client.fd, conn_established, strlen(conn_established),
+       sslConnectedWriteDone, sslState, NULL);
+ }
+ 
+@@ -536,7 +536,7 @@ sslProxyConnected(int fd, void *data)
+     packerClean(&p);
+     memBufAppend(&mb, "\r\n", 2);
+ 
+-    comm_write_mbuf(sslState->server.fd, mb, sslProxyConnectedWriteDone, sslState);
++    comm_old_write_mbuf(sslState->server.fd, mb, sslProxyConnectedWriteDone, sslState);
+ 
+     commSetTimeout(sslState->server.fd,
+ 	Config.Timeout.read,
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: typedefs.h,v 1.140 2002/10/14 08:16:59 robertc Exp $
++ * $Id: typedefs.h,v 1.141 2002/10/21 14:00:03 adrian Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -105,7 +105,6 @@ typedef struct _HttpHeaderFieldStat HttpHeaderFieldStat;
+ typedef struct _HttpHeaderStat HttpHeaderStat;
+ typedef struct _HttpBody HttpBody;
+ typedef struct _HttpReply HttpReply;
+-typedef struct _icpUdpData icpUdpData;
+ typedef struct _clientHttpRequest clientHttpRequest;
+ typedef struct _ConnStateData ConnStateData;
+ typedef struct _ConnCloseHelperData ConnCloseHelperData;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: wais.cc,v 1.143 2002/10/14 08:52:23 robertc Exp $
++ * $Id: wais.cc,v 1.144 2002/10/21 14:00:03 adrian Exp $
+  *
+  * DEBUG: section 24    WAIS Relay
+  * AUTHOR: Harvest Derived
+@@ -206,7 +206,7 @@ waisSendRequest(int fd, void *data)
+     }
+     memBufPrintf(&mb, "\r\n");
+     debug(24, 6) ("waisSendRequest: buf: %s\n", mb.buf);
+-    comm_write_mbuf(fd, mb, waisSendComplete, waisState);
++    comm_old_write_mbuf(fd, mb, waisSendComplete, waisState);
+     if (EBIT_TEST(waisState->entry->flags, ENTRY_CACHABLE))
+ 	storeSetPublicKey(waisState->entry);	/* Make it public */
+     EBIT_CLR(waisState->entry->flags, ENTRY_FWD_HDR_WAIT);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: whois.cc,v 1.20 2002/10/14 08:16:59 robertc Exp $
++ * $Id: whois.cc,v 1.21 2002/10/21 14:00:03 adrian Exp $
+  *
+  * DEBUG: section 75    WHOIS protocol
+  * AUTHOR: Duane Wessels, Kostas Anagnostakis
+@@ -70,7 +70,7 @@ whoisStart(FwdState * fwd)
+     l = strLen(p->request->urlpath) + 3;
+     buf = (char *)xmalloc(l);
+     snprintf(buf, l, "%s\r\n", strBuf(p->request->urlpath) + 1);
+-    comm_write(fd, buf, strlen(buf), NULL, p, xfree);
++    comm_old_write(fd, buf, strlen(buf), NULL, p, xfree);
+     comm_read(fd, p->buf, BUFSIZ, whoisReadReply, p);
+     commSetTimeout(fd, Config.Timeout.read, whoisTimeout, p);
+ }

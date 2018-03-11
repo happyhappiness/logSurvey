@@ -1,0 +1,6083 @@
+@@ -0,0 +1,245 @@
++#include "squid.h"
++#include "Parsing.h"
++#include "TextException.h"
++#include "ChunkedCodingParser.h"
++#include "MemBuf.h"
++
++ChunkedCodingParser::Step ChunkedCodingParser::psChunkBeg = &ChunkedCodingParser::parseChunkBeg;
++ChunkedCodingParser::Step ChunkedCodingParser::psChunkBody = &ChunkedCodingParser::parseChunkBody;
++ChunkedCodingParser::Step ChunkedCodingParser::psChunkEnd = &ChunkedCodingParser::parseChunkEnd;
++ChunkedCodingParser::Step ChunkedCodingParser::psTrailer = &ChunkedCodingParser::parseTrailer;
++ChunkedCodingParser::Step ChunkedCodingParser::psMessageEnd = &ChunkedCodingParser::parseMessageEnd;
++
++ChunkedCodingParser::ChunkedCodingParser()
++{
++    reset();
++}
++
++void ChunkedCodingParser::reset()
++{
++    theStep = psChunkBeg;
++    theChunkSize = theLeftBodySize = 0;
++    doNeedMoreData = false;
++    sawIeof = false;
++    theIn = theOut = NULL;
++}
++
++bool ChunkedCodingParser::parse(MemBuf *rawData, MemBuf *parsedContent)
++{
++    Must(rawData && parsedContent);
++    theIn = rawData;
++    theOut = parsedContent;
++
++    // we must reset this all the time so that mayContinue() lets us
++    // output more content if we stopped due to needsMoreSpace() before
++    doNeedMoreData = !theIn->hasContent();
++
++    while (mayContinue()) {
++        (this->*theStep)();
++    }
++
++    return theStep == psMessageEnd;
++}
++
++bool ChunkedCodingParser::needsMoreData() const
++{
++    return doNeedMoreData;
++}
++
++bool ChunkedCodingParser::needsMoreSpace() const
++{
++    assert(theOut);
++    return theStep == psChunkBody && !theOut->hasPotentialSpace();
++}
++
++bool ChunkedCodingParser::mayContinue() const
++{
++    return !needsMoreData() && !needsMoreSpace() && theStep != psMessageEnd;
++}
++
++void ChunkedCodingParser::parseChunkBeg()
++{
++    Must(theChunkSize <= 0); // Should(), really
++
++    size_t crlfBeg = 0;
++    size_t crlfEnd = 0;
++
++    if (findCrlf(crlfBeg, crlfEnd)) {
++        debugs(99,5, "found chunk-size end: " << crlfBeg << "-" << crlfEnd);
++        int size = -1;
++        const char *p = 0;
++
++        if (StringToInt(theIn->content(), size, &p, 16)) {
++            if (size < 0) {
++                throw TexcHere("negative chunk size");
++                return;
++            }
++
++            // check for ieof chunk extension in the last-chunk
++            if (size == 0 && p && *p++ == ';') {
++                const char *e = theIn->content() + crlfBeg; // end of extension
++
++                while (p < e && isspace(*p))
++                    ++p; // skip space
++
++                sawIeof = e - p >= 4 &&
++                          strncmp(p, "ieof", 4) == 0 &&
++                          isspace(p[4]);
++            }
++
++            theIn->consume(crlfEnd);
++            theChunkSize = theLeftBodySize = size;
++            debugs(99,5, "found chunk: " << theChunkSize);
++            theStep = theChunkSize == 0 ? psTrailer : psChunkBody;
++            return;
++        }
++
++        throw TexcHere("corrupted chunk size");
++    }
++
++    doNeedMoreData = true;
++}
++
++void ChunkedCodingParser::parseChunkBody()
++{
++    Must(theLeftBodySize > 0); // Should, really
++
++    const size_t availSize = XMIN(theLeftBodySize, (size_t)theIn->contentSize());
++    const size_t safeSize = XMIN(availSize, (size_t)theOut->potentialSpaceSize());
++
++    doNeedMoreData = availSize < theLeftBodySize;
++    // and we may also need more space
++
++    theOut->append(theIn->content(), safeSize);
++    theIn->consume(safeSize);
++    theLeftBodySize -= safeSize;
++
++    if (theLeftBodySize == 0)
++        theStep = psChunkEnd;
++    else
++        Must(needsMoreData() || needsMoreSpace());
++}
++
++void ChunkedCodingParser::parseChunkEnd()
++{
++    Must(theLeftBodySize == 0); // Should(), really
++
++    size_t crlfBeg = 0;
++    size_t crlfEnd = 0;
++
++    if (findCrlf(crlfBeg, crlfEnd)) {
++        if (crlfBeg != 0) {
++            throw TexcHere("found data bewteen chunk end and CRLF");
++            return;
++        }
++
++        theIn->consume(crlfEnd);
++        theChunkSize = 0; // done with the current chunk
++        theStep = psChunkBeg;
++        return;
++    }
++
++    doNeedMoreData = true;
++}
++
++void ChunkedCodingParser::parseTrailer()
++{
++    Must(theChunkSize == 0); // Should(), really
++
++    while (mayContinue())
++        parseTrailerHeader();
++}
++
++void ChunkedCodingParser::parseTrailerHeader()
++{
++    size_t crlfBeg = 0;
++    size_t crlfEnd = 0;
++
++    if (findCrlf(crlfBeg, crlfEnd)) {
++        if (crlfBeg > 0)
++
++            ; //theTrailer.append(theIn->content(), crlfEnd);
++
++        theIn->consume(crlfEnd);
++
++        if (crlfBeg == 0)
++            theStep = psMessageEnd;
++
++        return;
++    }
++
++    doNeedMoreData = true;
++}
++
++void ChunkedCodingParser::parseMessageEnd()
++{
++    // termination step, should not be called
++    Must(false); // Should(), really
++}
++
++// finds next CRLF
++bool ChunkedCodingParser::findCrlf(size_t &crlfBeg, size_t &crlfEnd)
++{
++    // XXX: This code was copied, with permission, from another software.
++    // There is a similar and probably better code inside httpHeaderParse
++    // but it seems difficult to isolate due to parsing-unrelated bloat.
++    // Such isolation should probably be done before this class is used
++    // for handling of traffic "more external" than ICAP.
++
++    const char *buf = theIn->content();
++    size_t size = theIn->contentSize();
++
++    ssize_t crOff = -1;
++    bool quoted = false;
++    bool slashed = false;
++
++    for (size_t i = 0; i < size; ++i) {
++        if (slashed) {
++            slashed = false;
++            continue;
++        }
++
++        const char c = buf[i];
++
++        // handle quoted strings
++        if (quoted) {
++            if (c == '\\')
++                slashed = true;
++            else
++                if (c == '"')
++                    quoted = false;
++
++            continue;
++        } else
++            if (c == '"') {
++                quoted = true;
++                crOff = -1;
++                continue;
++            }
++
++        if (crOff < 0) { // looking for the first CR or LF
++
++            if (c == '\n') {
++                crlfBeg = i;
++                crlfEnd = ++i;
++                return true;
++            }
++
++            if (c == '\r')
++                crOff = i;
++        } else { // skipping CRs, looking for the first LF
++
++            if (c == '\n') {
++                crlfBeg = crOff;
++                crlfEnd = ++i;
++                return true;
++            }
++
++            if (c != '\r')
++                crOff = -1;
++        }
++    }
++
++    return false;
++}
++
+@@ -0,0 +1,90 @@
++
++/*
++ * $Id: ChunkedCodingParser.h,v 1.1 2005/11/21 23:32:59 wessels Exp $
++ * 
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sources; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ */
++
++#ifndef SQUID_CHUNKEDCODINGPARSER_H
++#define SQUID_CHUNKEDCODINGPARSER_H
++
++#include "RefCount.h"
++
++// ChunkedCodingParser is an incremental parser for chunked transfer coding
++// used by HTTP and ICAP. The parser shovels content bytes from the raw
++// input buffer into the content output buffer, both caller-supplied.
++// Ignores chunk extensions except for ICAP's ieof.
++// Has a trailer-handling placeholder.
++
++class ChunkedCodingParser
++{
++
++public:
++    ChunkedCodingParser();
++
++    void reset();
++
++    // true = complete success; false == needs more data
++    bool parse(MemBuf *rawData, MemBuf *parsedContent); // throws on error
++
++    bool needsMoreData() const;
++    bool needsMoreSpace() const;
++    bool sawIeof; // saw ieof chunk extension after a 0-size chunk
++
++private:
++    typedef void (ChunkedCodingParser::*Step)();
++
++private:
++    bool mayContinue() const;
++
++    void parseChunkBeg();
++    void parseChunkBody();
++    void parseChunkEnd();
++    void parseTrailer();
++    void parseTrailerHeader();
++    void parseMessageEnd();
++
++    bool findCrlf(size_t &crlfBeg, size_t &crlfEnd);
++
++private:
++    static Step psChunkBeg;
++    static Step psChunkBody;
++    static Step psChunkEnd;
++    static Step psTrailer;
++    static Step psMessageEnd;
++
++    MemBuf *theIn;
++    MemBuf *theOut;
++
++    Step theStep;
++    size_t theChunkSize;
++    size_t theLeftBodySize;
++    bool doNeedMoreData;
++};
++
++#endif /* SQUID_CHUNKEDCODINGPARSER_H */
+@@ -0,0 +1,246 @@
++#include "squid.h"
++#include "http.h"
++#include "MsgPipe.h"
++#include "MsgPipeData.h"
++#include "MsgPipeSource.h"
++#include "MsgPipeSink.h"
++#include "HttpRequest.h"
++#include "HttpReply.h"
++#include "ICAPAnchor.h"
++#include "ICAPClient.h"
++#include "ICAPServiceRep.h"
++
++#include "LeakFinder.h"
++
++CBDATA_CLASS_INIT(ICAPAnchor);
++
++extern LeakFinder *MsgPipeLeaker;
++
++ICAPAnchor::ICAPAnchor(ICAPServiceRep::Pointer aService): service(aService), httpState(NULL), virgin(NULL), adapted(NULL)
++{
++    debug(93,5)("ICAPAnchor constructed, this=%p\n", this);
++}
++
++ICAPAnchor::~ICAPAnchor()
++{
++    stop(notifyNone);
++    cbdataReferenceDone(httpState);
++    debug(93,5)("ICAPAnchor destructed, this=%p\n", this);
++
++    if (virgin != NULL)
++        freeVirgin();
++
++    if (adapted != NULL)
++        freeAdapted();
++
++    service = NULL;
++}
++
++void ICAPAnchor::startRespMod(HttpStateData *anHttpState, HttpRequest *request, HttpReply *reply)
++{
++    httpState = cbdataReference(anHttpState);
++
++    virgin = new MsgPipe("virgin"); // this is the place to create a refcount ptr
++    leakTouch(virgin.getRaw(), MsgPipeLeaker);
++    virgin->source = this;
++    virgin->data = new MsgPipeData;
++    virgin->data->cause = requestLink(request);
++    virgin->data->header = reply;
++    virgin->data->body = new MemBuf;
++    virgin->data->body->init(ICAP::MsgPipeBufSizeMin, ICAP::MsgPipeBufSizeMax);
++
++    adapted = new MsgPipe("adapted");
++    leakTouch(adapted.getRaw(), MsgPipeLeaker);
++    adapted->sink = this;
++#if ICAP_ANCHOR_LOOPBACK
++
++    adapted->data = new MsgPipeData;
++    adapted->data->cause = request; // should not hurt
++#else
++
++    ICAPInitXaction(service, virgin, adapted);
++#endif
++
++    virgin->sendSourceStart(); // we may have virgin data to provide
++    adapted->sendSinkNeed();   // we want adapted response, eventially
++}
++
++void ICAPAnchor::sendMoreData(StoreIOBuffer buf)
++{
++    debug(93,5)("ICAPAnchor::sendMoreData() called\n");
++    //buf.dump();
++    /*
++     * The caller is responsible for not giving us more data
++     * than will fit in body MemBuf.  Caller should use
++     * potentialSpaceSize() to find out how much we can hold.
++     */
++    leakTouch(virgin.getRaw(), MsgPipeLeaker);
++    virgin->data->body->append(buf.data, buf.length);
++    virgin->sendSourceProgress();
++}
++
++int
++ICAPAnchor::potentialSpaceSize()
++{
++    if (virgin == NULL)
++        return 0;
++
++    leakTouch(virgin.getRaw(), MsgPipeLeaker);
++
++    return (int) virgin->data->body->potentialSpaceSize();
++}
++
++// HttpStateData says we have the entire HTTP message
++void ICAPAnchor::doneSending()
++{
++    debug(93,5)("ICAPAnchor::doneSending() called\n");
++
++#if ICAP_ANCHOR_LOOPBACK
++    /* simple assignments are not the right way to do this */
++    adapted->data->header = virgin->data->header;
++    adapted->data->body = virgin->data->body;
++    noteSourceFinish(adapted);
++    return;
++#else
++
++    leakTouch(virgin.getRaw(), MsgPipeLeaker);
++    virgin->sendSourceFinish();
++#endif
++}
++
++// HttpStateData tells us to abort
++void ICAPAnchor::ownerAbort()
++{
++    debug(93,5)("ICAPAnchor::ownerAbort() called\n");
++    stop(notifyIcap);
++}
++
++// ICAP client needs more virgin response data
++void ICAPAnchor::noteSinkNeed(MsgPipe *p)
++{
++    debug(93,5)("ICAPAnchor::noteSinkNeed() called\n");
++
++    leakTouch(virgin.getRaw(), MsgPipeLeaker);
++
++    if (virgin->data->body->potentialSpaceSize())
++        httpState->icapSpaceAvailable();
++}
++
++// ICAP client aborting
++void ICAPAnchor::noteSinkAbort(MsgPipe *p)
++{
++    debug(93,5)("ICAPAnchor::noteSinkAbort() called\n");
++    stop(notifyOwner);
++}
++
++// ICAP client starts sending adapted response
++// ICAP client has received new HTTP headers (if any) at this point
++void ICAPAnchor::noteSourceStart(MsgPipe *p)
++{
++    debug(93,5)("ICAPAnchor::noteSourceStart() called\n");
++    leakTouch(adapted.getRaw(), MsgPipeLeaker);
++
++    HttpReply *reply = dynamic_cast<HttpReply*>(adapted->data->header);
++    assert(reply); // check that ICAP xaction created the right object
++    httpState->takeAdaptedHeaders(reply);
++
++    assert(reply == adapted->data->header);
++    adapted->data->header = NULL;
++
++    noteSourceProgress(p);
++}
++
++// ICAP client sends more data
++void ICAPAnchor::noteSourceProgress(MsgPipe *p)
++{
++    debug(93,5)("ICAPAnchor::noteSourceProgress() called\n");
++    //tell HttpStateData to store a fresh portion of the adapted response
++
++    leakTouch(p, MsgPipeLeaker);
++
++    if (p->data->body->hasContent()) {
++        httpState->takeAdaptedBody(p->data->body);
++    }
++}
++
++// ICAP client is done sending adapted response
++void ICAPAnchor::noteSourceFinish(MsgPipe *p)
++{
++    debug(93,5)("ICAPAnchor::noteSourceFinish() called\n");
++    //tell HttpStateData that we expect no more response data
++    leakTouch(p, MsgPipeLeaker);
++    httpState->doneAdapting();
++    stop(notifyNone);
++}
++
++// ICAP client is aborting
++void ICAPAnchor::noteSourceAbort(MsgPipe *p)
++{
++    debug(93,5)("ICAPAnchor::noteSourceAbort() called\n");
++    leakTouch(p, MsgPipeLeaker);
++    stop(notifyOwner);
++}
++
++// internal cleanup
++void ICAPAnchor::stop(Notify notify)
++{
++    if (virgin != NULL) {
++        leakTouch(virgin.getRaw(), MsgPipeLeaker);
++
++        if (notify == notifyIcap)
++            virgin->sendSourceAbort();
++        else
++            virgin->source = NULL;
++
++        freeVirgin();
++    }
++
++    if (adapted != NULL) {
++        leakTouch(adapted.getRaw(), MsgPipeLeaker);
++
++        if (notify == notifyIcap)
++            adapted->sendSinkAbort();
++        else
++            adapted->sink = NULL;
++
++        freeAdapted();
++    }
++
++    if (httpState) {
++        if (notify == notifyOwner)
++            // tell HttpStateData that we are aborting prematurely
++            httpState->abortAdapting();
++
++        cbdataReferenceDone(httpState);
++
++        // httpState is now NULL, will not call it any more
++    }
++}
++
++void ICAPAnchor::freeVirgin()
++{
++    requestUnlink(virgin->data->cause);
++    virgin->data->cause = NULL;
++    virgin->data->header = NULL;
++    leakTouch(virgin.getRaw(), MsgPipeLeaker);
++    virgin = NULL;	// refcounted
++}
++
++void ICAPAnchor::freeAdapted()
++{
++    /*
++     * Note on adapted->data->header.  ICAPXaction-side created it
++     * but gave control of it to us.  Normally we give it to
++     * HttpStateData::takeAdaptedHeader.  If not, we have to
++     * make sure it gets deleted;
++     */
++
++    if (adapted->data->header != NULL) {
++        debug(93,3)("hey, adapted->data->header is still set!\n");
++        delete adapted->data->header;
++        adapted->data->header = NULL;
++    }
++
++    leakTouch(adapted.getRaw(), MsgPipeLeaker);
++    adapted = NULL;	// refcounted
++}
+@@ -0,0 +1,92 @@
++
++/*
++ * $Id: ICAPAnchor.h,v 1.1 2005/11/21 23:32:59 wessels Exp $
++ *
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sinks; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ */
++
++#ifndef SQUID_ICAPANCHOR_H
++#define SQUID_ICAPANCHOR_H
++
++#include "MsgPipe.h"
++#include "MsgPipeSource.h"
++#include "MsgPipeSink.h"
++#include "ICAPServiceRep.h"
++
++/* The ICAP Anchor implements message pipe sink and source interfaces.  It
++ * helps HttpStateData to marshall the incoming/virgin HTTP message (being
++ * recieved from the HTTP server) to Squid's ICAP client module, using the
++ * MsgPipe interface. The same interface is used to get the adapted HTTP
++ * message back from the ICAP client. HttpStateData is the "owner" of the
++ * ICAPAnchor.
++ */
++
++class HttpRequest;
++
++class HttpReply;
++
++class ICAPAnchor: public MsgPipeSource, public MsgPipeSink
++{
++
++public:
++    ICAPAnchor(ICAPServiceRep::Pointer);
++    virtual ~ICAPAnchor();
++
++    // synchronous calls called by HttpStateData
++    void startRespMod(HttpStateData *anHttpState, HttpRequest *request, HttpReply *reply);
++    void sendMoreData(StoreIOBuffer buf);
++    void doneSending();
++    void ownerAbort();
++    int potentialSpaceSize();	/* how much data can we accept? */
++
++    // pipe source methods; called by ICAP while receiving the virgin message
++    virtual void noteSinkNeed(MsgPipe *p);
++    virtual void noteSinkAbort(MsgPipe *p);
++
++    // pipe sink methods; called by ICAP while sending the adapted message
++    virtual void noteSourceStart(MsgPipe *p);
++    virtual void noteSourceProgress(MsgPipe *p);
++    virtual void noteSourceFinish(MsgPipe *p);
++    virtual void noteSourceAbort(MsgPipe *p);
++
++public:
++    ICAPServiceRep::Pointer service;
++    HttpStateData *httpState;
++    MsgPipe::Pointer virgin;
++    MsgPipe::Pointer adapted;
++
++private:
++    typedef enum { notifyNone, notifyOwner, notifyIcap } Notify;
++    void stop(Notify notify);
++    void freeVirgin();
++    void freeAdapted();
++    CBDATA_CLASS2(ICAPAnchor);
++};
++
++#endif /* SQUID_ICAPANCHOR_H */
+@@ -0,0 +1,37 @@
++#include "squid.h"
++#include "ICAPModXact.h"
++#include "ICAPClient.h"
++#include "http.h"
++
++void ICAPInitModule()
++{
++    /*
++     * ICAP's MsgPipe buffer needs to be at least as large
++     * as the HTTP read buffer.  Otherwise HTTP may take
++     * data from the network that won't fit into the MsgPipe,
++     * which leads to a runtime assertion.
++     */
++    assert(ICAP::MsgPipeBufSizeMax >= SQUID_TCP_SO_RCVBUF);
++}
++
++void ICAPCleanModule()
++{}
++
++// initialize ICAP-specific ends of message pipes
++void ICAPInitXaction(ICAPServiceRep::Pointer service, MsgPipe::Pointer virgin, MsgPipe::Pointer adapted)
++{
++    ICAPModXact::Pointer x = new ICAPModXact;
++    debugs(93,5, "ICAPInitXaction: " << x.getRaw());
++    x->init(service, virgin, adapted, x);
++    // if we want to do something to the transaction after it is done,
++    // we need to keep a pointer to it
++}
++
++// declared in ICAPModXact.h (ick?)
++void ICAPNoteXactionDone(ICAPModXact::Pointer x)
++{
++    // nothing to be done here?
++    // refcounting will delete the transaction
++    // as soon as the last pointer to it is gone
++    debugs(93,5, "ICAPNoteXactionDone: " << x.getRaw());
++}
+@@ -0,0 +1,50 @@
++
++/*
++ * $Id: ICAPClient.h,v 1.1 2005/11/21 23:32:59 wessels Exp $
++ *
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sinks; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ */
++
++#ifndef SQUID_ICAPCLIENT_H
++#define SQUID_ICAPCLIENT_H
++
++#include "MsgPipe.h"        // TODO: move; needed for ICAPInitXaction()
++#include "ICAPServiceRep.h" // TODO: move; needed for ICAPInitXaction()
++
++// ICAP-related things needed by code unaware of ICAP internals.
++
++extern void ICAPInitModule();
++extern void ICAPCleanModule();
++
++// let ICAP initialize ICAP-specific ends of message pipes
++
++class MsgPipe;
++extern void ICAPInitXaction(ICAPServiceRep::Pointer, MsgPipe::Pointer virgin, MsgPipe::Pointer adapted);
++
++#endif /* SQUID_ICAPCLIENT_H */
+@@ -0,0 +1,211 @@
++#include "squid.h"
++#include "client_side_request.h"
++#include "ClientRequestContext.h"
++#include "MsgPipe.h"
++#include "MsgPipeData.h"
++#include "MsgPipeSource.h"
++#include "MsgPipeSink.h"
++#include "HttpRequest.h"
++#include "ICAPClientSideHook.h"
++#include "ICAPServiceRep.h"
++#include "ICAPClient.h"
++
++#include "LeakFinder.h"
++
++extern LeakFinder *MsgPipeLeaker;
++
++CBDATA_CLASS_INIT(ICAPClientSideHook);
++
++ICAPClientSideHook::ICAPClientSideHook(ICAPServiceRep::Pointer aService): service(aService), http(NULL), virgin(NULL), adapted(NULL)
++{
++    debug(93,3)("ICAPClientSideHook constructed, this=%p\n", this);
++}
++
++ICAPClientSideHook::~ICAPClientSideHook()
++{
++    stop(notifyNone);
++    cbdataReferenceDone(http);
++    debug(93,3)("ICAPClientSideHook destructed, this=%p\n", this);
++
++    if (virgin != NULL)
++        freeVirgin();
++
++    if (adapted != NULL)
++        freeAdapted();
++}
++
++void ICAPClientSideHook::startReqMod(ClientHttpRequest *aHttp, HttpRequest *request)
++{
++    debug(93,3)("ICAPClientSideHook::startReqMod() called\n");
++    http = cbdataReference(aHttp);
++
++    virgin = new MsgPipe("virgin"); // this is the place to create a refcount ptr
++    leakTouch(virgin.getRaw(), MsgPipeLeaker);
++    virgin->source = this;
++    virgin->data = new MsgPipeData;
++    virgin->data->cause = NULL;
++    virgin->data->header = requestLink(request);
++    virgin->data->body = new MemBuf;
++    virgin->data->body->init(ICAP::MsgPipeBufSizeMin, ICAP::MsgPipeBufSizeMax);
++
++    adapted = new MsgPipe("adapted");
++    leakTouch(adapted.getRaw(), MsgPipeLeaker);
++    adapted->sink = this;
++
++    ICAPInitXaction(service, virgin, adapted);
++
++    virgin->sendSourceStart(); // we may have virgin data to provide
++    adapted->sendSinkNeed();   // we want adapted response, eventially
++}
++
++void ICAPClientSideHook::sendMoreData(StoreIOBuffer buf)
++{
++    debug(93,3)("ICAPClientSideHook::sendMoreData() called\n");
++    //buf.dump();
++    /*
++     * The caller is responsible for not giving us more data
++     * than will fit in body MemBuf.  Caller should use
++     * potentialSpaceSize() to find out how much we can hold.
++     */
++    leakTouch(virgin.getRaw(), MsgPipeLeaker);
++    virgin->data->body->append(buf.data, buf.length);
++    virgin->sendSourceProgress();
++}
++
++int
++ICAPClientSideHook::potentialSpaceSize()
++{
++    if (virgin == NULL)
++        return 0;
++
++    leakTouch(virgin.getRaw(), MsgPipeLeaker);
++
++    return (int) virgin->data->body->potentialSpaceSize();
++}
++
++// ClientHttpRequest says we have the entire HTTP message
++void ICAPClientSideHook::doneSending()
++{
++    debug(93,3)("ICAPClientSideHook::doneSending() called\n");
++    leakTouch(virgin.getRaw(), MsgPipeLeaker);
++
++    virgin->sendSourceFinish();
++}
++
++// ClientHttpRequest tells us to abort
++void ICAPClientSideHook::ownerAbort()
++{
++    debug(93,3)("ICAPClientSideHook::ownerAbort() called\n");
++    stop(notifyIcap);
++}
++
++// ICAP client needs more virgin response data
++void ICAPClientSideHook::noteSinkNeed(MsgPipe *p)
++{
++    debug(93,3)("ICAPClientSideHook::noteSinkNeed() called\n");
++
++    leakTouch(virgin.getRaw(), MsgPipeLeaker);
++
++    if (virgin->data->body->potentialSpaceSize())
++        http->icapSpaceAvailable();
++}
++
++// ICAP client aborting
++void ICAPClientSideHook::noteSinkAbort(MsgPipe *p)
++{
++    debug(93,3)("ICAPClientSideHook::noteSinkAbort() called\n");
++    stop(notifyOwner);
++}
++
++// ICAP client starts sending adapted response
++// ICAP client has received new HTTP headers (if any) at this point
++void ICAPClientSideHook::noteSourceStart(MsgPipe *p)
++{
++    debug(93,3)("ICAPClientSideHook::noteSourceStart() called\n");
++    leakTouch(adapted.getRaw(), MsgPipeLeaker);
++    http->takeAdaptedHeaders(adapted->data->header);
++    noteSourceProgress(p);
++}
++
++// ICAP client sends more data
++void ICAPClientSideHook::noteSourceProgress(MsgPipe *p)
++{
++    debug(93,3)("ICAPClientSideHook::noteSourceProgress() called\n");
++    //tell ClientHttpRequest to store a fresh portion of the adapted response
++
++    leakTouch(p, MsgPipeLeaker);
++
++    if (p->data->body->hasContent()) {
++        http->takeAdaptedBody(p->data->body);
++    }
++}
++
++// ICAP client is done sending adapted response
++void ICAPClientSideHook::noteSourceFinish(MsgPipe *p)
++{
++    debug(93,3)("ICAPClientSideHook::noteSourceFinish() called\n");
++    //tell ClientHttpRequest that we expect no more response data
++    leakTouch(p, MsgPipeLeaker);
++    http->doneAdapting();
++    stop(notifyNone);
++}
++
++// ICAP client is aborting
++void ICAPClientSideHook::noteSourceAbort(MsgPipe *p)
++{
++    debug(93,3)("ICAPClientSideHook::noteSourceAbort() called\n");
++    leakTouch(p, MsgPipeLeaker);
++    stop(notifyOwner);
++}
++
++// internal cleanup
++void ICAPClientSideHook::stop(Notify notify)
++{
++    if (virgin != NULL) {
++        leakTouch(virgin.getRaw(), MsgPipeLeaker);
++
++        if (notify == notifyIcap)
++            virgin->sendSourceAbort();
++        else
++            virgin->source = NULL;
++
++        freeVirgin();
++    }
++
++    if (adapted != NULL) {
++        leakTouch(adapted.getRaw(), MsgPipeLeaker);
++
++        if (notify == notifyIcap)
++            adapted->sendSinkAbort();
++        else
++            adapted->sink = NULL;
++
++        freeAdapted();
++    }
++
++    if (http) {
++        if (notify == notifyOwner)
++            // tell ClientHttpRequest that we are aborting prematurely
++            http->abortAdapting();
++
++        cbdataReferenceDone(http);
++
++        // http is now NULL, will not call it any more
++    }
++}
++
++void ICAPClientSideHook::freeVirgin()
++{
++    // virgin->data->cause should be NULL;
++    requestUnlink(dynamic_cast<HttpRequest*>(virgin->data->header));
++    virgin->data->header = NULL;
++    leakTouch(virgin.getRaw(), MsgPipeLeaker);
++    virgin = NULL;	// refcounted
++}
++
++void ICAPClientSideHook::freeAdapted()
++{
++    adapted->data->header = NULL;	// we don't own it
++    leakTouch(adapted.getRaw(), MsgPipeLeaker);
++    adapted = NULL;	// refcounted
++}
+@@ -0,0 +1,91 @@
++
++/*
++ * $Id: ICAPClientSideHook.h,v 1.1 2005/11/21 23:32:59 wessels Exp $
++ *
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sinks; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ */
++
++#ifndef SQUID_ICAPCLIENTSIDEHOOK_H
++#define SQUID_ICAPCLIENTSIDEHOOK_H
++
++#include "MsgPipe.h"
++#include "MsgPipeSource.h"
++#include "MsgPipeSink.h"
++
++/* The ICAP ClientSideHook implements message pipe sink and source interfaces.  It
++ * helps client-side to marshall the incoming/virgin HTTP message (being
++ * recieved from the HTTP client) to Squid's ICAP client module, using the
++ * MsgPipe interface. The same interface is used to get the adapted HTTP
++ * message back from the ICAP client. client-side is the "owner" of the
++ * ICAPClientSideHook.
++ */
++
++class HttpRequest;
++
++class ClientRequestContext;
++
++class ICAPClientSideHook: public MsgPipeSource, public MsgPipeSink
++{
++
++public:
++    ICAPClientSideHook(ICAPServiceRep::Pointer);
++    virtual ~ICAPClientSideHook();
++
++    // synchronous calls called by ClientHttpRequest
++    void startReqMod(ClientHttpRequest *, HttpRequest *);
++    void sendMoreData(StoreIOBuffer buf);
++    void doneSending();
++    void ownerAbort();
++    int potentialSpaceSize();	/* how much data can we accept? */
++
++    // pipe source methods; called by ICAP while receiving the virgin message
++    virtual void noteSinkNeed(MsgPipe *p);
++    virtual void noteSinkAbort(MsgPipe *p);
++
++    // pipe sink methods; called by ICAP while sending the adapted message
++    virtual void noteSourceStart(MsgPipe *p);
++    virtual void noteSourceProgress(MsgPipe *p);
++    virtual void noteSourceFinish(MsgPipe *p);
++    virtual void noteSourceAbort(MsgPipe *p);
++
++public:
++    ICAPServiceRep::Pointer service;
++    ClientHttpRequest *http;
++    MsgPipe::Pointer virgin;
++    MsgPipe::Pointer adapted;
++
++private:
++    typedef enum { notifyNone, notifyOwner, notifyIcap } Notify;
++    void stop(Notify notify);
++    void freeVirgin();
++    void freeAdapted();
++    CBDATA_CLASS2(ICAPClientSideHook);
++};
++
++#endif /* SQUID_ICAPCLIENTSIDEHOOK_H */
+@@ -0,0 +1,103 @@
++
++
++
++#include "squid.h"
++#include "ICAPClient.h"
++#include "clientStream.h"
++#include "client_side_reply.h"
++#include "HttpHeader.h"
++#include "HttpReply.h"
++
++struct _junk
++{
++    clientStreamNode *node;
++    clientHttpRequest *http;
++    HttpReply *rep;
++    StoreIOBuffer *receivedData;
++};
++
++static EVH someEvent;
++
++
++/*
++ * This callback is called for each incoming data chunk.
++ * Note receivedData only gives us the message body, not
++ * the headers
++ */
++void
++icapclientProcessStream(clientStreamNode *thisNode, clientHttpRequest *http, HttpReply *rep, StoreIOBuffer receivedData)
++{
++    assert (thisNode != NULL);
++    assert (cbdataReferenceValid (thisNode));
++
++    debug(0,0)("This is icapclientProcessStream\n");
++    debug(0,0)("\tthisNode=%p\n", thisNode);
++    debug(0,0)("\thttp=%p\n", http);
++    debug(0,0)("\trep=%p\n", rep);
++    //debug(0,0)("\trep->content_length=%d\n", rep->content_length);
++    char *foo;
++    foo = new char[receivedData.length+1];
++    xstrncpy(foo, receivedData.data, receivedData.length+1);
++    *(foo+receivedData.length) = '\0';
++    debug(0,0)("{%s}\n", foo);
++
++    struct _junk *j = (struct _junk *) xcalloc(1, sizeof(*j));
++    j->node = thisNode;
++    j->http = http;
++    j->rep = rep;
++    j->receivedData = &receivedData;
++
++    eventAdd("someEvent", someEvent, j, 5.0, 0, 0);
++
++}
++
++void
++icapclientStreamRead(clientStreamNode *thisNode, clientHttpRequest *http)
++{
++    debug(0,0)("This is icapclientStreamRead\n");
++
++    /* pass data through untouched */
++    clientStreamNode *next = thisNode->next();
++    clientStreamRead (thisNode, http, next->readBuffer);
++    return;
++}
++
++void
++icapclientStreamDetach(clientStreamNode *thisNode, clientHttpRequest *http)
++{
++    debug(0,0)("This is icapclientStreamDetach\n");
++}
++
++clientStream_status_t
++icapclientStreamStatus(clientStreamNode *thisNode, clientHttpRequest *http)
++{
++    debug(0,0)("This is icapclientStreamStatus\n");
++
++    /* pass data through untouched */
++    return clientStreamStatus (thisNode, http);
++
++    return STREAM_NONE;
++}
++
++static void
++someEvent(void *foo)
++{
++    debug(0,0)("this is someEvent\n");
++
++    struct _junk *j = (struct _junk *) foo;
++
++
++    if (NULL != j->rep) {
++        httpHeaderPutExt(&j->rep->header, "X-foo", "bar-bar");
++    }
++
++    if (NULL == j->node->data.getRaw()) {
++        /* first call; setup our state */
++    }
++
++    /* pass data through untouched */
++    clientStreamCallback (j->node, j->http, j->rep, *j->receivedData);
++
++    free(j);
++
++}
+@@ -0,0 +1,14 @@
++
++#ifndef SQUID_ICAP_CLIENT_H
++#define SQUID_ICAP_CLIENT_H
++
++
++#include "clientStream.h"
++
++extern CSR icapclientStreamRead;
++extern CSCB icapclientProcessStream;
++extern CSD icapclientStreamDetach;
++extern CSS icapclientStreamStatus;
++
++
++#endif
+@@ -0,0 +1,380 @@
++
++/*
++ * $Id: ICAPConfig.cc,v 1.1 2005/11/21 23:32:59 wessels Exp $
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sources; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ *
++ * Copyright (c) 2003, Robert Collins <robertc@squid-cache.org>
++ */
++
++#include "squid.h"
++
++#include "ConfigParser.h"
++#include "ACL.h"
++#include "Store.h"
++#include "Array.h"	// really Vector
++#include "ICAPConfig.h"
++#include "ICAPServiceRep.h"
++#include "HttpRequest.h"
++#include "ACLChecklist.h"
++
++ICAPConfig TheICAPConfig;
++
++ICAPServiceRep::Pointer
++ICAPConfig::findService(const String& key)
++{
++    Vector<ICAPServiceRep::Pointer>::iterator iter = services.begin();
++
++    while (iter != services.end()) {
++        if (iter->getRaw()->key == key)
++            return *iter;
++
++        ++iter;
++    }
++
++    return NULL;
++}
++
++ICAPClass *
++ICAPConfig::findClass(const String& key)
++{
++    if (!key.size())
++        return NULL;
++
++    Vector<ICAPClass*>::iterator iter = classes.begin();
++
++    while (iter != classes.end()) {
++        if ((*iter)->key == key)
++            return *iter;
++
++        ++iter;
++    }
++
++    return NULL;
++}
++
++int
++ICAPClass::prepare()
++{
++    int found = 0;
++    wordlist *service_names = NULL;
++    wordlist *iter;
++
++    ConfigParser::ParseString(&key);
++    ConfigParser::ParseWordList(&service_names);
++
++    for (iter = service_names; iter; iter = iter->next) {
++        ICAPServiceRep::Pointer match = TheICAPConfig.findService(iter->key);
++
++        if (match != NULL) {
++            found = 1;
++            services += match;
++        }
++    }
++
++    return found;
++};
++
++// ================================================================================ //
++
++CBDATA_CLASS_INIT(ICAPAccessCheck);
++
++ICAPAccessCheck::ICAPAccessCheck(ICAP::Method aMethod,
++                                 ICAP::VectPoint aPoint,
++                                 HttpRequest *aReq,
++                                 HttpReply *aRep,
++                                 ICAPAccessCheckCallback *aCallback,
++                                 void *aCallbackData)
++{
++    method = aMethod;
++    point = aPoint;
++    req = requestLink(aReq);
++    rep = aRep;
++    callback = aCallback;
++    callback_data = aCallbackData;
++    candidateClasses.clean();
++    matchedClass.clean();
++    acl_checklist = NULL;
++    debug(93,5)("ICAPAccessCheck constructed for %s %s\n",
++                ICAP::methodStr(method),
++                ICAP::vectPointStr(point));
++}
++
++ICAPAccessCheck::~ICAPAccessCheck()
++{
++    requestUnlink(req);
++}
++
++/*
++ * Walk the ICAPAccess list and find all classes that have at least
++ * one service with matching method and vectoring point.
++ */
++void
++ICAPAccessCheck::check()
++{
++    debug(93,3)("ICAPAccessCheck::check\n");
++    Vector<ICAPClass*>::iterator ci;
++
++    for (ci = TheICAPConfig.classes.begin(); ci != TheICAPConfig.classes.end(); ++ci) {
++
++        ICAPClass *theClass = *ci;
++
++        Vector<ICAPServiceRep::Pointer>::iterator si;
++
++        for (si = theClass->services.begin(); si != theClass->services.end(); ++si) {
++            ICAPServiceRep *theService = si->getRaw();
++
++            if (method != theService->method)
++                continue;
++
++            if (point != theService->point)
++                continue;
++
++            debug(93,1)("ICAPAccessCheck::check: class '%s' has candidate service '%s'\n", theClass->key.buf(), theService->key.buf());
++
++            candidateClasses += theClass->key;
++
++            break;
++        }
++    }
++
++    checkCandidates();
++}
++
++void
++ICAPAccessCheck::checkCandidates()
++{
++    while (!candidateClasses.empty()) {
++        // It didn't really match yet, but we use the name anyway.
++        matchedClass = candidateClasses.shift();
++        ICAPClass *theClass = TheICAPConfig.findClass(matchedClass);
++
++        if (theClass == NULL)
++            // class apparently went away (reconfigure)
++            continue;
++
++        // XXX we don't have access to conn->rfc931 here.
++        acl_checklist = aclChecklistCreate(theClass->accessList, req, dash_str);
++
++        acl_checklist->nonBlockingCheck(ICAPAccessCheckCallbackWrapper, this);
++
++        return;
++    }
++
++    /*
++     * when there are no canidates, set matchedClass to NULL string
++     * and call the wrapper with answer = 1
++     */
++    debug(93,1)("ICAPAccessCheck::check: NO candidates or matches found\n");
++
++    matchedClass.clean();
++
++    ICAPAccessCheckCallbackWrapper(1, this);
++
++    return;
++}
++
++void
++ICAPAccessCheck::ICAPAccessCheckCallbackWrapper(int answer, void *data)
++{
++    debug(93,5)("ICAPAccessCheckCallbackWrapper: answer=%d\n", answer);
++    ICAPAccessCheck *ac = (ICAPAccessCheck*)data;
++
++    if (ac->matchedClass.size()) {
++        debug(93,5)("ICAPAccessCheckCallbackWrapper matchedClass = %s\n",
++                    ac->matchedClass.buf());
++    }
++
++    if (!answer) {
++        ac->checkCandidates();
++        return;
++    }
++
++    /*
++     * We use an event here to break deep function call sequences
++     */
++    eventAdd("ICAPAccessCheckCallbackEvent",
++             ICAPAccessCheckCallbackEvent,
++             ac,
++             0.0,
++             0,
++             true);
++}
++
++void
++ICAPAccessCheck::ICAPAccessCheckCallbackEvent(void *data)
++{
++    debug(93,5)("ICAPAccessCheckCallbackEvent\n");
++    ICAPAccessCheck *ac = (ICAPAccessCheck*)data;
++    ac->do_callback();
++    delete ac;
++}
++
++void
++ICAPAccessCheck::do_callback()
++{
++    debug(93,3)("ICAPAccessCheck::do_callback\n");
++
++    if (matchedClass.size()) {
++        debug(93,3)("ICAPAccessCheck::do_callback matchedClass = %s\n", matchedClass.buf());
++    }
++
++    ICAPClass *theClass = TheICAPConfig.findClass(matchedClass);
++
++    if (theClass == NULL) {
++        callback(NULL, callback_data);
++        return;
++    }
++
++    matchedClass.clean();
++
++    Vector<ICAPServiceRep::Pointer>::iterator i;
++
++    for (i = theClass->services.begin(); i != theClass->services.end(); ++i) {
++        ICAPServiceRep *theService = i->getRaw();
++
++        if (method != theService->method)
++            continue;
++
++        if (point != theService->point)
++            continue;
++
++        callback(*i, callback_data);
++
++        return;
++    }
++
++    callback(NULL, callback_data);
++}
++
++// ================================================================================ //
++
++void
++ICAPConfig::parseICAPService()
++{
++    ICAPServiceRep::Pointer S = new ICAPServiceRep();
++
++    if (S->configure(S))
++        services += S;
++    else
++        S->invalidate();
++};
++
++void
++ICAPConfig::freeICAPService()
++{
++    services.clean();
++};
++
++void
++ICAPConfig::dumpICAPService(StoreEntry *entry, const char *name)
++{
++    typedef Vector<ICAPServiceRep::Pointer>::iterator VI;
++
++    for (VI i = services.begin(); i != services.end(); ++i) {
++        const ICAPServiceRep::Pointer &r = *i;
++        storeAppendPrintf(entry, "%s %s_%s %s %d %s\n", name, r->key.buf(),
++                          r->methodStr(), r->vectPointStr(), r->bypass, r->uri.buf());
++    }
++};
++
++void
++ICAPConfig::parseICAPClass()
++{
++    ICAPClass *C = new ICAPClass();
++
++    if (C->prepare()) {
++        classes.push_back(C);
++    } else {
++        delete C;
++    }
++};
++
++void
++ICAPConfig::freeICAPClass()
++{
++    classes.clean();
++};
++
++void
++ICAPConfig::dumpICAPClass(StoreEntry *entry, const char *name)
++{
++    Vector<ICAPClass*>::iterator i = classes.begin();
++
++    while (i != classes.end()) {
++        storeAppendPrintf(entry, "%s %s\n", name, (*i)->key.buf());
++        ++i;
++    }
++};
++
++void
++ICAPConfig::parseICAPAccess()
++{
++    String aKey;
++    ConfigParser::ParseString(&aKey);
++    ICAPClass *theClass = TheICAPConfig.findClass(aKey);
++
++    if (theClass == NULL)
++        fatalf("Did not find ICAP class '%s' referenced on line %d\n",
++               aKey.buf(), config_lineno);
++
++    aclParseAccessLine(&theClass->accessList);
++};
++
++void
++ICAPConfig::freeICAPAccess()
++{
++    (void) 0;
++};
++
++void
++ICAPConfig::dumpICAPAccess(StoreEntry *entry, const char *name)
++{
++    LOCAL_ARRAY(char, nom, 64);
++
++    Vector<ICAPClass*>::iterator i = classes.begin();
++
++    while (i != classes.end()) {
++        snprintf(nom, 64, "%s %s", name, (*i)->key.buf());
++        dump_acl_access(entry, nom, (*i)->accessList);
++        ++i;
++    }
++};
++
++ICAPConfig::~ICAPConfig()
++{
++
++    // invalidate each service so that it can be deleted when refcount=0
++    Vector<ICAPServiceRep::Pointer>::iterator si;
++
++    for (si = services.begin(); si != services.end(); ++si)
++        (*si)->invalidate();
++
++    classes.clean();
++
++};
+@@ -0,0 +1,125 @@
++
++/*
++ * $Id: ICAPConfig.h,v 1.1 2005/11/21 23:32:59 wessels Exp $
++ *
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sources; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ *
++ * Copyright (c) 2003, Robert Collins <robertc@squid-cache.org>
++ */
++
++#ifndef SQUID_ICAPCONFIG_H
++#define SQUID_ICAPCONFIG_H
++
++#include "ICAPServiceRep.h"
++
++class acl_access;
++
++class ICAPConfig;
++
++class ICAPClass
++{
++
++public:
++    String key;
++    acl_access *accessList;
++
++    Vector<ICAPServiceRep::Pointer> services;
++
++    ICAPClass() : key(NULL) {};
++
++    int prepare();
++};
++
++class ICAPAccessCheck
++{
++
++public:
++    typedef void ICAPAccessCheckCallback(ICAPServiceRep::Pointer match, void *data);
++    ICAPAccessCheck(ICAP::Method, ICAP::VectPoint, HttpRequest *, HttpReply *, ICAPAccessCheckCallback *, void *);
++    ~ICAPAccessCheck();
++
++private:
++    ICAP::Method method;
++    ICAP::VectPoint point;
++    HttpRequest *req;
++    HttpReply *rep;
++    ICAPAccessCheckCallback *callback;
++    void *callback_data;
++    ACLChecklist *acl_checklist;
++    Vector<String> candidateClasses;
++    String matchedClass;
++    void do_callback();
++
++public:
++    void check();
++    void checkCandidates();
++    static void ICAPAccessCheckCallbackWrapper(int, void*);
++    static EVH ICAPAccessCheckCallbackEvent;
++
++private:
++    CBDATA_CLASS2(ICAPAccessCheck);
++};
++
++class ICAPConfig
++{
++
++public:
++
++    int onoff;
++    int preview_enable;
++    int preview_size;
++    int check_interval;
++    int send_client_ip;
++    int auth_user;
++    char *auth_scheme;
++
++    Vector<ICAPServiceRep::Pointer> services;
++    Vector<ICAPClass*> classes;
++
++    ICAPConfig() {};
++
++    ~ICAPConfig();
++
++    void parseICAPService(void);
++    void freeICAPService(void);
++    void dumpICAPService(StoreEntry *, const char *);
++    ICAPServiceRep::Pointer findService(const String&);
++    ICAPClass * ICAPConfig::findClass(const String& key);
++
++    void parseICAPClass(void);
++    void freeICAPClass(void);
++    void dumpICAPClass(StoreEntry *, const char *);
++
++    void parseICAPAccess(void);
++    void freeICAPAccess(void);
++    void dumpICAPAccess(StoreEntry *, const char *);
++
++};
++
++#endif /* SQUID_ICAPCONFIG_H */
+@@ -0,0 +1,52 @@
++#include "squid.h"
++#include "ICAPElements.h"
++
++const char *ICAP::crlf = "\r\n";
++
++
++const char *
++ICAP::methodStr(ICAP::Method method)
++{
++    switch(method) {
++
++    case ICAP::methodReqmod:
++        return "REQMOD";
++        break;
++
++    case ICAP::methodRespmod:
++        return "RESPMOD";
++        break;
++
++    case ICAP::methodOptions:
++        return "OPTIONS";
++        break;
++
++    default:
++        break;
++    }
++
++    return "NONE";
++}
++
++
++const char *
++ICAP::vectPointStr(ICAP::VectPoint point)
++{
++    switch(point) {
++
++    case ICAP::pointPreCache:
++        return "PRECACHE";
++        break;
++
++    case ICAP::pointPostCache:
++        return "POSTCACHE";
++        break;
++
++    default:
++        break;
++    }
++
++    return "NONE";
++}
++
++
+@@ -0,0 +1,55 @@
++
++/*
++ * $Id: ICAPElements.h,v 1.1 2005/11/21 23:32:59 wessels Exp $
++ *
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sinks; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ */
++
++#ifndef SQUID_ICAPELEMENTS_H
++#define SQUID_ICAPELEMENTS_H
++
++// ICAP-related things shared by many ICAP classes
++
++// A "fake" class to encapsulate ICAP-related declarations without
++// adding namespaces to Squid. Eventually, namespaces should be added.
++
++struct ICAP
++{
++    typedef enum { methodNone, methodReqmod, methodRespmod, methodOptions } Method;
++    typedef enum { pointNone, pointPreCache, pointPostCache } VectPoint;
++
++    // recommended initial size and max capacity for MsgPipe buffer
++    enum { MsgPipeBufSizeMin = (4*1024), MsgPipeBufSizeMax = SQUID_TCP_SO_RCVBUF };
++
++    static const char *crlf;
++    static const char *methodStr(ICAP::Method);
++    static const char *vectPointStr(ICAP::VectPoint);
++};
++
++#endif /* SQUID_ICAPCLIENT_H */
+@@ -0,0 +1,1201 @@
++/*
++ * DEBUG: section 93  ICAP (RFC 3507) Client
++ */
++
++#include "squid.h"
++#include "comm.h"
++#include "MsgPipe.h"
++#include "MsgPipeData.h"
++#include "HttpRequest.h"
++#include "HttpReply.h"
++#include "ICAPServiceRep.h"
++#include "ICAPModXact.h"
++#include "ICAPClient.h"
++#include "ChunkedCodingParser.h"
++#include "TextException.h"
++
++// flow and terminology:
++//     HTTP| --> receive --> encode --> write --> |network
++//     end | <-- send    <-- parse  <-- read  <-- |end
++
++// TODO: doneSending()/doneReceving() data members should probably be in sync
++// with this->adapted/virgin pointers. Make adapted/virgin methods?
++
++// TODO: replace gotEncapsulated() with something faster; we call it often
++
++CBDATA_CLASS_INIT(ICAPModXact);
++
++static const size_t TheBackupLimit = ICAP::MsgPipeBufSizeMax;
++
++
++ICAPModXact::State::State()
++{
++    memset(this, sizeof(*this), 0);
++}
++
++ICAPModXact::ICAPModXact(): ICAPXaction("ICAPModXact"),
++        self(NULL), virgin(NULL), adapted(NULL),
++        icapReply(NULL), virginConsumed(0),
++        bodyParser(NULL)
++{}
++
++void ICAPModXact::init(ICAPServiceRep::Pointer &aService, MsgPipe::Pointer &aVirgin, MsgPipe::Pointer &anAdapted, Pointer &aSelf)
++{
++    assert(!self.getRaw() && !virgin.getRaw() && !adapted.getRaw());
++    assert(aSelf.getRaw() && aVirgin.getRaw() && anAdapted.getRaw());
++
++    self = aSelf;
++    service(aService);
++
++    virgin = aVirgin;
++    adapted = anAdapted;
++
++    // receiving end
++    virgin->sink = this; // should be 'self' and refcounted
++    // virgin pipe data is initiated by the source
++
++    // sending end
++    adapted->source = this; // should be 'self' and refcounted
++    adapted->data = new MsgPipeData;
++
++    adapted->data->body = new MemBuf; // XXX: make body a non-pointer?
++    adapted->data->body->init(ICAP::MsgPipeBufSizeMin, ICAP::MsgPipeBufSizeMax);
++    // headers are initialized when we parse them
++
++    // writing and reading ends are handled by ICAPXaction
++
++    // encoding
++    // nothing to do because we are using temporary buffers
++
++    // parsing
++    icapReply = new HttpReply;
++    icapReply->protoPrefix = "ICAP/"; // TODO: make an IcapReply class?
++
++    // XXX: make sure stop() cleans all buffers
++}
++
++// HTTP side starts sending virgin data
++void ICAPModXact::noteSourceStart(MsgPipe *p)
++{
++    ICAPXaction_Enter(noteSourceStart);
++
++    // make sure TheBackupLimit is in-sync with the buffer size
++    Must(TheBackupLimit <= static_cast<size_t>(virgin->data->body->max_capacity));
++
++    estimateVirginBody(); // before virgin disappears!
++
++    // it is an ICAP violation to send request to a service w/o known OPTIONS
++
++    if (service().up())
++        startWriting();
++    else
++        waitForService();
++
++    // XXX: but this has to be here to catch other errors. Thus, if
++    // commConnectStart in startWriting fails, we may get here
++    //_after_ the object got destroyed. Somebody please fix commConnectStart!
++    ICAPXaction_Exit();
++}
++
++static
++void ICAPModXact_noteServiceReady(void *data, ICAPServiceRep::Pointer &)
++{
++    ICAPModXact *x = static_cast<ICAPModXact*>(data);
++    assert(x);
++    x->noteServiceReady();
++}
++
++void ICAPModXact::waitForService()
++{
++    Must(!state.serviceWaiting);
++    debugs(93, 7, "ICAPModXact will wait for the ICAP service " << status());
++    state.serviceWaiting = true;
++    service().callWhenReady(&ICAPModXact_noteServiceReady, this);
++}
++
++void ICAPModXact::noteServiceReady()
++{
++    ICAPXaction_Enter(noteServiceReady);
++
++    Must(state.serviceWaiting);
++    state.serviceWaiting = false;
++    startWriting(); // will throw if service is not up
++
++    ICAPXaction_Exit();
++}
++
++void ICAPModXact::startWriting()
++{
++    Must(service().up());
++
++    state.writing = State::writingConnect;
++    openConnection();
++    // put nothing here as openConnection calls commConnectStart
++    // and that may call us back without waiting for the next select loop
++}
++
++// connection with the ICAP service established
++void ICAPModXact::handleCommConnected()
++{
++    Must(state.writing == State::writingConnect);
++
++    startReading(); // wait for early errors from the ICAP server
++
++    MemBuf requestBuf;
++    requestBuf.init();
++
++    makeRequestHeaders(requestBuf);
++    debugs(93, 9, "ICAPModXact ICAP request prefix " << status() << ":\n" <<
++           (requestBuf.terminate(), requestBuf.content()));
++
++    // write headers
++    state.writing = State::writingHeaders;
++    scheduleWrite(requestBuf);
++}
++
++void ICAPModXact::handleCommWrote(size_t)
++{
++    if (state.writing == State::writingHeaders)
++        handleCommWroteHeaders();
++    else
++        handleCommWroteBody();
++}
++
++void ICAPModXact::handleCommWroteHeaders()
++{
++    Must(state.writing == State::writingHeaders);
++
++    if (virginBody.expected()) {
++        state.writing = preview.enabled() ?
++                        State::writingPreview : State::writingPrime;
++        virginWriteClaim.protectAll();
++        writeMore();
++    } else {
++        stopWriting();
++    }
++}
++
++void ICAPModXact::writeMore()
++{
++    if (writer) // already writing something
++        return;
++
++    switch (state.writing) {
++
++    case State::writingInit:    // waiting for service OPTIONS
++        Must(state.serviceWaiting);
++
++    case State::writingConnect: // waiting for the connection to establish
++
++    case State::writingHeaders: // waiting for the headers to be written
++
++    case State::writingPaused:  // waiting for the ICAP server response
++
++    case State::writingDone:    // nothing more to write
++        return;
++
++    case State::writingPreview:
++        writePriviewBody();
++        return;
++
++    case State::writingPrime:
++        writePrimeBody();
++        return;
++
++    default:
++        throw TexcHere("ICAPModXact in bad writing state");
++    }
++}
++
++void ICAPModXact::writePriviewBody()
++{
++    debugs(93, 8, "ICAPModXact will write Preview body " << status());
++    Must(state.writing == State::writingPreview);
++
++    MsgPipeData::Body *body = virgin->data->body;
++    const size_t size = XMIN(preview.debt(), (size_t)body->contentSize());
++    writeSomeBody("preview body", size);
++
++    // change state once preview is written
++
++    if (preview.done()) {
++        debugs(93, 7, "ICAPModXact wrote entire Preview body " << status());
++
++        if (preview.ieof())
++            stopWriting();
++        else
++            state.writing = State::writingPaused;
++    }
++}
++
++void ICAPModXact::writePrimeBody()
++{
++    Must(state.writing == State::writingPrime);
++    Must(virginWriteClaim.active());
++
++    MsgPipeData::Body *body = virgin->data->body;
++    const size_t size = body->contentSize();
++    writeSomeBody("prime virgin body", size);
++
++    if (state.doneReceiving)
++        stopWriting();
++}
++
++void ICAPModXact::writeSomeBody(const char *label, size_t size)
++{
++    Must(!writer && !state.doneWriting());
++    debugs(93, 8, "ICAPModXact will write up to " << size << " bytes of " <<
++           label);
++
++    MemBuf writeBuf; // TODO: suggest a min size based on size and lastChunk
++
++    writeBuf.init(); // note: we assume that last-chunk will fit
++
++    const size_t writeableSize = claimSize(virginWriteClaim);
++    const size_t chunkSize = XMIN(writeableSize, size);
++
++    if (chunkSize) {
++        debugs(93, 7, "ICAPModXact will write " << chunkSize <<
++               "-byte chunk of " << label);
++    } else {
++        debugs(93, 7, "ICAPModXact has no writeable " << label << " content");
++    }
++
++    moveRequestChunk(writeBuf, chunkSize);
++
++    const bool lastChunk =
++        (state.writing == State::writingPreview && preview.done()) ||
++        (state.doneReceiving && claimSize(virginWriteClaim) <= 0);
++
++    if (lastChunk && virginBody.expected()) {
++        debugs(93, 8, "ICAPModXact will write last-chunk of " << label);
++        addLastRequestChunk(writeBuf);
++    }
++
++    debugs(93, 7, "ICAPModXact will write " << writeBuf.contentSize()
++           << " raw bytes of " << label);
++
++    if (writeBuf.hasContent()) {
++        scheduleWrite(writeBuf); // comm will free the chunk
++    } else {
++        writeBuf.clean();
++    }
++}
++
++void ICAPModXact::moveRequestChunk(MemBuf &buf, size_t chunkSize)
++{
++    if (chunkSize > 0) {
++        openChunk(buf, chunkSize);
++        buf.append(claimContent(virginWriteClaim), chunkSize);
++        closeChunk(buf, false);
++
++        virginWriteClaim.release(chunkSize);
++        virginConsume();
++    }
++
++    if (state.writing == State::writingPreview)
++        preview.wrote(chunkSize, state.doneReceiving); // even if wrote nothing
++}
++
++void ICAPModXact::addLastRequestChunk(MemBuf &buf)
++{
++    openChunk(buf, 0);
++    closeChunk(buf, state.writing == State::writingPreview && preview.ieof());
++}
++
++void ICAPModXact::openChunk(MemBuf &buf, size_t chunkSize)
++{
++    buf.Printf("%x\r\n", chunkSize);
++}
++
++void ICAPModXact::closeChunk(MemBuf &buf, bool ieof)
++{
++    if (ieof)
++        buf.append("; ieof", 6);
++
++    buf.append(ICAP::crlf, 2); // chunk-terminating CRLF
++}
++
++size_t ICAPModXact::claimSize(const MemBufClaim &claim) const
++{
++    Must(claim.active());
++    const size_t start = claim.offset();
++    const size_t end = virginConsumed + virgin->data->body->contentSize();
++    Must(virginConsumed <= start && start <= end);
++    return end - start;
++}
++
++const char *ICAPModXact::claimContent(const MemBufClaim &claim) const
++{
++    Must(claim.active());
++    const size_t start = claim.offset();
++    Must(virginConsumed <= start);
++    return virgin->data->body->content() + (start - virginConsumed);
++}
++
++void ICAPModXact::virginConsume()
++{
++    MemBuf &buf = *virgin->data->body;
++    const size_t have = static_cast<size_t>(buf.contentSize());
++    const size_t end = virginConsumed + have;
++    size_t offset = end;
++
++    if (virginWriteClaim.active())
++        offset = XMIN(virginWriteClaim.offset(), offset);
++
++    if (virginSendClaim.active())
++        offset = XMIN(virginSendClaim.offset(), offset);
++
++    Must(virginConsumed <= offset && offset <= end);
++
++    if (const size_t size = offset - virginConsumed) {
++        debugs(93, 8, "ICAPModXact consumes " << size << " out of " << have <<
++               " virgin body bytes");
++        buf.consume(size);
++        virginConsumed += size;
++
++        if (!state.doneReceiving)
++            virgin->sendSinkNeed();
++    }
++}
++
++void ICAPModXact::handleCommWroteBody()
++{
++    writeMore();
++}
++
++void ICAPModXact::stopWriting()
++{
++    if (state.writing == State::writingDone)
++        return;
++
++    debugs(93, 7, "ICAPModXact will no longer write " << status());
++
++    state.writing = State::writingDone;
++
++    virginWriteClaim.disable();
++
++    virginConsume();
++
++    // Comm does not have an interface to clear the writer, but
++    // writeMore() will not write if our write callback is called
++    // when state.writing == State::writingDone;
++}
++
++void ICAPModXact::stopBackup()
++{
++    if (!virginSendClaim.active())
++        return;
++
++    debugs(93, 7, "ICAPModXact will no longer backup " << status());
++
++    virginSendClaim.disable();
++
++    virginConsume();
++}
++
++bool ICAPModXact::doneAll() const
++{
++    return ICAPXaction::doneAll() && !state.serviceWaiting &&
++           state.doneReceiving && doneSending() &&
++           doneReading() && state.doneWriting();
++}
++
++void ICAPModXact::startReading()
++{
++    Must(connection >= 0);
++    Must(!reader);
++    Must(adapted.getRaw());
++    Must(adapted->data);
++    Must(adapted->data->body);
++
++    // we use the same buffer for headers and body and then consume headers
++    readMore();
++}
++
++void ICAPModXact::readMore()
++{
++    if (reader || doneReading())
++        return;
++
++    // do not fill readBuf if we have no space to store the result
++    if (!adapted->data->body->hasPotentialSpace())
++        return;
++
++    if (readBuf.hasSpace())
++        scheduleRead();
++}
++
++// comm module read a portion of the ICAP response for us
++void ICAPModXact::handleCommRead(size_t)
++{
++    Must(!state.doneParsing());
++    parseMore();
++    readMore();
++}
++
++void ICAPModXact::echoMore()
++{
++    Must(state.sending == State::sendingVirgin);
++    Must(virginSendClaim.active());
++
++    MemBuf &from = *virgin->data->body;
++    MemBuf &to = *adapted->data->body;
++
++    const size_t sizeMax = claimSize(virginSendClaim);
++    const size_t size = XMIN(static_cast<size_t>(to.potentialSpaceSize()),
++                             sizeMax);
++    debugs(93, 5, "ICAPModXact echos " << size << " out of " << sizeMax <<
++           " bytes");
++
++    if (size > 0) {
++        to.append(claimContent(virginSendClaim), size);
++        virginSendClaim.release(size);
++        virginConsume();
++        adapted->sendSourceProgress();
++    }
++
++    if (!from.hasContent() && state.doneReceiving) {
++        debugs(93, 5, "ICAPModXact echoed all " << status());
++        stopSending(true);
++    } else {
++        debugs(93, 5, "ICAPModXact has " << from.contentSize() << " bytes " <<
++               "and expects more to echo " << status());
++        virgin->sendSinkNeed(); // TODO: timeout if sink is broken
++    }
++}
++
++bool ICAPModXact::doneSending() const
++{
++    Must((state.sending == State::sendingDone) == (!adapted));
++    return state.sending == State::sendingDone;
++}
++
++void ICAPModXact::stopSending(bool nicely)
++{
++    if (doneSending())
++        return;
++
++    if (state.sending != State::sendingUndecided) {
++        debugs(93, 7, "ICAPModXact will no longer send " << status());
++
++        if (nicely)
++            adapted->sendSourceFinish();
++        else
++            adapted->sendSourceAbort();
++    } else {
++        debugs(93, 7, "ICAPModXact will not start sending " << status());
++        adapted->sendSourceAbort(); // or the sink may wait forever
++    }
++
++    state.sending = State::sendingDone;
++
++    /*
++    * Note on adapted->data->header:  we created the header, but allow the
++    * other side (ICAPAnchor) to take control of it.  We won't touch it here
++    * and instead rely on the Anchor-side to make sure it is properly freed.
++    */
++    adapted = NULL; // refcounted
++}
++
++void ICAPModXact::stopReceiving()
++{
++    // stopSending NULLifies adapted but we do not NULLify virgin.
++    // This is assymetric because we want to keep virgin->data even
++    // though we are not expecting any more virgin->data->body.
++    // TODO: can we cache just the needed headers info instead?
++
++    // If they closed first, there is not point (or means) to notify them.
++
++    if (state.doneReceiving)
++        return;
++
++    // There is no sendSinkFinished() to notify the other side.
++    debugs(93, 7, "ICAPModXact will not receive " << status());
++
++    state.doneReceiving = true;
++}
++
++void ICAPModXact::parseMore()
++{
++    debugs(93, 5, "have " << readBuf.contentSize() << " bytes to parse" <<
++           status());
++
++    if (state.parsingHeaders())
++        parseHeaders();
++
++    if (state.parsing == State::psBody)
++        parseBody();
++}
++
++// note that allocation for echoing is done in handle204NoContent()
++void ICAPModXact::maybeAllocateHttpMsg()
++{
++    if (adapted->data->header) // already allocated
++        return;
++
++    if (gotEncapsulated("res-hdr")) {
++        adapted->data->header = new HttpReply;
++    } else if (gotEncapsulated("req-hdr")) {
++        adapted->data->header = new HttpRequest;
++    } else
++        throw TexcHere("Neither res-hdr nor req-hdr in maybeAllocateHttpMsg()");
++}
++
++void ICAPModXact::parseHeaders()
++{
++    Must(state.parsingHeaders());
++
++    if (state.parsing == State::psIcapHeader)
++        parseIcapHead();
++
++    if (state.parsing == State::psHttpHeader)
++        parseHttpHead();
++
++    if (state.parsingHeaders()) { // need more data
++        Must(mayReadMore());
++        return;
++    }
++
++    adapted->sendSourceStart();
++
++    if (state.sending == State::sendingVirgin)
++        echoMore();
++}
++
++void ICAPModXact::parseIcapHead()
++{
++    Must(state.sending == State::sendingUndecided);
++
++    if (!parseHead(icapReply))
++        return;
++
++    switch (icapReply->sline.status) {
++
++    case 100:
++        handle100Continue();
++        break;
++
++    case 200:
++        handle200Ok();
++        break;
++
++    case 204:
++        handle204NoContent();
++        break;
++
++    default:
++        handleUnknownScode();
++        break;
++    }
++
++    // handle100Continue() manages state.writing on its own.
++    // Non-100 status means the server needs no postPreview data from us.
++    if (state.writing == State::writingPaused)
++        stopWriting();
++
++    // TODO: Consider applying a Squid 2.5 patch to recognize 201 responses
++}
++
++void ICAPModXact::handle100Continue()
++{
++    Must(state.writing == State::writingPaused);
++    Must(preview.enabled() && preview.done() && !preview.ieof());
++    Must(virginSendClaim.active());
++
++    if (virginSendClaim.limited()) // preview only
++        stopBackup();
++
++    state.parsing = State::psHttpHeader; // eventually
++
++    state.writing = State::writingPrime;
++
++    writeMore();
++}
++
++void ICAPModXact::handle200Ok()
++{
++    state.parsing = State::psHttpHeader;
++    state.sending = State::sendingAdapted;
++    stopBackup();
++}
++
++void ICAPModXact::handle204NoContent()
++{
++    stopParsing();
++    Must(virginSendClaim.active());
++    virginSendClaim.protectAll(); // extends protection if needed
++    state.sending = State::sendingVirgin;
++
++    // We want to clone the HTTP message, but we do not want
++    // to copy non-HTTP state parts that HttpMsg kids carry in them.
++    // Thus, we cannot use a smart pointer, copy constructor, or equivalent.
++    // Instead, we simply write the HTTP message and "clone" it by parsing.
++
++    HttpMsg *oldHead = virgin->data->header;
++    debugs(93, 7, "ICAPModXact cloning virgin message " << oldHead);
++
++    MemBuf httpBuf;
++
++    // write the virgin message into a memory buffer
++    httpBuf.init();
++    packHead(httpBuf, oldHead);
++
++    // allocate the adapted message
++    HttpMsg *&newHead = adapted->data->header;
++    Must(!newHead);
++
++    if (dynamic_cast<const HttpRequest*>(oldHead))
++        newHead = new HttpRequest;
++    else
++        if (dynamic_cast<const HttpReply*>(oldHead))
++            newHead = new HttpReply;
++
++    Must(newHead);
++
++    // parse the buffer back
++    http_status error = HTTP_STATUS_NONE;
++
++    Must(newHead->parse(&httpBuf, true, &error));
++
++    Must(newHead->hdr_sz == httpBuf.contentSize()); // no leftovers
++
++    httpBuf.clean();
++
++    debugs(93, 7, "ICAPModXact cloned virgin message " << oldHead << " to " << newHead);
++}
++
++void ICAPModXact::handleUnknownScode()
++{
++    stopParsing();
++    stopBackup();
++    // TODO: mark connection as "bad"
++
++    // Terminate the transaction; we do not know how to handle this response.
++    throw TexcHere("Unsupported ICAP status code");
++}
++
++void ICAPModXact::parseHttpHead()
++{
++    if (gotEncapsulated("res-hdr") || gotEncapsulated("req-hdr")) {
++        maybeAllocateHttpMsg();
++
++        if (!parseHead(adapted->data->header))
++            return;
++    }
++
++    state.parsing = State::psBody;
++}
++
++bool ICAPModXact::parseHead(HttpMsg *head)
++{
++    assert(head);
++    debugs(93, 5, "have " << readBuf.contentSize() << " head bytes to parse" <<
++           "; state: " << state.parsing);
++
++    http_status error = HTTP_STATUS_NONE;
++    const bool parsed = head->parse(&readBuf, commEof, &error);
++    Must(parsed || !error); // success or need more data
++
++    if (!parsed) {	// need more data
++        head->reset();
++        return false;
++    }
++
++    readBuf.consume(head->hdr_sz);
++    return true;
++}
++
++void ICAPModXact::parseBody()
++{
++    Must(state.parsing == State::psBody);
++
++    debugs(93, 5, "have " << readBuf.contentSize() << " body bytes to parse");
++
++    if (gotEncapsulated("res-body")) {
++        if (!parsePresentBody()) // need more body data
++            return;
++    } else {
++        debugs(93, 5, "not expecting a body");
++    }
++
++    stopParsing();
++    stopSending(true);
++}
++
++// returns true iff complete body was parsed
++bool ICAPModXact::parsePresentBody()
++{
++    if (!bodyParser)
++        bodyParser = new ChunkedCodingParser;
++
++    // the parser will throw on errors
++    const bool parsed = bodyParser->parse(&readBuf, adapted->data->body);
++
++    adapted->sendSourceProgress(); // TODO: do not send if parsed nothing
++
++    debugs(93, 5, "have " << readBuf.contentSize() << " body bytes after " <<
++           "parse; parsed all: " << parsed);
++
++    if (parsed)
++        return true;
++
++    if (bodyParser->needsMoreData())
++        Must(mayReadMore());
++
++    if (bodyParser->needsMoreSpace()) {
++        Must(!doneSending()); // can hope for more space
++        Must(adapted->data->body->hasContent()); // paranoid
++        // TODO: there should be a timeout in case the sink is broken.
++    }
++
++    return false;
++}
++
++void ICAPModXact::stopParsing()
++{
++    if (state.parsing == State::psDone)
++        return;
++
++    debugs(93, 7, "ICAPModXact will no longer parse " << status());
++
++    delete bodyParser;
++
++    bodyParser = NULL;
++
++    state.parsing = State::psDone;
++}
++
++// HTTP side added virgin body data
++void ICAPModXact::noteSourceProgress(MsgPipe *p)
++{
++    ICAPXaction_Enter(noteSourceProgress);
++
++    Must(!state.doneReceiving);
++    writeMore();
++
++    if (state.sending == State::sendingVirgin)
++        echoMore();
++
++    ICAPXaction_Exit();
++}
++
++// HTTP side sent us all virgin info
++void ICAPModXact::noteSourceFinish(MsgPipe *p)
++{
++    ICAPXaction_Enter(noteSourceFinish);
++
++    Must(!state.doneReceiving);
++    stopReceiving();
++
++    // push writer and sender in case we were waiting for the last-chunk
++    writeMore();
++
++    if (state.sending == State::sendingVirgin)
++        echoMore();
++
++    ICAPXaction_Exit();
++}
++
++// HTTP side is aborting
++void ICAPModXact::noteSourceAbort(MsgPipe *p)
++{
++    ICAPXaction_Enter(noteSourceAbort);
++
++    Must(!state.doneReceiving);
++    stopReceiving();
++    mustStop("HTTP source quit");
++
++    ICAPXaction_Exit();
++}
++
++// HTTP side wants more adapted data and possibly freed some buffer space
++void ICAPModXact::noteSinkNeed(MsgPipe *p)
++{
++    ICAPXaction_Enter(noteSinkNeed);
++
++    if (state.sending == State::sendingVirgin)
++        echoMore();
++    else
++        if (state.sending == State::sendingAdapted)
++            parseMore();
++        else
++            Must(state.sending == State::sendingUndecided);
++
++    ICAPXaction_Exit();
++}
++
++// HTTP side aborted
++void ICAPModXact::noteSinkAbort(MsgPipe *p)
++{
++    ICAPXaction_Enter(noteSinkAbort);
++
++    mustStop("HTTP sink quit");
++
++    ICAPXaction_Exit();
++}
++
++// internal cleanup
++void ICAPModXact::doStop()
++{
++    ICAPXaction::doStop();
++
++    stopWriting();
++    stopBackup();
++
++    if (icapReply) {
++        delete icapReply;
++        icapReply = NULL;
++    }
++
++    stopSending(false);
++
++    // see stopReceiving() for reasons it cannot NULLify virgin there
++
++    if (virgin != NULL) {
++        if (!state.doneReceiving)
++            virgin->sendSinkAbort();
++        else
++            virgin->sink = NULL;
++
++        virgin = NULL; // refcounted
++    }
++
++    if (self != NULL) {
++        Pointer s = self;
++        self = NULL;
++        ICAPNoteXactionDone(s);
++        /* this object may be destroyed when 's' is cleared */
++    }
++}
++
++void ICAPModXact::makeRequestHeaders(MemBuf &buf)
++{
++    const ICAPServiceRep &s = service();
++    buf.Printf("%s %s ICAP/1.0\r\n", s.methodStr(), s.uri.buf());
++    buf.Printf("Host: %s:%d\r\n", s.host.buf(), s.port);
++    buf.Printf("Encapsulated: ");
++
++    MemBuf httpBuf;
++    httpBuf.init();
++
++    // build HTTP request header, if any
++    ICAP::Method m = s.method;
++
++    if (ICAP::methodRespmod == m && virgin->data->cause)
++        encapsulateHead(buf, "req-hdr", httpBuf, virgin->data->cause);
++    else if (ICAP::methodReqmod == m)
++        encapsulateHead(buf, "req-hdr", httpBuf, virgin->data->header);
++
++    if (ICAP::methodRespmod == m)
++        if (const MsgPipeData::Header *prime = virgin->data->header)
++            encapsulateHead(buf, "res-hdr", httpBuf, prime);
++
++    if (!virginBody.expected())
++        buf.Printf("null-body=%d", httpBuf.contentSize());
++    else if (ICAP::methodReqmod == m)
++        buf.Printf("req-body=%d", httpBuf.contentSize());
++    else
++        buf.Printf("res-body=%d", httpBuf.contentSize());
++
++    buf.append(ICAP::crlf, 2); // terminate Encapsulated line
++
++    if (shouldPreview()) {
++        buf.Printf("Preview: %d\r\n", (int)preview.ad());
++        virginSendClaim.protectUpTo(preview.ad());
++    }
++
++    if (shouldAllow204()) {
++        buf.Printf("Allow: 204\r\n");
++        // be robust: do not rely on the expected body size
++        virginSendClaim.protectAll();
++    }
++
++    buf.append(ICAP::crlf, 2); // terminate ICAP header
++
++    // start ICAP request body with encapsulated HTTP headers
++    buf.append(httpBuf.content(), httpBuf.contentSize());
++
++    httpBuf.clean();
++}
++
++void ICAPModXact::encapsulateHead(MemBuf &icapBuf, const char *section, MemBuf &httpBuf, const HttpMsg *head)
++{
++    // update ICAP header
++    icapBuf.Printf("%s=%d,", section, httpBuf.contentSize());
++
++    // pack HTTP head
++    packHead(httpBuf, head);
++}
++
++void ICAPModXact::packHead(MemBuf &httpBuf, const HttpMsg *head)
++{
++    Packer p;
++    packerToMemInit(&p, &httpBuf);
++    head->packInto(&p, true);
++    packerClean(&p);
++}
++
++// decides whether to offer a preview and calculates its size
++bool ICAPModXact::shouldPreview()
++{
++    size_t wantedSize;
++
++    if (!service().wantsPreview(wantedSize)) {
++        debugs(93, 5, "ICAPModXact should not offer preview");
++        return false;
++    }
++
++    Must(wantedSize >= 0);
++
++    // cannot preview more than we can backup
++    size_t ad = XMIN(wantedSize, TheBackupLimit);
++
++    if (virginBody.expected() && virginBody.knownSize())
++        ad = XMIN(ad, virginBody.size()); // not more than we have
++    else
++        ad = 0; // questionable optimization?
++
++    debugs(93, 5, "ICAPModXact should offer " << ad << "-byte preview " <<
++           "(service wanted " << wantedSize << ")");
++
++    preview.enable(ad);
++
++    return preview.enabled();
++}
++
++// decides whether to allow 204 responses
++bool ICAPModXact::shouldAllow204()
++{
++    if (!service().allows204())
++        return false;
++
++    if (!virginBody.expected())
++        return true; // no body means no problems with supporting 204s.
++
++    // if there is a body, make sure we can backup it all
++
++    if (!virginBody.knownSize())
++        return false;
++
++    // or should we have a different backup limit?
++    // note that '<' allows for 0-termination of the "full" backup buffer
++    return virginBody.size() < TheBackupLimit;
++}
++
++// returns a temporary string depicting transaction status, for debugging
++void ICAPModXact::fillPendingStatus(MemBuf &buf) const
++{
++    if (state.serviceWaiting)
++        buf.append("U", 1);
++
++    if (!state.doneWriting() && state.writing != State::writingInit)
++        buf.Printf("w(%d)", state.writing);
++
++    if (preview.enabled()) {
++        if (!preview.done())
++            buf.Printf("P(%d)", preview.debt());
++    }
++
++    if (virginSendClaim.active())
++        buf.append("B", 1);
++
++    if (!state.doneParsing() && state.parsing != State::psIcapHeader)
++        buf.Printf("p(%d)", state.parsing);
++
++    if (!doneSending() && state.sending != State::sendingUndecided)
++        buf.Printf("S(%d)", state.sending);
++}
++
++void ICAPModXact::fillDoneStatus(MemBuf &buf) const
++{
++    if (state.doneReceiving)
++        buf.append("R", 1);
++
++    if (state.doneWriting())
++        buf.append("w", 1);
++
++    if (preview.enabled()) {
++        if (preview.done())
++            buf.Printf("P%s", preview.ieof() ? "(ieof)" : "");
++    }
++
++    if (doneReading())
++        buf.append("r", 1);
++
++    if (state.doneParsing())
++        buf.append("p", 1);
++
++    if (doneSending())
++        buf.append("S", 1);
++}
++
++bool ICAPModXact::gotEncapsulated(const char *section) const
++{
++    return httpHeaderGetByNameListMember(&icapReply->header, "Encapsulated",
++                                         section, ',').size() > 0;
++}
++
++// calculate whether there is a virgin HTTP body and
++// whether its expected size is known
++void ICAPModXact::estimateVirginBody()
++{
++    // note: defaults should be fine but will disable previews and 204s
++
++    Must(virgin != NULL && virgin->data->header);
++
++    method_t method;
++
++    if (virgin->data->cause)
++        method = virgin->data->cause->method;
++    else
++        if (HttpRequest *req= dynamic_cast<HttpRequest*>(virgin->data->
++                              header))
++            method = req->method;
++        else
++            return;
++
++    ssize_t size;
++    if (virgin->data->header->expectingBody(method, size)) {
++        virginBody.expect(size)
++        ;
++        debugs(93, 6, "ICAPModXact expects virgin body; size: " << size);
++    } else {
++        debugs(93, 6, "ICAPModXact does not expect virgin body");
++    }
++}
++
++
++// TODO: Move SizedEstimate, MemBufBackup, and ICAPPreview elsewhere
++
++SizedEstimate::SizedEstimate()
++        : theData(dtUnexpected)
++{}
++
++void SizedEstimate::expect(ssize_t aSize)
++{
++    theData = (aSize >= 0) ? aSize : (ssize_t)dtUnknown;
++}
++
++bool SizedEstimate::expected() const
++{
++    return theData != dtUnexpected;
++}
++
++bool SizedEstimate::knownSize() const
++{
++    Must(expected());
++    return theData != dtUnknown;
++}
++
++size_t SizedEstimate::size() const
++{
++    Must(knownSize());
++    return static_cast<size_t>(theData);
++}
++
++
++
++MemBufClaim::MemBufClaim(): theStart(-1), theGoal(-1)
++{}
++
++void MemBufClaim::protectAll()
++{
++    if (theStart < 0)
++        theStart = 0;
++
++    theGoal = -1; // no specific goal
++}
++
++void MemBufClaim::protectUpTo(size_t aGoal)
++{
++    if (theStart < 0)
++        theStart = 0;
++
++    Must(aGoal >= 0);
++
++    theGoal = (theGoal < 0) ? static_cast<ssize_t>(aGoal) :
++              XMIN(static_cast<ssize_t>(aGoal), theGoal);
++}
++
++void MemBufClaim::disable()
++{
++    theStart = -1;
++}
++
++void MemBufClaim::release(size_t size)
++{
++    Must(active());
++    Must(size >= 0);
++    theStart += static_cast<ssize_t>(size);
++
++    if (limited() && theStart >= theGoal)
++        disable();
++}
++
++size_t MemBufClaim::offset() const
++{
++    Must(active());
++    return static_cast<size_t>(theStart);
++}
++
++bool MemBufClaim::limited() const
++{
++    Must(active());
++    return theGoal >= 0;
++}
++
++
++ICAPPreview::ICAPPreview(): theWritten(0), theAd(0), theState(stDisabled)
++{}
++
++void ICAPPreview::enable(size_t anAd)
++{
++    // TODO: check for anAd not exceeding preview size limit
++    Must(anAd >= 0);
++    Must(!enabled());
++    theAd = anAd;
++    theState = stWriting;
++}
++
++bool ICAPPreview::enabled() const
++{
++    return theState != stDisabled;
++}
++
++size_t ICAPPreview::ad() const
++{
++    Must(enabled());
++    return theAd;
++}
++
++bool ICAPPreview::done() const
++{
++    Must(enabled());
++    return theState >= stIeof;
++}
++
++bool ICAPPreview::ieof() const
++{
++    Must(enabled());
++    return theState == stIeof;
++}
++
++size_t ICAPPreview::debt() const
++{
++    Must(enabled());
++    return done() ? 0 : (theAd - theWritten);
++}
++
++void ICAPPreview::wrote(size_t size, bool sawEof)
++{
++    Must(enabled());
++    theWritten += size;
++
++    if (theWritten >= theAd)
++        theState = stDone; // sawEof is irrelevant
++    else
++        if (sawEof)
++            theState = stIeof;
++}
++
+@@ -0,0 +1,279 @@
++
++/*
++ * $Id: ICAPModXact.h,v 1.1 2005/11/21 23:32:59 wessels Exp $
++ *
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sinks; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ */
++
++#ifndef SQUID_ICAPMODXACT_H
++#define SQUID_ICAPMODXACT_H
++
++#include "ICAPXaction.h"
++#include "MsgPipe.h"
++#include "MsgPipeSource.h"
++#include "MsgPipeSink.h"
++
++/* ICAPModXact implements ICAP REQMOD and RESPMOD transaction using ICAPXaction
++ * as the base. It implements message pipe sink and source interfaces for
++ * communication with various HTTP "anchors" and "hooks".  ICAPModXact receives
++ * virgin HTTP messages, communicates with the ICAP server, and sends the
++ * adapted messages back. ICAPClient is the "owner" of the ICAPModXact. */
++
++class ChunkedCodingParser;
++
++// estimated future presence and size of something (e.g., HTTP body)
++
++class SizedEstimate
++{
++
++public:
++    SizedEstimate(); // not expected by default
++    void expect(ssize_t aSize); // expect with any, even unknown size
++    bool expected() const;
++
++    /* other members can be accessed iff expected() */
++
++    bool knownSize() const;
++    size_t size() const; // can be accessed iff knownSize()
++
++private:
++    enum { dtUnexpected = -2, dtUnknown = -1 };
++    ssize_t theData; // combines expectation and size info to save RAM
++};
++
++// Protects buffer area. If area size is unknown, protects buffer suffix.
++// Only "released" data can be consumed by the caller. Used to maintain
++// write, preview, and 204 promises for ICAPModXact virgin->data-body buffer.
++
++class MemBufClaim
++{
++
++public:
++    MemBufClaim();
++
++    void protectAll();
++    void protectUpTo(size_t aGoal);
++    void disable();
++    bool active() const { return theStart >= 0; }
++
++    // methods below require active()
++
++    void release(size_t size); // stop protecting size more bytes
++    size_t offset() const;     // protected area start
++    bool limited() const;      // protects up to a known size goal
++
++private:
++    ssize_t theStart; // left area border
++    ssize_t theGoal;  // "end" maximum, if any
++};
++
++// maintains preview-related sizes
++
++class ICAPPreview
++{
++
++public:
++    ICAPPreview();            // disabled
++    void enable(size_t anAd); // enabled with advertised size
++    bool enabled() const;
++
++    /* other members can be accessed iff enabled() */
++
++    size_t ad() const;      // advertised preview size
++    size_t debt() const;    // remains to write
++    bool done() const;      // wrote everything
++    bool ieof() const;      // premature EOF
++
++    void wrote(size_t size, bool sawEof);
++
++private:
++    size_t theWritten;
++    size_t theAd;
++    enum State { stDisabled, stWriting, stIeof, stDone } theState;
++};
++
++class ICAPModXact: public ICAPXaction, public MsgPipeSource, public MsgPipeSink
++{
++
++public:
++    typedef RefCount<ICAPModXact> Pointer;
++
++public:
++    ICAPModXact();
++
++    // called by ICAPClient
++    void init(ICAPServiceRep::Pointer&, MsgPipe::Pointer &aVirgin, MsgPipe::Pointer &anAdapted, Pointer &aSelf);
++
++    // pipe source methods; called by Anchor while receiving the adapted msg
++    virtual void noteSinkNeed(MsgPipe *p);
++    virtual void noteSinkAbort(MsgPipe *p);
++
++    // pipe sink methods; called by ICAP while sending the virgin message
++    virtual void noteSourceStart(MsgPipe *p);
++    virtual void noteSourceProgress(MsgPipe *p);
++    virtual void noteSourceFinish(MsgPipe *p);
++    virtual void noteSourceAbort(MsgPipe *p);
++
++    // comm handlers
++    virtual void handleCommConnected();
++    virtual void handleCommWrote(size_t size);
++    virtual void handleCommRead(size_t size);
++    void handleCommWroteHeaders();
++    void handleCommWroteBody();
++
++    // service waiting
++    void noteServiceReady();
++
++private:
++    void estimateVirginBody();
++
++    void waitForService();
++
++    // will not send anything [else] on the adapted pipe
++    bool doneSending() const;
++
++    void startWriting();
++    void writeMore();
++    void writePriviewBody();
++    void writePrimeBody();
++    void writeSomeBody(const char *label, size_t size);
++
++    void startReading();
++    void readMore();
++    virtual bool doneReading() const { return commEof || state.doneParsing(); }
++
++    size_t claimSize(const MemBufClaim &claim) const;
++    const char *claimContent(const MemBufClaim &claim) const;
++    void makeRequestHeaders(MemBuf &buf);
++    void moveRequestChunk(MemBuf &buf, size_t chunkSize);
++    void addLastRequestChunk(MemBuf &buf);
++    void openChunk(MemBuf &buf, size_t chunkSize);
++    void closeChunk(MemBuf &buf, bool ieof);
++    void virginConsume();
++
++    bool shouldPreview();
++    bool shouldAllow204();
++    void prepBackup(size_t expectedSize);
++    void backup(const MemBuf &buf);
++
++    void parseMore();
++
++    void parseHeaders();
++    void parseIcapHead();
++    void parseHttpHead();
++    bool parseHead(HttpMsg *head);
++
++    void parseBody();
++    bool parsePresentBody();
++    void maybeAllocateHttpMsg();
++
++    void handle100Continue();
++    void handle200Ok();
++    void handle204NoContent();
++    void handleUnknownScode();
++
++    void echoMore();
++
++    virtual bool doneAll() const;
++
++    virtual void doStop();
++    void stopReceiving();
++    void stopSending(bool nicely);
++    void stopWriting();
++    void stopParsing();
++    void stopBackup();
++
++    virtual void fillPendingStatus(MemBuf &buf) const;
++    virtual void fillDoneStatus(MemBuf &buf) const;
++
++private:
++    void packHead(MemBuf &httpBuf, const HttpMsg *head);
++    void encapsulateHead(MemBuf &icapBuf, const char *section, MemBuf &httpBuf, const HttpMsg *head);
++    bool gotEncapsulated(const char *section) const;
++
++    Pointer self;
++    MsgPipe::Pointer virgin;
++    MsgPipe::Pointer adapted;
++
++    HttpReply *icapReply;
++
++    SizedEstimate virginBody;
++    MemBufClaim virginWriteClaim; // preserve virgin data buffer for writing
++    MemBufClaim virginSendClaim;  // ... for sending (previe and 204s)
++    size_t virginConsumed;         // virgin data consumed so far
++    ICAPPreview preview; // use for creating (writing) the preview
++
++    ChunkedCodingParser *bodyParser; // ICAP response body parser
++
++    class State
++    {
++
++    public:
++        State();
++
++    public:
++
++    unsigned serviceWaiting:
++        1; // waiting for the ICAPServiceRep preparing the ICAP service
++
++    unsigned doneReceiving:
++        1; // expect no new virgin info (from the virgin pipe)
++
++        // will not write anything [else] to the ICAP server connection
++        bool doneWriting() const { return writing == writingDone; }
++
++        // parsed entire ICAP response from the ICAP server
++        bool doneParsing() const { return parsing == psDone; }
++
++        // is parsing ICAP or HTTP headers read from the ICAP server
++        bool parsingHeaders() const
++        {
++            return parsing == psIcapHeader ||
++                   parsing == psHttpHeader;
++        }
++
++        enum Parsing { psIcapHeader, psHttpHeader, psBody, psDone } parsing;
++
++        // measures ICAP request writing progress
++        enum Writing { writingInit, writingConnect, writingHeaders,
++                       writingPreview, writingPaused, writingPrime, writingDone } writing;
++
++        enum Sending { sendingUndecided, sendingVirgin, sendingAdapted,
++                       sendingDone } sending;
++    }
++
++    state;
++
++    CBDATA_CLASS2(ICAPModXact);
++};
++
++// destroys the transaction; implemented in ICAPClient.cc (ick?)
++extern void ICAPNoteXactionDone(ICAPModXact::Pointer x);
++
++#endif /* SQUID_ICAPMOD_XACT_H */
+@@ -0,0 +1,111 @@
++/*
++ * DEBUG: section 93  ICAP (RFC 3507) Client
++ */
++
++#include "squid.h"
++#include "comm.h"
++#include "HttpReply.h"
++
++#include "ICAPOptXact.h"
++#include "ICAPOptions.h"
++#include "TextException.h"
++
++CBDATA_CLASS_INIT(ICAPOptXact);
++
++ICAPOptXact::ICAPOptXact(): ICAPXaction("ICAPOptXact"), options(NULL),
++        cb(NULL), cbData(NULL)
++
++{
++    debug(93,9)("ICAPOptXact constructed, this=%p\n", this);
++}
++
++ICAPOptXact::~ICAPOptXact()
++{
++    Must(!options); // the caller must set to NULL
++    debug(93,9)("ICAPOptXact destructed, this=%p\n", this);
++}
++
++void ICAPOptXact::start(ICAPServiceRep::Pointer &aService, Callback *aCb, void *aCbData)
++{
++    service(aService);
++
++    Must(!cb && aCb && aCbData);
++    cb = aCb;
++    cbData = cbdataReference(aCbData);
++
++    openConnection();
++}
++
++void ICAPOptXact::handleCommConnected()
++{
++    scheduleRead();
++
++    MemBuf requestBuf;
++    requestBuf.init();
++    makeRequest(requestBuf);
++    debugs(93, 9, "ICAPOptXact request " << status() << ":\n" <<
++           (requestBuf.terminate(), requestBuf.content()));
++
++    scheduleWrite(requestBuf);
++}
++
++void ICAPOptXact::doStop()
++{
++    ICAPXaction::doStop();
++
++    if (Callback *call = cb) {
++        cb = NULL;
++        void *data = NULL;
++
++        if (cbdataReferenceValidDone(cbData, &data)) {
++            (*call)(this, data); // will delete us
++            return;
++        }
++    }
++
++    // get rid of options if we did call the callback
++    delete options;
++
++    options = NULL;
++}
++
++void ICAPOptXact::makeRequest(MemBuf &buf)
++{
++    const ICAPServiceRep &s = service();
++    buf.Printf("OPTIONS %s ICAP/1.0\r\n", s.uri.buf());
++    buf.Printf("Host: %s:%d\r\n", s.host.buf(), s.port);
++    buf.append(ICAP::crlf, 2);
++}
++
++void ICAPOptXact::handleCommWrote(size_t size)
++{
++    debugs(93, 9, "ICAPOptXact finished writing " << size <<
++           "-byte request " << status());
++}
++
++// comm module read a portion of the ICAP response for us
++void ICAPOptXact::handleCommRead(size_t)
++{
++    if (parseResponse())
++        Must(done()); // there should be nothing else to do
++    else
++        scheduleRead();
++}
++
++bool ICAPOptXact::parseResponse()
++{
++    HttpReply *r = new HttpReply;
++    r->protoPrefix = "ICAP/"; // TODO: make an IcapReply class?
++
++    if (!parseHttpMsg(r)) {
++        delete r;
++        return false;
++    }
++
++    options = new ICAPOptions;
++
++    options->configure(r);
++
++    delete r;
++    return true;
++}
+@@ -0,0 +1,77 @@
++/*
++ * $Id: ICAPOptXact.h,v 1.1 2005/11/21 23:32:59 wessels Exp $
++ *
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sinks; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ */
++
++#ifndef SQUID_ICAPOPTXACT_H
++#define SQUID_ICAPOPTXACT_H
++
++#include "ICAPXaction.h"
++
++class ICAPOptions;
++
++/* ICAPOptXact sends an ICAP OPTIONS request to the ICAP service,
++ * converts the response into ICAPOptions object, and notifies
++ * the caller via the callback. NULL options objects means the
++ * ICAP service could not be contacted or did not return any response */
++
++class ICAPOptXact: public ICAPXaction
++{
++
++public:
++    typedef void Callback(ICAPOptXact*, void *data);
++
++    ICAPOptXact();
++    virtual ~ICAPOptXact();
++
++    void start(ICAPServiceRep::Pointer &aService, Callback *aCb, void *aCbData);
++
++    ICAPOptions *options; // result for the caller to take/handle
++
++protected:
++    virtual void handleCommConnected();
++    virtual void handleCommWrote(size_t size);
++    virtual void handleCommRead(size_t size);
++
++    void makeRequest(MemBuf &buf);
++    bool parseResponse();
++
++    void startReading();
++
++    virtual void doStop();
++
++private:
++    Callback *cb;
++    void *cbData;
++
++    CBDATA_CLASS2(ICAPOptXact);
++};
++
++#endif /* SQUID_ICAPOPTXACT_H */
+@@ -0,0 +1,182 @@
++#include "squid.h"
++#include "HttpReply.h"
++#include "ICAPOptions.h"
++#include "TextException.h"
++
++ICAPOptions::ICAPOptions(): error("unconfigured"), method(ICAP::methodNone),
++        max_connections(-1), allow204(false),
++        preview(-1), ttl(-1), transfer_ext(NULL)
++{
++    transfers.preview = transfers.ignore = transfers.complete = NULL;
++    transfers.other = TRANSFER_NONE;
++};
++
++ICAPOptions::~ICAPOptions()
++{
++    delete transfers.preview;
++    delete transfers.ignore;
++    delete transfers.complete;
++    delete transfer_ext;
++};
++
++ICAPOptions::transfer_type ICAPOptions::getTransferExt(const char *s)
++{
++
++    if (transfer_ext) {
++        List<TransferPair> *data = transfer_ext;
++
++        while (data) {
++            if (*(data->element.ext) == *s) {
++                return data->element.type;
++            }
++
++            data = data->next;
++        }
++    }
++
++    return TRANSFER_NONE;
++}
++
++#if UNUSED_CODE
++void ICAPOptions::insertTransferExt(const char *t, transfer_type t_type)
++{
++    List<TransferPair> **Tail;
++    TransferPair t_ext;
++
++    if (t == "*") {
++        transfers.other = t_type;
++        return;
++    }
++
++    for (Tail = &transfer_ext; *Tail; Tail = &((*Tail)->next)) {
++        if (*(*Tail)->element.ext == *t) {
++            (*Tail)->element.type = t_type;
++            return;
++        }
++    }
++
++    t_ext.ext = xstrdup(t);
++    t_ext.type = t_type;
++    List<TransferPair> *q = new List<TransferPair>(t_ext);
++    *(Tail) = q;
++
++};
++
++List<String> *ICAPOptions::parseExtFileList(const char *start, const char *end, transfer_type t_type)
++{
++    const String s = xstrndup(start, end - start - 1);
++    const char *item;
++    const char *pos = NULL;
++    char *fext = NULL;
++    int ilen;
++    String t = NULL;
++
++    List<String> **Tail;
++    List<String> *H;
++
++    for (Tail = &H; *Tail; Tail = &((*Tail)->next))
++
++        ;
++    while (strListGetItem(&s, ',', &item, &ilen, &pos)) {
++        fext = xstrndup(item, ilen + 1);
++        t = fext;
++        List<String> *q = new List<String> (t);
++        *(Tail) = q;
++        Tail = &q->next;
++        insertTransferExt(fext, t_type);
++    }
++
++    return H;
++}
++
++#endif
++
++bool ICAPOptions::valid() const
++{
++    return !error;
++}
++
++bool ICAPOptions::fresh() const
++{
++    return squid_curtime <= expire();
++}
++
++time_t ICAPOptions::expire() const
++{
++    Must(valid());
++    return ttl >= 0 ? timestamp + ttl : -1;
++}
++
++void ICAPOptions::configure(const HttpReply *reply)
++{
++    error = NULL; // reset initial "unconfigured" value (or an old error?)
++
++    const HttpHeader *h = &reply->header;
++
++    if (reply->sline.status != 200)
++        error = "unsupported status code of OPTIONS response";
++
++    // Methods
++    if (httpHeaderGetByNameListMember(h, "Methods", "REQMOD", ',').size())
++        cfgMethod(ICAP::methodReqmod);
++
++    if (httpHeaderGetByNameListMember(h, "Methods", "RESPMOD", ',').size())
++        cfgMethod(ICAP::methodRespmod);
++
++    service = httpHeaderGetByName(h, "Service");
++
++    serviceId = httpHeaderGetByName(h, "ServiceId");
++
++    istag = httpHeaderGetByName(h, "ISTag");
++
++    if (httpHeaderGetByName(h, "Opt-body-type").size())
++        error = "ICAP service returns unsupported OPTIONS body";
++
++    cfgIntHeader(h, "Max-Connections", max_connections);
++
++    cfgIntHeader(h, "Options-TTL", ttl);
++
++    timestamp = httpHeaderGetTime(h, HDR_DATE);
++
++    if (timestamp < 0)
++        timestamp = squid_curtime;
++
++    if (httpHeaderGetByNameListMember(h, "Allow", "204", ',').size())
++        allow204 = true;
++
++    cfgIntHeader(h, "Preview", preview);
++
++#if 0
++
++    if (!strncasecmp("Transfer-Preview", start, 16))
++        headers->transfer_preview = parseExtFileList(value_start, end, TRANSFER_PREVIEW);
++
++    if (!strncasecmp("Transfer-Ignore", start, 15))
++        headers->transfer_ignore = parseExtFileList(value_start, end, TRANSFER_IGNORE);
++
++    if (!strncasecmp("Transfer-Complete", start, 17))
++        headers->transfer_complete = parseExtFileList(value_start, end, TRANSFER_COMPLETE);
++
++#endif
++}
++
++void ICAPOptions::cfgMethod(ICAP::Method m)
++{
++    Must(m != ICAP::methodNone);
++
++    if (method == ICAP::methodNone)
++        method = m;
++    else
++        error = "the service claims to support several request methods";
++}
++
++// TODO: HttpHeader should provide a general method for this type of conversion
++void ICAPOptions::cfgIntHeader(const HttpHeader *h, const char *fname, int &value)
++{
++    const String s = httpHeaderGetByName(h, fname);
++
++    if (s.size() && xisdigit(*s.buf()))
++        value = atoi(s.buf());
++    else
++        value = -1;
++}
+@@ -0,0 +1,111 @@
++
++/*
++ * $Id: ICAPOptions.h,v 1.1 2005/11/21 23:32:59 wessels Exp $
++ *
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sinks; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ */
++
++#ifndef SQUID_ICAPOPTIONS_H
++#define SQUID_ICAPOPTIONS_H
++
++#include "squid.h"
++#include "List.h"
++#include "ICAPClient.h"
++
++/* Maintains options supported by a given ICAP service.
++ * See RFC 3507, Section "4.10.2 OPTIONS Response". */
++
++class ICAPOptions
++{
++
++public:
++    typedef void GetCallback(void *data, ICAPOptions *options);
++    static void Get(ICAPServiceRep::Pointer &service, GetCallback *cb, void *data);
++
++public:
++    ICAPOptions();
++    ~ICAPOptions();
++
++    void configure(const HttpReply *reply);
++
++    bool valid() const;
++    bool fresh() const;
++    time_t expire() const;
++
++    typedef enum { TRANSFER_NONE, TRANSFER_PREVIEW, TRANSFER_IGNORE, TRANSFER_COMPLETE } transfer_type;
++    transfer_type getTransferExt(const char *);
++
++public:
++    const char *error; // human-readable information; set iff !valid()
++
++    // ICAP server MUST supply this info
++    ICAP::Method method;
++    String istag;
++
++    // ICAP server MAY supply this info. If not, Squid supplies defaults.
++    String service;
++    String serviceId;
++    int max_connections;
++    bool allow204;
++    int preview;
++
++    // varios Transfer-* lists
++
++    struct Transfers
++    {
++        List<String> *preview;
++        List<String> *ignore;
++        List<String> *complete;
++        transfer_type other; // default X from Transfer-X: *
++    }
++
++    transfers;
++
++protected:
++    int ttl;
++    time_t timestamp;
++
++    //  The list of pairs "file extension <-> transfer type"
++
++    struct TransferPair
++    {
++        char *ext;
++        transfer_type type;
++    };
++
++    List<TransferPair> *transfer_ext;
++
++private:
++    void cfgMethod(ICAP::Method m);
++    void cfgIntHeader(const HttpHeader *h, const char *fname, int &value);
++};
++
++
++
++#endif /* SQUID_ICAPOPTIONS_H */
+@@ -0,0 +1,381 @@
++/*
++ * DEBUG: section 93  ICAP (RFC 3507) Client
++ */
++
++#include "squid.h"
++#include "TextException.h"
++#include "ICAPServiceRep.h"
++#include "ICAPOptions.h"
++#include "ICAPOptXact.h"
++#include "ConfigParser.h"
++
++CBDATA_CLASS_INIT(ICAPServiceRep);
++
++ICAPServiceRep::ICAPServiceRep(): method(ICAP::methodNone),
++        point(ICAP::pointNone), port(-1), bypass(false), unreachable(false),
++        theOptions(NULL), theState(stateInit), notifying(false), self(NULL)
++{}
++
++ICAPServiceRep::~ICAPServiceRep()
++{
++    Must(!waiting());
++    changeOptions(0);
++}
++
++const char *
++ICAPServiceRep::methodStr() const
++{
++    return ICAP::methodStr(method);
++}
++
++ICAP::Method
++ICAPServiceRep::parseMethod(const char *str) const
++{
++    if (!strncasecmp(str, "REQMOD", 6))
++        return ICAP::methodReqmod;
++
++    if (!strncasecmp(str, "RESPMOD", 7))
++        return ICAP::methodRespmod;
++
++    return ICAP::methodNone;
++}
++
++
++const char *
++ICAPServiceRep::vectPointStr() const
++{
++    return ICAP::vectPointStr(point);
++}
++
++ICAP::VectPoint
++ICAPServiceRep::parseVectPoint(const char *service) const
++{
++    const char *t = service;
++    const char *q = strchr(t, '_');
++
++    if (q)
++        t = q + 1;
++
++    if (!strcasecmp(t, "precache"))
++        return ICAP::pointPreCache;
++
++    if (!strcasecmp(t, "postcache"))
++        return ICAP::pointPostCache;
++
++    return ICAP::pointNone;
++}
++
++bool
++ICAPServiceRep::configure(Pointer &aSelf)
++{
++    assert(!self && aSelf != NULL);
++    self = aSelf;
++
++    char *service_type = NULL;
++
++    ConfigParser::ParseString(&key);
++    ConfigParser::ParseString(&service_type);
++    ConfigParser::ParseBool(&bypass);
++    ConfigParser::ParseString(&uri);
++
++    debug(3, 5) ("ICAPService::parseConfigLine (line %d): %s %s %d\n", config_lineno, key.buf(), service_type, bypass);
++
++    method = parseMethod(service_type);
++    point = parseVectPoint(service_type);
++
++    debug(3, 5) ("ICAPService::parseConfigLine (line %d): service is %s_%s\n", config_lineno, methodStr(), vectPointStr());
++
++    if (uri.cmp("icap://", 7) != 0) {
++        debug(3, 0) ("ICAPService::parseConfigLine (line %d): wrong uri: %s\n", config_lineno, uri.buf());
++        return false;
++    }
++
++    const char *s = uri.buf() + 7;
++
++    const char *e;
++
++    bool have_port = false;
++
++    if ((e = strchr(s, ':')) != NULL) {
++        have_port = true;
++    } else if ((e = strchr(s, '/')) != NULL) {
++        have_port = false;
++    } else {
++        return false;
++    }
++
++    int len = e - s;
++    host.limitInit(s, len);
++    s = e;
++
++    if (have_port) {
++        s++;
++
++        if ((e = strchr(s, '/')) != NULL) {
++            char *t;
++            port = strtoul(s, &t, 0) % 65536;
++
++            if (t != e) {
++                return false;
++            }
++
++            s = e;
++
++            if (s[0] != '/') {
++                return false;
++            }
++        }
++    } else {
++
++        struct servent *serv = getservbyname("icap", "tcp");
++
++        if (serv) {
++            port = htons(serv->s_port);
++        } else {
++            port = 1344;
++        }
++    }
++
++    s++;
++    e = strchr(s, '\0');
++    len = e - s;
++
++    if (len > 1024) {
++        debug(3, 0) ("icap_service_process (line %d): long resource name (>1024), probably wrong\n", config_lineno);
++    }
++
++    resource.limitInit(s, len + 1);
++
++    if ((bypass != 0) && (bypass != 1)) {
++        return false;
++    }
++
++    return true;
++
++};
++
++void ICAPServiceRep::invalidate()
++{
++    assert(self != NULL);
++    self = NULL; // may destroy us and, hence, invalidate cbdata(this)
++    // TODO: it would be nice to invalidate cbdata(this) when not destroyed
++}
++
++bool ICAPServiceRep::up() const
++{
++    return self != NULL && theState == stateUp;
++}
++
++bool ICAPServiceRep::wantsPreview(size_t &wantedSize) const
++{
++    Must(up());
++
++    if (theOptions->preview < 0)
++        return false;
++
++    wantedSize = theOptions->preview;
++
++    return true;
++}
++
++bool ICAPServiceRep::allows204() const
++{
++    Must(up());
++    return true; // in the future, we may have ACLs to prevent 204s
++}
++
++
++static
++void ICAPServiceRep_noteTimeToUpdate(void *data)
++{
++    ICAPServiceRep *service = static_cast<ICAPServiceRep*>(data);
++    Must(service);
++    service->noteTimeToUpdate();
++}
++
++void ICAPServiceRep::noteTimeToUpdate()
++{
++    if (!self || waiting()) {
++        debugs(93,5, "ICAPService ignores options update " << status());
++        return;
++    }
++
++    debugs(93,5, "ICAPService performs a regular options update " << status());
++    startGettingOptions();
++}
++
++static
++void ICAPServiceRep_noteTimeToNotify(void *data)
++{
++    ICAPServiceRep *service = static_cast<ICAPServiceRep*>(data);
++    Must(service);
++    service->noteTimeToNotify();
++}
++
++void ICAPServiceRep::noteTimeToNotify()
++{
++    Must(!notifying);
++    notifying = true;
++    debugs(93,7, "ICAPService notifies " << theClients.size() << " clients " <<
++           status());
++
++    // note: we must notify even if we are invalidated
++
++    Pointer us = NULL;
++
++    while (!theClients.empty()) {
++        Client i = theClients.pop_back();
++        us = i.service; // prevent callbacks from destroying us while we loop
++
++        if (cbdataReferenceValid(i.data))
++            (*i.callback)(i.data, us);
++
++        cbdataReferenceDone(i.data);
++    }
++
++    notifying = false;
++}
++
++void ICAPServiceRep::callWhenReady(Callback *cb, void *data)
++{
++    Must(cb);
++    Must(self != NULL);
++
++    Client i;
++    i.service = self;
++    i.callback = cb;
++    i.data = cbdataReference(data);
++    theClients.push_back(i);
++
++    if (waiting() || notifying)
++        return; // do nothing, we will be picked up in noteTimeToNotify()
++
++    if (needNewOptions())
++        startGettingOptions();
++    else
++        scheduleNotification();
++}
++
++void ICAPServiceRep::scheduleNotification()
++{
++    debugs(93,7, "ICAPService will notify " << theClients.size() << " clients");
++    eventAdd("ICAPServiceRep::noteTimeToNotify", &ICAPServiceRep_noteTimeToNotify, this, 0, 0, true);
++}
++
++bool ICAPServiceRep::waiting() const
++{
++    return theState == stateWait;
++}
++
++bool ICAPServiceRep::needNewOptions() const
++{
++    return !theOptions || !theOptions->fresh();
++}
++
++void ICAPServiceRep::changeOptions(ICAPOptions *newOptions)
++{
++    debugs(93,9, "ICAPService changes options from " << theOptions << " to " <<
++           newOptions);
++    delete theOptions;
++    theOptions = newOptions;
++}
++
++static
++void ICAPServiceRep_noteNewOptions(ICAPOptXact *x, void *data)
++{
++    ICAPServiceRep *service = static_cast<ICAPServiceRep*>(data);
++    Must(service);
++    service->noteNewOptions(x);
++}
++
++void ICAPServiceRep::noteNewOptions(ICAPOptXact *x)
++{
++    Must(x);
++    Must(waiting());
++
++    theState = stateDown; // default in case we fail to set new options
++
++    changeOptions(x->options);
++    x->options = NULL;
++    delete x;
++
++    if (theOptions && theOptions->valid())
++        theState = stateUp;
++
++    debugs(93,6, "ICAPService got new options and is now " <<
++           (up() ? "up" : "down"));
++
++    scheduleUpdate();
++
++    scheduleNotification();
++}
++
++void ICAPServiceRep::startGettingOptions()
++{
++    debugs(93,6, "ICAPService will get new options " << status());
++    theState = stateWait;
++
++    ICAPOptXact *x = new ICAPOptXact;
++    x->start(self, &ICAPServiceRep_noteNewOptions, this);
++    // TODO: timeout incase ICAPOptXact never calls us back?
++}
++
++void ICAPServiceRep::scheduleUpdate()
++{
++    int delay = -1;
++
++    if (theOptions && theOptions->valid()) {
++        const time_t expire = theOptions->expire();
++
++        if (expire > squid_curtime)
++            delay = expire - squid_curtime;
++        else
++            if (expire >= 0)
++                delay = 1; // delay for expired or 'expiring now' options
++            else
++                delay = 60*60; // default for options w/o known expiration time
++    } else {
++        delay = 5*60; // delay for a down service
++    }
++
++    if (delay <= 0) {
++        debugs(93,0, "internal error: ICAPServiceRep failed to compute options update schedule");
++        delay = 5*60; // delay for an internal error
++    }
++
++    // with zero delay, the state changes to stateWait before
++    // notifications are sent out to clients
++    assert(delay > 0);
++
++    debugs(93,7, "ICAPService will update options in " << delay << " sec");
++
++    eventAdd("ICAPServiceRep::noteTimeToUpdate",
++             &ICAPServiceRep_noteTimeToUpdate, this, delay, 0, true);
++
++    // XXX: prompt updates of valid options should not disable concurrent ICAP
++    // xactions. 'Wait' state should not mark the service 'down'! This will
++    // also remove 'delay == 0' as a special case above.
++}
++
++const char *ICAPServiceRep::status() const
++{
++    if (!self)
++        return "[invalidated]";
++
++    switch (theState) {
++
++    case stateInit:
++        return "[init]";
++
++    case stateWait:
++        return "[wait]";
++
++    case stateUp:
++        return "[up]";
++
++    case stateDown:
++        return "[down]";
++    }
++
++    return "[unknown]";
++}
+@@ -0,0 +1,138 @@
++
++/*
++ * $Id: ICAPServiceRep.h,v 1.1 2005/11/21 23:32:59 wessels Exp $
++ *
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sinks; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ */
++
++#ifndef SQUID_ICAPSERVICEREP_H
++#define SQUID_ICAPSERVICEREP_H
++
++#include "ICAPElements.h"
++
++class ICAPOptions;
++
++class ICAPOptXact;
++
++/* The ICAP service representative maintains information about a single ICAP
++   service that Squid communicates with. The representative initiates OPTIONS
++   requests to the service to keep cached options fresh. One ICAP server may
++   host many ICAP services */
++
++class ICAPServiceRep : public RefCountable
++{
++
++public:
++    typedef RefCount<ICAPServiceRep> Pointer;
++
++public:
++    ICAPServiceRep();
++    virtual ~ICAPServiceRep();
++
++    bool configure(Pointer &aSelf); // needs self pointer for ICAPOptXact
++    void invalidate(); // call when the service is no longer needed or valid
++
++    const char *methodStr() const;
++    const char *vectPointStr() const;
++
++    bool up() const;
++
++    /* Service is "up" iff there is a fresh cached OPTIONS response. To
++       get an OPTIONS response, ICAPServiceRep does an OPTIONS
++       transaction.  Failed transaction results in a "down" service. The
++       Callback is called if/once the service is in a steady ("up" or
++       "down") state. */
++    typedef void Callback(void *data, Pointer &service);
++    void callWhenReady(Callback *cb, void *data);
++
++
++    // the methods below can only be called on an up() service
++
++    bool wantsPreview(size_t &wantedSize) const;
++    bool allows204() const;
++
++public:
++    String key;
++    ICAP::Method method;
++    ICAP::VectPoint point;
++    String uri;    // service URI
++
++    // URI components
++    String host;
++    int port;
++    String resource;
++
++    // non-options flags; TODO: check that both are used.
++    bool bypass;
++    bool unreachable;
++
++public: // treat these as private, they are for callbacks only
++    void noteTimeToUpdate();
++    void noteTimeToNotify();
++    void noteNewOptions(ICAPOptXact *x);
++
++private:
++    // stores Prepare() callback info
++
++    struct Client
++    {
++        Pointer service; // one for each client to preserve service
++        Callback *callback;
++        void *data;
++    };
++
++    typedef Vector<Client> Clients;
++    Clients theClients; // all clients waiting for a call back
++
++    ICAPOptions *theOptions;
++
++    typedef enum { stateInit, stateWait, stateUp, stateDown } State;
++    State theState;
++    bool notifying; // may be true in any state except for the initial
++
++private:
++    ICAP::Method parseMethod(const char *) const;
++    ICAP::VectPoint parseVectPoint(const char *) const;
++
++    bool waiting() const;
++    bool needNewOptions() const;
++
++    void scheduleNotification();
++    void changeOptions(ICAPOptions *newOptions);
++    void startGettingOptions();
++    void scheduleUpdate();
++
++    const char *status() const;
++
++    Pointer self;
++    CBDATA_CLASS2(ICAPServiceRep);
++};
++
++
++#endif /* SQUID_ICAPSERVICEREP_H */
+@@ -0,0 +1,400 @@
++/*
++ * DEBUG: section 93  ICAP (RFC 3507) Client
++ */
++
++#include "squid.h"
++#include "comm.h"
++#include "HttpReply.h"
++#include "ICAPXaction.h"
++#include "ICAPClient.h"
++#include "TextException.h"
++
++/* comm module handlers (wrappers around corresponding ICAPXaction methods */
++
++// TODO: Teach comm module to call object methods directly
++
++//CBDATA_CLASS_INIT(ICAPXaction);
++
++static
++ICAPXaction &ICAPXaction_fromData(void *data)
++{
++    ICAPXaction *x = static_cast<ICAPXaction*>(data);
++    assert(x);
++    return *x;
++}
++
++static
++void ICAPXaction_noteCommTimedout(int, void *data)
++{
++    ICAPXaction_fromData(data).noteCommTimedout();
++}
++
++static
++void ICAPXaction_noteCommClosed(int, void *data)
++{
++    ICAPXaction_fromData(data).noteCommClosed();
++}
++
++static
++void ICAPXaction_noteCommConnected(int, comm_err_t status, int xerrno, void *data)
++{
++    ICAPXaction_fromData(data).noteCommConnected(status);
++}
++
++static
++void ICAPXaction_noteCommWrote(int, char *, size_t size, comm_err_t status, void *data)
++{
++    ICAPXaction_fromData(data).noteCommWrote(status, size);
++}
++
++static
++void ICAPXaction_noteCommRead(int, char *, size_t size, comm_err_t status, int xerrno, void *data)
++{
++    ICAPXaction_fromData(data).noteCommRead(status, size);
++}
++
++ICAPXaction::ICAPXaction(const char *aTypeName):
++        connection(-1),
++        commBuf(NULL), commBufSize(0),
++        commEof(false),
++        connector(NULL), reader(NULL), writer(NULL), closer(NULL),
++        typeName(aTypeName),
++        theService(NULL),
++        inCall(NULL)
++{
++    readBuf.init(SQUID_TCP_SO_RCVBUF, SQUID_TCP_SO_RCVBUF);
++    commBuf = (char*)memAllocBuf(SQUID_TCP_SO_RCVBUF, &commBufSize);
++    // make sure maximum readBuf space does not exceed commBuf size
++    Must(static_cast<size_t>(readBuf.potentialSpaceSize()) <= commBufSize);
++}
++
++ICAPXaction::~ICAPXaction()
++{
++    doStop();
++    readBuf.clean();
++    memFreeBuf(commBufSize, commBuf);
++}
++
++// TODO: obey service-specific, OPTIONS-reported connection limit
++void ICAPXaction::openConnection()
++{
++    const ICAPServiceRep &s = service();
++    // TODO: check whether NULL domain is appropriate here
++    connection = pconnPop(s.host.buf(), s.port, NULL);
++
++    if (connection < 0) {
++        connection = comm_open(SOCK_STREAM, 0, getOutgoingAddr(NULL), 0,
++                               COMM_NONBLOCKING, s.uri.buf());
++
++        if (connection < 0)
++            throw TexcHere("cannot connect to ICAP service " /* + uri */);
++    }
++
++    debugs(93,3, typeName << " opens connection to " << s.host.buf() << ":" << s.port);
++
++    commSetTimeout(connection, Config.Timeout.connect,
++                   &ICAPXaction_noteCommTimedout, this);
++
++    closer = &ICAPXaction_noteCommClosed;
++    comm_add_close_handler(connection, closer, this);
++
++    connector = &ICAPXaction_noteCommConnected;
++    commConnectStart(connection, s.host.buf(), s.port, connector, this);
++}
++
++void ICAPXaction::closeConnection()
++{
++    if (connection >= 0) {
++        commSetTimeout(connection, -1, NULL, NULL);
++
++        if (closer) {
++            comm_remove_close_handler(connection, closer, this);
++            closer = NULL;
++        }
++
++        cancelRead();
++
++        comm_close(connection);
++
++        connector = NULL;
++        connection = -1;
++    }
++}
++
++// connection with the ICAP service established
++void ICAPXaction::noteCommConnected(comm_err_t commStatus)
++{
++    ICAPXaction_Enter(noteCommConnected);
++
++    Must(connector);
++    connector = NULL;
++    Must(commStatus == COMM_OK);
++
++    handleCommConnected();
++
++    ICAPXaction_Exit();
++}
++
++void ICAPXaction::scheduleWrite(MemBuf &buf)
++{
++    // comm module will free the buffer
++    writer = &ICAPXaction_noteCommWrote;
++    comm_old_write_mbuf(connection, &buf, writer, this);
++}
++
++void ICAPXaction::noteCommWrote(comm_err_t commStatus, size_t size)
++{
++    ICAPXaction_Enter(noteCommWrote);
++
++    Must(writer);
++    writer = NULL;
++
++    Must(commStatus == COMM_OK);
++
++    handleCommWrote(size);
++
++    ICAPXaction_Exit();
++}
++
++// communication timeout with the ICAP service
++void ICAPXaction::noteCommTimedout()
++{
++    ICAPXaction_Enter(noteCommTimedout);
++
++    handleCommTimedout();
++
++    ICAPXaction_Exit();
++}
++
++void ICAPXaction::handleCommTimedout()
++{
++    mustStop("connection with ICAP service timed out");
++}
++
++// unexpected connection close while talking to the ICAP service
++void ICAPXaction::noteCommClosed()
++{
++    closer = NULL;
++    ICAPXaction_Enter(noteCommClosed);
++
++    handleCommClosed();
++
++    ICAPXaction_Exit();
++}
++
++void ICAPXaction::handleCommClosed()
++{
++    mustStop("ICAP service connection externally closed");
++}
++
++bool ICAPXaction::done() const
++{
++    if (stopReason != NULL) // mustStop() has been called
++        return true;
++
++    return doneAll();
++}
++
++bool ICAPXaction::doneAll() const
++{
++    return !connector && !reader && !writer;
++}
++
++void ICAPXaction::scheduleRead()
++{
++    Must(connection >= 0);
++    Must(!reader);
++    Must(readBuf.hasSpace());
++
++    reader = &ICAPXaction_noteCommRead;
++    /*
++     * See comments in ICAPXaction.h about why we use commBuf
++     * here instead of reading directly into readBuf.buf.
++     */
++
++    comm_read(connection, commBuf, readBuf.spaceSize(), reader, this);
++}
++
++// comm module read a portion of the ICAP response for us
++void ICAPXaction::noteCommRead(comm_err_t commStatus, size_t sz)
++{
++    ICAPXaction_Enter(noteCommRead);
++
++    Must(reader);
++    reader = NULL;
++
++    Must(commStatus == COMM_OK);
++    Must(sz >= 0);
++
++    debugs(93, 5, "read " << sz << " bytes");
++
++    /*
++     * See comments in ICAPXaction.h about why we use commBuf
++     * here instead of reading directly into readBuf.buf.
++     */
++
++    if (sz > 0)
++        readBuf.append(commBuf, sz);
++    else
++        commEof = true;
++
++    handleCommRead(sz);
++
++    ICAPXaction_Exit();
++}
++
++void ICAPXaction::cancelRead()
++{
++    if (reader) {
++        // check callback presence because comm module removes
++        // fdc_table[].read.callback after the actual I/O but
++        // before we get the callback via a queued event.
++        // These checks try to mimic the comm_read_cancel() assertions.
++
++        if (comm_has_pending_read(connection) &&
++                !comm_has_pending_read_callback(connection))
++            comm_read_cancel(connection, reader, this);
++
++        reader = NULL;
++    }
++}
++
++bool ICAPXaction::parseHttpMsg(HttpMsg *msg)
++{
++    debugs(93, 5, "have " << readBuf.contentSize() << " head bytes to parse");
++
++    http_status error = HTTP_STATUS_NONE;
++    const bool parsed = msg->parse(&readBuf, commEof, &error);
++    Must(parsed || !error); // success or need more data
++
++    if (!parsed) {	// need more data
++        Must(mayReadMore());
++        msg->reset();
++        return false;
++    }
++
++    readBuf.consume(msg->hdr_sz);
++    return true;
++}
++
++bool ICAPXaction::mayReadMore() const
++{
++    return !doneReading() && // will read more data
++           readBuf.hasSpace();  // have space for more data
++}
++
++bool ICAPXaction::doneReading() const
++{
++    return commEof;
++}
++
++void ICAPXaction::mustStop(const char *aReason)
++{
++    Must(inCall); // otherwise nobody will call doStop()
++    Must(!stopReason);
++    Must(aReason);
++    stopReason = aReason;
++    debugs(93, 5, typeName << " will stop, reason: " << stopReason);
++}
++
++// internal cleanup
++void ICAPXaction::doStop()
++{
++    debugs(93, 5, typeName << "::doStop " << status());
++
++    closeConnection(); // TODO: pconn support: close iff bad connection
++}
++
++void ICAPXaction::service(ICAPServiceRep::Pointer &aService)
++{
++    Must(!theService);
++    Must(aService != NULL);
++    theService = aService;
++}
++
++ICAPServiceRep &ICAPXaction::service()
++{
++    Must(theService != NULL);
++    return *theService;
++}
++
++bool ICAPXaction::callStart(const char *method)
++{
++    debugs(93, 5, typeName << "::" << method << " called " << status());
++
++    if (inCall) {
++        // this may happen when we have bugs or when arguably buggy
++        // comm interface calls us while we are closing the connection
++        debugs(93, 5, typeName << "::" << inCall << " is in progress; " <<
++               typeName << "::" << method << " cancels reentry.");
++        return false;
++    }
++
++    inCall = method;
++    return true;
++}
++
++void ICAPXaction::callException(const TextException &e)
++{
++    debugs(93, 4, typeName << "::" << inCall << " caught an exception: " <<
++           e.message << ' ' << status());
++
++    if (!done())
++        mustStop("exception");
++}
++
++void ICAPXaction::callEnd()
++{
++    if (done()) {
++        debugs(93, 5, "ICAPXaction::" << inCall << " ends xaction " <<
++               status());
++        doStop(); // may delete us
++        return;
++    }
++
++    debugs(93, 6, typeName << "::" << inCall << " ended " << status());
++    inCall = NULL;
++}
++
++// returns a temporary string depicting transaction status, for debugging
++const char *ICAPXaction::status() const
++{
++    static MemBuf buf;
++    buf.reset();
++
++    buf.append("[", 1);
++
++    fillPendingStatus(buf);
++    buf.append("/", 1);
++    fillDoneStatus(buf);
++
++    buf.append("]", 1);
++
++    buf.terminate();
++
++    return buf.content();
++}
++
++void ICAPXaction::fillPendingStatus(MemBuf &buf) const
++{
++    if (connection >= 0) {
++        buf.Printf("Comm(%d", connection);
++
++        if (writer)
++            buf.append("w", 1);
++
++        if (reader)
++            buf.append("r", 1);
++
++        buf.append(")", 1);
++    }
++}
++
++void ICAPXaction::fillDoneStatus(MemBuf &buf) const
++{
++    if (connection >= 0 && commEof)
++        buf.Printf("Comm(%d)", connection);
++
++    if (stopReason != NULL)
++        buf.Printf("Stopped");
++}
+@@ -0,0 +1,164 @@
++
++/*
++ * $Id: ICAPXaction.h,v 1.1 2005/11/21 23:32:59 wessels Exp $
++ *
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sinks; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ */
++
++#ifndef SQUID_ICAPXACTION_H
++#define SQUID_ICAPXACTION_H
++
++#include "MemBuf.h"
++#include "ICAPServiceRep.h"
++
++class HttpMsg;
++
++class TextException;
++
++/* The ICAP Xaction implements message pipe sink and source interfaces.  It
++ * receives virgin HTTP messages, communicates with the ICAP server, and sends
++ * the adapted messages back. ICAPClient is the "owner" of the ICAPXaction. */
++
++// Note: ICAPXaction must be the first parent for object-unaware cbdata to work
++
++class ICAPXaction: public RefCountable
++{
++
++public:
++    typedef RefCount<ICAPXaction> Pointer;
++
++public:
++    ICAPXaction(const char *aTypeName);
++    virtual ~ICAPXaction();
++
++    // comm handler wrappers, treat as private
++    void noteCommConnected(comm_err_t status);
++    void noteCommWrote(comm_err_t status, size_t sz);
++    void noteCommRead(comm_err_t status, size_t sz);
++    void noteCommTimedout();
++    void noteCommClosed();
++
++protected:
++    // Set or get service pointer; ICAPXaction cbdata-locks it.
++    void service(ICAPServiceRep::Pointer &aService);
++    ICAPServiceRep &service();
++
++    // comm hanndlers; called by comm handler wrappers
++    virtual void handleCommConnected() = 0;
++    virtual void handleCommWrote(size_t sz) = 0;
++    virtual void handleCommRead(size_t sz) = 0;
++    virtual void handleCommTimedout();
++    virtual void handleCommClosed();
++
++    void openConnection();
++    void closeConnection();
++    void scheduleRead();
++    void scheduleWrite(MemBuf &buf);
++
++    void cancelRead();
++
++    bool parseHttpMsg(HttpMsg *msg); // true=success; false=needMore; throw=err
++    bool mayReadMore() const;
++    virtual bool doneReading() const;
++
++    bool done() const;
++    virtual bool doneAll() const;
++    virtual void doStop();
++    void mustStop(const char *reason);
++
++    // returns a temporary string depicting transaction status, for debugging
++    const char *status() const;
++    virtual void fillPendingStatus(MemBuf &buf) const;
++    virtual void fillDoneStatus(MemBuf &buf) const;
++
++protected:
++    int connection;     // FD of the ICAP server connection
++
++    /*
++     * We have two read buffers.   We would prefer to read directly
++     * into the MemBuf, but since comm_read isn't MemBuf-aware, and
++     * uses event-delayed callbacks, it leaves the MemBuf in an
++     * inconsistent state.  There would be data in the buffer, but
++     * MemBuf.size won't be updated until the (delayed) callback
++     * occurs.   To avoid that situation we use a plain buffer
++     * (commBuf) and then copy (append) its contents to readBuf in
++     * the callback.  If comm_read ever becomes MemBuf-aware, we
++     * can eliminate commBuf and this extra buffer copy.
++     */
++    MemBuf readBuf;
++    char *commBuf;
++    size_t commBufSize;
++    bool commEof;
++
++    const char *stopReason;
++
++    // asynchronous call maintenance
++    bool callStart(const char *method);
++    void callException(const TextException &e);
++    void callEnd();
++
++    // active (pending) comm callbacks for the ICAP server connection
++    CNCB *connector;
++    IOCB *reader;
++    CWCB *writer;
++    PF *closer;
++
++    const char *typeName; // the type of the final class (child), for debugging
++
++private:
++    ICAPServiceRep::Pointer theService;
++
++    const char *inCall; // name of the asynchronous call being executed, if any
++
++    //CBDATA_CLASS2(ICAPXaction);
++};
++
++// call guards for all "asynchronous" note*() methods
++
++// asynchronous call entry:
++// - open the try clause;
++// - call callStart().
++#define ICAPXaction_Enter(method) \
++	try { \
++		if (!callStart(#method)) \
++			return;
++
++// asynchronous call exit:
++// - close the try clause;
++// - catch exceptions;
++// - let callEnd() handle transaction termination conditions
++#define ICAPXaction_Exit() \
++	} \
++	catch (const TextException &e) { \
++		callException(e); \
++	} \
++	callEnd();
++
++
++#endif /* SQUID_ICAPXACTION_H */
+@@ -0,0 +1,38 @@
++#
++#  Makefile for the Squid Object Cache server
++#
++#  $Id: Makefile.am,v 1.1 2005/11/21 23:32:59 wessels Exp $
++#
++#  Uncomment and customize the following to suit your needs:
++#
++
++install: all
++install-strip: all
++
++AM_CFLAGS = @SQUID_CFLAGS@
++AM_CXXFLAGS = @SQUID_CXXFLAGS@
++
++SUBDIRS		= 
++
++EXTRA_LIBRARIES	= \
++	libicapclient.a
++
++noinst_LIBRARIES = \
++	libicapclient.a
++
++libicapclient_a_SOURCES = \
++ 	ChunkedCodingParser.cc \
++	ICAPAnchor.cc \
++	ICAPClientSideHook.cc \
++	ICAPClient.cc \
++	ICAPElements.cc \
++	ICAPXaction.cc \
++	ICAPOptXact.cc \
++	ICAPModXact.cc \
++	ICAPServiceRep.cc \
++	ICAPConfig.cc \
++	ICAPOptions.cc \
++	TextException.cc \
++	MsgPipe.cc
++
++INCLUDES        = -I$(top_builddir)/include -I$(top_srcdir)/include -I$(top_srcdir)/src
+@@ -0,0 +1,666 @@
++# Makefile.in generated by automake 1.9.6 from Makefile.am.
++# @configure_input@
++
++# Copyright (C) 1994, 1995, 1996, 1997, 1998, 1999, 2000, 2001, 2002,
++# 2003, 2004, 2005  Free Software Foundation, Inc.
++# This Makefile.in is free software; the Free Software Foundation
++# gives unlimited permission to copy and/or distribute it,
++# with or without modifications, as long as this notice is preserved.
++
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY, to the extent permitted by law; without
++# even the implied warranty of MERCHANTABILITY or FITNESS FOR A
++# PARTICULAR PURPOSE.
++
++@SET_MAKE@
++
++#
++#  Makefile for the Squid Object Cache server
++#
++#  $Id: Makefile.in,v 1.1 2005/11/21 23:32:59 wessels Exp $
++#
++#  Uncomment and customize the following to suit your needs:
++#
++
++srcdir = @srcdir@
++top_srcdir = @top_srcdir@
++VPATH = @srcdir@
++pkgdatadir = $(datadir)/@PACKAGE@
++pkglibdir = $(libdir)/@PACKAGE@
++pkgincludedir = $(includedir)/@PACKAGE@
++top_builddir = ../..
++am__cd = CDPATH="$${ZSH_VERSION+.}$(PATH_SEPARATOR)" && cd
++INSTALL = @INSTALL@
++install_sh_DATA = $(install_sh) -c -m 644
++install_sh_PROGRAM = $(install_sh) -c
++install_sh_SCRIPT = $(install_sh) -c
++INSTALL_HEADER = $(INSTALL_DATA)
++transform = $(program_transform_name)
++NORMAL_INSTALL = :
++PRE_INSTALL = :
++POST_INSTALL = :
++NORMAL_UNINSTALL = :
++PRE_UNINSTALL = :
++POST_UNINSTALL = :
++build_triplet = @build@
++host_triplet = @host@
++subdir = src/icapclient
++DIST_COMMON = $(srcdir)/Makefile.am $(srcdir)/Makefile.in
++ACLOCAL_M4 = $(top_srcdir)/aclocal.m4
++am__aclocal_m4_deps = $(top_srcdir)/acinclude.m4 \
++	$(top_srcdir)/configure.in
++am__configure_deps = $(am__aclocal_m4_deps) $(CONFIGURE_DEPENDENCIES) \
++	$(ACLOCAL_M4)
++mkinstalldirs = $(install_sh) -d
++CONFIG_HEADER = $(top_builddir)/include/autoconf.h
++CONFIG_CLEAN_FILES =
++LIBRARIES = $(noinst_LIBRARIES)
++ARFLAGS = cru
++libicapclient_a_AR = $(AR) $(ARFLAGS)
++libicapclient_a_LIBADD =
++am_libicapclient_a_OBJECTS = ChunkedCodingParser.$(OBJEXT) \
++	ICAPAnchor.$(OBJEXT) ICAPClientSideHook.$(OBJEXT) \
++	ICAPClient.$(OBJEXT) ICAPElements.$(OBJEXT) \
++	ICAPXaction.$(OBJEXT) ICAPOptXact.$(OBJEXT) \
++	ICAPModXact.$(OBJEXT) ICAPServiceRep.$(OBJEXT) \
++	ICAPConfig.$(OBJEXT) ICAPOptions.$(OBJEXT) \
++	TextException.$(OBJEXT) MsgPipe.$(OBJEXT)
++libicapclient_a_OBJECTS = $(am_libicapclient_a_OBJECTS)
++DEFAULT_INCLUDES = -I. -I$(srcdir) -I$(top_builddir)/include
++depcomp = $(SHELL) $(top_srcdir)/cfgaux/depcomp
++am__depfiles_maybe = depfiles
++CXXCOMPILE = $(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) \
++	$(AM_CPPFLAGS) $(CPPFLAGS) $(AM_CXXFLAGS) $(CXXFLAGS)
++LTCXXCOMPILE = $(LIBTOOL) --tag=CXX --mode=compile $(CXX) $(DEFS) \
++	$(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) \
++	$(AM_CXXFLAGS) $(CXXFLAGS)
++CXXLD = $(CXX)
++CXXLINK = $(LIBTOOL) --tag=CXX --mode=link $(CXXLD) $(AM_CXXFLAGS) \
++	$(CXXFLAGS) $(AM_LDFLAGS) $(LDFLAGS) -o $@
++SOURCES = $(libicapclient_a_SOURCES)
++DIST_SOURCES = $(libicapclient_a_SOURCES)
++RECURSIVE_TARGETS = all-recursive check-recursive dvi-recursive \
++	html-recursive info-recursive install-data-recursive \
++	install-exec-recursive install-info-recursive \
++	install-recursive installcheck-recursive installdirs-recursive \
++	pdf-recursive ps-recursive uninstall-info-recursive \
++	uninstall-recursive
++ETAGS = etags
++CTAGS = ctags
++DIST_SUBDIRS = $(SUBDIRS)
++DISTFILES = $(DIST_COMMON) $(DIST_SOURCES) $(TEXINFOS) $(EXTRA_DIST)
++ACLOCAL = @ACLOCAL@
++ALLOCA = @ALLOCA@
++AMDEP_FALSE = @AMDEP_FALSE@
++AMDEP_TRUE = @AMDEP_TRUE@
++AMTAR = @AMTAR@
++AR = @AR@
++AR_R = @AR_R@
++AUTH_LIBS = @AUTH_LIBS@
++AUTH_LINKOBJS = @AUTH_LINKOBJS@
++AUTH_MODULES = @AUTH_MODULES@
++AUTH_OBJS = @AUTH_OBJS@
++AUTOCONF = @AUTOCONF@
++AUTOHEADER = @AUTOHEADER@
++AUTOMAKE = @AUTOMAKE@
++AWK = @AWK@
++BASIC_AUTH_HELPERS = @BASIC_AUTH_HELPERS@
++CACHE_HTTP_PORT = @CACHE_HTTP_PORT@
++CACHE_ICP_PORT = @CACHE_ICP_PORT@
++CC = @CC@
++CCDEPMODE = @CCDEPMODE@
++CFLAGS = @CFLAGS@
++CGIEXT = @CGIEXT@
++CPP = @CPP@
++CPPFLAGS = @CPPFLAGS@
++CRYPTLIB = @CRYPTLIB@
++CXX = @CXX@
++CXXCPP = @CXXCPP@
++CXXDEPMODE = @CXXDEPMODE@
++CXXFLAGS = @CXXFLAGS@
++CYGPATH_W = @CYGPATH_W@
++DEFS = @DEFS@
++DEPDIR = @DEPDIR@
++DIGEST_AUTH_HELPERS = @DIGEST_AUTH_HELPERS@
++DISK_LIBS = @DISK_LIBS@
++DISK_LINKOBJS = @DISK_LINKOBJS@
++DISK_PROGRAMS = @DISK_PROGRAMS@
++ECHO = @ECHO@
++ECHO_C = @ECHO_C@
++ECHO_N = @ECHO_N@
++ECHO_T = @ECHO_T@
++EGREP = @EGREP@
++ENABLE_ARP_ACL_FALSE = @ENABLE_ARP_ACL_FALSE@
++ENABLE_ARP_ACL_TRUE = @ENABLE_ARP_ACL_TRUE@
++ENABLE_HTCP_FALSE = @ENABLE_HTCP_FALSE@
++ENABLE_HTCP_TRUE = @ENABLE_HTCP_TRUE@
++ENABLE_IDENT_FALSE = @ENABLE_IDENT_FALSE@
++ENABLE_IDENT_TRUE = @ENABLE_IDENT_TRUE@
++ENABLE_PINGER_FALSE = @ENABLE_PINGER_FALSE@
++ENABLE_PINGER_TRUE = @ENABLE_PINGER_TRUE@
++ENABLE_SSL_FALSE = @ENABLE_SSL_FALSE@
++ENABLE_SSL_TRUE = @ENABLE_SSL_TRUE@
++ENABLE_UNLINKD_FALSE = @ENABLE_UNLINKD_FALSE@
++ENABLE_UNLINKD_TRUE = @ENABLE_UNLINKD_TRUE@
++ENABLE_WIN32SPECIFIC_FALSE = @ENABLE_WIN32SPECIFIC_FALSE@
++ENABLE_WIN32SPECIFIC_TRUE = @ENABLE_WIN32SPECIFIC_TRUE@
++ENABLE_XPROF_STATS_FALSE = @ENABLE_XPROF_STATS_FALSE@
++ENABLE_XPROF_STATS_TRUE = @ENABLE_XPROF_STATS_TRUE@
++EPOLL_LIBS = @EPOLL_LIBS@
++ERR_DEFAULT_LANGUAGE = @ERR_DEFAULT_LANGUAGE@
++ERR_LANGUAGES = @ERR_LANGUAGES@
++EXEEXT = @EXEEXT@
++EXTERNAL_ACL_HELPERS = @EXTERNAL_ACL_HELPERS@
++F77 = @F77@
++FALSE = @FALSE@
++FFLAGS = @FFLAGS@
++INSTALL_DATA = @INSTALL_DATA@
++INSTALL_PROGRAM = @INSTALL_PROGRAM@
++INSTALL_SCRIPT = @INSTALL_SCRIPT@
++INSTALL_STRIP_PROGRAM = @INSTALL_STRIP_PROGRAM@
++LDFLAGS = @LDFLAGS@
++LIBADD_DL = @LIBADD_DL@
++LIBDLMALLOC = @LIBDLMALLOC@
++LIBOBJS = @LIBOBJS@
++LIBREGEX = @LIBREGEX@
++LIBS = @LIBS@
++LIBSASL = @LIBSASL@
++LIBTOOL = @LIBTOOL@
++LIB_LBER = @LIB_LBER@
++LIB_LDAP = @LIB_LDAP@
++LIB_MALLOC = @LIB_MALLOC@
++LN = @LN@
++LN_S = @LN_S@
++LTLIBOBJS = @LTLIBOBJS@
++MAINT = @MAINT@
++MAINTAINER_MODE_FALSE = @MAINTAINER_MODE_FALSE@
++MAINTAINER_MODE_TRUE = @MAINTAINER_MODE_TRUE@
++MAKEINFO = @MAKEINFO@
++MAKE_LEAKFINDER_FALSE = @MAKE_LEAKFINDER_FALSE@
++MAKE_LEAKFINDER_TRUE = @MAKE_LEAKFINDER_TRUE@
++MINGW_LIBS = @MINGW_LIBS@
++MKDIR = @MKDIR@
++MV = @MV@
++NEED_OWN_MD5_FALSE = @NEED_OWN_MD5_FALSE@
++NEED_OWN_MD5_TRUE = @NEED_OWN_MD5_TRUE@
++NEED_OWN_SNPRINTF_FALSE = @NEED_OWN_SNPRINTF_FALSE@
++NEED_OWN_SNPRINTF_TRUE = @NEED_OWN_SNPRINTF_TRUE@
++NEGOTIATE_AUTH_HELPERS = @NEGOTIATE_AUTH_HELPERS@
++NTLM_AUTH_HELPERS = @NTLM_AUTH_HELPERS@
++OBJEXT = @OBJEXT@
++OPT_DEFAULT_HOSTS = @OPT_DEFAULT_HOSTS@
++PACKAGE = @PACKAGE@
++PACKAGE_BUGREPORT = @PACKAGE_BUGREPORT@
++PACKAGE_NAME = @PACKAGE_NAME@
++PACKAGE_STRING = @PACKAGE_STRING@
++PACKAGE_TARNAME = @PACKAGE_TARNAME@
++PACKAGE_VERSION = @PACKAGE_VERSION@
++PATH_SEPARATOR = @PATH_SEPARATOR@
++PERL = @PERL@
++RANLIB = @RANLIB@
++REGEXLIB = @REGEXLIB@
++REPL_LIBS = @REPL_LIBS@
++REPL_OBJS = @REPL_OBJS@
++REPL_POLICIES = @REPL_POLICIES@
++RM = @RM@
++SET_MAKE = @SET_MAKE@
++SH = @SH@
++SHELL = @SHELL@
++SNMPLIB = @SNMPLIB@
++SQUID_CFLAGS = @SQUID_CFLAGS@
++SQUID_CPPUNIT_DIR = @SQUID_CPPUNIT_DIR@
++SQUID_CPPUNIT_INC = @SQUID_CPPUNIT_INC@
++SQUID_CPPUNIT_LA = @SQUID_CPPUNIT_LA@
++SQUID_CXXFLAGS = @SQUID_CXXFLAGS@
++SSLLIB = @SSLLIB@
++STORE_LIBS = @STORE_LIBS@
++STORE_LINKOBJS = @STORE_LINKOBJS@
++STORE_OBJS = @STORE_OBJS@
++STRIP = @STRIP@
++TRUE = @TRUE@
++USE_DELAY_POOLS_FALSE = @USE_DELAY_POOLS_FALSE@
++USE_DELAY_POOLS_TRUE = @USE_DELAY_POOLS_TRUE@
++USE_DNSSERVER_FALSE = @USE_DNSSERVER_FALSE@
++USE_DNSSERVER_TRUE = @USE_DNSSERVER_TRUE@
++USE_ESI_FALSE = @USE_ESI_FALSE@
++USE_ESI_TRUE = @USE_ESI_TRUE@
++USE_ICAP_CLIENT_FALSE = @USE_ICAP_CLIENT_FALSE@
++USE_ICAP_CLIENT_TRUE = @USE_ICAP_CLIENT_TRUE@
++USE_SNMP_FALSE = @USE_SNMP_FALSE@
++USE_SNMP_TRUE = @USE_SNMP_TRUE@
++VERSION = @VERSION@
++WIN32_PSAPI = @WIN32_PSAPI@
++XTRA_LIBS = @XTRA_LIBS@
++XTRA_OBJS = @XTRA_OBJS@
++ac_ct_AR = @ac_ct_AR@
++ac_ct_CC = @ac_ct_CC@
++ac_ct_CXX = @ac_ct_CXX@
++ac_ct_F77 = @ac_ct_F77@
++ac_ct_RANLIB = @ac_ct_RANLIB@
++ac_ct_STRIP = @ac_ct_STRIP@
++am__fastdepCC_FALSE = @am__fastdepCC_FALSE@
++am__fastdepCC_TRUE = @am__fastdepCC_TRUE@
++am__fastdepCXX_FALSE = @am__fastdepCXX_FALSE@
++am__fastdepCXX_TRUE = @am__fastdepCXX_TRUE@
++am__include = @am__include@
++am__leading_dot = @am__leading_dot@
++am__quote = @am__quote@
++am__tar = @am__tar@
++am__untar = @am__untar@
++bindir = @bindir@
++build = @build@
++build_alias = @build_alias@
++build_cpu = @build_cpu@
++build_os = @build_os@
++build_vendor = @build_vendor@
++datadir = @datadir@
++exec_prefix = @exec_prefix@
++host = @host@
++host_alias = @host_alias@
++host_cpu = @host_cpu@
++host_os = @host_os@
++host_vendor = @host_vendor@
++includedir = @includedir@
++infodir = @infodir@
++install_sh = @install_sh@
++libdir = @libdir@
++libexecdir = @libexecdir@
++localstatedir = @localstatedir@
++makesnmplib = @makesnmplib@
++mandir = @mandir@
++mkdir_p = @mkdir_p@
++oldincludedir = @oldincludedir@
++prefix = @prefix@
++program_transform_name = @program_transform_name@
++sbindir = @sbindir@
++sharedstatedir = @sharedstatedir@
++subdirs = @subdirs@
++sysconfdir = @sysconfdir@
++target_alias = @target_alias@
++AM_CFLAGS = @SQUID_CFLAGS@
++AM_CXXFLAGS = @SQUID_CXXFLAGS@
++SUBDIRS = 
++EXTRA_LIBRARIES = \
++	libicapclient.a
++
++noinst_LIBRARIES = \
++	libicapclient.a
++
++libicapclient_a_SOURCES = \
++ 	ChunkedCodingParser.cc \
++	ICAPAnchor.cc \
++	ICAPClientSideHook.cc \
++	ICAPClient.cc \
++	ICAPElements.cc \
++	ICAPXaction.cc \
++	ICAPOptXact.cc \
++	ICAPModXact.cc \
++	ICAPServiceRep.cc \
++	ICAPConfig.cc \
++	ICAPOptions.cc \
++	TextException.cc \
++	MsgPipe.cc
++
++INCLUDES = -I$(top_builddir)/include -I$(top_srcdir)/include -I$(top_srcdir)/src
++all: all-recursive
++
++.SUFFIXES:
++.SUFFIXES: .cc .lo .o .obj
++$(srcdir)/Makefile.in: @MAINTAINER_MODE_TRUE@ $(srcdir)/Makefile.am  $(am__configure_deps)
++	@for dep in $?; do \
++	  case '$(am__configure_deps)' in \
++	    *$$dep*) \
++	      cd $(top_builddir) && $(MAKE) $(AM_MAKEFLAGS) am--refresh \
++		&& exit 0; \
++	      exit 1;; \
++	  esac; \
++	done; \
++	echo ' cd $(top_srcdir) && $(AUTOMAKE) --foreign  src/icapclient/Makefile'; \
++	cd $(top_srcdir) && \
++	  $(AUTOMAKE) --foreign  src/icapclient/Makefile
++.PRECIOUS: Makefile
++Makefile: $(srcdir)/Makefile.in $(top_builddir)/config.status
++	@case '$?' in \
++	  *config.status*) \
++	    cd $(top_builddir) && $(MAKE) $(AM_MAKEFLAGS) am--refresh;; \
++	  *) \
++	    echo ' cd $(top_builddir) && $(SHELL) ./config.status $(subdir)/$@ $(am__depfiles_maybe)'; \
++	    cd $(top_builddir) && $(SHELL) ./config.status $(subdir)/$@ $(am__depfiles_maybe);; \
++	esac;
++
++$(top_builddir)/config.status: $(top_srcdir)/configure $(CONFIG_STATUS_DEPENDENCIES)
++	cd $(top_builddir) && $(MAKE) $(AM_MAKEFLAGS) am--refresh
++
++$(top_srcdir)/configure: @MAINTAINER_MODE_TRUE@ $(am__configure_deps)
++	cd $(top_builddir) && $(MAKE) $(AM_MAKEFLAGS) am--refresh
++$(ACLOCAL_M4): @MAINTAINER_MODE_TRUE@ $(am__aclocal_m4_deps)
++	cd $(top_builddir) && $(MAKE) $(AM_MAKEFLAGS) am--refresh
++
++clean-noinstLIBRARIES:
++	-test -z "$(noinst_LIBRARIES)" || rm -f $(noinst_LIBRARIES)
++libicapclient.a: $(libicapclient_a_OBJECTS) $(libicapclient_a_DEPENDENCIES) 
++	-rm -f libicapclient.a
++	$(libicapclient_a_AR) libicapclient.a $(libicapclient_a_OBJECTS) $(libicapclient_a_LIBADD)
++	$(RANLIB) libicapclient.a
++
++mostlyclean-compile:
++	-rm -f *.$(OBJEXT)
++
++distclean-compile:
++	-rm -f *.tab.c
++
++@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ChunkedCodingParser.Po@am__quote@
++@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ICAPAnchor.Po@am__quote@
++@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ICAPClient.Po@am__quote@
++@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ICAPClientSideHook.Po@am__quote@
++@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ICAPConfig.Po@am__quote@
++@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ICAPElements.Po@am__quote@
++@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ICAPModXact.Po@am__quote@
++@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ICAPOptXact.Po@am__quote@
++@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ICAPOptions.Po@am__quote@
++@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ICAPServiceRep.Po@am__quote@
++@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/ICAPXaction.Po@am__quote@
++@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/MsgPipe.Po@am__quote@
++@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/TextException.Po@am__quote@
++
++.cc.o:
++@am__fastdepCXX_TRUE@	if $(CXXCOMPILE) -MT $@ -MD -MP -MF "$(DEPDIR)/$*.Tpo" -c -o $@ $<; \
++@am__fastdepCXX_TRUE@	then mv -f "$(DEPDIR)/$*.Tpo" "$(DEPDIR)/$*.Po"; else rm -f "$(DEPDIR)/$*.Tpo"; exit 1; fi
++@AMDEP_TRUE@@am__fastdepCXX_FALSE@	source='$<' object='$@' libtool=no @AMDEPBACKSLASH@
++@AMDEP_TRUE@@am__fastdepCXX_FALSE@	DEPDIR=$(DEPDIR) $(CXXDEPMODE) $(depcomp) @AMDEPBACKSLASH@
++@am__fastdepCXX_FALSE@	$(CXXCOMPILE) -c -o $@ $<
++
++.cc.obj:
++@am__fastdepCXX_TRUE@	if $(CXXCOMPILE) -MT $@ -MD -MP -MF "$(DEPDIR)/$*.Tpo" -c -o $@ `$(CYGPATH_W) '$<'`; \
++@am__fastdepCXX_TRUE@	then mv -f "$(DEPDIR)/$*.Tpo" "$(DEPDIR)/$*.Po"; else rm -f "$(DEPDIR)/$*.Tpo"; exit 1; fi
++@AMDEP_TRUE@@am__fastdepCXX_FALSE@	source='$<' object='$@' libtool=no @AMDEPBACKSLASH@
++@AMDEP_TRUE@@am__fastdepCXX_FALSE@	DEPDIR=$(DEPDIR) $(CXXDEPMODE) $(depcomp) @AMDEPBACKSLASH@
++@am__fastdepCXX_FALSE@	$(CXXCOMPILE) -c -o $@ `$(CYGPATH_W) '$<'`
++
++.cc.lo:
++@am__fastdepCXX_TRUE@	if $(LTCXXCOMPILE) -MT $@ -MD -MP -MF "$(DEPDIR)/$*.Tpo" -c -o $@ $<; \
++@am__fastdepCXX_TRUE@	then mv -f "$(DEPDIR)/$*.Tpo" "$(DEPDIR)/$*.Plo"; else rm -f "$(DEPDIR)/$*.Tpo"; exit 1; fi
++@AMDEP_TRUE@@am__fastdepCXX_FALSE@	source='$<' object='$@' libtool=yes @AMDEPBACKSLASH@
++@AMDEP_TRUE@@am__fastdepCXX_FALSE@	DEPDIR=$(DEPDIR) $(CXXDEPMODE) $(depcomp) @AMDEPBACKSLASH@
++@am__fastdepCXX_FALSE@	$(LTCXXCOMPILE) -c -o $@ $<
++
++mostlyclean-libtool:
++	-rm -f *.lo
++
++clean-libtool:
++	-rm -rf .libs _libs
++
++distclean-libtool:
++	-rm -f libtool
++uninstall-info-am:
++
++# This directory's subdirectories are mostly independent; you can cd
++# into them and run `make' without going through this Makefile.
++# To change the values of `make' variables: instead of editing Makefiles,
++# (1) if the variable is set in `config.status', edit `config.status'
++#     (which will cause the Makefiles to be regenerated when you run `make');
++# (2) otherwise, pass the desired values on the `make' command line.
++$(RECURSIVE_TARGETS):
++	@failcom='exit 1'; \
++	for f in x $$MAKEFLAGS; do \
++	  case $$f in \
++	    *=* | --[!k]*);; \
++	    *k*) failcom='fail=yes';; \
++	  esac; \
++	done; \
++	dot_seen=no; \
++	target=`echo $@ | sed s/-recursive//`; \
++	list='$(SUBDIRS)'; for subdir in $$list; do \
++	  echo "Making $$target in $$subdir"; \
++	  if test "$$subdir" = "."; then \
++	    dot_seen=yes; \
++	    local_target="$$target-am"; \
++	  else \
++	    local_target="$$target"; \
++	  fi; \
++	  (cd $$subdir && $(MAKE) $(AM_MAKEFLAGS) $$local_target) \
++	  || eval $$failcom; \
++	done; \
++	if test "$$dot_seen" = "no"; then \
++	  $(MAKE) $(AM_MAKEFLAGS) "$$target-am" || exit 1; \
++	fi; test -z "$$fail"
++
++mostlyclean-recursive clean-recursive distclean-recursive \
++maintainer-clean-recursive:
++	@failcom='exit 1'; \
++	for f in x $$MAKEFLAGS; do \
++	  case $$f in \
++	    *=* | --[!k]*);; \
++	    *k*) failcom='fail=yes';; \
++	  esac; \
++	done; \
++	dot_seen=no; \
++	case "$@" in \
++	  distclean-* | maintainer-clean-*) list='$(DIST_SUBDIRS)' ;; \
++	  *) list='$(SUBDIRS)' ;; \
++	esac; \
++	rev=''; for subdir in $$list; do \
++	  if test "$$subdir" = "."; then :; else \
++	    rev="$$subdir $$rev"; \
++	  fi; \
++	done; \
++	rev="$$rev ."; \
++	target=`echo $@ | sed s/-recursive//`; \
++	for subdir in $$rev; do \
++	  echo "Making $$target in $$subdir"; \
++	  if test "$$subdir" = "."; then \
++	    local_target="$$target-am"; \
++	  else \
++	    local_target="$$target"; \
++	  fi; \
++	  (cd $$subdir && $(MAKE) $(AM_MAKEFLAGS) $$local_target) \
++	  || eval $$failcom; \
++	done && test -z "$$fail"
++tags-recursive:
++	list='$(SUBDIRS)'; for subdir in $$list; do \
++	  test "$$subdir" = . || (cd $$subdir && $(MAKE) $(AM_MAKEFLAGS) tags); \
++	done
++ctags-recursive:
++	list='$(SUBDIRS)'; for subdir in $$list; do \
++	  test "$$subdir" = . || (cd $$subdir && $(MAKE) $(AM_MAKEFLAGS) ctags); \
++	done
++
++ID: $(HEADERS) $(SOURCES) $(LISP) $(TAGS_FILES)
++	list='$(SOURCES) $(HEADERS) $(LISP) $(TAGS_FILES)'; \
++	unique=`for i in $$list; do \
++	    if test -f "$$i"; then echo $$i; else echo $(srcdir)/$$i; fi; \
++	  done | \
++	  $(AWK) '    { files[$$0] = 1; } \
++	       END { for (i in files) print i; }'`; \
++	mkid -fID $$unique
++tags: TAGS
++
++TAGS: tags-recursive $(HEADERS) $(SOURCES)  $(TAGS_DEPENDENCIES) \
++		$(TAGS_FILES) $(LISP)
++	tags=; \
++	here=`pwd`; \
++	if ($(ETAGS) --etags-include --version) >/dev/null 2>&1; then \
++	  include_option=--etags-include; \
++	  empty_fix=.; \
++	else \
++	  include_option=--include; \
++	  empty_fix=; \
++	fi; \
++	list='$(SUBDIRS)'; for subdir in $$list; do \
++	  if test "$$subdir" = .; then :; else \
++	    test ! -f $$subdir/TAGS || \
++	      tags="$$tags $$include_option=$$here/$$subdir/TAGS"; \
++	  fi; \
++	done; \
++	list='$(SOURCES) $(HEADERS)  $(LISP) $(TAGS_FILES)'; \
++	unique=`for i in $$list; do \
++	    if test -f "$$i"; then echo $$i; else echo $(srcdir)/$$i; fi; \
++	  done | \
++	  $(AWK) '    { files[$$0] = 1; } \
++	       END { for (i in files) print i; }'`; \
++	if test -z "$(ETAGS_ARGS)$$tags$$unique"; then :; else \
++	  test -n "$$unique" || unique=$$empty_fix; \
++	  $(ETAGS) $(ETAGSFLAGS) $(AM_ETAGSFLAGS) $(ETAGS_ARGS) \
++	    $$tags $$unique; \
++	fi
++ctags: CTAGS
++CTAGS: ctags-recursive $(HEADERS) $(SOURCES)  $(TAGS_DEPENDENCIES) \
++		$(TAGS_FILES) $(LISP)
++	tags=; \
++	here=`pwd`; \
++	list='$(SOURCES) $(HEADERS)  $(LISP) $(TAGS_FILES)'; \
++	unique=`for i in $$list; do \
++	    if test -f "$$i"; then echo $$i; else echo $(srcdir)/$$i; fi; \
++	  done | \
++	  $(AWK) '    { files[$$0] = 1; } \
++	       END { for (i in files) print i; }'`; \
++	test -z "$(CTAGS_ARGS)$$tags$$unique" \
++	  || $(CTAGS) $(CTAGSFLAGS) $(AM_CTAGSFLAGS) $(CTAGS_ARGS) \
++	     $$tags $$unique
++
++GTAGS:
++	here=`$(am__cd) $(top_builddir) && pwd` \
++	  && cd $(top_srcdir) \
++	  && gtags -i $(GTAGS_ARGS) $$here
++
++distclean-tags:
++	-rm -f TAGS ID GTAGS GRTAGS GSYMS GPATH tags
++
++distdir: $(DISTFILES)
++	@srcdirstrip=`echo "$(srcdir)" | sed 's|.|.|g'`; \
++	topsrcdirstrip=`echo "$(top_srcdir)" | sed 's|.|.|g'`; \
++	list='$(DISTFILES)'; for file in $$list; do \
++	  case $$file in \
++	    $(srcdir)/*) file=`echo "$$file" | sed "s|^$$srcdirstrip/||"`;; \
++	    $(top_srcdir)/*) file=`echo "$$file" | sed "s|^$$topsrcdirstrip/|$(top_builddir)/|"`;; \
++	  esac; \
++	  if test -f $$file || test -d $$file; then d=.; else d=$(srcdir); fi; \
++	  dir=`echo "$$file" | sed -e 's,/[^/]*$$,,'`; \
++	  if test "$$dir" != "$$file" && test "$$dir" != "."; then \
++	    dir="/$$dir"; \
++	    $(mkdir_p) "$(distdir)$$dir"; \
++	  else \
++	    dir=''; \
++	  fi; \
++	  if test -d $$d/$$file; then \
++	    if test -d $(srcdir)/$$file && test $$d != $(srcdir); then \
++	      cp -pR $(srcdir)/$$file $(distdir)$$dir || exit 1; \
++	    fi; \
++	    cp -pR $$d/$$file $(distdir)$$dir || exit 1; \
++	  else \
++	    test -f $(distdir)/$$file \
++	    || cp -p $$d/$$file $(distdir)/$$file \
++	    || exit 1; \
++	  fi; \
++	done
++	list='$(DIST_SUBDIRS)'; for subdir in $$list; do \
++	  if test "$$subdir" = .; then :; else \
++	    test -d "$(distdir)/$$subdir" \
++	    || $(mkdir_p) "$(distdir)/$$subdir" \
++	    || exit 1; \
++	    distdir=`$(am__cd) $(distdir) && pwd`; \
++	    top_distdir=`$(am__cd) $(top_distdir) && pwd`; \
++	    (cd $$subdir && \
++	      $(MAKE) $(AM_MAKEFLAGS) \
++	        top_distdir="$$top_distdir" \
++	        distdir="$$distdir/$$subdir" \
++	        distdir) \
++	      || exit 1; \
++	  fi; \
++	done
++check-am: all-am
++check: check-recursive
++all-am: Makefile $(LIBRARIES)
++installdirs: installdirs-recursive
++installdirs-am:
++install-exec: install-exec-recursive
++install-data: install-data-recursive
++uninstall: uninstall-recursive
++
++install-am: all-am
++	@$(MAKE) $(AM_MAKEFLAGS) install-exec-am install-data-am
++
++installcheck: installcheck-recursive
++mostlyclean-generic:
++
++clean-generic:
++
++distclean-generic:
++	-test -z "$(CONFIG_CLEAN_FILES)" || rm -f $(CONFIG_CLEAN_FILES)
++
++maintainer-clean-generic:
++	@echo "This command is intended for maintainers to use"
++	@echo "it deletes files that may require special tools to rebuild."
++clean: clean-recursive
++
++clean-am: clean-generic clean-libtool clean-noinstLIBRARIES \
++	mostlyclean-am
++
++distclean: distclean-recursive
++	-rm -rf ./$(DEPDIR)
++	-rm -f Makefile
++distclean-am: clean-am distclean-compile distclean-generic \
++	distclean-libtool distclean-tags
++
++dvi: dvi-recursive
++
++dvi-am:
++
++html: html-recursive
++
++info: info-recursive
++
++info-am:
++
++install-data-am:
++
++install-exec-am:
++
++install-info: install-info-recursive
++
++install-man:
++
++installcheck-am:
++
++maintainer-clean: maintainer-clean-recursive
++	-rm -rf ./$(DEPDIR)
++	-rm -f Makefile
++maintainer-clean-am: distclean-am maintainer-clean-generic
++
++mostlyclean: mostlyclean-recursive
++
++mostlyclean-am: mostlyclean-compile mostlyclean-generic \
++	mostlyclean-libtool
++
++pdf: pdf-recursive
++
++pdf-am:
++
++ps: ps-recursive
++
++ps-am:
++
++uninstall-am: uninstall-info-am
++
++uninstall-info: uninstall-info-recursive
++
++.PHONY: $(RECURSIVE_TARGETS) CTAGS GTAGS all all-am check check-am \
++	clean clean-generic clean-libtool clean-noinstLIBRARIES \
++	clean-recursive ctags ctags-recursive distclean \
++	distclean-compile distclean-generic distclean-libtool \
++	distclean-recursive distclean-tags distdir dvi dvi-am html \
++	html-am info info-am install install-am install-data \
++	install-data-am install-exec install-exec-am install-info \
++	install-info-am install-man install-strip installcheck \
++	installcheck-am installdirs installdirs-am maintainer-clean \
++	maintainer-clean-generic maintainer-clean-recursive \
++	mostlyclean mostlyclean-compile mostlyclean-generic \
++	mostlyclean-libtool mostlyclean-recursive pdf pdf-am ps ps-am \
++	tags tags-recursive uninstall uninstall-am uninstall-info-am
++
++
++install: all
++install-strip: all
++# Tell versions [3.59,3.63) of GNU make to not export all variables.
++# Otherwise a system limit (for SysV at least) may be exceeded.
++.NOEXPORT:
+@@ -0,0 +1,114 @@
++#include "squid.h"
++#include "MsgPipe.h"
++#include "MsgPipeSource.h"
++#include "MsgPipeSink.h"
++#include "MsgPipeData.h"
++
++#include "LeakFinder.h"
++LeakFinder *MsgPipeLeaker = new LeakFinder;
++
++CBDATA_CLASS_INIT(MsgPipe);
++
++// static event callback template
++// XXX: refcounting needed to make sure destination still exists
++#define MsgPipe_MAKE_CALLBACK(callName, destination) \
++static \
++void MsgPipe_send ## callName(void *p) { \
++	MsgPipe *pipe = static_cast<MsgPipe*>(p); \
++	if (pipe && pipe->canSend(pipe->destination, #callName, false)) \
++		pipe->destination->note##callName(pipe); \
++}
++
++// static event callbacks
++MsgPipe_MAKE_CALLBACK(SourceStart, sink)
++MsgPipe_MAKE_CALLBACK(SourceProgress, sink)
++MsgPipe_MAKE_CALLBACK(SourceFinish, sink)
++MsgPipe_MAKE_CALLBACK(SourceAbort, sink)
++MsgPipe_MAKE_CALLBACK(SinkNeed, source)
++MsgPipe_MAKE_CALLBACK(SinkAbort, source)
++
++
++MsgPipe::MsgPipe(const char *aName): name(aName),
++        data(NULL), source(NULL), sink(NULL)
++{
++    leakAdd(this, MsgPipeLeaker);
++}
++
++MsgPipe::~MsgPipe()
++{
++    delete data;
++    delete source;
++    delete sink;
++    leakFree(this, MsgPipeLeaker);
++};
++
++void MsgPipe::sendSourceStart()
++{
++    leakTouch(this, MsgPipeLeaker);
++    debug(99,5)("MsgPipe::sendSourceStart() called\n");
++    sendLater("SourceStart", &MsgPipe_sendSourceStart, sink);
++}
++
++
++
++void MsgPipe::sendSourceProgress()
++{
++    leakTouch(this, MsgPipeLeaker);
++    debug(99,5)("MsgPipe::sendSourceProgress() called\n");
++    sendLater("SourceProgress", &MsgPipe_sendSourceProgress, sink);
++}
++
++void MsgPipe::sendSourceFinish()
++{
++    leakTouch(this, MsgPipeLeaker);
++    debug(99,5)("MsgPipe::sendSourceFinish() called\n");
++    sendLater("sendSourceFinish", &MsgPipe_sendSourceFinish, sink);
++    source = NULL;
++}
++
++void MsgPipe::sendSourceAbort()
++{
++    leakTouch(this, MsgPipeLeaker);
++    debug(99,5)("MsgPipe::sendSourceAbort() called\n");
++    sendLater("SourceAbort", &MsgPipe_sendSourceAbort, sink);
++    source = NULL;
++}
++
++
++void MsgPipe::sendSinkNeed()
++{
++    leakTouch(this, MsgPipeLeaker);
++    debug(99,5)("MsgPipe::sendSinkNeed() called\n");
++    sendLater("SinkNeed", &MsgPipe_sendSinkNeed, source);
++}
++
++void MsgPipe::sendSinkAbort()
++{
++    leakTouch(this, MsgPipeLeaker);
++    debug(99,5)("MsgPipe::sendSinkAbort() called\n");
++    sendLater("SinkAbort", &MsgPipe_sendSinkAbort, source);
++    sink = NULL;
++}
++
++void MsgPipe::sendLater(const char *callName, EVH * handler, MsgPipeEnd *destination)
++{
++    leakTouch(this, MsgPipeLeaker);
++
++    if (canSend(destination, callName, true))
++        eventAdd(callName, handler, this, 0.0, 0, true);
++}
++
++bool MsgPipe::canSend(MsgPipeEnd *destination, const char *callName, bool future)
++{
++    leakTouch(this, MsgPipeLeaker);
++    const bool res = destination != NULL;
++    const char *verb = future ?
++                       (res ? "will send " : "wont send ") :
++                               (res ? "sends " : "ignores ");
++    debugs(99,5, "MsgPipe " << name << "(" << this << ") " <<
++           verb << callName << " to the " <<
++           (destination ? destination->kind() : "destination") << "(" <<
++           destination << "); " <<
++           "data: " << data << "; source: " << source << "; sink " << sink);
++    return res;
++}
+@@ -0,0 +1,87 @@
++
++/*
++ * $Id: MsgPipe.h,v 1.1 2005/11/21 23:32:59 wessels Exp $
++ *
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sinks; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ */
++
++#ifndef SQUID_MSGPIPE_H
++#define SQUID_MSGPIPE_H
++
++
++// MsgPipe is a unidirectional communication channel for asynchronously
++// transmitting potentially large messages. It aggregates the message
++// being piped and pointers to the message sender and recepient.
++// MsgPipe also provides convenience wrappers for asynchronous calls to
++// recepient's and sender's note*() methods.
++
++class MsgPipeData;
++
++class MsgPipeEnd;
++
++class MsgPipeSource;
++
++class MsgPipeSink;
++
++class MsgPipe : public RefCountable
++{
++
++public:
++    typedef RefCount<MsgPipe> Pointer;
++
++    MsgPipe(const char *aName = "anonym");
++    ~MsgPipe();
++
++    // the pipe source calls these to notify the sink
++    void sendSourceStart();
++    void sendSourceProgress();
++    void sendSourceFinish();
++    void sendSourceAbort();
++
++    // the pipe sink calls these to notify the source
++    void sendSinkNeed();
++    void sendSinkAbort();
++
++    // private method exposed for the event handler only
++    bool canSend(MsgPipeEnd *destination, const char *callName, bool future);
++
++public:
++    const char *name; // unmanaged pointer used for debugging only
++
++    MsgPipeData *data;
++    MsgPipeSource *source;
++    MsgPipeSink *sink;
++
++private:
++    void sendLater(const char *callName, EVH * handler, MsgPipeEnd *destination);
++
++    CBDATA_CLASS2(MsgPipe);
++};
++
++#endif /* SQUID_MSGPIPE_H */
+@@ -0,0 +1,76 @@
++
++/*
++ * $Id: MsgPipeData.h,v 1.1 2005/11/21 23:32:59 wessels Exp $
++ *
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sinks; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ */
++
++#ifndef SQUID_MSGPIPEDATA_H
++#define SQUID_MSGPIPEDATA_H
++
++#include "HttpMsg.h"
++#include "MemBuf.h"
++
++// MsgPipeData contains information about the HTTP message being sent
++// from the pipe source to the sink. Since the entire message body may be
++// large, only partial information about the body is kept. For HTTP
++// responses, request header information is also available as metadata.
++
++class HttpRequest;
++
++class MsgPipeData
++{
++
++public:
++    MsgPipeData(): header(0), body(0), cause(0) {};
++
++    ~MsgPipeData()
++    {
++        assert(NULL == cause);
++        assert(NULL == header);
++
++        if (body) {
++            body->clean();
++            delete body;
++        }
++    };
++
++public:
++    typedef HttpMsg Header;
++    typedef MemBuf Body;
++
++    // message being piped
++    Header *header;   // parsed HTTP status/request line and headers
++    Body *body;     // a buffer for decoded HTTP body piping
++
++    // HTTP request header for piped responses (the cause of the response)
++    HttpRequest *cause;
++};
++
++#endif /* SQUID_MSGPIPEDATA_H */
+@@ -0,0 +1,50 @@
++
++/*
++ * $Id: MsgPipeEnd.h,v 1.1 2005/11/21 23:32:59 wessels Exp $
++ *
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sources; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ */
++
++#ifndef SQUID_MSGPIPEEND_H
++#define SQUID_MSGPIPEEND_H
++
++// MsgPipeEnd is a common part of the MsgPipeSource and MsgPipeSink interfaces.
++// Mesage pipe ends must be refcounted so that the recepient does not disappear
++// while a message is being [asynchoronously] delivered to it.
++
++class MsgPipeEnd: public RefCountable
++{
++
++public:
++    virtual ~MsgPipeEnd() {}
++
++    virtual const char *kind() const = 0; // "sink" or "source", for debugging
++};
++
++#endif /* SQUID_MSGPIPEEND_H */
+@@ -0,0 +1,56 @@
++
++/*
++ * $Id: MsgPipeSink.h,v 1.1 2005/11/21 23:32:59 wessels Exp $
++ *
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sources; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ */
++
++#ifndef SQUID_MSGPIPESINK_H
++#define SQUID_MSGPIPESINK_H
++
++#include "MsgPipeEnd.h"
++
++// MsgPipeSink is an interface for the recepient of a given message
++// over a given message pipe. Use MsgPipe to call sink methods.
++
++class MsgPipe;
++
++class MsgPipeSink: public MsgPipeEnd
++{
++
++public:
++    virtual void noteSourceStart(MsgPipe *p) = 0;
++    virtual void noteSourceProgress(MsgPipe *p) = 0;
++    virtual void noteSourceFinish(MsgPipe *p) = 0;
++    virtual void noteSourceAbort(MsgPipe *p) = 0;
++
++    virtual const char *kind() const { return "sink"; }
++};
++
++#endif /* SQUID_MSGPIPESINK_H */
+@@ -0,0 +1,54 @@
++
++/*
++ * $Id: MsgPipeSource.h,v 1.1 2005/11/21 23:32:59 wessels Exp $
++ *
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sinks; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ */
++
++#ifndef SQUID_MSGPIPESOURCE_H
++#define SQUID_MSGPIPESOURCE_H
++
++#include "MsgPipeEnd.h"
++
++// MsgPipeSource is an interface for the sender of a given message
++// over a given message pipe. Use MsgPipe to call source methods.
++
++class MsgPipe;
++
++class MsgPipeSource: public MsgPipeEnd
++{
++
++public:
++    virtual const char *kind() const { return "source"; }
++
++    virtual void noteSinkNeed(MsgPipe *p) = 0;
++    virtual void noteSinkAbort(MsgPipe *p) = 0;
++};
++
++#endif /* SQUID_MSGPIPESOURCE_H */
+@@ -0,0 +1,27 @@
++#include "squid.h"
++#include "TextException.h"
++
++TextException::TextException(const char *aMsg, const char *aFileName, int aLineNo):
++        message(xstrdup(aMsg)), theFileName(aFileName), theLineNo(aLineNo)
++{}
++
++TextException::~TextException()
++{
++    xfree(message);
++}
++
++void Throw(const char *message, const char *fileName, int lineNo)
++{
++
++    // or should we let the exception recepient print the exception instead?
++
++    if (fileName) {
++        debugs(0, 3, fileName << ':' << lineNo << ": exception" <<
++               (message ? ": " : ".") << (message ? message : ""));
++    } else {
++        debugs(0, 3, "exception" <<
++               (message ? ": " : ".") << (message ? message : ""));
++    }
++
++    throw TextException(message, fileName, lineNo);
++}
+@@ -0,0 +1,46 @@
++#ifndef SQUID__TEXTEXCEPTION_H
++#define SQUID__TEXTEXCEPTION_H
++
++// Origin: xstd/TextException
++
++
++// simple exception to report custom errors
++// we may want to change the interface to be able to report system errors
++
++class TextException
++{
++
++public:
++    TextException(const char *aMessage, const char *aFileName = 0, int aLineNo = -1);
++    ~TextException();
++
++    // ostream &print(ostream &os) const;
++
++public:
++    char *message; // read-only
++
++protected:
++    // optional location information
++    const char *theFileName;
++    int theLineNo;
++};
++
++//inline
++//ostream &operator <<(ostream &os, const TextException &exx) {
++//	return exx.print(os);
++//}
++
++#if !defined(TexcHere)
++#	define TexcHere(msg) TextException((msg), __FILE__, __LINE__)
++#endif
++
++extern void Throw(const char *message, const char *fileName, int lineNo);
++
++// Must(condition) is like assert(condition) but throws an exception instead
++#if !defined(Must)
++#	define Must(cond) ((cond) ? \
++		(void)0 : \
++		(void)Throw(#cond, __FILE__, __LINE__))
++#endif
++
++#endif /* SQUID__TEXTEXCEPTION_H */

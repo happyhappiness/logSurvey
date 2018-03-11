@@ -1,0 +1,520 @@
+@@ -1014,12 +1014,19 @@ void ICAPModXact::noteBodyProductionEnded(BodyPipe &)
+     ICAPXaction_Exit();
+ }
+ 
+-// body producer aborted
++// body producer aborted, but the initiator may still want to know 
++// the answer, even though the HTTP message has been truncated
+ void ICAPModXact::noteBodyProducerAborted(BodyPipe &)
+ {
+     ICAPXaction_Enter(noteBodyProducerAborted);
+ 
+-    mustStop("virgin HTTP body producer aborted");
++    Must(virgin.body_pipe->productionEnded());
++
++    // push writer and sender in case we were waiting for the last-chunk
++    writeMore();
++
++    if (state.sending == State::sendingVirgin)
++        echoMore();
+ 
+     ICAPXaction_Exit();
+ }
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: Server.cc,v 1.20 2007/08/02 19:32:22 rousskov Exp $
++ * $Id: Server.cc,v 1.21 2007/08/09 23:30:52 rousskov Exp $
+  *
+  * DEBUG:
+  * AUTHOR: Duane Wessels
+@@ -63,7 +63,8 @@ ServerStateData::~ServerStateData()
+     entry->unlock();
+ 
+     HTTPMSGUNLOCK(request);
+-    HTTPMSGUNLOCK(reply);
++    HTTPMSGUNLOCK(theVirginReply);
++    HTTPMSGUNLOCK(theFinalReply);
+ 
+     fwd = NULL; // refcounted
+ 
+@@ -80,6 +81,47 @@ ServerStateData::~ServerStateData()
+     }
+ }
+ 
++HttpReply *
++ServerStateData::virginReply() {
++    assert(theVirginReply);
++    return theVirginReply;
++}
++
++const HttpReply *
++ServerStateData::virginReply() const {
++    assert(theVirginReply);
++    return theVirginReply;
++}
++
++HttpReply *
++ServerStateData::setVirginReply(HttpReply *rep) {
++    debugs(11,5, HERE << this << " setting virgin reply to " << rep);
++    assert(!theVirginReply);
++    assert(rep);
++    theVirginReply = HTTPMSGLOCK(rep);
++	return theVirginReply;
++}
++
++HttpReply *
++ServerStateData::finalReply() {
++    assert(theFinalReply);
++    return theFinalReply;
++}
++
++HttpReply *
++ServerStateData::setFinalReply(HttpReply *rep) {
++    debugs(11,5, HERE << this << " setting final reply to " << rep);
++
++    assert(!theFinalReply);
++    assert(rep);
++    theFinalReply = HTTPMSGLOCK(rep);
++
++    entry->replaceHttpReply(theFinalReply);
++    haveParsedReplyHeaders();
++
++    return theFinalReply;
++}
++
+ // called when no more server communication is expected; may quit
+ void
+ ServerStateData::serverComplete()
+@@ -342,21 +384,22 @@ ServerStateData::startIcap(ICAPServiceRep::Pointer service, HttpRequest *cause)
+     }
+ 
+     // check whether we should be sending a body as well
+-    assert(!virginBodyDestination);
+-    assert(!reply->body_pipe);
+     // start body pipe to feed ICAP transaction if needed
++    assert(!virginBodyDestination);
++	HttpReply *vrep = virginReply();
++    assert(!vrep->body_pipe);
+     ssize_t size = 0;
+-    if (reply->expectingBody(cause->method, size) && size) {
++    if (vrep->expectingBody(cause->method, size) && size) {
+         virginBodyDestination = new BodyPipe(this);
+-        reply->body_pipe = virginBodyDestination;
++        vrep->body_pipe = virginBodyDestination;
+         debugs(93, 6, HERE << "will send virgin reply body to " << 
+             virginBodyDestination << "; size: " << size);
+         if (size > 0)
+             virginBodyDestination->setBodySize(size);
+     }
+ 
+     adaptedHeadSource = initiateIcap(
+-        new ICAPModXactLauncher(this, reply, cause, service));
++        new ICAPModXactLauncher(this, vrep, cause, service));
+     return true;
+ }
+ 
+@@ -455,27 +498,20 @@ ServerStateData::noteBodyConsumerAborted(BodyPipe &bp)
+ void
+ ServerStateData::noteIcapAnswer(HttpMsg *msg)
+ {
+-    HttpReply *rep = dynamic_cast<HttpReply*>(msg);
+-    HTTPMSGLOCK(rep);
+     clearIcap(adaptedHeadSource); // we do not expect more messages
+ 
+-    if (abortOnBadEntry("entry went bad while waiting for adapted headers")) {
+-        HTTPMSGUNLOCK(rep); // hopefully still safe, even if "this" is deleted
++    if (abortOnBadEntry("entry went bad while waiting for adapted headers"))
+         return;
+-    }
+ 
++    HttpReply *rep = dynamic_cast<HttpReply*>(msg);
+     assert(rep);
+-    entry->replaceHttpReply(rep);
+-    HTTPMSGUNLOCK(reply);
+-
+-    reply = rep; // already HTTPMSGLOCKed above
+-
+-    haveParsedReplyHeaders();
++    debugs(11,5, HERE << this << " setting adapted reply to " << rep);
++    setFinalReply(rep);
+ 
+     assert(!adaptedBodySource);
+-    if (reply->body_pipe != NULL) {
++    if (rep->body_pipe != NULL) {
+         // subscribe to receive adapted body
+-        adaptedBodySource = reply->body_pipe;
++        adaptedBodySource = rep->body_pipe;
+         // assume that ICAP does not auto-consume on failures
+         assert(adaptedBodySource->setConsumerIfNotLate(this));
+     } else {
+@@ -591,11 +627,8 @@ ServerStateData::icapAclCheckDone(ICAPServiceRep::Pointer service)
+     if (!startedIcap && (!service || service->bypass)) {
+         // handle ICAP start failure when no service was selected
+         // or where the selected service was optional
+-        entry->replaceHttpReply(reply);
+-
+-        haveParsedReplyHeaders();
++        setFinalReply(virginReply());
+         processReplyBody();
+-
+         return;
+     }
+ 
+@@ -620,14 +653,17 @@ ServerStateData::icapAclCheckDoneWrapper(ICAPServiceRep::Pointer service, void *
+ }
+ #endif
+ 
++// TODO: when HttpStateData sends all errors to ICAP, 
++// we should be able to move this at the end of setVirginReply().
+ void
+-ServerStateData::setReply()
++ServerStateData::adaptOrFinalizeReply()
+ {
+ #if ICAP_CLIENT
+ 
+     if (TheICAPConfig.onoff) {
+         ICAPAccessCheck *icap_access_check =
+-            new ICAPAccessCheck(ICAP::methodRespmod, ICAP::pointPreCache, request, reply, icapAclCheckDoneWrapper, this);
++            new ICAPAccessCheck(ICAP::methodRespmod, ICAP::pointPreCache,
++                request, virginReply(), icapAclCheckDoneWrapper, this);
+ 
+         icapAccessCheckPending = true;
+         icap_access_check->check(); // will eventually delete self
+@@ -636,9 +672,7 @@ ServerStateData::setReply()
+ 
+ #endif
+ 
+-    entry->replaceHttpReply(reply);
+-
+-    haveParsedReplyHeaders();
++    setFinalReply(virginReply());
+ }
+ 
+ void
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: Server.h,v 1.8 2007/08/01 04:16:00 rousskov Exp $
++ * $Id: Server.h,v 1.9 2007/08/09 23:30:52 rousskov Exp $
+  *
+  * AUTHOR: Duane Wessels
+  *
+@@ -148,8 +148,15 @@ class ServerStateData:
+ #endif
+ 
+ protected:
++    const HttpReply *virginReply() const;
++    HttpReply *virginReply();
++    HttpReply *setVirginReply(HttpReply *r);
++
++    HttpReply *finalReply();
++    HttpReply *setFinalReply(HttpReply *r);
++
+     // Kids use these to stuff data into the response instead of messing with the entry directly
+-    void setReply();
++    void adaptOrFinalizeReply();
+     void addVirginReplyBody(const char *buf, ssize_t len);
+     void storeReplyBody(const char *buf, ssize_t len);
+     size_t replyBodySpace(size_t space = 4096 * 10);
+@@ -162,7 +169,6 @@ class ServerStateData:
+     StoreEntry *entry;
+     FwdState::Pointer fwd;
+     HttpRequest *request;
+-    HttpReply *reply;
+ 
+ protected:
+     BodyPipe::Pointer requestBodySource; // to consume request body
+@@ -179,7 +185,9 @@ class ServerStateData:
+ 
+ private:
+     void quitIfAllDone(); // successful termination
+-    
++
++	HttpReply *theVirginReply; // reply received from the origin server
++	HttpReply *theFinalReply; // adapted reply from ICAP or virgin reply
+ };
+ 
+ #endif /* SQUID_SERVER_H */
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: ftp.cc,v 1.431 2007/08/01 04:16:00 rousskov Exp $
++ * $Id: ftp.cc,v 1.432 2007/08/09 23:30:52 rousskov Exp $
+  *
+  * DEBUG: section 9     File Transfer Protocol (FTP)
+  * AUTHOR: Harvest Derived
+@@ -3115,15 +3115,14 @@ FtpStateData::appendSuccessHeader()
+     const char *filename = NULL;
+     const char *t = NULL;
+     StoreEntry *e = entry;
+-    HttpReply *newrep = new HttpReply;
+ 
+     debugs(9, 3, HERE << "FtpStateData::appendSuccessHeader starting");
+ 
+-    reply = HTTPMSGLOCK(newrep);
+-
+     if (flags.http_header_sent)
+         return;
+ 
++    HttpReply *reply = new HttpReply;
++
+     flags.http_header_sent = 1;
+ 
+     assert(e->isEmpty());
+@@ -3189,7 +3188,8 @@ FtpStateData::appendSuccessHeader()
+     if (mime_enc)
+         reply->header.putStr(HDR_CONTENT_ENCODING, mime_enc);
+ 
+-    setReply();
++    setVirginReply(reply);
++    adaptOrFinalizeReply();
+ }
+ 
+ void
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: http.cc,v 1.535 2007/08/01 04:16:00 rousskov Exp $
++ * $Id: http.cc,v 1.536 2007/08/09 23:30:52 rousskov Exp $
+  *
+  * DEBUG: section 11    Hypertext Transfer Protocol (HTTP)
+  * AUTHOR: Harvest Derived
+@@ -367,7 +367,7 @@ HttpStateData::processSurrogateControl(HttpReply *reply)
+ int
+ HttpStateData::cacheableReply()
+ {
+-    HttpReply const *rep = getReply();
++    HttpReply const *rep = finalReply();
+     HttpHeader const *hdr = &rep->header;
+     const int cc_mask = (rep->cache_control) ? rep->cache_control->mask : 0;
+     const char *v;
+@@ -442,7 +442,7 @@ HttpStateData::cacheableReply()
+         if (!strncasecmp(v, "multipart/x-mixed-replace", 25))
+             return 0;
+ 
+-    switch (getReply()->sline.status) {
++    switch (rep->sline.status) {
+         /* Responses that are cacheable */
+ 
+     case HTTP_OK:
+@@ -558,7 +558,7 @@ HttpStateData::cacheableReply()
+         return 0;
+ 
+     default:			/* Unknown status code */
+-        debugs (11, 0, HERE << "HttpStateData::cacheableReply: unexpected http status code " << getReply()->sline.status);
++        debugs (11, 0, HERE << "HttpStateData::cacheableReply: unexpected http status code " << rep->sline.status);
+ 
+         return 0;
+ 
+@@ -688,14 +688,14 @@ HttpStateData::processReplyHeader()
+     /* Creates a blank header. If this routine is made incremental, this will
+      * not do 
+      */
+-    HttpReply *newrep = new HttpReply;
+     Ctx ctx = ctx_enter(entry->mem_obj->url);
+     debugs(11, 3, "processReplyHeader: key '" << entry->getMD5Text() << "'");
+ 
+     assert(!flags.headers_parsed);
+ 
+     http_status error = HTTP_STATUS_NONE;
+ 
++    HttpReply *newrep = new HttpReply;
+     const bool parsed = newrep->parse(readBuf, eof, &error);
+ 
+     if(!parsed && readBuf->contentSize() > 5 && strncmp(readBuf->content(), "HTTP/", 5) != 0){
+@@ -715,8 +715,8 @@ HttpStateData::processReplyHeader()
+ 	      flags.headers_parsed = 1;
+           newrep->sline.version = HttpVersion(1, 0);
+           newrep->sline.status = error;
+-          reply = HTTPMSGLOCK(newrep);
+-          entry->replaceHttpReply(reply);
++          HttpReply *vrep = setVirginReply(newrep);
++          entry->replaceHttpReply(vrep);
+ 	      ctx_exit(ctx);
+ 	      return;
+ 	 }
+@@ -735,14 +735,14 @@ HttpStateData::processReplyHeader()
+ 	 readBuf->consume(header_bytes_read);
+     }
+ 
+-    reply = HTTPMSGLOCK(newrep);
++    HttpReply *vrep = setVirginReply(newrep);
+     flags.headers_parsed = 1;
+ 
+-    keepaliveAccounting(reply);
++    keepaliveAccounting(vrep);
+ 
+-    checkDateSkew(reply);
++    checkDateSkew(vrep);
+ 
+-    processSurrogateControl (reply);
++    processSurrogateControl (vrep);
+ 
+     /* TODO: IF the reply is a 1.0 reply, AND it has a Connection: Header
+      * Parse the header and remove all referenced headers
+@@ -758,25 +758,26 @@ void
+ HttpStateData::haveParsedReplyHeaders()
+ {
+     Ctx ctx = ctx_enter(entry->mem_obj->url);
++    HttpReply *rep = finalReply();
+ 
+-    if (getReply()->sline.status == HTTP_PARTIAL_CONTENT &&
+-            getReply()->content_range)
+-        currentOffset = getReply()->content_range->spec.offset;
++    if (rep->sline.status == HTTP_PARTIAL_CONTENT &&
++            rep->content_range)
++        currentOffset = rep->content_range->spec.offset;
+ 
+     entry->timestampsSet();
+ 
+     /* Check if object is cacheable or not based on reply code */
+-    debugs(11, 3, "haveParsedReplyHeaders: HTTP CODE: " << getReply()->sline.status);
++    debugs(11, 3, "haveParsedReplyHeaders: HTTP CODE: " << rep->sline.status);
+ 
+     if (neighbors_do_private_keys)
+-        httpMaybeRemovePublic(entry, getReply()->sline.status);
++        httpMaybeRemovePublic(entry, rep->sline.status);
+ 
+-    if (getReply()->header.has(HDR_VARY)
++    if (rep->header.has(HDR_VARY)
+ #if X_ACCELERATOR_VARY
+-            || getReply()->header.has(HDR_X_ACCELERATOR_VARY)
++            || rep->header.has(HDR_X_ACCELERATOR_VARY)
+ #endif
+        ) {
+-        const char *vary = httpMakeVaryMark(orig_request, getReply());
++        const char *vary = httpMakeVaryMark(orig_request, rep);
+ 
+         if (!vary) {
+             entry->makePrivate();
+@@ -795,7 +796,7 @@ HttpStateData::haveParsedReplyHeaders()
+      * If its not a reply that we will re-forward, then
+      * allow the client to get it.
+      */
+-    if (!fwd->reforwardableStatus(getReply()->sline.status))
++    if (!fwd->reforwardableStatus(rep->sline.status))
+         EBIT_CLR(entry->flags, ENTRY_FWD_HDR_WAIT);
+ 
+     switch (cacheableReply()) {
+@@ -825,15 +826,15 @@ HttpStateData::haveParsedReplyHeaders()
+ 
+ no_cache:
+ 
+-    if (!ignoreCacheControl && getReply()->cache_control) {
+-        if (EBIT_TEST(getReply()->cache_control->mask, CC_PROXY_REVALIDATE))
++    if (!ignoreCacheControl && rep->cache_control) {
++        if (EBIT_TEST(rep->cache_control->mask, CC_PROXY_REVALIDATE))
+             EBIT_SET(entry->flags, ENTRY_REVALIDATE);
+-        else if (EBIT_TEST(getReply()->cache_control->mask, CC_MUST_REVALIDATE))
++        else if (EBIT_TEST(rep->cache_control->mask, CC_MUST_REVALIDATE))
+             EBIT_SET(entry->flags, ENTRY_REVALIDATE);
+     }
+ 
+ #if HEADERS_LOG
+-    headersLog(1, 0, request->method, getReply());
++    headersLog(1, 0, request->method, rep);
+ 
+ #endif
+ 
+@@ -843,7 +844,7 @@ HttpStateData::haveParsedReplyHeaders()
+ HttpStateData::ConnectionStatus
+ HttpStateData::statusIfComplete() const
+ {
+-    HttpReply const *rep = getReply();
++    const HttpReply *rep = virginReply();
+     /* If the reply wants to close the connection, it takes precedence */
+ 
+     if (httpHeaderHasConnDir(&rep->header, "close"))
+@@ -882,13 +883,12 @@ HttpStateData::statusIfComplete() const
+     return COMPLETE_PERSISTENT_MSG;
+ }
+ 
+-// XXX: This is also called for ICAP-adapted responses but they have
+-// no notion of "persistent connection"
+ HttpStateData::ConnectionStatus
+ HttpStateData::persistentConnStatus() const
+ {
+     debugs(11, 3, "persistentConnStatus: FD " << fd << " eof=" << eof);
+-    debugs(11, 5, "persistentConnStatus: content_length=" << reply->content_length);
++    const HttpReply *vrep = virginReply();
++    debugs(11, 5, "persistentConnStatus: content_length=" << vrep->content_length);
+ 
+     /* If we haven't seen the end of reply headers, we are not done */
+     debugs(11, 5, "persistentConnStatus: flags.headers_parsed=" << flags.headers_parsed);
+@@ -899,7 +899,7 @@ HttpStateData::persistentConnStatus() const
+     if (eof) // already reached EOF
+         return COMPLETE_NONPERSISTENT_MSG;
+ 
+-    const int clen = reply->bodySize(request->method);
++    const int clen = vrep->bodySize(request->method);
+ 
+     debugs(11, 5, "persistentConnStatus: clen=" << clen);
+ 
+@@ -910,12 +910,12 @@ HttpStateData::persistentConnStatus() const
+     /* If the body size is known, we must wait until we've gotten all of it. */
+     if (clen > 0) {
+         // old technique:
+-        // if (entry->mem_obj->endOffset() < reply->content_length + reply->hdr_sz)
++        // if (entry->mem_obj->endOffset() < vrep->content_length + vrep->hdr_sz)
+         const int body_bytes_read = reply_bytes_read - header_bytes_read;
+         debugs(11,5, "persistentConnStatus: body_bytes_read=" <<
+-               body_bytes_read << " content_length=" << reply->content_length);
++               body_bytes_read << " content_length=" << vrep->content_length);
+ 
+-        if (body_bytes_read < reply->content_length)
++        if (body_bytes_read < vrep->content_length)
+             return INCOMPLETE_MSG;
+     }
+ 
+@@ -1032,7 +1032,7 @@ HttpStateData::readReply (size_t len, comm_err_t flag, int xerrno)
+         if (!continueAfterParsingHeader()) // parsing error or need more data
+             return; // TODO: send errors to ICAP
+ 
+-        setReply();
++        adaptOrFinalizeReply();
+     }
+ 
+     // kick more reads if needed and/or process the response body, if any
+@@ -1059,9 +1059,9 @@ HttpStateData::continueAfterParsingHeader()
+ 
+     if (flags.headers_parsed) { // parsed headers, possibly with errors
+         // check for header parsing errors
+-        if (reply != NULL) {
+-            const http_status s = getReply()->sline.status;
+-            const HttpVersion &v = getReply()->sline.version;
++        if (HttpReply *vrep = virginReply()) {
++            const http_status s = vrep->sline.status;
++            const HttpVersion &v = vrep->sline.version;
+             if (s == HTTP_INVALID_HEADER && v != HttpVersion(0,9)) {
+                 error = ERR_INVALID_RESP;
+             } else
+@@ -1827,7 +1827,7 @@ HttpStateData::handleMoreRequestBodyAvailable()
+             flags.abuse_detected = 1;
+             debugs(11, 1, "http handleMoreRequestBodyAvailable: Likely proxy abuse detected '" << inet_ntoa(orig_request->client_addr) << "' -> '" << entry->url() << "'" );
+ 
+-            if (getReply()->sline.status == HTTP_INVALID_HEADER) {
++            if (virginReply()->sline.status == HTTP_INVALID_HEADER) {
+                 comm_close(fd);
+                 return;
+             }
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: http.h,v 1.31 2007/07/23 19:58:46 rousskov Exp $
++ * $Id: http.h,v 1.32 2007/08/09 23:30:53 rousskov Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -77,12 +77,6 @@ class HttpStateData : public ServerStateData
+ 
+     void processSurrogateControl(HttpReply *);
+ 
+-    /*
+-     * getReply() public only because it is called from a static function
+-     * as httpState->getReply()
+-     */
+-    const HttpReply * getReply() const { assert(reply); return reply; }
+-
+ protected:
+     virtual HttpRequest *originalRequest();
+ 

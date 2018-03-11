@@ -1,245 +1,1083 @@
-@@ -379,10 +379,10 @@ ServerStateData::sentRequestBody(const CommIoCbParams &io)
-     }
- 
-     if (io.flag) {
--        debugs(11, 1, "sentRequestBody error: FD " << io.fd << ": " << xstrerr(errno));
-+        debugs(11, 1, "sentRequestBody error: FD " << io.fd << ": " << xstrerr(io.xerrno));
-         ErrorState *err;
-         err = errorCon(ERR_WRITE_ERROR, HTTP_BAD_GATEWAY, fwd->request);
--        err->xerrno = errno;
-+        err->xerrno = io.xerrno;
-         fwd->fail(err);
-         abortTransaction("I/O error while sending request body");
-         return;
-@@ -69,6 +69,7 @@ Adaptation::ServiceConfig::parse()
- 
-     // handle optional service name=value parameters
-     const char *lastOption = NULL;
-+    bool grokkedUri = false;
-     while (char *option = strtok(NULL, w_space)) {
-         if (strcmp(option, "0") == 0) { // backward compatibility
-             bypass = false;
-@@ -94,6 +95,8 @@ Adaptation::ServiceConfig::parse()
-             grokked = grokBool(bypass, name, value);
-         else if (strcmp(name, "routing") == 0)
-             grokked = grokBool(routing, name, value);
-+        else if (strcmp(name, "uri") == 0)
-+            grokked = grokkedUri = grokUri(value);
-         else if (strcmp(name, "ipv6") == 0) {
-             grokked = grokBool(ipv6, name, value);
-             if (grokked && ipv6 && !Ip::EnableIpv6)
-@@ -107,7 +110,7 @@ Adaptation::ServiceConfig::parse()
-     }
- 
-     // what is left must be the service URI
--    if (!grokUri(lastOption))
-+    if (!grokkedUri && !grokUri(lastOption))
-         return false;
- 
-     // there should be nothing else left
-@@ -8,6 +8,7 @@ namespace Icap
- {
- 
- const XactOutcome xoUnknown = "ICAP_ERR_UNKNOWN";
-+const XactOutcome xoGone = "ICAP_ERR_GONE";
- const XactOutcome xoRace = "ICAP_ERR_RACE";
- const XactOutcome xoError = "ICAP_ERR_OTHER";
- const XactOutcome xoOpt = "ICAP_OPT";
-@@ -64,6 +64,7 @@ using Adaptation::vectPointStr;
- 
- typedef const char *XactOutcome; ///< transaction result for logging
- extern const XactOutcome xoUnknown; ///< initial value: outcome was not set
-+extern const XactOutcome xoGone; ///< initiator gone, will not continue
- extern const XactOutcome xoRace; ///< ICAP server closed pconn when we started
- extern const XactOutcome xoError; ///< all kinds of transaction errors
- extern const XactOutcome xoOpt; ///< OPTION transaction
-@@ -92,6 +92,8 @@ class ServiceRep : public RefCountable, public Adaptation::Service,
- 
-     virtual void finalize();
- 
-+    void invalidate(); // call when the service is no longer needed or valid
-+
-     virtual bool probed() const; // see comments above
-     virtual bool up() const; // see comments above
- 
-@@ -196,10 +196,14 @@ void Adaptation::Icap::Xaction::closeConnection()
-                                 theService->cfg().port, NULL, client_addr);
-             disableRetries();
-         } else {
--            //status() adds leading spaces.
--            debugs(93,3, HERE << "closing pconn" << status());
-+            const bool reset = al.icap.outcome == xoGone || al.icap.outcome == xoError;
-+            debugs(93,3, HERE << (reset ? "RST" : "FIN") << "-closing" <<
-+                   status());
-             // comm_close will clear timeout
--            comm_close(connection);
-+            if (reset)
-+                comm_reset_close(connection);
-+            else
-+                comm_close(connection);
-         }
- 
-         writer = NULL;
-@@ -444,8 +448,10 @@ void Adaptation::Icap::Xaction::noteInitiatorAborted()
- {
- 
-     if (theInitiator.set()) {
-+        debugs(93,4, HERE << "Initiator gone before ICAP transaction ended");
-         clearInitiator();
-         detailError(ERR_DETAIL_ICAP_INIT_GONE);
-+        setOutcome(xoGone);
-         mustStop("initiator aborted");
-     }
- 
-@@ -615,7 +615,10 @@ prepareLogWithRequestDetails(HttpRequest * request, AccessLogEntry * aLogEntry)
- void
- ClientHttpRequest::logRequest()
- {
--    if (out.size || logType) {
-+    if (!out.size && !logType)
-+        debugs(33,2, HERE << "logging half-baked transaction: " << log_uri);
-+
-+    if (true) {
-         al.icp.opcode = ICP_INVALID;
-         al.url = log_uri;
-         debugs(33, 9, "clientLogRequest: al.url='" << al.url << "'");
-@@ -2244,8 +2247,10 @@ parseHttpRequest(ConnStateData *conn, HttpParser *hp, HttpRequestMethod * method
- int
- ConnStateData::getAvailableBufferLength() const
- {
--    int result = in.allocatedSize - in.notYetUsed - 1;
--    assert (result >= 0);
-+    assert (in.allocatedSize > in.notYetUsed); // allocated more than used
-+    const size_t result = in.allocatedSize - in.notYetUsed - 1;
-+    // huge request_header_max_size may lead to more than INT_MAX unused space
-+    assert (static_cast<ssize_t>(result) <= INT_MAX);
-     return result;
- }
- 
-@@ -161,6 +161,9 @@ static long ipcache_high = 200;
- extern int _dns_ttl_;
+@@ -32,6 +32,7 @@
+ #define _GNU_SOURCE 1
  #endif
  
-+/// \ingroup IPCacheInternal
-+inline int ipcacheCount() { return ip_table ? ip_table->count : 0; }
++#define SQUID_NO_ALLOC_PROTECT 1
+ #include "config.h"
+ 
+ #if USE_GNUREGEX /* only if squid needs it. Usually not */
+@@ -20,6 +20,7 @@ libcompat_la_SOURCES = \
+ 	osdetect.h \
+ 	stdvarargs.h \
+ 	types.h \
++	unsafe.h \
+ 	valgrind.h \
+ 	\
+ 	os/aix.h \
+@@ -28,6 +29,7 @@ libcompat_la_SOURCES = \
+ 	os/hpux.h \
+ 	os/linux.h \
+ 	os/mswin.h \
++	os/netbsd.h \
+ 	os/next.h \
+ 	os/openbsd.h \
+ 	os/os2.h \
+@@ -55,6 +55,7 @@
+ #include "compat/os/hpux.h"
+ #include "compat/os/linux.h"
+ #include "compat/os/mswin.h"
++#include "compat/os/netbsd.h"
+ #include "compat/os/next.h"
+ #include "compat/os/openbsd.h"
+ #include "compat/os/os2.h"
+@@ -95,5 +96,7 @@
+  */
+ #include "compat/GnuRegex.h"
+ 
++/* some functions are unsafe to be used in Squid. */
++#include "compat/unsafe.h"
+ 
+ #endif /* _SQUID_COMPAT_H */
+@@ -36,7 +36,6 @@
+ #if HAVE_DIRENT_H
+ #include <dirent.h>
+ #define NAMLEN(dirent) strlen((dirent)->d_name)
+-
+ #else /* if not HAVE_DIRENT_H */
+ #define dirent direct
+ #define NAMLEN(dirent) (dirent)->d_namlen
+@@ -173,6 +172,7 @@ max(A const & lhs, A const & rhs)
+ #endif
+ 
+ 
++#ifndef SQUID_NONBLOCK
+ /* REQUIRED for the below logics. If they move this needs to as well */
+ #if HAVE_FCNTL_H
+ #include <fcntl.h>
+@@ -189,7 +189,7 @@ max(A const & lhs, A const & rhs)
+ /** O_NDELAY is our fallback. */
+ #define SQUID_NONBLOCK O_NDELAY
+ #endif
+-
++#endif
+ 
+ /**
+  * Signalling flags are apparently not always provided.
+@@ -211,8 +211,8 @@ max(A const & lhs, A const & rhs)
+ 
+ 
+ /**
+- * com_err.h is a C header and needs excplicit shielding, but not
+- * all other system headers including this care to do this.
++ * com_err.h is a C header and needs explicit shielding, but not
++ * all other system headers including this care to do so.
+  */
+ #ifdef __cplusplus
+ #if HAVE_ET_COM_ERR_H
+@@ -20,6 +20,11 @@
+ #undef HAVE_MALLOC_H
+ #endif
+ 
++/* Exclude CPPUnit tests from the allocator restrictions. */
++/* BSD implementation uses these still */
++#if defined(SQUID_UNIT_TEST)
++#define SQUID_NO_ALLOC_PROTECT 1
++#endif
+ 
+ #endif /* _SQUID_DRAGONFLY_ */
+ #endif /* SQUID_OS_DRAGONFLY_H */
+@@ -27,5 +27,12 @@
+ 
+ #define _etext etext
+ 
++/* Exclude CPPUnit tests from the allocator restrictions. */
++/* BSD implementation uses these still */
++#if defined(SQUID_UNIT_TEST)
++#define SQUID_NO_ALLOC_PROTECT 1
++#endif
 +
- int
- ipcache_entry::age() const
- {
-@@ -235,7 +238,7 @@ ipcache_purgelru(void *voidnotused)
-     eventAdd("ipcache_purgelru", ipcache_purgelru, NULL, 10.0, 1);
++
+ #endif /* _SQUID_FREEBSD_ */
+ #endif /* SQUID_OS_FREEBSD_H */
+@@ -27,6 +27,13 @@
+ #define getrusage(a, b)  syscall(SYS_GETRUSAGE, a, b)
+ #endif
  
-     for (m = lru_list.tail; m; m = prev) {
--        if (memInUse(MEM_IPCACHE_ENTRY) < ipcache_low)
-+        if (ipcacheCount() < ipcache_low)
-             break;
++/*
++ * getpagesize(...) not available on HPUX
++ */
++#if !defined(HAVE_GETPAGESIZE)
++#define HAVE_GETPAGESIZE
++#define getpagesize( )   sysconf(_SC_PAGE_SIZE)
++#endif
  
-         prev = m->prev;
-@@ -855,8 +858,10 @@ stat_ipcache_get(StoreEntry * sentry)
-     dlink_node *m;
-     assert(ip_table != NULL);
-     storeAppendPrintf(sentry, "IP Cache Statistics:\n");
--    storeAppendPrintf(sentry, "IPcache Entries:  %d\n",
-+    storeAppendPrintf(sentry, "IPcache Entries In Use:  %d\n",
-                       memInUse(MEM_IPCACHE_ENTRY));
-+    storeAppendPrintf(sentry, "IPcache Entries Cached:  %d\n",
-+                      ipcacheCount());
-     storeAppendPrintf(sentry, "IPcache Requests: %d\n",
-                       IpcacheStats.requests);
-     storeAppendPrintf(sentry, "IPcache Hits:            %d\n",
-@@ -1231,7 +1236,7 @@ snmp_netIpFn(variable_list * Var, snint * ErrP)
+ #endif /* _SQUID_HPUX_ */
+ #endif /* SQUID_OS_HPUX_H */
+@@ -716,5 +716,10 @@ struct rusage {
  
-     case IP_ENT:
-         Answer = snmp_var_new_integer(Var->name, Var->name_length,
--                                      memInUse(MEM_IPCACHE_ENTRY),
-+                                      ipcacheCount(),
-                                       SMI_GAUGE32);
-         break;
+ #undef ACL
  
-@@ -794,11 +794,18 @@ Log::Format::SquidCustom(AccessLogEntry * al, customlog * log)
++#if !defined(getpagesize)
++/* Windows may lack getpagesize() prototype */
++SQUIDCEXTERN size_t getpagesize(void);
++#endif
++
+ #endif /* _SQUID_WIN32_ */
+ #endif /* SQUID_OS_MSWIN_H */
+@@ -0,0 +1,23 @@
++#ifndef SQUID_CONFIG_H
++#include "config.h"
++#endif
++
++#ifndef SQUID_OS_NETBSD_H
++#define SQUID_OS_NETBSD_H
++
++#ifdef _SQUID_NETBSD_
++
++/****************************************************************************
++ *--------------------------------------------------------------------------*
++ * DO *NOT* MAKE ANY CHANGES below here unless you know what you're doing...*
++ *--------------------------------------------------------------------------*
++ ****************************************************************************/
++
++/* Exclude CPPUnit tests from the allocator restrictions. */
++/* BSD implementation uses these still */
++#if defined(SQUID_UNIT_TEST)
++#define SQUID_NO_ALLOC_PROTECT 1
++#endif
++
++#endif /* _SQUID_NETBSD_ */
++#endif /* SQUID_OS_NETBSD_H */
+@@ -20,6 +20,11 @@
+ #undef HAVE_MALLOC_H
+ #endif
+ 
++/* Exclude CPPUnit tests from the allocator restrictions. */
++/* BSD implementation uses these still */
++#if defined(SQUID_UNIT_TEST)
++#define SQUID_NO_ALLOC_PROTECT 1
++#endif
+ 
+ #endif /* _SQUID_OPENBSD_ */
+ #endif /* SQUID_OS_OPENBSD_H */
+@@ -14,6 +14,11 @@
+  ****************************************************************************/
+ 
+ 
++/* O_NONBLOCK requires <fcntl.h> to be included first */
++#if HAVE_FCNTL_H
++#include <fcntl.h>
++#endif
++
+ /*
+  * We assume O_NONBLOCK is broken, or does not exist, on SunOS.
+  */
+@@ -0,0 +1,33 @@
++#ifndef SQUID_CONFIG_H
++#include "config.h"
++#endif
++
++#ifndef _SQUID_COMPAT_UNSAFE_H
++#define _SQUID_COMPAT_UNSAFE_H
++
++/*
++ * Trap unintentional use of functions unsafe for use within squid.
++ */
++
++#if !SQUID_NO_ALLOC_PROTECT
++#ifndef free
++#define free(x) ERROR_free_UNSAFE_IN_SQUID(x)
++#endif
++#ifndef malloc
++#define malloc ERROR_malloc_UNSAFE_IN_SQUID
++#endif
++#ifndef calloc
++#define calloc ERROR_calloc_UNSAFE_IN_SQUID
++#endif
++#endif /* !SQUID_NO_ALLOC_PROTECT */
++
++#if !SQUID_NO_STRING_BUFFER_PROTECT
++#ifndef sprintf
++#define sprintf ERROR_sprintf_UNSAFE_IN_SQUID
++#endif
++#ifndef strdup
++#define strdup ERROR_strdup_UNSAFE_IN_SQUID
++#endif
++#endif /* SQUID_NO_STRING_BUFFER_PROTECT */
++
++#endif /* _SQUID_COMPAT_UNSAFE_H */
+@@ -22,11 +22,8 @@
+  * along with this program; if not, write to the Free Software
+  * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+  */
++#define SQUID_NO_ALLOC_PROTECT 1
+ 
+-int SMBlib_errno;
+-int SMBlib_SMB_Error;
+-#define SMBLIB_ERRNO
+-#define uchar unsigned char
+ #include "util.h"
+ #include "smblib-priv.h"
+ #include "smblib.h"
+@@ -41,6 +38,11 @@ int SMBlib_SMB_Error;
+ #include <string.h>
+ #include <signal.h>
+ 
++#define SMBLIB_ERRNO
++#define uchar unsigned char
++
++int SMBlib_errno;
++int SMBlib_SMB_Error;
+ SMB_State_Types SMBlib_State;
+ 
+ /* Initialize the SMBlib package     */
+@@ -24,12 +24,13 @@
+  */
+ 
+ /* the types are provided by squid's configure preocess */
++#define SQUID_NO_ALLOC_PROTECT 1
+ #include "config.h"
++
+ #define BOOL int16_t
+ #define int16 int16_t
+ 
+ #include <netdb.h>
+-#include <sys/types.h>
+ #include <netinet/in.h>
+ #include <sys/socket.h>
+ #include <signal.h>
+@@ -189,7 +189,7 @@ char *md5sum(const char *s)
+     SquidMD5Final(digest,&ctx);
+ 
+     for (idx=0; idx<16; idx++)
+-        sprintf(&sum[idx*2],"%02x",digest[idx]);
++        snprintf(&sum[idx*2],(33-(idx*2)),"%02x",digest[idx]);
+ 
+     sum[32]='\0';
+ 
+@@ -65,6 +65,8 @@
+  *
+  * Compile this program with: gcc -o basic_pam_auth basic_pam_auth.cc -lpam -ldl
+  */
++#define SQUID_NO_ALLOC_PROTECT 1
++#define SQUID_NO_STRING_BUFFER_PROTECT 1
+ #include "config.h"
+ 
+ #include "rfc1738.h"
+@@ -28,6 +28,8 @@
+  *
+  * Copyright (c) 2003  Robert Collins  <robertc@squid-cache.org>
+  */
++#define SQUID_NO_ALLOC_PROTECT 1
++#include "config.h"
+ 
+ #include "text_backend.h"
+ 
+@@ -171,7 +171,7 @@ check_gss_err(OM_uint32 major_status, OM_uint32 minor_status,
+                                           GSS_C_GSS_CODE, GSS_C_NULL_OID, &msg_ctx, &status_string);
+             if (maj_stat == GSS_S_COMPLETE) {
+                 if (sizeof(buf) > len + status_string.length + 1) {
+-                    sprintf(buf + len, "%s", (char *) status_string.value);
++                    snprintf(buf + len, (sizeof(buf)-len), "%s", (char *) status_string.value);
+                     len += status_string.length;
                  }
-             }
- 
--            if (fmt->width) {
-+            // enforce width limits if configured
-+            const bool haveMaxWidth = fmt->precision && !doint && !dooff;
-+            if (haveMaxWidth || fmt->width) {
-+                const int minWidth = fmt->width ?
-+                                     static_cast<int>(fmt->width) : 0;
-+                const int maxWidth = haveMaxWidth ?
-+                                     static_cast<int>(fmt->precision) : strlen(out);
+                 gss_release_buffer(&min_stat, &status_string);
+@@ -180,7 +180,7 @@ check_gss_err(OM_uint32 major_status, OM_uint32 minor_status,
+             gss_release_buffer(&min_stat, &status_string);
+         }
+         if (sizeof(buf) > len + 2) {
+-            sprintf(buf + len, "%s", ". ");
++            snprintf(buf + len, (sizeof(buf)-len), "%s", ". ");
+             len += 2;
+         }
+         msg_ctx = 0;
+@@ -190,7 +190,7 @@ check_gss_err(OM_uint32 major_status, OM_uint32 minor_status,
+                                           GSS_C_MECH_CODE, GSS_C_NULL_OID, &msg_ctx, &status_string);
+             if (maj_stat == GSS_S_COMPLETE) {
+                 if (sizeof(buf) > len + status_string.length) {
+-                    sprintf(buf + len, "%s", (char *) status_string.value);
++                    snprintf(buf + len,(sizeof(buf)-len), "%s", (char *) status_string.value);
+                     len += status_string.length;
+                 }
+                 gss_release_buffer(&min_stat, &status_string);
+@@ -122,7 +122,7 @@ check_gss_err(OM_uint32 major_status, OM_uint32 minor_status,
+                                           GSS_C_GSS_CODE, GSS_C_NULL_OID, &msg_ctx, &status_string);
+             if (maj_stat == GSS_S_COMPLETE) {
+                 if (sizeof(buf) > len + status_string.length + 1) {
+-                    sprintf(buf + len, "%s", (char *) status_string.value);
++                    snprintf(buf + len, (sizeof(buf)-len), "%s", (char *)status_string.value);
+                     len += status_string.length;
+                 }
+                 gss_release_buffer(&min_stat, &status_string);
+@@ -131,7 +131,7 @@ check_gss_err(OM_uint32 major_status, OM_uint32 minor_status,
+             gss_release_buffer(&min_stat, &status_string);
+         }
+         if (sizeof(buf) > len + 2) {
+-            sprintf(buf + len, "%s", ". ");
++            snprintf(buf + len, (sizeof(buf)-len), "%s", ". ");
+             len += 2;
+         }
+         msg_ctx = 0;
+@@ -141,7 +141,7 @@ check_gss_err(OM_uint32 major_status, OM_uint32 minor_status,
+                                           GSS_C_MECH_CODE, GSS_C_NULL_OID, &msg_ctx, &status_string);
+             if (maj_stat == GSS_S_COMPLETE) {
+                 if (sizeof(buf) > len + status_string.length) {
+-                    sprintf(buf + len, "%s", (char *) status_string.value);
++                    snprintf(buf + len, (sizeof(buf)-len), "%s", (char *) status_string.value);
+                     len += status_string.length;
+                 }
+                 gss_release_buffer(&min_stat, &status_string);
+@@ -13,11 +13,11 @@
+  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
+  *
+  */
+-
++#define SQUID_NO_ALLOC_PROTECT 1
+ #include "config.h"
 +
-                 if (fmt->left)
--                    mb.Printf("%-*s", (int) fmt->width, out);
-+                    mb.Printf("%-*.*s", minWidth, maxWidth, out);
-                 else
--                    mb.Printf("%*s", (int) fmt->width, out);
-+                    mb.Printf("%*.*s", minWidth, maxWidth, out);
-             } else
-                 mb.append(out, strlen(out));
-         } else {
-@@ -75,11 +75,12 @@ Log::Format::SquidIcap(AccessLogEntry * al, Logfile * logfile)
-     if (user && !*user)
-         safe_free(user);
+ #include "ntlmauth.h"
+ #include "ntlm_smb_lm_auth.h"
+-#include "squid_endian.h"
+ #include "util.h"
+ #include "smbval/smblib-common.h"
+ #include "smbval/rfcnb-error.h"
+@@ -46,27 +46,27 @@
+ #define IVAL(buf,pos) (SVAL(buf,pos)|SVAL(buf,(pos)+2)<<16)
+ #define SSVALX(buf,pos,val) (CVAL(buf,pos)=(val)&0xFF,CVAL(buf,pos+1)=(val)>>8)
+ #define SIVALX(buf,pos,val) (SSVALX(buf,pos,val&0xFFFF),SSVALX(buf,pos+2,val>>16))
+-#define SVALS(buf,pos) ((int16)SVAL(buf,pos))
+-#define IVALS(buf,pos) ((int32)IVAL(buf,pos))
+-#define SSVAL(buf,pos,val) SSVALX((buf),(pos),((uint16)(val)))
+-#define SIVAL(buf,pos,val) SIVALX((buf),(pos),((uint32)(val)))
+-#define SSVALS(buf,pos,val) SSVALX((buf),(pos),((int16)(val)))
+-#define SIVALS(buf,pos,val) SIVALX((buf),(pos),((int32)(val)))
++#define SVALS(buf,pos) ((int16_t)SVAL(buf,pos))
++#define IVALS(buf,pos) ((int32_t)IVAL(buf,pos))
++#define SSVAL(buf,pos,val) SSVALX((buf),(pos),((uint16_t)(val)))
++#define SIVAL(buf,pos,val) SIVALX((buf),(pos),((uint32_t)(val)))
++#define SSVALS(buf,pos,val) SSVALX((buf),(pos),((int16_t)(val)))
++#define SIVALS(buf,pos,val) SIVALX((buf),(pos),((int32_t)(val)))
+ #else
+ /* this handles things for architectures like the 386 that can handle
+  * alignment errors */
+ /*
+  * WARNING: This section is dependent on the length of int16 and int32
+  * being correct
+  */
+-#define SVAL(buf,pos) (*(uint16 *)((char *)(buf) + (pos)))
+-#define IVAL(buf,pos) (*(uint32 *)((char *)(buf) + (pos)))
+-#define SVALS(buf,pos) (*(int16 *)((char *)(buf) + (pos)))
+-#define IVALS(buf,pos) (*(int32 *)((char *)(buf) + (pos)))
+-#define SSVAL(buf,pos,val) SVAL(buf,pos)=((uint16)(val))
+-#define SIVAL(buf,pos,val) IVAL(buf,pos)=((uint32)(val))
+-#define SSVALS(buf,pos,val) SVALS(buf,pos)=((int16)(val))
+-#define SIVALS(buf,pos,val) IVALS(buf,pos)=((int32)(val))
++#define SVAL(buf,pos) (*(uint16_t *)((char *)(buf) + (pos)))
++#define IVAL(buf,pos) (*(uint32_t *)((char *)(buf) + (pos)))
++#define SVALS(buf,pos) (*(int16_t *)((char *)(buf) + (pos)))
++#define IVALS(buf,pos) (*(int32_t *)((char *)(buf) + (pos)))
++#define SSVAL(buf,pos,val) SVAL(buf,pos)=((uint16_t)(val))
++#define SIVAL(buf,pos,val) IVAL(buf,pos)=((uint32_t)(val))
++#define SSVALS(buf,pos,val) SVALS(buf,pos)=((int16_t)(val))
++#define SIVALS(buf,pos,val) IVALS(buf,pos)=((int32_t)(val))
+ #endif
  
--    logfilePrintf(logfile, "%9ld.%03d %6d %s -/%03d %"PRId64" %s %s %s -/%s -\n",
-+    logfilePrintf(logfile, "%9ld.%03d %6d %s %s/%03d %"PRId64" %s %s %s -/%s -\n",
-                   (long int) current_time.tv_sec,
-                   (int) current_time.tv_usec / 1000,
-                   al->icap.trTime,
-                   client,
-+                  al->icap.outcome,
-                   al->icap.resStatus,
-                   al->icap.bytesRead,
-                   Adaptation::Icap::ICAP::methodStr(al->icap.reqMethod),
-@@ -189,8 +189,8 @@ class logformat_token
-         } header;
-         char *timespec;
-     } data;
--    unsigned char width;
--    unsigned char precision;
-+    unsigned int width;
-+    unsigned int precision;
-     enum log_quote quote;
-     unsigned int left:1;
-     unsigned int space:1;
-@@ -1208,10 +1208,10 @@ SquidMainSafe(int argc, char **argv)
-     try {
-         return SquidMain(argc, argv);
-     } catch (const std::exception &e) {
--        std::cerr << "dying from an unhandled exception: " << e.what() << std::endl;
-+        debugs(0,0, "dying from an unhandled exception: " << e.what());
-         throw;
-     } catch (...) {
--        std::cerr << "dying from an unhandled exception." << std::endl;
-+        debugs(0,0, "dying from an unhandled exception.");
-         throw;
-     }
-     return -1; // not reached
-@@ -489,7 +489,8 @@ void
- memClean(void)
+ 
+@@ -22,24 +22,17 @@
+  * along with this program; if not, write to the Free Software
+  * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+  */
++#define SQUID_NO_ALLOC_PROTECT 1
++#include "config.h"
+ 
+ #include <string.h>
+-#include <stdlib.h>
+ 
+ #include "std-includes.h"
+ #include "rfcnb-priv.h"
+ #include "rfcnb-util.h"
+ #include "rfcnb-io.h"
+ #include <arpa/inet.h>
+ 
+-#ifndef uint16
+-#ifdef u_int16_t
+-typedef u_int16_t uint16;
+-#else
+-typedef unsigned short uint16;
+-#endif
+-#endif
+-
+ extern void (*Prot_Print_Routine) ();	/* Pointer to protocol print routine */
+ 
+ /* Convert name and pad to 16 chars as needed */
+@@ -22,9 +22,10 @@
+  * along with this program; if not, write to the Free Software
+  * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+  */
++#define SQUID_NO_ALLOC_PROTECT 1
++#include "config.h"
+ 
+ #include <string.h>
+-#include <stdlib.h>
+ 
+ int RFCNB_errno = 0;
+ int RFCNB_saved_errno = 0;
+@@ -347,14 +348,12 @@ RFCNB_Listen()
+ void
+ RFCNB_Get_Error(char *buffer, int buf_len)
  {
-     MemPoolGlobalStats stats;
--    MemPools::GetInstance().setIdleLimit(0);
-+    if (Config.MemPools.limit > 0) // do not reset if disabled or same
-+        MemPools::GetInstance().setIdleLimit(0);
-     MemPools::GetInstance().clean(0);
-     memPoolGetGlobalStats(&stats);
- 
-@@ -254,6 +254,16 @@ StoreEntry::delayAwareRead(int fd, char *buf, int len, AsyncCall::Pointer callba
- 
+-
+     if (RFCNB_saved_errno <= 0) {
+-        sprintf(buffer, "%s", RFCNB_Error_Strings[RFCNB_errno]);
++        snprintf(buffer, buf_len, "%s", RFCNB_Error_Strings[RFCNB_errno]);
+     } else {
+-        sprintf(buffer, "%s\n\terrno:%s", RFCNB_Error_Strings[RFCNB_errno],
++        snprintf(buffer, buf_len, "%s\n\terrno:%s", RFCNB_Error_Strings[RFCNB_errno],
+                 strerror(RFCNB_saved_errno));
      }
- 
-+    if (fd_table[fd].closing()) {
-+        // Readers must have closing callbacks if they want to be notified. No
-+        // readers appeared to care around 2009/12/14 as they skipped reading
-+        // for other reasons. Closing may already be true at the delyaAwareRead
-+        // call time or may happen while we wait after delayRead() above.
-+        debugs(20, 3, HERE << "wont read from closing FD " << fd << " for " <<
-+               callback);
-+        return; // the read callback will never be called
-+    }
-+
-     comm_read(fd, buf, amountToRead, callback);
+-
  }
  
+ /* Pick up the last error response and returns as a code                 */
+@@ -22,9 +22,10 @@
+  * along with this program; if not, write to the Free Software
+  * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+  */
++#define SQUID_NO_ALLOC_PROTECT 1
++#include "config.h"
+ 
+ #include "smblib-priv.h"
+-#include <stdlib.h>
+ #include <string.h>
+ 
+ #include "rfcnb.h"
+@@ -112,7 +113,7 @@ SMB_DOSTimToStr(int DOS_time)
+     DOS_month = (DOS_time & 0x01E00000) >> 21;
+     DOS_year = ((DOS_time & 0xFE000000) >> 25) + 80;
+ 
+-    sprintf(SMB_Time_Temp, "%2d/%02d/%2d %2d:%02d:%02d", DOS_day, DOS_month,
++    snprintf(SMB_Time_Temp, 48, "%2d/%02d/%2d %2d:%02d:%02d", DOS_day, DOS_month,
+             DOS_year, DOS_hour, DOS_min, DOS_sec);
+ 
+     return (SMB_Time_Temp);
+@@ -23,9 +23,9 @@
+  * along with this program; if not, write to the Free Software
+  * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+  */
+-
++#define SQUID_NO_ALLOC_PROTECT 1
+ #include "config.h"
+-#include <stdlib.h>
++
+ #include <ctype.h>
+ #include <string.h>
+ 
+@@ -209,7 +209,7 @@ class MemAllocator
+     /**
+      * Free a element allocated by MemAllocator::alloc()
+      */
+-    virtual void free(void *) = 0;
++    virtual void freeOne(void *) = 0;
+ 
+     virtual char const *objectType() const;
+     virtual size_t objectSize() const = 0;
+@@ -259,7 +259,7 @@ class MemAllocatorProxy
+     /**
+      * Free a element allocated by MemAllocatorProxy::alloc()
+      */
+-    void free(void *);
++    void freeOne(void *);
+ 
+     int inUseCount() const;
+     size_t objectSize() const;
+@@ -317,7 +317,7 @@ CLASS::operator new (size_t byteCount) \
+ void \
+ CLASS::operator delete (void *address) \
+ { \
+-    Pool().free(address); \
++    Pool().freeOne(address); \
+ }
+ 
+ /// \ingroup MemPoolsAPI
+@@ -338,7 +338,7 @@ class MemImplementingAllocator : public MemAllocator
+     /**
+      * Free a element allocated by MemImplementingAllocator::alloc()
+      */
+-    virtual void free(void *);
++    virtual void freeOne(void *);
+ 
+     virtual bool idleTrigger(int shift) const = 0;
+     virtual void clean(time_t maxage) = 0;
+@@ -555,7 +555,7 @@ MemImplementingAllocator::alloc()
+ }
+ 
+ void
+-MemImplementingAllocator::free(void *obj)
++MemImplementingAllocator::freeOne(void *obj)
+ {
+     assert(obj != NULL);
+     (void) VALGRIND_CHECK_MEM_IS_ADDRESSABLE(obj, obj_size);
+@@ -882,9 +882,9 @@ MemAllocatorProxy::alloc()
+ }
+ 
+ void
+-MemAllocatorProxy::free(void *address)
++MemAllocatorProxy::freeOne(void *address)
+ {
+-    getAllocator()->free(address);
++    getAllocator()->freeOne(address);
+     /* TODO: check for empty, and if so, if the default type has altered,
+      * switch
+      */
+@@ -1,4 +1,3 @@
+-
+ /*
+  * $Id$
+  *
+@@ -33,13 +32,15 @@
+  *
+  */
+ 
+-/*
++/**
+  * CPU Profiling implementation.
+  *
++ * \par
+  *  This library implements the Probes needed to gather stats.
+  *  See src/ProfStats.c which implements historical recording and
+  *  presentation in CacheMgr.cgi.
+  *
++ * \par
+  *  For timing we prefer on-CPU ops that retrieve cpu ticks counter.
+  *  For Intel, this is "rdtsc", which is 64-bit counter that virtually
+  *  never wraps. For alpha, this is "rpcc" which is 32-bit counter and
+@@ -56,16 +57,19 @@
+  *   probename must be added to profiling.h into xprof_type enum list
+  *   with prepended "XPROF_" string.
+  *
+- * Description.
+- *  PROF gathers stats per probename into structures. It indexes these
++ * \section description Description.
++ * \par PROF
++ *  gathers stats per probename into structures. It indexes these
+  *  structures by enum type index in an array.
+  *
+- *  PROF records best, best, average and worst values for delta time,
++ * \par PROF
++ *  records best, best, average and worst values for delta time,
+  *  also, if UNACCED is defined, it measures "empty" time during which
+  *  no probes are in measuring state. This allows to see time "unaccounted"
+  *  for. If OVERHEAD is defined, additional calculations are made at every
+  *  probe to measure approximate overhead of the probe code itself.
+  *
++ * \par
+  *  Probe data is stored in linked-list, so the more probes you define,
+  *  the more overhead is added to find the deepest nested probe. To reduce
+  *  average overhead, linked list is manipulated each time PR_start is
+@@ -77,17 +81,20 @@
+  *  fast and frequent sections of code, we want to reduce this overhead
+  *  to absolute minimum possible.
+  *
++ * \par
+  *  For actual measurements, probe overhead cancels out mostly. Still,
+  *  do not take the measured times as facts, they should be viewed in
+  *  relative comparison to overall CPU time and on the same platform.
+  *
++ * \par
+  *  Every 1 second, Event within squid is called that parses gathered
+  *  statistics of every probe, and accumulates that into historical
+  *  structures for last 1,5,30 secs, 1,5,30 mins, and 1,5 and 24 hours.
+  *  Each second active probe stats are reset, and only historical data
+  *  is presented in cachemgr output.
+  *
+- * Reading stats.
++ * \section reading Reading stats.
++ * \par
+  *  "Worst case" may be misleading. Anything can happen at any section
+  *  of code that could delay reaching to probe stop. For eg. system may
+  *  need to service interrupt routine, task switch could occur, or page
+@@ -99,19 +106,23 @@
+  *  in given section of code, and its average completion time. This data
+  *  could be used to detect bottlenecks withing squid and optimise them.
+  *
++ * \par
+  *  TOTALS are quite off reality. Its there just to summarise cumulative
+  *  times and percent column. Percent values over 100% shows that there
+  *  have been some probes nested into each other.
+  *
+  */
+ 
+-#include "profiling.h"
+-
+-#include <assert.h>
++#define SQUID_NO_ALLOC_PROTECT 1
++#include "config.h"
+ 
+ #ifdef USE_XPROF_STATS
+ 
++#include "profiling.h"
+ 
++#if HAVE_ASSERT_H
++#include <assert.h>
++#endif
+ #if HAVE_GNUMALLLOC_H
+ #include <gnumalloc.h>
+ #elif HAVE_MALLOC_H
+@@ -1,4 +1,3 @@
+-
+ /*
+  * $Id$
+  *
+@@ -35,6 +34,9 @@
+ 
+ #define _etext etext
+ 
++/* NP: this file is where the memory allocators are defined. */
++#define SQUID_NO_ALLOC_PROTECT 1
++
+ #include "config.h"
+ #include "profiling.h"
+ 
+@@ -21,6 +21,7 @@ ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS
+ SOFTWARE.
+ ******************************************************************/
+ 
++#define SQUID_NO_STRING_BUFFER_PROTECT 1
+ #include "config.h"
+ 
+ #include <stdio.h>
+@@ -166,7 +166,7 @@ DiskThreadsIOStrategy::callback()
+         if (ctrlp->operation == _AIO_READ)
+             squidaio_xfree(ctrlp->bufp, ctrlp->len);
+ 
+-        squidaio_ctrl_pool->free(ctrlp);
++        squidaio_ctrl_pool->freeOne(ctrlp);
+     }
+ 
+     return retval;
+@@ -218,7 +218,7 @@ squidaio_xfree(void *p, int size)
+     MemAllocator *pool;
+ 
+     if ((pool = squidaio_get_pool(size)) != NULL) {
+-        pool->free(p);
++        pool->freeOne(p);
+     } else
+         xfree(p);
+ }
+@@ -230,7 +230,7 @@ squidaio_xstrfree(char *str)
+     int len = strlen(str) + 1;
+ 
+     if ((pool = squidaio_get_pool(len)) != NULL) {
+-        pool->free(str);
++        pool->freeOne(str);
+     } else
+         xfree(str);
+ }
+@@ -634,7 +634,7 @@ squidaio_cleanup_request(squidaio_request_t * requestp)
+         resultp->aio_errno = requestp->err;
+     }
+ 
+-    squidaio_request_pool->free(requestp);
++    squidaio_request_pool->freeOne(requestp);
+ }				/* squidaio_cleanup_request */
+ 
+ 
+@@ -125,7 +125,7 @@ aioCancel(int fd)
+         }
+ 
+         dlinkDelete(m, &used_list);
+-        DiskThreadsIOStrategy::Instance.squidaio_ctrl_pool->free(ctrlp);
++        DiskThreadsIOStrategy::Instance.squidaio_ctrl_pool->freeOne(ctrlp);
+     }
+ }
+ 
+@@ -99,7 +99,7 @@ template <class MatchType>
+ void
+ ACLStrategised<MatchType>::operator delete (void *address)
+ {
+-    Pool->free(address);
++    Pool->freeOne(address);
+ }
+ 
+ template <class MatchType>
+@@ -220,7 +220,7 @@ authenticateDigestNonceDelete(digest_nonce_h * nonce)
+ 
+         safe_free(nonce->key);
+ 
+-        digest_nonce_pool->free(nonce);
++        digest_nonce_pool->freeOne(nonce);
+     }
+ }
+ 
+@@ -379,10 +379,10 @@ cbdataInternalFree(void *p)
+ #if HASHED_CBDATA
+     hash_remove_link(cbdata_htable, &c->hash);
+     delete c;
+-    cbdata_index[theType].pool->free((void *)p);
++    cbdata_index[theType].pool->freeOne((void *)p);
+ #else
+     c->cbdata::~cbdata();
+-    cbdata_index[theType].pool->free(c);
++    cbdata_index[theType].pool->freeOne(c);
+ #endif
+     return NULL;
+ }
+@@ -489,10 +489,10 @@ cbdataInternalUnlock(const void *p)
+ #if HASHED_CBDATA
+     hash_remove_link(cbdata_htable, &c->hash);
+     delete c;
+-    cbdata_index[theType].pool->free((void *)p);
++    cbdata_index[theType].pool->freeOne((void *)p);
+ #else
+     c->cbdata::~cbdata();
+-    cbdata_index[theType].pool->free(c);
++    cbdata_index[theType].pool->freeOne(c);
+ #endif
+ }
+ 
+@@ -1,4 +1,3 @@
+-
+ /*
+  * $Id$
+  *
+@@ -41,6 +40,20 @@
+ 
+ #ifdef USE_POLL
+ 
++#if HAVE_POLL_H
++#include <poll.h>
++#endif
++
++/* Needed for poll() on Linux at least */
++#if USE_POLL
++#ifndef POLLRDNORM
++#define POLLRDNORM POLLIN
++#endif
++#ifndef POLLWRNORM
++#define POLLWRNORM POLLOUT
++#endif
++#endif
++
+ static int MAX_POLL_TIME = 1000;	/* see also comm_quick_poll_required() */
+ 
+ #ifndef        howmany
+@@ -31,7 +31,7 @@ dlinkNodeDelete(dlink_node * m)
+     if (m == NULL)
+         return;
+ 
+-    dlink_node_pool->free(m);
++    dlink_node_pool->freeOne(m);
+ }
+ 
+ void
+@@ -786,7 +786,7 @@ helperStatefulServerFree(int fd, void *data)
+     }
+ 
+     if (srv->data != NULL)
+-        hlp->datapool->free(srv->data);
++        hlp->datapool->freeOne(srv->data);
+ 
+     cbdataReferenceDone(srv->parent);
+ 
+@@ -639,7 +639,7 @@ htcpFreeSpecifier(htcpSpecifier * s)
+ static void
+ htcpFreeDetail(htcpDetail * d)
+ {
+-    htcpDetailPool->free(d);
++    htcpDetailPool->freeOne(d);
+ }
+ 
+ /*
+@@ -186,7 +186,7 @@ memAllocate(mem_type type)
+ void
+ memFree(void *p, int type)
+ {
+-    MemPools[type]->free(p);
++    MemPools[type]->freeOne(p);
+ }
+ 
+ /* allocate a variable size buffer using best-fit pool */
+@@ -241,7 +241,7 @@ memFreeString(size_t size, void *buf)
+ 
+     memMeterDec(StrCountMeter);
+     memMeterDel(StrVolumeMeter, size);
+-    pool ? pool->free(buf) : xfree(buf);
++    pool ? pool->freeOne(buf) : xfree(buf);
+ }
+ 
+ /* Find the best fit MEM_X_BUF type */
+@@ -61,7 +61,7 @@ IdleConnList::~IdleConnList()
+     parent->unlinkList(this);
+ 
+     if (nfds_alloc == PCONN_FDS_SZ)
+-        pconn_fds_pool->free(fds);
++        pconn_fds_pool->freeOne(fds);
+     else
+         xfree(fds);
+ 
+@@ -118,7 +118,7 @@ IdleConnList::push(int fd)
+         xmemcpy(fds, old, nfds * sizeof(int));
+ 
+         if (nfds == PCONN_FDS_SZ)
+-            pconn_fds_pool->free(old);
++            pconn_fds_pool->freeOne(old);
+         else
+             xfree(old);
+     }
+@@ -135,7 +135,7 @@ lru_remove(RemovalPolicy * policy, StoreEntry * entry, RemovalPolicyNode * node)
+ 
+     dlinkDelete(&lru_node->node, &lru->list);
+ 
+-    lru_node_pool->free(lru_node);
++    lru_node_pool->freeOne(lru_node);
+ 
+     lru->count -= 1;
+ }
+@@ -249,7 +249,7 @@ lru_purgeNext(RemovalPurgeWalker * walker)
+         goto try_again;
+     }
+ 
+-    lru_node_pool->free(lru_node);
++    lru_node_pool->freeOne(lru_node);
+     lru->count -= 1;
+     lru->setPolicyNode(entry, NULL);
+     return entry;
+@@ -52,9 +52,6 @@ using namespace Squid;
+ #if HAVE_ERRNO_H
+ #include <errno.h>
+ #endif
+-#if HAVE_FCNTL_H
+-#include <fcntl.h>
+-#endif
+ #if HAVE_GRP_H
+ #include <grp.h>
+ #endif
+@@ -132,114 +129,17 @@ using namespace Squid;
+ #ifdef _SQUID_WIN32_
+ #include <io.h>
+ #endif
+-
+-#if HAVE_DIRENT_H
+-#include <dirent.h>
+-#define NAMLEN(dirent) strlen((dirent)->d_name)
+-#else /* HAVE_DIRENT_H */
+-#define dirent direct
+-#define NAMLEN(dirent) (dirent)->d_namlen
+-#if HAVE_SYS_NDIR_H
+-#include <sys/ndir.h>
+-#endif /* HAVE_SYS_NDIR_H */
+-#if HAVE_SYS_DIR_H
+-#include <sys/dir.h>
+-#endif /* HAVE_SYS_DIR_H */
+-#if HAVE_NDIR_H
+-#include <ndir.h>
+-#endif /* HAVE_NDIR_H */
+-#endif /* HAVE_DIRENT_H */
+-
+-#if defined(__QNX__)
+-#include <unix.h>
+-#endif
+-
+ #if HAVE_SYS_MOUNT_H
+ #include <sys/mount.h>
+ #endif
+-
+-/*
+- * We require poll.h before using poll().  If the symbols used
+- * by poll() are defined elsewhere, we will need to make this
+- * a more sophisticated test.
+- *  -- Oskar Pearson <oskar@is.co.za>
+- *  -- Stewart Forster <slf@connect.com.au>
+- */
+-#if USE_POLL
+-#if HAVE_POLL_H
+-#include <poll.h>
+-#endif /* HAVE_POLL_H */
+-#endif /* USE_POLL */
+-
+-
+-/*
+- * Trap unintentional use of fd_set. Must not be used outside the
+- * select code as it only supports FD_SETSIZE number of filedescriptors
+- * and Squid may be running with a lot more..
+- * But only for code linked into Squid, not the helpers.. (unlinkd, pinger)
+- */
+-#ifdef SQUID_FDSET_NOUSE
+-# ifndef SQUID_HELPER
+-#  define fd_set ERROR_FD_SET_USED
+-# endif
+-#endif
+-
+ #if HAVE_MATH_H
+ #include <math.h>
+ #endif
+ 
+-#if 0  // moved to include/rfc2181.h - RFC defined constants
+-#define SQUIDHOSTNAMELEN 256
+-#endif
+-
+ #ifndef MAXPATHLEN
+ #define MAXPATHLEN SQUID_MAXPATHLEN
+ #endif
+ 
+-
+-#if !HAVE_STRUCT_RUSAGE
+-/*
+- * If we don't have getrusage() then we create a fake structure
+- * with only the fields Squid cares about.  This just makes the
+- * source code cleaner, so we don't need lots of #ifdefs in other
+- * places
+- */
+-
+-struct rusage {
+-
+-    struct timeval ru_stime;
+-
+-    struct timeval ru_utime;
+-    int ru_maxrss;
+-    int ru_majflt;
+-};
+-
+-#endif
+-
+-#if !defined(HAVE_GETPAGESIZE) && defined(_SQUID_HPUX_)
+-#define HAVE_GETPAGESIZE
+-#define getpagesize( )   sysconf(_SC_PAGE_SIZE)
+-#endif
+-
+-#if defined(_SQUID_MSWIN_) && !defined(getpagesize)
+-/* Windows may lack getpagesize() prototype */
+-SQUIDCEXTERN size_t getpagesize(void);
+-#endif /* _SQUID_MSWIN_ */
+-
+-#ifndef SA_RESTART
+-#define SA_RESTART 0
+-#endif
+-#ifndef SA_NODEFER
+-#define SA_NODEFER 0
+-#endif
+-#ifndef SA_RESETHAND
+-#define SA_RESETHAND 0
+-#endif
+-#if SA_RESETHAND == 0 && defined(SA_ONESHOT)
+-#undef SA_RESETHAND
+-#define SA_RESETHAND SA_ONESHOT
+-#endif
+-
+ #if LEAK_CHECK_MODE
+ #define LOCAL_ARRAY(type,name,size) \
+         static type *local_##name=NULL; \
+@@ -259,16 +159,6 @@ SQUIDCEXTERN size_t getpagesize(void);
+ #include "ssl_support.h"
+ #endif
+ 
+-/* Needed for poll() on Linux at least */
+-#if USE_POLL
+-#ifndef POLLRDNORM
+-#define POLLRDNORM POLLIN
+-#endif
+-#ifndef POLLWRNORM
+-#define POLLWRNORM POLLOUT
+-#endif
+-#endif
+-
+ #ifdef SQUID_SNMP
+ #include "cache_snmp.h"
+ #endif
+@@ -306,55 +196,6 @@ SQUIDCEXTERN size_t getpagesize(void);
+ #include "protos.h"
+ #include "globals.h"
+ 
+-/* Exclude CPPUnit tests from the below restriction. */
+-/* BSD implementation uses these still */
+-#if !defined(SQUID_UNIT_TEST)
+-/*
+- * Squid source files should not call these functions directly.
+- * Use xmalloc, xfree, xcalloc, snprintf, and xstrdup instead.
+- * Also use xmemcpy, xisspace, ...
+- */
+-#ifndef malloc
+-#define malloc +
+-#endif
+-template <class V>
+-void free(V x) { fatal("Do not use ::free()"); }
+-#ifndef calloc
+-#define calloc +
+-#endif
+-#ifndef sprintf
+-#define sprintf +
+-#endif
+-#ifndef strdup
+-#define strdup +
+-#endif
+-#endif /* !SQUID_UNIT_TEST */
+-
+-/*
+- * Hey dummy, don't be tempted to move this to lib/config.h.in
+- * again.  O_NONBLOCK will not be defined there because you didn't
+- * #include <fcntl.h> yet.
+- */
+-#if defined(_SQUID_SUNOS_)
+-/*
+- * We assume O_NONBLOCK is broken, or does not exist, on SunOS.
+- */
+-#define SQUID_NONBLOCK O_NDELAY
+-#elif defined(O_NONBLOCK)
+-/*
+-* We used to assume O_NONBLOCK was broken on Solaris, but evidence
+-* now indicates that its fine on Solaris 8, and in fact required for
+-* properly detecting EOF on FIFOs.  So now we assume that if
+-* its defined, it works correctly on all operating systems.
+-*/
+-#define SQUID_NONBLOCK O_NONBLOCK
+-/*
+-* O_NDELAY is our fallback.
+-*/
+-#else
+-#define SQUID_NONBLOCK O_NDELAY
+-#endif
+-
+ /*
+  * I'm sick of having to keep doing this ..
+  */
+@@ -169,7 +169,7 @@ StoreEntry::operator new (size_t bytecount)
+ void
+ StoreEntry::operator delete (void *address)
+ {
+-    pool->free(address);
++    pool->freeOne(address);
+ }
+ 
+ void
+@@ -74,11 +74,11 @@ MemPoolTest::run()
+     assert (something);
+     assert (something->aValue == 0);
+     something->aValue = 5;
+-    Pool->free(something);
++    Pool->freeOne(something);
+     SomethingToAlloc *otherthing = static_cast<SomethingToAlloc *>(Pool->alloc());
+     assert (otherthing == something);
+     assert (otherthing->aValue == 0);
+-    Pool->free (otherthing);
++    Pool->freeOne(otherthing);
+     delete Pool;
+ }
+ 
+@@ -170,7 +170,7 @@ dlinkNodeDelete(dlink_node * m)
+     if (m == NULL)
+         return;
+ 
+-    dlink_node_pool->free(m);
++    dlink_node_pool->freeOne(m);
+ }
+ 
+ void
+@@ -353,7 +353,7 @@ main(int argc, char *argv[])
+         if (newhost) {
+             char *t;
+             newhost += 3;
+-            newhost = strdup(newhost);
++            newhost = xstrdup(newhost);
+             t = newhost + strcspn(newhost, "@/?");
+             if (*t == '@') {
+                 newhost = t + 1;

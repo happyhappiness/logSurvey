@@ -1,0 +1,241 @@
+@@ -1,7 +1,7 @@
+ #
+ #  Makefile for the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.94 1997/11/12 23:36:19 wessels Exp $
++#  $Id: Makefile.in,v 1.95 1997/11/13 05:25:47 wessels Exp $
+ #
+ #  Uncomment and customize the following to suit your needs:
+ #
+@@ -82,6 +82,7 @@ OBJS	 	= \
+ 		access_log.o \
+ 		acl.o \
+ 		aiops.o \
++		asn.o \
+ 		async_io.o \
+ 		cache_cf.o \
+ 		cbdata.o \
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: acl.cc,v 1.117 1997/11/12 23:36:21 wessels Exp $
++ * $Id: acl.cc,v 1.118 1997/11/13 05:25:48 wessels Exp $
+  *
+  * DEBUG: section 28    Access Control
+  * AUTHOR: Duane Wessels
+@@ -164,6 +164,10 @@ aclType(const char *s)
+ 	return ACL_BROWSER;
+     if (!strcmp(s, "proxy_auth"))
+ 	return ACL_PROXY_AUTH;
++    if (!strcmp(s, "src_as"))
++	return ACL_SRC_ASN;
++    if (!strcmp(s, "dst_as"))
++	return ACL_DST_ASN;
+     return ACL_NONE;
+ }
+ 
+@@ -688,9 +692,13 @@ aclParseAclLine(acl ** head)
+     case ACL_PROXY_AUTH:
+ 	aclParseProxyAuth(&A->data);
+ 	break;
++    case ACL_SRC_ASN:
++    case ACL_DST_ASN:
++	aclParseIntlist(&A->data);
++	break;
+     case ACL_NONE:
+     default:
+-	debug_trap("Bad ACL type");
++	fatal("Bad ACL type");
+ 	break;
+     }
+     if (!new_acl)
+@@ -1232,6 +1240,11 @@ aclMatchAcl(struct _acl *acl, aclCheck_t * checklist)
+ 	    return 1;
+ 	}
+ 	/* NOTREACHED */
++    case ACL_SRC_ASN:
++	return asnMatchIp(&acl->data, checklist->src_addr);
++    case ACL_DST_ASN:
++	assert(0);
++	return 0;
+     case ACL_NONE:
+     default:
+ 	debug(28, 0) ("aclMatchAcl: '%s' has bad type %d\n",
+@@ -1524,6 +1537,10 @@ aclDestroyAcls(acl ** head)
+ 	case ACL_PROXY_AUTH:
+ 	    aclDestroyProxyAuth(a->data);
+ 	    break;
++	case ACL_SRC_ASN:
++	case ACL_DST_ASN:
++	    intlistDestroy(a->data);
++	    break;
+ 	case ACL_NONE:
+ 	default:
+ 	    assert(0);
+@@ -0,0 +1,134 @@
++
++#include "squid.h"
++
++#define WHOIS_PORT 43
++
++static void asnLoadStart(int as);
++static PF asnLoadClose;
++static CNCB asnLoadConnected;
++static PF asnLoadRead;
++
++struct _asnLoadData {
++    int as;
++    char *buf;
++    size_t bufsz;
++    off_t offset;
++};
++
++/* PUBLIC */
++
++int
++asnMatchIp(void *data, struct in_addr addr)
++{
++    return 0;
++}
++
++void
++asnAclInitialize(acl * acls)
++{
++    acl *a;
++    intlist *i;
++    debug(0, 0) ("asnAclInitialize: STARTING\n");
++    for (a = acls; a; a = a->next) {
++	if (a->type != ACL_DST_ASN && a->type != ACL_SRC_ASN)
++	    continue;
++	for (i = a->data; i; i = i->next) {
++	    asnLoadStart(i->i);
++	}
++    }
++}
++
++/* PRIVATE */
++
++static void
++asnLoadStart(int as)
++{
++    int fd;
++    struct _asnLoadData *p = xcalloc(1, sizeof(struct _asnLoadData));
++    cbdataAdd(p);
++    debug(0, 0) ("asnLoad: AS# %d\n", as);
++    p->as = as;
++    fd = comm_open(SOCK_STREAM, 0, any_addr, 0, COMM_NONBLOCKING, "asnLoad");
++    if (fd == COMM_ERROR) {
++	debug(0, 0) ("asnLoad: failed to open a socket\n");
++	return;
++    }
++    comm_add_close_handler(fd, asnLoadClose, p);
++    commConnectStart(fd, "whois.ra.net", WHOIS_PORT, asnLoadConnected, p);
++}
++
++static void
++asnLoadClose(int fdnotused, void *data)
++{
++    struct _asnLoadData *p = data;
++    cbdataFree(p);
++}
++
++static void
++asnLoadConnected(int fd, int status, void *data)
++{
++    struct _asnLoadData *p = data;
++    char buf[128];
++    if (status != COMM_OK) {
++	debug(0, 0) ("asnLoadConnected: connection failed\n");
++	comm_close(fd);
++	return;
++    }
++    snprintf(buf, 128, "!gAS%d\n", p->as);
++    p->offset = 0;
++    p->bufsz = 4096;
++    p->buf = get_free_4k_page();
++    debug(0, 0) ("asnLoadConnected: FD %d, '%s'\n", fd, buf);
++    comm_write(fd, xstrdup(buf), strlen(buf), NULL, p, xfree);
++    commSetSelect(fd, COMM_SELECT_READ, asnLoadRead, p, Config.Timeout.read);
++}
++
++static void
++asnLoadRead(int fd, void *data)
++{
++    struct _asnLoadData *p = data;
++    char *t;
++    char *s;
++    size_t readsz;
++    int len;
++    readsz = p->bufsz - p->offset;
++    readsz--;
++    debug(0, 0) ("asnLoadRead: offset = %d\n", p->offset);
++    s = p->buf + p->offset;
++    len = read(fd, s, readsz);
++    debug(0, 0) ("asnLoadRead: read %d bytes\n", len);
++    if (len <= 0) {
++	debug(0, 0) ("asnLoadRead: got EOF\n");
++	comm_close(fd);
++	return;
++    }
++    fd_bytes(fd, len, FD_READ);
++    p->offset += len;
++    *(s + len) = '\0';
++    s = p->buf;
++    while (*s) {
++	for (t = s; *t; t++) {
++	    if (isspace(*t))
++		break;
++	}
++	if (*t == '\0') {
++	    /* oof, word should continue on next block */
++	    break;
++	}
++	*t = '\0';
++	debug(0, 0) ("asnLoadRead: AS# %d '%s'\n", p->as, s);
++	s = t + 1;
++	while (*s && isspace(*s))
++	    s++;
++    }
++    if (*s) {
++	/* expect more */
++	debug(0, 0) ("asnLoadRead: AS# %d expecting more\n", p->as);
++	xstrncpy(p->buf, s, p->bufsz);
++	p->offset = strlen(p->buf);
++	debug(0, 0) ("asnLoadRead: p->buf = '%s'\n", p->buf);
++    } else {
++	p->offset = 0;
++    }
++    commSetSelect(fd, COMM_SELECT_READ, asnLoadRead, p, Config.Timeout.read);
++}
+@@ -60,6 +60,8 @@ typedef enum {
+     ACL_METHOD,
+     ACL_BROWSER,
+     ACL_PROXY_AUTH,
++    ACL_SRC_ASN,
++    ACL_DST_ASN,
+     ACL_ENUM_MAX
+ } squid_acl;
+ 
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: main.cc,v 1.190 1997/11/10 20:52:57 wessels Exp $
++ * $Id: main.cc,v 1.191 1997/11/13 05:25:49 wessels Exp $
+  *
+  * DEBUG: section 1     Startup and Main Loop
+  * AUTHOR: Harvest Derived
+@@ -528,6 +528,7 @@ mainInitialize(void)
+     useragentOpenLog();
+     errorInitialize();
+     accessLogInit();
++    asnAclInitialize(Config.aclList);
+ 
+ #if MALLOC_DBG
+     malloc_debug(0, malloc_debug_level);
+@@ -549,3 +549,6 @@ extern void dump_peers(StoreEntry *, peer *);
+ extern void pconnPush(int, const char *host, u_short port);
+ extern int pconnPop(const char *host, u_short port);
+ extern void pconnInit(void);
++
++extern int asnMatchIp(void *, struct in_addr);
++extern void asnAclInitialize (acl *);

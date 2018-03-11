@@ -1,526 +1,714 @@
-@@ -3596,6 +3596,7 @@ AC_CONFIG_FILES([\
- 	helpers/log_daemon/file/Makefile \
- 	helpers/url_rewrite/Makefile \
- 	helpers/url_rewrite/fake/Makefile \
-+	helpers/ssl/Makefile \
- 	tools/Makefile
- 	tools/purge/Makefile
- ])
-@@ -20,3 +20,8 @@ SUBDIRS = \
- if ENABLE_AUTH_NTLM
- SUBDIRS += ntlm_auth
- endif
-+
-+if ENABLE_SSL
-+SUBDIRS += ssl
-+endif
-+
-@@ -2351,6 +2351,47 @@ DOC_START
- 	You must have at least one ssl_crtd process.
- DOC_END
- 
-+NAME: sslcrtvalidator_program
-+TYPE: eol
-+IFDEF: USE_SSL
-+DEFAULT: none
-+LOC: Ssl::TheConfig.ssl_crt_validator
-+DOC_START
-+	Specify the location and options of the executable for ssl_crt_validator
-+	process.
-+DOC_END
-+
-+NAME: sslcrtvalidator_children
-+TYPE: HelperChildConfig
-+IFDEF: USE_SSL
-+DEFAULT: 32 startup=5 idle=1
-+LOC: Ssl::TheConfig.ssl_crt_validator_Children
-+DOC_START
-+	The maximum number of processes spawn to service ssl server.
-+	The maximum this may be safely set to is 32.
-+	
-+	The startup= and idle= options allow some measure of skew in your
-+	tuning.
-+	
-+		startup=N
-+	
-+	Sets the minimum number of processes to spawn when Squid
-+	starts or reconfigures. When set to zero the first request will
-+	cause spawning of the first child process to handle it.
-+	
-+	Starting too few children temporary slows Squid under load while it
-+	tries to spawn enough additional processes to cope with traffic.
-+	
-+		idle=N
-+	
-+	Sets a minimum of how many processes Squid is to try and keep available
-+	at all times. When traffic begins to rise above what the existing
-+	processes can handle this many more will be spawned up to the maximum
-+	configured. A minimum setting of 1 is required.
-+	
-+	You must have at least one ssl_crt_validator process.
-+DOC_END
-+
- COMMENT_START
-  OPTIONS WHICH AFFECT THE NEIGHBOR SELECTION ALGORITHM
-  -----------------------------------------------------------------------------
-@@ -68,6 +68,9 @@
- #include "Store.h"
- #include "whois.h"
- #if USE_SSL
-+#include "ssl/cert_validate_message.h"
-+#include "ssl/Config.h"
-+#include "ssl/helper.h"
- #include "ssl/support.h"
- #include "ssl/ErrorDetail.h"
- #include "ssl/ServerBump.h"
-@@ -213,6 +216,12 @@ FwdState::completed()
-             assert(err);
-             errorAppendEntry(entry, err);
-             err = NULL;
-+#if USE_SSL
-+            if (request->flags.sslPeek && request->clientConnectionManager.valid()) {
-+                CallJobHere1(17, 4, request->clientConnectionManager, ConnStateData,
-+                             ConnStateData::httpsPeeked, Comm::ConnectionPointer(NULL));
-+            }
-+#endif
-         } else {
-             EBIT_CLR(entry->flags, ENTRY_FWD_HDR_WAIT);
-             entry->complete();
-@@ -368,14 +377,6 @@ FwdState::startConnectionOrFail()
-             ErrorState *anErr = new ErrorState(ERR_CANNOT_FORWARD, HTTP_INTERNAL_SERVER_ERROR, request);
-             fail(anErr);
-         } // else use actual error from last connection attempt
--#if USE_SSL
--        if (request->flags.sslPeek && request->clientConnectionManager.valid()) {
--            errorAppendEntry(entry, err); // will free err
--            err = NULL;
--            CallJobHere1(17, 4, request->clientConnectionManager, ConnStateData,
--                         ConnStateData::httpsPeeked, Comm::ConnectionPointer(NULL));
--        }
--#endif
-         self = NULL;       // refcounted
-     }
- }
-@@ -758,9 +759,150 @@ FwdState::negotiateSSL(int fd)
-         serverConnection()->getPeer()->sslSession = SSL_get1_session(ssl);
-     }
- 
-+#if 1 // USE_SSL_CERT_VALIDATOR
-+    if (Ssl::TheConfig.ssl_crt_validator) {
-+        Ssl::ValidateCertificate certValidate;
-+        // WARNING: The STACK_OF(*) OpenSSL objects does not support locking.
-+        // If we need to support locking we need to sk_X509_dup the STACK_OF(X509)
-+        // list and lock all of the X509 members of the list.
-+        // Currently we do not use any locking for any of the members of the 
-+        // Ssl::ValidateCertificate class. If the ssl object gone, the value returned 
-+        // from SSL_get_peer_cert_chain may not exist any more. In this code the
-+        // Ssl::ValidateCertificate object used only to pass data to
-+        // Ssl::CertValidationHelper::submit method.
-+        certValidate.peerCerts = SSL_get_peer_cert_chain(ssl);
-+        certValidate.domainName = request->GetHost();
-+        if (Ssl::Errors *errs = static_cast<Ssl::Errors *>(SSL_get_ex_data(ssl, ssl_ex_index_ssl_errors)))
-+            certValidate.errors = errs;
-+        else
-+            certValidate.errors = NULL;
-+        try {
-+            debugs(83, 5, HERE << "Sending SSL certificate for validation to ssl_crtvd.");
-+            Ssl::CertValidateMessage request_message;
-+            request_message.setCode(Ssl::CertValidateMessage::code_cert_validate);
-+            request_message.composeRequest(certValidate);
-+            debugs(83, 5, HERE << "SSL crtvd request: " << request_message.compose().c_str());
-+            Ssl::CertValidationHelper::GetInstance()->sslSubmit(request_message, sslCrtvdHandleReplyWrapper, this);
-+            return;
-+        } catch (const std::exception &e) {
-+            debugs(33, DBG_IMPORTANT, "ERROR: Failed to compose ssl_crtd " <<
-+                   "request for " << certValidate.domainName <<
-+                   " certificate: " << e.what() << "; will now block to " <<
-+                   "validate that certificate.");
-+            // fall through to do blocking in-process generation.
-+        }
-+    }
-+#endif // USE_SSL_CERT_VALIDATOR
-+
-     dispatch();
+@@ -221,11 +221,11 @@ AuthUserRequest::direction()
  }
  
-+#if 1 // USE_SSL_CERT_VALIDATOR
-+void
-+FwdState::sslCrtvdHandleReplyWrapper(void *data, char *reply)
-+{
-+    FwdState * fwd = (FwdState *)(data);
-+    fwd->sslCrtvdHandleReply(reply);
-+}
-+
-+void
-+FwdState::sslCrtvdHandleReply(const char *reply)
-+{
-+    Ssl::Errors *errs = NULL;
-+    Ssl::ErrorDetail *errDetails = NULL;
-+    if (!Comm::IsConnOpen(serverConnection())) {
-+        return;
-+    }
-+    SSL *ssl = fd_table[serverConnection()->fd].ssl;
-+
-+    if (!reply) {
-+        debugs(83, 1, HERE << "\"ssl_crtd\" helper return <NULL> reply");
-+    } else {
-+        Ssl::CertValidateMessage reply_message;
-+        Ssl::ValidateCertificateResponse resp;
-+        std::string error;
-+        if (reply_message.parse(reply, strlen(reply)) != Ssl::CrtdMessage::OK ||
-+            !reply_message.parseResponse(resp, error) ) {
-+            debugs(83, 5, HERE << "Reply from ssl_crtvd for " << request->GetHost() << " is incorrect");
-+        } else {
-+            if (reply_message.getCode() != "OK") {
-+                debugs(83, 5, HERE << "Certificate for " << request->GetHost() << " cannot be validated. ssl_crtvd response: " << reply_message.getBody());
-+            } else {
-+                debugs(83, 5, HERE << "Certificate for " << request->GetHost() << " was successfully validated from ssl_crtvd");
-+                // Copy the list of errors etc....
-+                ACLFilledChecklist *check = NULL;
-+                if (acl_access *acl = Config.ssl_client.cert_error) {
-+                    check = new ACLFilledChecklist(acl, request, dash_str);
-+                    for(std::vector<Ssl::ValidateCertificateResponse::ErrorItem>::const_iterator i = resp.errors.begin(); i != resp.errors.end(); ++i) {
-+                        debugs(83, 7, "Error item: " << i->error_no << " " << i->error_reason << " " << i->certId);
-+
-+                        if (i->error_no == SSL_ERROR_NONE)
-+                            continue; //ignore????
-+
-+                        if (errDetails == NULL && check) {
-+                            check->sslErrors = new Ssl::Errors(i->error_no);
-+                            if (check->fastCheck() == ACCESS_ALLOWED) {
-+                                debugs(83, 3, "bypassing SSL error " << i->error_no << " in " << "buffer");
-+                            } else {
-+                                debugs(83, 5, "confirming SSL error " << i->error_no);
-+                                STACK_OF(X509) *peerCerts = SSL_get_peer_cert_chain(ssl);
-+                                //if i->certID is not correct sk_X509_value returns NULL
-+                                X509 *brokenCert = NULL;
-+                                if (i->cert != NULL)
-+                                    brokenCert = i->cert;
-+                                else
-+                                    brokenCert = sk_X509_value(peerCerts, i->certId);
-+                                X509 *peerCert = SSL_get_peer_certificate(ssl);
-+                                const char *aReason = i->error_reason.empty() ? NULL : i->error_reason.c_str();
-+                                errDetails = new Ssl::ErrorDetail(i->error_no, peerCert, brokenCert, aReason);
-+                                X509_free(peerCert);
-+                                // set error detail reason
-+                            }
-+                            delete check->sslErrors;
-+                            check->sslErrors = NULL;
-+                        }
-+
-+                        if (errs == NULL)
-+                            errs = new Ssl::Errors(i->error_no);
-+                        else 
-+                            errs->push_back_unique(i->error_no);
-+                    }
-+
-+                    if (!errDetails) {
-+                        dispatch();
-+                        return;
-+                    }
-+
-+                }
-+            }
-+        }
-+    }
-+    // Check the list error with
-+    if (errDetails && request->clientConnectionManager.valid()) {
-+        // remember the server certificate from the ErrorDetail object
-+        if (Ssl::ServerBump *serverBump = request->clientConnectionManager->serverBump()) {
-+            // remember validation errors, if any
-+            if (errs) {
-+                if (serverBump->sslErrors)
-+                    cbdataReference(serverBump->sslErrors);
-+                serverBump->sslErrors = cbdataReference(errs);
-+            }
-+        }
-+    }
-+
-+    ErrorState *const anErr = makeConnectingError(ERR_SECURE_CONNECT_FAIL);
-+    anErr->detail = errDetails;
-+    /*anErr->xerrno= Should preserved*/
-+    fail(anErr);
-+    if (serverConnection()->getPeer()) {
-+        peerConnectFailed(serverConnection()->getPeer());
-+    }
-+    serverConn->close();
-+    self = NULL;
-+    return;
-+}
-+#endif // USE_SSL_CERT_VALIDATOR
-+
  void
- FwdState::initiateSSL()
- {
-@@ -823,13 +965,21 @@ FwdState::initiateSSL()
-             Ssl::setClientSNI(ssl, hostname);
-     }
+-AuthUserRequest::addHeader(HttpReply * rep, int accelerated)
++AuthUserRequest::addAuthenticationInfoHeader(HttpReply * rep, int accelerated)
+ {}
  
--    // Create the ACL check list now, while we have access to more info.
--    // The list is used in ssl_verify_cb() and is freed in ssl_free().
--    if (acl_access *acl = Config.ssl_client.cert_error) {
--        ACLFilledChecklist *check = new ACLFilledChecklist(acl, request, dash_str);
--        check->fd(fd);
--        SSL_set_ex_data(ssl, ssl_ex_index_cert_error_check, check);
-+#if 1 // USE_SSL_CERT_VALIDATOR
-+    // If CertValidation Helper used do not lookup checklist for errors,
-+    // but keep a list of errors to send it to CertValidator
-+    if (!Ssl::TheConfig.ssl_crt_validator) {
-+#endif
-+        // Create the ACL check list now, while we have access to more info.
-+        // The list is used in ssl_verify_cb() and is freed in ssl_free().
-+        if (acl_access *acl = Config.ssl_client.cert_error) {
-+            ACLFilledChecklist *check = new ACLFilledChecklist(acl, request, dash_str);
-+            check->fd(fd);
-+            SSL_set_ex_data(ssl, ssl_ex_index_cert_error_check, check);
-+        }
-+#if 1 // USE_SSL_CERT_VALIDATOR
-     }
-+#endif
+ void
+-AuthUserRequest::addTrailer(HttpReply * rep, int accelerated)
++AuthUserRequest::addAuthenticationInfoTrailer(HttpReply * rep, int accelerated)
+ {}
  
-     // store peeked cert to check SQUID_X509_V_ERR_CERT_CHANGE
-     X509 *peeked_cert;
-@@ -69,6 +69,10 @@ class FwdState : public RefCountable
-     /** return a ConnectionPointer to the current server connection (may or may not be open) */
-     Comm::ConnectionPointer const & serverConnection() const { return serverConn; };
- 
-+#if 1 // USE_SSL_CERT_VALIDATOR
-+    static void sslCrtvdHandleReplyWrapper(void *data, char *reply);
-+    void sslCrtvdHandleReply(const char *reply);
-+#endif
- private:
-     // hidden for safer management of self; use static fwdStart
-     FwdState(const Comm::ConnectionPointer &client, StoreEntry *, HttpRequest *, const AccessLogEntryPointer &alp);
-@@ -758,6 +758,7 @@ mainReconfigureStart(void)
-     Ssl::Helper::GetInstance()->Shutdown();
- #endif
- #if USE_SSL
-+    Ssl::CertValidationHelper::GetInstance()->Shutdown();
-     Ssl::TheGlobalContextStorage.reconfigureStart();
- #endif
-     redirectShutdown();
-@@ -840,6 +841,10 @@ mainReconfigureFinish(void *)
- #if USE_SSL_CRTD
-     Ssl::Helper::GetInstance()->Init();
- #endif
-+#if USE_SSL
-+    if (Ssl::CertValidationHelper::GetInstance())
-+        Ssl::CertValidationHelper::GetInstance()->Init();
-+#endif
- 
-     redirectInit();
- #if USE_AUTH
-@@ -1039,6 +1044,11 @@ mainInitialize(void)
-     Ssl::Helper::GetInstance()->Init();
- #endif
- 
-+#if USE_SSL
-+    if (Ssl::CertValidationHelper::GetInstance())
-+        Ssl::CertValidationHelper::GetInstance()->Init();
-+#endif
-+
-     redirectInit();
- #if USE_AUTH
-     authenticateInit(&Auth::TheConfig);
-@@ -1846,6 +1856,9 @@ SquidShutdown()
-     dnsShutdown();
- #if USE_SSL_CRTD
-     Ssl::Helper::GetInstance()->Shutdown();
-+#endif
-+#if USE_SSL
-+    Ssl::CertValidationHelper::GetInstance()->Shutdown();
- #endif
-     redirectShutdown();
-     externalAclShutdown();
-@@ -17,6 +17,8 @@ class Config
-     char *ssl_crtd; ///< Name of external ssl_crtd application.
-     /// The number of processes spawn for ssl_crtd.
-     HelperChildConfig ssl_crtdChildren;
-+    char *ssl_crt_validator;
-+    HelperChildConfig ssl_crt_validator_Children;
- #endif
-     Config();
-     ~Config();
-@@ -338,7 +338,9 @@ const char *Ssl::ErrorDetail::err_descr() const
- 
- const char *Ssl::ErrorDetail::err_lib_error() const
- {
--    if (lib_error_no != SSL_ERROR_NONE)
-+    if (errReason.defined())
-+        return errReason.termedBuf();
-+    else if (lib_error_no != SSL_ERROR_NONE)
-         return ERR_error_string(lib_error_no, NULL);
-     else
-         return "[No Error]";
-@@ -414,7 +416,7 @@ const String &Ssl::ErrorDetail::toString() const
-     return errDetailStr;
- }
- 
--Ssl::ErrorDetail::ErrorDetail( Ssl::ssl_error_t err_no, X509 *cert, X509 *broken): error_no (err_no), lib_error_no(SSL_ERROR_NONE)
-+Ssl::ErrorDetail::ErrorDetail( Ssl::ssl_error_t err_no, X509 *cert, X509 *broken, const char *aReason): error_no (err_no), lib_error_no(SSL_ERROR_NONE), errReason(aReason)
- {
-     if (cert)
-         peer_cert.resetAndLock(cert);
-@@ -49,7 +49,7 @@ class ErrorDetail
- {
- public:
-     // if broken certificate is nil, the peer certificate is broken
--    ErrorDetail(ssl_error_t err_no, X509 *peer, X509 *broken);
-+    ErrorDetail(ssl_error_t err_no, X509 *peer, X509 *broken, const char *aReason = NULL);
-     ErrorDetail(ErrorDetail const &);
-     const String &toString() const;  ///< An error detail string to embed in squid error pages
-     void useRequest(HttpRequest *aRequest) { if (aRequest != NULL) request = aRequest;}
-@@ -93,6 +93,7 @@ class ErrorDetail
-     unsigned long lib_error_no; ///< low-level error returned by OpenSSL ERR_get_error(3SSL)
-     X509_Pointer peer_cert; ///< A pointer to the peer certificate
-     X509_Pointer broken_cert; ///< A pointer to the broken certificate (peer or intermediate)
-+    String errReason; ///< A custom reason for error, else retrieved from OpenSSL.
-     mutable ErrorDetailEntry detailEntry;
-     HttpRequest::Pointer request;
- };
-@@ -21,6 +21,8 @@ endif
- 
- ## SSL stuff used by main Squid but not by ssl_crtd
- libsslsquid_la_SOURCES = \
-+	cert_validate_message.cc \
-+	cert_validate_message.h \
- 	context_storage.cc \
- 	context_storage.h \
- 	Config.cc \
-@@ -80,7 +80,7 @@ class CrtdMessage
-     static const std::string param_SetCommonName;
-     /// Parameter name for passing signing algorithm
-     static const std::string param_Sign;
--private:
-+protected:
-     enum ParseState {
-         BEFORE_CODE,
-         CODE,
-@@ -106,3 +106,85 @@ void Ssl::Helper::sslSubmit(CrtdMessage const & message, HLPCB * callback, void
-     msg += '\n';
-     helperSubmit(ssl_crtd, msg.c_str(), callback, data);
- }
-+
-+/*ssl_crtd_validator*/
-+
-+Ssl::CertValidationHelper * Ssl::CertValidationHelper::GetInstance()
-+{
-+    static Ssl::CertValidationHelper sslHelper;
-+    if (!Ssl::TheConfig.ssl_crt_validator)
-+        return NULL;
-+    return &sslHelper;
-+}
-+
-+Ssl::CertValidationHelper::CertValidationHelper() : ssl_crt_validator(NULL)
-+{
-+}
-+
-+Ssl::CertValidationHelper::~CertValidationHelper()
-+{
-+    Shutdown();
-+}
-+
-+void Ssl::CertValidationHelper::Init()
-+{
-+    assert(ssl_crt_validator == NULL);
-+
-+    // we need to start ssl_crtd only if some port(s) need to bump SSL
-+    bool found = false;
-+    for (AnyP::PortCfg *s = ::Config.Sockaddr.http; !found && s; s = s->next)
-+        found = s->sslBump;
-+    for (AnyP::PortCfg *s = ::Config.Sockaddr.https; !found && s; s = s->next)
-+        found = s->sslBump;
-+    if (!found)
-+        return;
-+
-+    ssl_crt_validator = new helper("ssl_crt_validator");
-+    ssl_crt_validator->childs.updateLimits(Ssl::TheConfig.ssl_crt_validator_Children);
-+    ssl_crt_validator->ipc_type = IPC_STREAM;
-+    // The crtd messages may contain the eol ('\n') character. We are
-+    // going to use the '\1' char as the end-of-message mark.
-+    ssl_crt_validator->eom = '\1';
-+    assert(ssl_crt_validator->cmdline == NULL);
-+    {
-+        char *tmp = xstrdup(Ssl::TheConfig.ssl_crt_validator);
-+        char *tmp_begin = tmp;
-+        char * token = NULL;
-+        while ((token = strwordtok(NULL, &tmp))) {
-+            wordlistAdd(&ssl_crt_validator->cmdline, token);
-+        }
-+        safe_free(tmp_begin);
-+    }
-+    helperOpenServers(ssl_crt_validator);
-+}
-+
-+void Ssl::CertValidationHelper::Shutdown()
-+{
-+    if (!ssl_crt_validator)
-+        return;
-+    helperShutdown(ssl_crt_validator);
-+    wordlistDestroy(&ssl_crt_validator->cmdline);
-+    delete ssl_crt_validator;
-+    ssl_crt_validator = NULL;
-+}
-+
-+void Ssl::CertValidationHelper::sslSubmit(CrtdMessage const & message, HLPCB * callback, void * data)
-+{
-+    static time_t first_warn = 0;
-+    assert(ssl_crt_validator);
-+
-+    if (ssl_crt_validator->stats.queue_size >= (int)(ssl_crt_validator->childs.n_running * 2)) {
-+        if (first_warn == 0)
-+            first_warn = squid_curtime;
-+        if (squid_curtime - first_warn > 3 * 60)
-+            fatal("SSL servers not responding for 3 minutes");
-+        debugs(34, 1, HERE << "Queue overload, rejecting");
-+        callback(data, (char *)"error 45 Temporary network problem, please retry later");
-+        return;
-+    }
-+
-+    first_warn = 0;
-+    std::string msg = message.compose();
-+    msg += '\n';
-+    helperSubmit(ssl_crt_validator, msg.c_str(), callback, data);
-+}
-@@ -30,5 +30,20 @@ class Helper
-     helper * ssl_crtd; ///< helper for management of ssl_crtd.
- };
- 
-+class CertValidationHelper
-+{
-+public:
-+    static CertValidationHelper * GetInstance(); ///< Instance class.
-+    void Init(); ///< Init helper structure.
-+    void Shutdown(); ///< Shutdown helper structure.
-+    /// Submit crtd message to external crtd server.
-+    void sslSubmit(CrtdMessage const & message, HLPCB * callback, void *data);
-+private:
-+    CertValidationHelper();
-+    ~CertValidationHelper();
-+
-+    helper * ssl_crt_validator; ///< helper for management of ssl_crtd.
-+};
-+
- } //namespace Ssl
- #endif // SQUID_SSL_HELPER_H
-@@ -45,6 +45,7 @@
- #include "fde.h"
- #include "globals.h"
- #include "protos.h"
-+#include "ssl/Config.h"
- #include "ssl/ErrorDetail.h"
- #include "ssl/support.h"
- #include "ssl/gadgets.h"
-@@ -289,6 +290,12 @@ ssl_verify_cb(int ok, X509_STORE_CTX * ctx)
-             delete filledCheck->sslErrors;
-             filledCheck->sslErrors = NULL;
+ void
+@@ -527,13 +527,13 @@ AuthUserRequest::addReplyAuthHeader(HttpReply * rep, AuthUserRequest::Pointer au
          }
-+#if 1 // USE_SSL_CERT_VALIDATOR
-+        // If the certificate validator is used then we need to allow all errors and 
-+        // pass them tp certficate validator for more processing
-+        else if (Ssl::TheConfig.ssl_crt_validator)
-+            ok = 1;
-+#endif
+ 
+     }
++
+     /*
+      * allow protocol specific headers to be _added_ to the existing
+-     * response - ie digest auth
++     * response - currently Digest or Negotiate auth
+      */
+-
+     if (auth_user_request != NULL) {
+-        auth_user_request->addHeader(rep, accelerated);
++        auth_user_request->addAuthenticationInfoHeader(rep, accelerated);
+         if (auth_user_request->lastReply != AUTH_AUTHENTICATED)
+             auth_user_request->lastReply = AUTH_ACL_CANNOT_AUTHENTICATE;
+     }
+@@ -545,13 +545,12 @@ authenticateFixHeader(HttpReply * rep, AuthUserRequest::Pointer auth_user_reques
+     AuthUserRequest::addReplyAuthHeader(rep, auth_user_request, request, accelerated, internal);
+ }
+ 
+-
+ /* call the active auth module and allow it to add a trailer to the request */
+ void
+ authenticateAddTrailer(HttpReply * rep, AuthUserRequest::Pointer auth_user_request, HttpRequest * request, int accelerated)
+ {
+     if (auth_user_request != NULL)
+-        auth_user_request->addTrailer(rep, accelerated);
++        auth_user_request->addAuthenticationInfoTrailer(rep, accelerated);
+ }
+ 
+ Auth::Scheme::Pointer
+@@ -49,6 +49,12 @@ class ConnStateData;
+ class HttpReply;
+ class HttpRequest;
+ 
++/**
++ * Maximum length (buffer size) for token strings.
++ */
++// AYJ: must match re-definition in helpers/negotiate_auth/kerberos/negotiate_kerb_auth.cc
++#define MAX_AUTHTOKEN_LEN   32768
++
+ /// \ingroup AuthAPI
+ class AuthUserIP
+ {
+@@ -128,18 +134,24 @@ class AuthUserRequest : public RefCountable
+     bool valid() const;
+ 
+     virtual void authenticate(HttpRequest * request, ConnStateData * conn, http_hdr_type type) = 0;
+-    /* template method */
++
++    /* template method - what needs to be done next? advertise schemes, challenge, handle error, nothing? */
+     virtual Auth::Direction module_direction() = 0;
+-    virtual void addHeader(HttpReply * rep, int accel);
+-    virtual void addTrailer(HttpReply * rep, int accel);
++
++    /* add the [Proxy-]Authentication-Info header */
++    virtual void addAuthenticationInfoHeader(HttpReply * rep, int accel);
++
++    /* add the [Proxy-]Authentication-Info trailer */
++    virtual void addAuthenticationInfoTrailer(HttpReply * rep, int accel);
++
+     virtual void onConnectionClose(ConnStateData *);
+ 
+     /**
+      * Called when squid is ready to put the request on hold and wait for a callback from the auth module
+      * when the auth module has performed it's external activities.
+      *
+-     \param handler	Handler to process the callback when its run
+-     \param data	CBDATA for handler
++     * \param handler	Handler to process the callback when its run
++     * \param data	CBDATA for handler
+      */
+     virtual void module_start(RH *handler, void *data) = 0;
+ 
+@@ -190,9 +190,8 @@ AuthDigestUserRequest::module_direction()
+     }
+ }
+ 
+-/* add the [proxy]authorisation header */
+ void
+-AuthDigestUserRequest::addHeader(HttpReply * rep, int accel)
++AuthDigestUserRequest::addAuthenticationInfoHeader(HttpReply * rep, int accel)
+ {
+     http_hdr_type type;
+ 
+@@ -218,9 +217,8 @@ AuthDigestUserRequest::addHeader(HttpReply * rep, int accel)
+ }
+ 
+ #if WAITING_FOR_TE
+-/** add the [proxy]authorisation header */
+ void
+-AuthDigestUserRequest::addTrailer(HttpReply * rep, int accel)
++AuthDigestUserRequest::addAuthenticationInfoTrailer(HttpReply * rep, int accel)
+ {
+     int type;
+ 
+@@ -24,10 +24,9 @@ class AuthDigestUserRequest : public AuthUserRequest
+     virtual int authenticated() const;
+     virtual void authenticate(HttpRequest * request, ConnStateData * conn, http_hdr_type type);
+     virtual Auth::Direction module_direction();
+-    virtual void addHeader(HttpReply * rep, int accel);
++    virtual void addAuthenticationInfoHeader(HttpReply * rep, int accel);
+ #if WAITING_FOR_TE
+-
+-    virtual void addTrailer(HttpReply * rep, int accel);
++    virtual void addAuthenticationInfoTrailer(HttpReply * rep, int accel);
+ #endif
+ 
+     virtual void module_start(RH *, void *);
+@@ -8,12 +8,6 @@
+ #include "HttpRequest.h"
+ #include "SquidTime.h"
+ 
+-/**
+- * Maximum length (buffer size) for token strings.
+- */
+-// AYJ: must match re-definition in helpers/negotiate_auth/kerberos/negotiate_kerb_auth.cc
+-#define MAX_AUTHTOKEN_LEN   32768
+-
+ AuthNegotiateUserRequest::AuthNegotiateUserRequest()
+ {
+     waiting=0;
+@@ -29,11 +23,8 @@ AuthNegotiateUserRequest::~AuthNegotiateUserRequest()
+     safe_free(server_blob);
+     safe_free(client_blob);
+ 
+-    if (authserver != NULL) {
+-        debugs(29, 9, HERE << "releasing server '" << authserver << "'");
+-        helperStatefulReleaseServer(authserver);
+-        authserver = NULL;
+-    }
++    releaseAuthServer();
++
+     if (request) {
+         HTTPMSGUNLOCK(request);
+         request = NULL;
+@@ -87,27 +78,6 @@ AuthNegotiateUserRequest::module_direction()
+     }
+ }
+ 
+-/* add the [proxy]authorisation header */
+-void
+-AuthNegotiateUserRequest::addHeader(HttpReply * rep, int accel)
+-{
+-    http_hdr_type type;
+-
+-    if (!server_blob)
+-        return;
+-
+-    /* don't add to authentication error pages */
+-    if ((!accel && rep->sline.status == HTTP_PROXY_AUTHENTICATION_REQUIRED)
+-            || (accel && rep->sline.status == HTTP_UNAUTHORIZED))
+-        return;
+-
+-    type = accel ? HDR_AUTHENTICATION_INFO : HDR_PROXY_AUTHENTICATION_INFO;
+-    httpHeaderPutStrf(&rep->header, type, "Negotiate %s", server_blob);
+-
+-    safe_free(server_blob);
+-}
+-
+-/** send the initial data to a stateful negotiate authenticator module */
+ void
+ AuthNegotiateUserRequest::module_start(RH * handler, void *data)
+ {
+@@ -119,23 +89,23 @@ AuthNegotiateUserRequest::module_start(RH * handler, void *data)
+     assert(user() != NULL);
+     assert(user()->auth_type == Auth::AUTH_NEGOTIATE);
+ 
+-    debugs(29, 8, HERE << "auth state is '" << user()->credentials() << "'");
+-
+     if (static_cast<Auth::Negotiate::Config*>(Auth::Config::Find("negotiate"))->authenticateProgram == NULL) {
+         debugs(29, DBG_CRITICAL, "ERROR: No Negotiate authentication program configured.");
+         handler(data, NULL);
+         return;
      }
  
-     if (!dont_verify_domain && server) {}
++    debugs(29, 8, HERE << "credentials state is '" << user()->credentials() << "'");
++
+     authenticateStateData *r = cbdataAlloc(authenticateStateData);
+     r->handler = handler;
+     r->data = cbdataReference(data);
+     r->auth_user_request = this;
+ 
+     if (user()->credentials() == Auth::Pending) {
+-        snprintf(buf, MAX_AUTHTOKEN_LEN, "YR %s\n", client_blob); //CHECKME: can ever client_blob be 0 here?
++        snprintf(buf, sizeof(buf), "YR %s\n", client_blob); //CHECKME: can ever client_blob be 0 here?
+     } else {
+-        snprintf(buf, MAX_AUTHTOKEN_LEN, "KK %s\n", client_blob);
++        snprintf(buf, sizeof(buf), "KK %s\n", client_blob);
+     }
+ 
+     waiting = 1;
+@@ -175,18 +145,20 @@ AuthNegotiateUserRequest::onConnectionClose(ConnStateData *conn)
+     releaseAuthServer();
+ 
+     /* unlock the connection based lock */
+-    debugs(29, 9, "AuthNegotiateUserRequest::onConnectionClose: Unlocking auth_user from the connection '" << conn << "'.");
++    debugs(29, 9, HERE << "Unlocking auth_user from the connection '" << conn << "'.");
+ 
+     conn->auth_user_request = NULL;
+ }
+ 
+ void
+ AuthNegotiateUserRequest::authenticate(HttpRequest * aRequest, ConnStateData * conn, http_hdr_type type)
+ {
+-    assert (this);
++    assert(this);
++
++    /* Check that we are in the client side, where we can generate
++     * auth challenges */
+ 
+-    /** Check that we are in the client side, where we can generate auth challenges */
+-    if (conn == NULL) {
++    if (conn == NULL || !cbdataReferenceValid(conn)) {
+         user()->credentials(Auth::Failed);
+         debugs(29, DBG_IMPORTANT, "WARNING: Negotiate Authentication attempt to perform authentication without a connection!");
+         return;
+@@ -257,8 +229,6 @@ AuthNegotiateUserRequest::authenticate(HttpRequest * aRequest, ConnStateData * c
+         debugs(29, 9, HERE << "auth state negotiate failed. " << proxy_auth);
+         break;
+     }
+-
+-    return;
+ }
+ 
+ void
+@@ -287,20 +257,20 @@ AuthNegotiateUserRequest::HandleReply(void *data, void *lastserver, char *reply)
+     AuthUserRequest::Pointer auth_user_request = r->auth_user_request;
+     assert(auth_user_request != NULL);
+ 
+-    AuthNegotiateUserRequest *negotiate_request = dynamic_cast<AuthNegotiateUserRequest *>(auth_user_request.getRaw());
+-    assert(negotiate_request != NULL);
++    AuthNegotiateUserRequest *lm_request = dynamic_cast<AuthNegotiateUserRequest *>(auth_user_request.getRaw());
++    assert(lm_request != NULL);
++    assert(lm_request->waiting);
+ 
+-    assert(negotiate_request->waiting);
+-    negotiate_request->waiting = 0;
+-    safe_free(negotiate_request->client_blob);
++    lm_request->waiting = 0;
++    safe_free(lm_request->client_blob);
+ 
+     assert(auth_user_request->user() != NULL);
+     assert(auth_user_request->user()->auth_type == Auth::AUTH_NEGOTIATE);
+ 
+-    if (negotiate_request->authserver == NULL)
+-        negotiate_request->authserver = static_cast<helper_stateful_server*>(lastserver);
++    if (lm_request->authserver == NULL)
++        lm_request->authserver = static_cast<helper_stateful_server*>(lastserver);
+     else
+-        assert(negotiate_request->authserver == lastserver);
++        assert(lm_request->authserver == lastserver);
+ 
+     /* seperate out the useful data */
+     blob = strchr(reply, ' ');
+@@ -316,10 +286,10 @@ AuthNegotiateUserRequest::HandleReply(void *data, void *lastserver, char *reply)
+         /* we have been given a blob to send to the client */
+         if (arg)
+             *arg++ = '\0';
+-        safe_free(negotiate_request->server_blob);
+-        negotiate_request->request->flags.must_keepalive = 1;
+-        if (negotiate_request->request->flags.proxy_keepalive) {
+-            negotiate_request->server_blob = xstrdup(blob);
++        safe_free(lm_request->server_blob);
++        lm_request->request->flags.must_keepalive = 1;
++        if (lm_request->request->flags.proxy_keepalive) {
++            lm_request->server_blob = xstrdup(blob);
+             auth_user_request->user()->credentials(Auth::Handshake);
+             auth_user_request->denyMessage("Authentication in progress");
+             debugs(29, 4, HERE << "Need to challenge the client with a server blob '" << blob << "'");
+@@ -335,16 +305,16 @@ AuthNegotiateUserRequest::HandleReply(void *data, void *lastserver, char *reply)
+ 
+         auth_user_request->user()->username(arg);
+         auth_user_request->denyMessage("Login successful");
+-        safe_free(negotiate_request->server_blob);
+-        negotiate_request->server_blob = xstrdup(blob);
+-        negotiate_request->releaseAuthServer();
++        safe_free(lm_request->server_blob);
++        lm_request->server_blob = xstrdup(blob);
++        lm_request->releaseAuthServer();
+ 
+         /* connection is authenticated */
+         debugs(29, 4, HERE << "authenticated user " << auth_user_request->user()->username());
+         /* see if this is an existing user with a different proxy_auth
+          * string */
+         AuthUserHashPointer *usernamehash = static_cast<AuthUserHashPointer *>(hash_lookup(proxy_auth_username_cache, auth_user_request->user()->username()));
+-        Auth::User::Pointer local_auth_user = negotiate_request->user();
++        Auth::User::Pointer local_auth_user = lm_request->user();
+         while (usernamehash && (usernamehash->user()->auth_type != Auth::AUTH_NEGOTIATE ||
+                                 strcmp(usernamehash->user()->username(), auth_user_request->user()->username()) != 0))
+             usernamehash = static_cast<AuthUserHashPointer *>(usernamehash->next);
+@@ -374,10 +344,10 @@ AuthNegotiateUserRequest::HandleReply(void *data, void *lastserver, char *reply)
+             *arg++ = '\0';
+ 
+         auth_user_request->denyMessage(arg);
+-        negotiate_request->user()->credentials(Auth::Failed);
+-        safe_free(negotiate_request->server_blob);
+-        negotiate_request->server_blob = xstrdup(blob);
+-        negotiate_request->releaseAuthServer();
++        auth_user_request->user()->credentials(Auth::Failed);
++        safe_free(lm_request->server_blob);
++        lm_request->server_blob = xstrdup(blob);
++        lm_request->releaseAuthServer();
+         debugs(29, 4, HERE << "Failed validating user via Negotiate. Error returned '" << blob << "'");
+     } else if (strncasecmp(reply, "BH ", 3) == 0) {
+         /* TODO kick off a refresh process. This can occur after a YR or after
+@@ -387,17 +357,35 @@ AuthNegotiateUserRequest::HandleReply(void *data, void *lastserver, char *reply)
+          * Needing YR. */
+         auth_user_request->denyMessage(blob);
+         auth_user_request->user()->credentials(Auth::Failed);
+-        safe_free(negotiate_request->server_blob);
+-        negotiate_request->releaseAuthServer();
++        safe_free(lm_request->server_blob);
++        lm_request->releaseAuthServer();
+         debugs(29, DBG_IMPORTANT, "ERROR: Negotiate Authentication validating user. Error returned '" << reply << "'");
+     } else {
+         /* protocol error */
+         fatalf("authenticateNegotiateHandleReply: *** Unsupported helper response ***, '%s'\n", reply);
+     }
+ 
+-    negotiate_request->request = NULL;
++    lm_request->request = NULL;
+     r->handler(r->data, NULL);
+     cbdataReferenceDone(r->data);
+     authenticateStateFree(r);
+ }
+ 
++void
++AuthNegotiateUserRequest::addAuthenticationInfoHeader(HttpReply * rep, int accel)
++{
++    http_hdr_type type;
++
++    if (!server_blob)
++        return;
++
++    /* don't add to authentication error pages */
++    if ((!accel && rep->sline.status == HTTP_PROXY_AUTHENTICATION_REQUIRED)
++            || (accel && rep->sline.status == HTTP_UNAUTHORIZED))
++        return;
++
++    type = accel ? HDR_AUTHENTICATION_INFO : HDR_PROXY_AUTHENTICATION_INFO;
++    httpHeaderPutStrf(&rep->header, type, "Negotiate %s", server_blob);
++
++    safe_free(server_blob);
++}
+@@ -25,7 +25,7 @@ class AuthNegotiateUserRequest : public AuthUserRequest
+     virtual void onConnectionClose(ConnStateData *);
+     virtual void module_start(RH *, void *);
+ 
+-    virtual void addHeader(HttpReply * rep, int accel);
++    virtual void addAuthenticationInfoHeader(HttpReply * rep, int accel);
+ 
+     virtual const char * connLastHeader();
+ 
+@@ -6,15 +6,13 @@
+ #include "HttpRequest.h"
+ #include "SquidTime.h"
+ 
+-/* state wrapper functions */
+-
+ AuthNTLMUserRequest::AuthNTLMUserRequest()
+ {
+     waiting=0;
+     client_blob=0;
+     server_blob=0;
+     authserver=NULL;
+-    request = NULL;
++    request=NULL;
+ }
+ 
+ AuthNTLMUserRequest::~AuthNTLMUserRequest()
+@@ -37,6 +35,18 @@ AuthNTLMUserRequest::connLastHeader()
+     return NULL;
+ }
+ 
++int
++AuthNTLMUserRequest::authenticated() const
++{
++    if (user() != NULL && user()->credentials() == Auth::Ok) {
++        debugs(29, 9, HERE << "user authenticated.");
++        return 1;
++    }
++
++    debugs(29, 9, HERE << "user not fully authenticated.");
++    return 0;
++}
++
+ Auth::Direction
+ AuthNTLMUserRequest::module_direction()
+ {
+@@ -52,47 +62,45 @@ AuthNTLMUserRequest::module_direction()
+ 
+     case Auth::Handshake:
+         assert(server_blob);
+-        return Auth::CRED_CHALLENGE; /* send to client */
++        return Auth::CRED_CHALLENGE;
+ 
+     case Auth::Ok:
+         return Auth::CRED_VALID;
+ 
+     case Auth::Failed:
+-        return Auth::CRED_ERROR; // XXX really? not VALID or CHALLENGE?
++        return Auth::CRED_ERROR; // XXX: really? not VALID or CHALLENGE?
+ 
+     default:
+         debugs(29, DBG_IMPORTANT, "WARNING: NTLM Authentication in unexpected state: " << user()->credentials());
+         return Auth::CRED_ERROR;
+     }
+ }
+ 
+-/* send the initial data to a stateful ntlm authenticator module */
+ void
+ AuthNTLMUserRequest::module_start(RH * handler, void *data)
+ {
+-    authenticateStateData *r = NULL;
+-    static char buf[8192];
++    static char buf[MAX_AUTHTOKEN_LEN];
+ 
+     assert(data);
+     assert(handler);
+ 
+-    debugs(29, 8, HERE << "credentials state is '" << user()->credentials() << "'");
+-
+     if (static_cast<Auth::Ntlm::Config*>(Auth::Config::Find("ntlm"))->authenticateProgram == NULL) {
+         debugs(29, DBG_CRITICAL, "ERROR: NTLM Start: no NTLM program configured.");
+         handler(data, NULL);
+         return;
+     }
+ 
+-    r = cbdataAlloc(authenticateStateData);
++    debugs(29, 8, HERE << "credentials state is '" << user()->credentials() << "'");
++
++    authenticateStateData *r = cbdataAlloc(authenticateStateData);
+     r->handler = handler;
+     r->data = cbdataReference(data);
+     r->auth_user_request = this;
+ 
+     if (user()->credentials() == Auth::Pending) {
+-        snprintf(buf, 8192, "YR %s\n", client_blob); //CHECKME: can ever client_blob be 0 here?
++        snprintf(buf, sizeof(buf), "YR %s\n", client_blob); //CHECKME: can ever client_blob be 0 here?
+     } else {
+-        snprintf(buf, 8192, "KK %s\n", client_blob);
++        snprintf(buf, sizeof(buf), "KK %s\n", client_blob);
+     }
+ 
+     waiting = 1;
+@@ -128,59 +136,43 @@ AuthNTLMUserRequest::onConnectionClose(ConnStateData *conn)
+         return;
+     }
+ 
+-    // unlock / un-reserve the helpers
+     releaseAuthServer();
+ 
+     /* unlock the connection based lock */
+-    debugs(29, 9, "AuthNTLMUserRequest::onConnectionClose: Unlocking auth_user from the connection '" << conn << "'.");
++    debugs(29, 9, HERE << "Unlocking auth_user from the connection '" << conn << "'.");
+ 
+     conn->auth_user_request = NULL;
+ }
+ 
+-int
+-AuthNTLMUserRequest::authenticated() const
+-{
+-    if (user()->credentials() == Auth::Ok) {
+-        debugs(29, 9, "AuthNTLMUserRequest::authenticated: user authenticated.");
+-        return 1;
+-    }
+-
+-    debugs(29, 9, "AuthNTLMUserRequest::authenticated: user not fully authenticated.");
+-
+-    return 0;
+-}
+-
+ void
+ AuthNTLMUserRequest::authenticate(HttpRequest * aRequest, ConnStateData * conn, http_hdr_type type)
+ {
+-    const char *proxy_auth, *blob;
+-
+     assert(this);
+ 
+     /* Check that we are in the client side, where we can generate
+      * auth challenges */
+ 
+     if (conn == NULL || !cbdataReferenceValid(conn)) {
+         user()->credentials(Auth::Failed);
+-        debugs(29, 1, "AuthNTLMUserRequest::authenticate: attempt to perform authentication without a connection!");
++        debugs(29, DBG_IMPORTANT, "WARNING: NTLM Authentication attempt to perform authentication without a connection!");
+         return;
+     }
+ 
+     if (waiting) {
+-        debugs(29, 1, "AuthNTLMUserRequest::authenticate: waiting for helper reply!");
++        debugs(29, DBG_IMPORTANT, "WARNING: NTLM Authentication waiting for helper reply!");
+         return;
+     }
+ 
+     if (server_blob) {
+-        debugs(29, 2, "AuthNTLMUserRequest::authenticate: need to challenge client '" << server_blob << "'!");
++        debugs(29, 2, HERE << "need to challenge client '" << server_blob << "'!");
+         return;
+     }
+ 
+     /* get header */
+-    proxy_auth = aRequest->header.getStr(type);
++    const char *proxy_auth = aRequest->header.getStr(type);
+ 
+     /* locate second word */
+-    blob = proxy_auth;
++    const char *blob = proxy_auth;
+ 
+     /* if proxy_auth is actually NULL, we'd better not manipulate it. */
+     if (blob) {
+@@ -198,7 +190,7 @@ AuthNTLMUserRequest::authenticate(HttpRequest * aRequest, ConnStateData * conn,
+ 
+     case Auth::Unchecked:
+         /* we've received a ntlm request. pass to a helper */
+-        debugs(29, 9, "AuthNTLMUserRequest::authenticate: auth state ntlm none. Received blob: '" << proxy_auth << "'");
++        debugs(29, 9, HERE << "auth state ntlm none. Received blob: '" << proxy_auth << "'");
+         user()->credentials(Auth::Pending);
+         safe_free(client_blob);
+         client_blob=xstrdup(blob);
+@@ -209,15 +201,14 @@ AuthNTLMUserRequest::authenticate(HttpRequest * aRequest, ConnStateData * conn,
+         break;
+ 
+     case Auth::Pending:
+-        debugs(29, 1, "AuthNTLMUserRequest::authenticate: need to ask helper");
++        debugs(29, 1, HERE << "need to ask helper");
+         break;
+ 
+     case Auth::Handshake:
+         /* we should have received a blob from the client. Hand it off to
+          * some helper */
+         safe_free(client_blob);
+-        client_blob = xstrdup (blob);
+-
++        client_blob = xstrdup(blob);
+         if (request)
+             HTTPMSGUNLOCK(request);
+         request = aRequest;
+@@ -230,7 +221,7 @@ AuthNTLMUserRequest::authenticate(HttpRequest * aRequest, ConnStateData * conn,
+ 
+     case Auth::Failed:
+         /* we've failed somewhere in authentication */
+-        debugs(29, 9, "AuthNTLMUserRequest::authenticate: auth state ntlm failed. " << proxy_auth);
++        debugs(29, 9, HERE << "auth state ntlm failed. " << proxy_auth);
+         break;
+     }
+ }
+@@ -243,37 +234,38 @@ AuthNTLMUserRequest::HandleReply(void *data, void *lastserver, char *reply)
+     int valid;
+     char *blob;
+ 
+-    debugs(29, 8, "authenticateNTLMHandleReply: helper: '" << lastserver << "' sent us '" << (reply ? reply : "<NULL>") << "'");
++    debugs(29, 8, HERE << "helper: '" << lastserver << "' sent us '" << (reply ? reply : "<NULL>") << "'");
+     valid = cbdataReferenceValid(r->data);
+ 
+     if (!valid) {
+-        debugs(29, 1, "authenticateNTLMHandleReply: invalid callback data. helper '" << lastserver << "'.");
++        debugs(29, DBG_IMPORTANT, "ERROR: NTLM Authentication invalid callback data. helper '" << lastserver << "'.");
+         cbdataReferenceDone(r->data);
+         authenticateStateFree(r);
+         return;
+     }
+ 
+     if (!reply) {
+-        debugs(29, 1, "authenticateNTLMHandleReply: Helper '" << lastserver << "' crashed!.");
++        debugs(29, DBG_IMPORTANT, "ERROR: NTLM Authentication Helper '" << lastserver << "' crashed!.");
+         reply = (char *)"BH Internal error";
+     }
+ 
+     AuthUserRequest::Pointer auth_user_request = r->auth_user_request;
+     assert(auth_user_request != NULL);
+ 
+-    AuthNTLMUserRequest *ntlm_request = dynamic_cast<AuthNTLMUserRequest *>(auth_user_request.getRaw());
+-    assert(ntlm_request != NULL);
+-    assert(ntlm_request->waiting);
+-    assert(ntlm_request->user() != NULL);
+-    assert(ntlm_request->user()->auth_type == Auth::AUTH_NTLM);
++    AuthNTLMUserRequest *lm_request = dynamic_cast<AuthNTLMUserRequest *>(auth_user_request.getRaw());
++    assert(lm_request != NULL);
++    assert(lm_request->waiting);
+ 
+-    ntlm_request->waiting = 0;
+-    safe_free(ntlm_request->client_blob);
++    lm_request->waiting = 0;
++    safe_free(lm_request->client_blob);
+ 
+-    if (ntlm_request->authserver == NULL)
+-        ntlm_request->authserver = static_cast<helper_stateful_server*>(lastserver);
++    assert(auth_user_request->user() != NULL);
++    assert(auth_user_request->user()->auth_type == Auth::AUTH_NTLM);
++
++    if (lm_request->authserver == NULL)
++        lm_request->authserver = static_cast<helper_stateful_server*>(lastserver);
+     else
+-        assert(ntlm_request->authserver == lastserver);
++        assert(lm_request->authserver == lastserver);
+ 
+     /* seperate out the useful data */
+     blob = strchr(reply, ' ');
+@@ -282,30 +274,31 @@ AuthNTLMUserRequest::HandleReply(void *data, void *lastserver, char *reply)
+ 
+     if (strncasecmp(reply, "TT ", 3) == 0) {
+         /* we have been given a blob to send to the client */
+-        safe_free(ntlm_request->server_blob);
+-        ntlm_request->request->flags.must_keepalive = 1;
+-        if (ntlm_request->request->flags.proxy_keepalive) {
+-            ntlm_request->server_blob = xstrdup(blob);
+-            ntlm_request->user()->credentials(Auth::Handshake);
++        safe_free(lm_request->server_blob);
++        lm_request->request->flags.must_keepalive = 1;
++        if (lm_request->request->flags.proxy_keepalive) {
++            lm_request->server_blob = xstrdup(blob);
++            auth_user_request->user()->credentials(Auth::Handshake);
+             auth_user_request->denyMessage("Authentication in progress");
+-            debugs(29, 4, "authenticateNTLMHandleReply: Need to challenge the client with a server blob '" << blob << "'");
++            debugs(29, 4, HERE << "Need to challenge the client with a server blob '" << blob << "'");
+         } else {
+-            ntlm_request->user()->credentials(Auth::Failed);
++            auth_user_request->user()->credentials(Auth::Failed);
+             auth_user_request->denyMessage("NTLM authentication requires a persistent connection");
+         }
+     } else if (strncasecmp(reply, "AF ", 3) == 0) {
+         /* we're finished, release the helper */
+         auth_user_request->user()->username(blob);
+         auth_user_request->denyMessage("Login successful");
+-        safe_free(ntlm_request->server_blob);
++        safe_free(lm_request->server_blob);
++        lm_request->releaseAuthServer();
+ 
+-        debugs(29, 4, "authenticateNTLMHandleReply: Successfully validated user via NTLM. Username '" << blob << "'");
++        debugs(29, 4, HERE << "Successfully validated user via NTLM. Username '" << blob << "'");
+         /* connection is authenticated */
+-        debugs(29, 4, "AuthNTLMUserRequest::authenticate: authenticated user " << auth_user_request->user()->username());
++        debugs(29, 4, HERE << "authenticated user " << auth_user_request->user()->username());
+         /* see if this is an existing user with a different proxy_auth
+          * string */
+-        auth_user_hash_pointer *usernamehash = static_cast<AuthUserHashPointer *>(hash_lookup(proxy_auth_username_cache, auth_user_request->user()->username()));
+-        Auth::User::Pointer local_auth_user = ntlm_request->user();
++        AuthUserHashPointer *usernamehash = static_cast<AuthUserHashPointer *>(hash_lookup(proxy_auth_username_cache, auth_user_request->user()->username()));
++        Auth::User::Pointer local_auth_user = lm_request->user();
+         while (usernamehash && (usernamehash->user()->auth_type != Auth::AUTH_NTLM ||
+                                 strcmp(usernamehash->user()->username(), auth_user_request->user()->username()) != 0))
+             usernamehash = static_cast<AuthUserHashPointer *>(usernamehash->next);
+@@ -315,6 +308,7 @@ AuthNTLMUserRequest::HandleReply(void *data, void *lastserver, char *reply)
+              * Just free the temporary auth_user after merging as
+              * much of it new state into the existing one as possible */
+             usernamehash->user()->absorb(local_auth_user);
++            /* from here on we are working with the original cached credentials. */
+             local_auth_user = usernamehash->user();
+             auth_user_request->user(local_auth_user);
+         } else {
+@@ -324,15 +318,16 @@ AuthNTLMUserRequest::HandleReply(void *data, void *lastserver, char *reply)
+         /* set these to now because this is either a new login from an
+          * existing user or a new user */
+         local_auth_user->expiretime = current_time.tv_sec;
+-        ntlm_request->releaseAuthServer();
+-        local_auth_user->credentials(Auth::Ok);
++        auth_user_request->user()->credentials(Auth::Ok);
++        debugs(29, 4, HERE << "Successfully validated user via NTLM. Username '" << blob << "'");
++
+     } else if (strncasecmp(reply, "NA ", 3) == 0) {
+         /* authentication failure (wrong password, etc.) */
+         auth_user_request->denyMessage(blob);
+-        ntlm_request->user()->credentials(Auth::Failed);
+-        safe_free(ntlm_request->server_blob);
+-        ntlm_request->releaseAuthServer();
+-        debugs(29, 4, "authenticateNTLMHandleReply: Failed validating user via NTLM. Error returned '" << blob << "'");
++        auth_user_request->user()->credentials(Auth::Failed);
++        safe_free(lm_request->server_blob);
++        lm_request->releaseAuthServer();
++        debugs(29, 4, HERE << "Failed validating user via NTLM. Error returned '" << blob << "'");
+     } else if (strncasecmp(reply, "BH ", 3) == 0) {
+         /* TODO kick off a refresh process. This can occur after a YR or after
+          * a KK. If after a YR release the helper and resubmit the request via
+@@ -341,17 +336,17 @@ AuthNTLMUserRequest::HandleReply(void *data, void *lastserver, char *reply)
+          * Needing YR. */
+         auth_user_request->denyMessage(blob);
+         auth_user_request->user()->credentials(Auth::Failed);
+-        safe_free(ntlm_request->server_blob);
+-        ntlm_request->releaseAuthServer();
+-        debugs(29, 1, "authenticateNTLMHandleReply: Error validating user via NTLM. Error returned '" << reply << "'");
++        safe_free(lm_request->server_blob);
++        lm_request->releaseAuthServer();
++        debugs(29, DBG_IMPORTANT, "ERROR: NTLM Authentication validating user. Error returned '" << reply << "'");
+     } else {
+         /* protocol error */
+         fatalf("authenticateNTLMHandleReply: *** Unsupported helper response ***, '%s'\n", reply);
+     }
+ 
+-    if (ntlm_request->request) {
+-        HTTPMSGUNLOCK(ntlm_request->request);
+-        ntlm_request->request = NULL;
++    if (lm_request->request) {
++        HTTPMSGUNLOCK(lm_request->request);
++        lm_request->request = NULL;
+     }
+     r->handler(r->data, NULL);
+     cbdataReferenceDone(r->data);

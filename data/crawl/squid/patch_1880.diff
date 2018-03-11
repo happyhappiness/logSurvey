@@ -1,0 +1,2869 @@
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: client_side.cc,v 1.90 1997/02/24 20:21:37 wessels Exp $
++ * $Id: client_side.cc,v 1.91 1997/02/26 19:46:09 wessels Exp $
+  *
+  * DEBUG: section 33    Client-side Routines
+  * AUTHOR: Duane Wessels
+@@ -516,10 +516,13 @@ icpHandleIMSReply(int fd, StoreEntry * entry, void *data)
+ 	}
+ 	icpState->log_type = LOG_TCP_REFRESH_HIT;
+ 	hbuf = get_free_8k_page();
+-	storeClientCopy(oldentry, 0, 8191, hbuf, &len, fd);
+-	if (oldentry->mem_obj->request == NULL) {
+-	    oldentry->mem_obj->request = requestLink(mem->request);
+-	    unlink_request = 1;
++	if (storeClientCopy(oldentry, 0, 8191, hbuf, &len, fd) < 0) {
++	    debug(33, 1, "icpHandleIMSReply: Couldn't copy old entry\n");
++	} else {
++	    if (oldentry->mem_obj->request == NULL) {
++		oldentry->mem_obj->request = requestLink(mem->request);
++		unlink_request = 1;
++	    }
+ 	}
+ 	storeUnregister(entry, fd);
+ 	storeUnlockObject(entry);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: comm.cc,v 1.138 1997/02/23 06:01:15 wessels Exp $
++ * $Id: comm.cc,v 1.139 1997/02/26 19:46:10 wessels Exp $
+  *
+  * DEBUG: section 5     Socket Functions
+  * AUTHOR: Harvest Derived
+@@ -105,6 +105,7 @@
+  */
+ 
+ #include "squid.h"
++#include <errno.h>
+ 
+ #ifdef HAVE_NETINET_TCP_H
+ #include <netinet/tcp.h>
+@@ -271,7 +272,6 @@ comm_open(int sock_type,
+     if (note)
+ 	fd_note(new_socket, note);
+     conn->openned = 1;
+-
+     if (!BIT_TEST(flags, COMM_NOCLOEXEC))
+ 	commSetCloseOnExec(new_socket);
+     if (port > (u_short) 0) {
+@@ -415,6 +415,7 @@ comm_connect_addr(int sock, const struct sockaddr_in *address)
+ #if EAGAIN != EWOULDBLOCK
+ 	case EAGAIN:
+ #endif
++	case EINTR:
+ 	case EWOULDBLOCK:
+ 	case EINPROGRESS:
+ 	    status = COMM_INPROGRESS;
+@@ -470,9 +471,8 @@ comm_accept(int fd, struct sockaddr_in *peer, struct sockaddr_in *me)
+ 	case EAGAIN:
+ #endif
+ 	case EWOULDBLOCK:
+-	    return COMM_NOMESSAGE;
+ 	case EINTR:
+-	    break;		/* if accept interrupted, try again */
++	    return COMM_NOMESSAGE;
+ 	case ENFILE:
+ 	case EMFILE:
+ 	    Reserve_More_FDs();
+@@ -538,7 +538,11 @@ comm_close(int fd)
+     fdstat_close(fd);		/* update fdstat */
+     commCallCloseHandlers(fd);
+     memset(conn, '\0', sizeof(FD_ENTRY));
++#if USE_ASYNC_IO
++    aioClose(fd);
++#else
+     close(fd);
++#endif
+ }
+ 
+ /* use to clean up fdtable when socket is closed without
+@@ -621,7 +625,7 @@ comm_select_incoming(void)
+ {
+     int fd = 0;
+     int fds[4];
+-    struct pollfd pfds[3];
++    struct pollfd pfds[4];
+     unsigned long N = 0;
+     unsigned long i = 0;
+     int dopoll = 0;
+@@ -652,22 +656,25 @@ comm_select_incoming(void)
+     }
+     if (!dopoll)
+ 	return;
+-    if (poll(pfds, N, 0) < 1)
+-	return;
++    poll(pfds, N, 0);
+     getCurrentTime();
+     for (i = 0; i < N; i++) {
+-	if ((pfds[i].revents == 0) || (pfds[i].fd == -1))
++	if (pfds[i].fd == -1)
+ 	    continue;
+ 	fd = fds[i];
+-	if (pfds[i].revents & (POLLRDNORM | POLLIN | POLLHUP | POLLERR)) {
+-	    hdl = fd_table[fd].read_handler;
+-	    fd_table[fd].read_handler = 0;
+-	    hdl(fd, fd_table[fd].read_data);
++	if (fd_table[fd].read_handler) {
++	    if (pfds[i].revents & (POLLRDNORM | POLLIN | POLLHUP | POLLERR)) {
++		hdl = fd_table[fd].read_handler;
++		fd_table[fd].read_handler = 0;
++		hdl(fd, fd_table[fd].read_data);
++	    }
+ 	}
+-	if (pfds[i].revents & (POLLWRNORM | POLLOUT | POLLHUP | POLLERR)) {
+-	    hdl = fd_table[fd].write_handler;
+-	    fd_table[fd].write_handler = 0;
+-	    hdl(fd, fd_table[fd].write_data);
++	if (fd_table[fd].write_handler) {
++	    if (pfds[i].revents & (POLLWRNORM | POLLOUT | POLLHUP | POLLERR)) {
++		hdl = fd_table[fd].write_handler;
++		fd_table[fd].write_handler = 0;
++		hdl(fd, fd_table[fd].write_data);
++	    }
+ 	}
+     }
+     /* TO FIX: repoll ICP connection here */
+@@ -736,16 +743,16 @@ comm_select_incoming(void)
+ int
+ comm_select(time_t sec)
+ {
+-    struct pollfd pfds[FD_SETSIZE];
++    struct pollfd pfds[SQUID_MAXFD];
+     PF hdl = NULL;
+     int fd;
+     int i;
+     int maxfd;
+     unsigned long nfds;
+     int incnfd;
+     int num;
+-    int httpindex;
+     static time_t last_timeout = 0;
++    static time_t pending_time;
+     int poll_time = 0;
+     time_t timeout;
+     struct close_handler *ch = NULL;
+@@ -769,65 +776,71 @@ comm_select(time_t sec)
+ 	    else
+ 		setSocketShutdownLifetimes(0);
+ 	}
+-	nfds = 0;
+ 	maxfd = fdstat_biggest_fd() + 1;
+-	httpindex = -1;
+-	for (i = 0; i < maxfd; i++) {
+-	    pfds[nfds].fd = -1;
+-	    pfds[nfds].events = 0;
++	for (nfds = 0, i = 0; i < maxfd; i++) {
++	    pfds[i].fd = i;
++	    pfds[i].events = 0;
++	    if (i == theHttpConnection && !fdstat_are_n_free_fd(RESERVED_FD))
++		continue;
+ 	    /* Check each open socket for a handler. */
+ 	    incnfd = 0;
+-	    if (fd_table[i].read_handler && fd_table[i].stall_until <= squid_curtime) {
+-		pfds[nfds].events |= POLLRDNORM;
+-		pfds[nfds].fd = i;
++	    if (fd_table[i].read_handler
++		&& fd_table[i].stall_until <= squid_curtime) {
++		pfds[i].events |= POLLRDNORM;
+ 		incnfd = 1;
+ 	    }
+ 	    if (fd_table[i].write_handler) {
+-		pfds[nfds].events |= POLLWRNORM;
+-		pfds[nfds].fd = i;
++		pfds[i].events |= POLLWRNORM;
+ 		incnfd = 1;
+ 	    }
+-	    if (incnfd == 1) {
+-		if (i == theHttpConnection)
+-		    httpindex = nfds;
++	    if (incnfd)
+ 		nfds++;
+-	    }
++	    if (pfds[i].events == 0)
++		pfds[i].fd = -1;
+ 	}
+-	/* If we're out of free fd's, don't poll the http incoming fd */
+-	if (!fdstat_are_n_free_fd(RESERVED_FD) && httpindex >= 0) {
+-	    pfds[httpindex].fd = -1;
+-	    pfds[httpindex].events = 0;
+-	}
+-	pfds[nfds].fd = -1;	/* just in case */
+-	pfds[nfds].events = 0;
+-	if (shutdown_pending || reread_pending)
++	if (shutdown_pending || reread_pending) {
+ 	    debug(5, 2, "comm_select: Still waiting on %d FDs\n", nfds);
++	    if (pending_time == 0)
++		pending_time = squid_curtime;
++	    if ((squid_curtime - pending_time) > (Config.lifetimeShutdown + 5)) {
++		pending_time = 0;
++		for (i = 1; i < maxfd; i++) {
++		    if ((fd = pfds[i].fd) < 0)
++			continue;
++		    if (fdstatGetType(fd) == FD_FILE)
++			file_must_close(fd);
++		    else
++			comm_close(fd);
++		    pfds[fd].fd = -1;
++		}
++	    }
++	} else
++	    pending_time = 0;
+ 	if (nfds == 0)
+ 	    return COMM_SHUTDOWN;
++	poll_time = sec > 0 ? 100 : 0;
++#if USE_ASYNC_IO
++	aioCheckCallbacks();
++#endif
+ 	for (;;) {
+-	    poll_time = sec > 0 ? 1000 : 0;
+-	    num = poll(pfds, nfds, poll_time);
+-	    getCurrentTime();
++	    num = poll(pfds, maxfd, poll_time);
+ 	    if (num >= 0)
+ 		break;
+ 	    if (errno == EINTR)
+-		break;
++		continue;
+ 	    debug(5, 0, "comm_select: poll failure: %s\n",
+ 		xstrerror());
+ 	    if (errno == EINVAL) {
+ 		/* nfds greater than OPEN_MAX?? How possible? Time */
+ 		/* to bail - write out nfds to cache.log and start */
+ 		/* emergency shutdown by sending SIGTERM to self */
+-		debug(20, 1, "  Poll died with EINVAL. Tried to poll %d FD's\n", nfds);
++		debug(20, 1, "Poll returned EINVAL. Polled %d FD's\n", nfds);
+ 		kill(getpid(), SIGTERM);
+ 	    }
+-	    /* examine_select is handled below and efficiently too */
+-	    /*examine_select(&readfds, &writefds); XXXXX TO FIX */
+ 	    return COMM_ERROR;
+ 	    /* NOTREACHED */
+ 	}
+-	if (num < 0)
+-	    continue;		/* redo the top loop */
++	getCurrentTime();
+ 	debug(5, num ? 5 : 8, "comm_select: %d sockets ready at %d\n",
+ 	    num, (int) squid_curtime);
+ 	/* Check lifetime and timeout handlers ONCE each second.
+@@ -842,38 +855,28 @@ comm_select(time_t sec)
+ 	/* scan each socket but the accept socket. Poll this 
+ 	 * more frequently to minimize losses due to the 5 connect 
+ 	 * limit in SunOS */
+-	for (i = 0; i < nfds; i++) {
+-	    fd = pfds[i].fd;
+-	    if ((fd == -1) || (pfds[i].revents == 0))
++	for (i = 0; i < maxfd; i++) {
++	    if ((fd = pfds[i].fd) == -1)
+ 		continue;
+ 	    /*
+ 	     * Admit more connections quickly until we hit the hard limit.
+ 	     * Don't forget to keep the UDP acks coming and going.
+ 	     */
+-	    comm_select_incoming();
+-	    if (fd == theInIcpConnection)
+-		continue;
+-	    if (fd == theOutIcpConnection)
++	    if ((i % 2) == 0)
++		comm_select_incoming();
++	    if ((fd == theInIcpConnection) || (fd == theHttpConnection) || (fd == theOutIcpConnection) || (fd == 0))
+ 		continue;
+-	    if (fd == theHttpConnection)
+-		continue;
+-	    if (pfds[i].revents & (POLLRDNORM | POLLIN | POLLHUP | POLLERR)) {
++	    if (fd_table[fd].read_handler && (pfds[i].revents & (POLLRDNORM | POLLIN | POLLHUP | POLLERR))) {
+ 		debug(5, 6, "comm_select: FD %d ready for reading\n", fd);
+-		if (fd_table[fd].read_handler) {
+-		    hdl = fd_table[fd].read_handler;
+-		    fd_table[fd].read_handler = 0;
+-		    hdl(fd, fd_table[fd].read_data);
+-		    comm_select_incoming();
+-		}
++		hdl = fd_table[fd].read_handler;
++		fd_table[fd].read_handler = 0;
++		hdl(fd, fd_table[fd].read_data);
+ 	    }
+-	    if (pfds[i].revents & (POLLWRNORM | POLLOUT | POLLHUP | POLLERR)) {
++	    if (fd_table[fd].write_handler && (pfds[i].revents & (POLLWRNORM | POLLOUT | POLLHUP | POLLERR))) {
+ 		debug(5, 5, "comm_select: FD %d ready for writing\n", fd);
+-		if (fd_table[fd].write_handler) {
+-		    hdl = fd_table[fd].write_handler;
+-		    fd_table[fd].write_handler = 0;
+-		    hdl(fd, fd_table[fd].write_data);
+-		    comm_select_incoming();
+-		}
++		hdl = fd_table[fd].write_handler;
++		fd_table[fd].write_handler = 0;
++		hdl(fd, fd_table[fd].write_data);
+ 	    }
+ 	    if (pfds[i].revents & POLLNVAL) {
+ 		f = &fd_table[fd];
+@@ -975,6 +978,9 @@ comm_select(time_t sec)
+ 	    debug(5, 2, "comm_select: Still waiting on %d FDs\n", nfds);
+ 	if (nfds == 0)
+ 	    return COMM_SHUTDOWN;
++#if USE_ASYNC_IO
++	aioCheckCallbacks();
++#endif
+ 	for (;;) {
+ 	    poll_time.tv_sec = sec > 0 ? 1 : 0;
+ 	    poll_time.tv_usec = 0;
+@@ -1476,7 +1482,7 @@ commHandleWrite(int fd, RWStateData * state)
+ 	RWStateCallbackAndFree(fd, nleft ? COMM_ERROR : COMM_OK);
+     } else if (len < 0) {
+ 	/* An error */
+-	if (errno == EWOULDBLOCK || errno == EAGAIN) {
++	if (errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR) {
+ 	    debug(50, 10, "commHandleWrite: FD %d: write failure: %s.\n",
+ 		fd, xstrerror());
+ 	    commSetSelect(fd,
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: disk.cc,v 1.56 1997/02/24 04:25:13 wessels Exp $
++ * $Id: disk.cc,v 1.57 1997/02/26 19:46:11 wessels Exp $
+  *
+  * DEBUG: section 6     Disk I/O Routines
+  * AUTHOR: Harvest Derived
+@@ -107,6 +107,19 @@
+ 
+ #define DISK_LINE_LEN  1024
+ 
++typedef struct disk_ctrl_t {
++    int fd;
++    void *data;
++} disk_ctrl_t;
++
++
++typedef struct open_ctrl_t {
++    void (*callback) ();
++    void *callback_data;
++    char *path;
++} open_ctrl_t;
++
++
+ typedef struct _dwalk_ctrl {
+     int fd;
+     off_t offset;
+@@ -124,6 +137,10 @@ FileEntry *file_table;
+ static int diskHandleRead _PARAMS((int, dread_ctrl *));
+ static int diskHandleWalk _PARAMS((int, dwalk_ctrl *));
+ static int diskHandleWrite _PARAMS((int, FileEntry *));
++static int diskHandleWriteComplete _PARAMS((void *, int, int));
++static int diskHandleReadComplete _PARAMS((void *, int, int));
++static int diskHandleWalkComplete _PARAMS((void *, int, int));
++static void file_open_complete _PARAMS((void *, int, int));
+ 
+ /* initialize table */
+ int
+@@ -147,10 +164,15 @@ disk_init(void)
+ 
+ /* Open a disk file. Return a file descriptor */
+ int
+-file_open(const char *path, int (*handler) _PARAMS((void)), int mode)
++file_open(const char *path, int (*handler) _PARAMS((void)), int mode, void (*callback) (), void *callback_data)
+ {
+-    FD_ENTRY *conn;
+     int fd;
++    open_ctrl_t *ctrlp;
++
++    ctrlp = xmalloc(sizeof(open_ctrl_t));
++    ctrlp->path = xstrdup(path);
++    ctrlp->callback = callback;
++    ctrlp->callback_data = callback_data;
+ 
+     if (mode & O_WRONLY)
+ 	mode |= O_APPEND;
+@@ -161,17 +183,50 @@ file_open(const char *path, int (*handler) _PARAMS((void)), int mode)
+ #endif
+ 
+     /* Open file */
+-    if ((fd = open(path, mode, 0644)) < 0) {
+-	debug(50, 0, "file_open: error opening file %s: %s\n",
+-	    path, xstrerror());
+-	return (DISK_ERROR);
++#if USE_ASYNC_IO
++    if (callback == NULL) {
++	fd = open(path, mode, 0644);
++	file_open_complete(ctrlp, fd, errno);
++	if (fd < 0)
++	    return DISK_ERROR;
++	return fd;
++    }
++    aioOpen(path, mode, 0644, file_open_complete, ctrlp);
++    return DISK_OK;
++#else
++    fd = open(path, mode, 0644);
++    file_open_complete(ctrlp, fd, errno);
++    if (fd < 0)
++	return DISK_ERROR;
++    return fd;
++#endif
++}
++
++
++static void
++file_open_complete(void *data, int retcode, int errcode)
++{
++    open_ctrl_t *ctrlp = (open_ctrl_t *) data;
++    FD_ENTRY *conn;
++    int fd;
++
++    fd = retcode;
++    if (fd < 0) {
++	errno = errcode;
++	debug(50, 0, "file_open: error opening file %s: %s\n", ctrlp->path,
++	    xstrerror());
++	if (ctrlp->callback)
++	    (ctrlp->callback) (ctrlp->callback_data, DISK_ERROR);
++	xfree(ctrlp->path);
++	xfree(ctrlp);
++	return;
+     }
+     /* update fdstat */
+     fdstat_open(fd, FD_FILE);
+     commSetCloseOnExec(fd);
+ 
+     /* init table */
+-    xstrncpy(file_table[fd].filename, path, SQUID_MAXPATHLEN);
++    xstrncpy(file_table[fd].filename, ctrlp->path, SQUID_MAXPATHLEN);
+     file_table[fd].at_eof = NO;
+     file_table[fd].open_stat = FILE_OPEN;
+     file_table[fd].close_request = NOT_REQUEST;
+@@ -181,7 +236,43 @@ file_open(const char *path, int (*handler) _PARAMS((void)), int mode)
+ 
+     conn = &fd_table[fd];
+     memset(conn, '\0', sizeof(FD_ENTRY));
+-    return fd;
++    if (ctrlp->callback)
++	(ctrlp->callback) (ctrlp->callback_data, fd);
++    xfree(ctrlp->path);
++    xfree(ctrlp);
++}
++
++
++/* must close a disk file */
++
++int
++file_must_close(int fd)
++{
++    FileEntry *entry;
++    dwrite_q *q = NULL;
++    if (fdstatGetType(fd) != FD_FILE)
++	fatal_dump("file_must_close: NOT A FILE");
++    entry = &file_table[fd];
++    if (entry->open_stat == FILE_NOT_OPEN)
++	return DISK_OK;
++    entry->close_request = REQUEST;
++    entry->write_daemon = NOT_PRESENT;
++    entry->write_pending = NO_WRT_PENDING;
++    /* Drain queue */
++    while (entry->write_q) {
++	q = entry->write_q;
++	entry->write_q = q->next;
++	if (q->free)
++	    (q->free) (q->buf);
++	safe_free(q);
++    }
++    entry->write_q_tail = NULL;
++    if (entry->wrt_handle)
++	entry->wrt_handle(fd, DISK_ERROR, entry->wrt_handle_data);
++    commSetSelect(fd, COMM_SELECT_READ, NULL, NULL, 0);
++    commSetSelect(fd, COMM_SELECT_WRITE, NULL, NULL, 0);
++    file_close(fd);
++    return DISK_OK;
+ }
+ 
+ 
+@@ -218,7 +309,11 @@ file_close(int fd)
+ 	conn = &fd_table[fd];
+ 	memset(conn, '\0', sizeof(FD_ENTRY));
+ 	comm_set_fd_lifetime(fd, -1);	/* invalidate the lifetime */
++#if USE_ASYNC_IO
++	aioClose(fd);
++#else
+ 	close(fd);
++#endif
+ 	return DISK_OK;
+     }
+ 
+@@ -233,60 +328,115 @@ file_close(int fd)
+ static int
+ diskHandleWrite(int fd, FileEntry * entry)
+ {
+-    int rlen = 0;
+     int len = 0;
+-    dwrite_q *r = NULL;
++    disk_ctrl_t *ctrlp;
++    dwrite_q *q = NULL;
++    dwrite_q *wq = NULL;
++    if (!entry->write_q)
++	return DISK_OK;
+     if (file_table[fd].at_eof == NO)
+ 	lseek(fd, 0, SEEK_END);
+-    while ((r = entry->write_q)) {
+-	debug(6, 3, "diskHandleWrite: FD %d, %d bytes\n", fd, r->len - r->cur_offset);
+-	len = write(fd, r->buf + r->cur_offset, r->len - r->cur_offset);
+-	file_table[fd].at_eof = YES;
+-	if (len < 0) {
+-	    if (errno == EAGAIN || errno == EWOULDBLOCK)
+-		break;
++    /* We need to combine subsequent write requests after the first */
++    if (entry->write_q->next != NULL && entry->write_q->next->next != NULL) {
++	for (len = 0, q = entry->write_q->next; q != NULL; q = q->next)
++	    len += q->len - q->cur_offset;
++	wq = xcalloc(1, sizeof(dwrite_q));
++	wq->buf = xmalloc(len);
++	wq->len = 0;
++	wq->cur_offset = 0;
++	wq->next = NULL;
++	wq->free = xfree;
++	do {
++	    q = entry->write_q->next;
++	    len = q->len - q->cur_offset;
++	    memcpy(wq->buf + wq->len, q->buf + q->cur_offset, len);
++	    wq->len += len;
++	    entry->write_q->next = q->next;
++	    if (q->free)
++		(q->free) (q->buf);
++	    safe_free(q);
++	} while (entry->write_q->next != NULL);
++	entry->write_q_tail = wq;
++	entry->write_q->next = wq;
++    }
++    ctrlp = xcalloc(1, sizeof(disk_ctrl_t));
++    ctrlp->fd = fd;
++    ctrlp->data = (void *) entry;
++#if USE_ASYNC_IO
++    aioWrite(fd,
++	entry->write_q->buf + entry->write_q->cur_offset,
++	entry->write_q->len - entry->write_q->cur_offset,
++	diskHandleWriteComplete,
++	(void *) ctrlp);
++    return DISK_OK;
++#else
++    len = write(fd,
++	entry->write_q->buf + entry->write_q->cur_offset,
++	entry->write_q->len - entry->write_q->cur_offset);
++    return diskHandleWriteComplete(ctrlp, len, errno);
++#endif
++}
++
++static int
++diskHandleWriteComplete(void *data, int retcode, int errcode)
++{
++    disk_ctrl_t *ctrlp = data;
++    FileEntry *entry = ctrlp->data;
++    dwrite_q *q = entry->write_q;
++    int fd = ctrlp->fd;
++    int len = retcode;
++    errno = errcode;
++    safe_free(data);
++    if (q == NULL)		/* Someone aborted and then the write */
++	return DISK_ERROR;	/* completed anyway. :( */
++    file_table[fd].at_eof = YES;
++    if (len < 0) {
++	if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
++	    len = 0;
++	} else {
+ 	    /* disk i/o failure--flushing all outstanding writes  */
+ 	    debug(50, 1, "diskHandleWrite: FD %d: disk write error: %s\n",
+ 		fd, xstrerror());
+ 	    entry->write_daemon = NOT_PRESENT;
+ 	    entry->write_pending = NO_WRT_PENDING;
+ 	    /* call finish handler */
+ 	    do {
+-		entry->write_q = r->next;
+-		if (r->free)
+-		    (r->free) (r->buf);
+-		safe_free(r);
+-	    } while ((r = entry->write_q));
++		entry->write_q = q->next;
++		if (q->free)
++		    (q->free) (q->buf);
++		safe_free(q);
++	    } while ((q = entry->write_q));
+ 	    if (entry->wrt_handle) {
+ 		entry->wrt_handle(fd,
+ 		    errno == ENOSPC ? DISK_NO_SPACE_LEFT : DISK_ERROR,
+ 		    entry->wrt_handle_data);
+ 	    }
+ 	    return DISK_ERROR;
+ 	}
+-	rlen += len;
+-	r->cur_offset += len;
+-	if (r->cur_offset < r->len)
+-	    continue;		/* partial write? */
++    }
++    q->cur_offset += len;
++    if (q->cur_offset > q->len)
++	fatal_dump("diskHandleWriteComplete: offset > len");
++    if (q->cur_offset == q->len) {
+ 	/* complete write */
+-	entry->write_q = r->next;
+-	if (r->free)
+-	    (r->free) (r->buf);
+-	safe_free(r);
++	entry->write_q = q->next;
++	if (q->free)
++	    (q->free) (q->buf);
++	safe_free(q);
+     }
+-    if (entry->write_q == NULL) {
+-	/* no more data */
+-	entry->write_q_tail = NULL;
+-	entry->write_pending = NO_WRT_PENDING;
+-	entry->write_daemon = NOT_PRESENT;
+-    } else {
++    if (entry->write_q != NULL) {
++	/* another block is queued */
+ 	commSetSelect(fd,
+ 	    COMM_SELECT_WRITE,
+ 	    (PF) diskHandleWrite,
+ 	    (void *) entry,
+ 	    0);
+-	entry->write_daemon = PRESENT;
++	return DISK_OK;
+     }
++    /* no more data */
++    entry->write_q = entry->write_q_tail = NULL;
++    entry->write_pending = NO_WRT_PENDING;
++    entry->write_daemon = NOT_PRESENT;
+     if (entry->wrt_handle)
+ 	entry->wrt_handle(fd, DISK_OK, entry->wrt_handle_data);
+     if (file_table[fd].close_request == REQUEST)
+@@ -332,11 +482,15 @@ file_write(int fd,
+ 
+     if (file_table[fd].write_daemon == PRESENT)
+ 	return DISK_OK;
++#if USE_ASYNC_IO
++    diskHandleWrite(fd, &file_table[fd]);
++#else
+     commSetSelect(fd,
+ 	COMM_SELECT_WRITE,
+ 	(PF) diskHandleWrite,
+ 	(void *) &file_table[fd],
+ 	0);
++#endif
+     return DISK_OK;
+ }
+ 
+@@ -347,41 +501,69 @@ static int
+ diskHandleRead(int fd, dread_ctrl * ctrl_dat)
+ {
+     int len;
+-
++    disk_ctrl_t *ctrlp;
++    ctrlp = xcalloc(1, sizeof(disk_ctrl_t));
++    ctrlp->fd = fd;
++    ctrlp->data = (void *) ctrl_dat;
+     /* go to requested position. */
+     lseek(fd, ctrl_dat->offset, SEEK_SET);
+     file_table[fd].at_eof = NO;
++#if USE_ASYNC_IO
++    aioRead(fd,
++	ctrl_dat->buf + ctrl_dat->cur_len,
++	ctrl_dat->req_len - ctrl_dat->cur_len,
++	diskHandleReadComplete,
++	(void *) ctrlp);
++    return DISK_OK;
++#else
+     len = read(fd,
+ 	ctrl_dat->buf + ctrl_dat->cur_len,
+ 	ctrl_dat->req_len - ctrl_dat->cur_len);
+-
+-    if (len < 0)
+-	switch (errno) {
+-#if EAGAIN != EWOULDBLOCK
+-	case EAGAIN:
++    return diskHandleReadComplete(ctrlp, len, errno);
+ #endif
+-	case EWOULDBLOCK:
+-	    break;
+-	default:
+-	    debug(50, 1, "diskHandleRead: FD %d: error reading: %s\n",
+-		fd, xstrerror());
+-	    ctrl_dat->handler(fd, ctrl_dat->buf,
+-		ctrl_dat->cur_len, DISK_ERROR,
+-		ctrl_dat->client_data);
+-	    safe_free(ctrl_dat);
+-	    return DISK_ERROR;
++}
++
++static int
++diskHandleReadComplete(void *data, int retcode, int errcode)
++{
++    disk_ctrl_t *ctrlp = data;
++    dread_ctrl *ctrl_dat = ctrlp->data;
++    int fd = ctrlp->fd;
++    int len = retcode;
++    errno = errcode;
++    xfree(data);
++    if (len < 0) {
++	if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
++	    commSetSelect(fd,
++		COMM_SELECT_READ,
++		(PF) diskHandleRead,
++		(void *) ctrl_dat,
++		0);
++	    return DISK_OK;
++	}
++	debug(50, 1, "diskHandleRead: FD %d: error reading: %s\n",
++	    fd, xstrerror());
++	ctrl_dat->handler(fd, ctrl_dat->buf,
++	    ctrl_dat->cur_len,
++	    DISK_ERROR,
++	    ctrl_dat->client_data);
++	safe_free(ctrl_dat);
++	return DISK_ERROR;
+     } else if (len == 0) {
+ 	/* EOF */
+ 	ctrl_dat->end_of_file = 1;
+ 	/* call handler */
+-	ctrl_dat->handler(fd, ctrl_dat->buf, ctrl_dat->cur_len, DISK_EOF,
++	ctrl_dat->handler(fd,
++	    ctrl_dat->buf,
++	    ctrl_dat->cur_len,
++	    DISK_EOF,
+ 	    ctrl_dat->client_data);
+ 	safe_free(ctrl_dat);
+ 	return DISK_OK;
++    } else {
++	ctrl_dat->cur_len += len;
++	ctrl_dat->offset = lseek(fd, 0L, SEEK_CUR);
+     }
+-    ctrl_dat->cur_len += len;
+-    ctrl_dat->offset = lseek(fd, 0L, SEEK_CUR);
+-
+     /* reschedule if need more data. */
+     if (ctrl_dat->cur_len < ctrl_dat->req_len) {
+ 	commSetSelect(fd,
+@@ -423,11 +605,15 @@ file_read(int fd, char *buf, int req_len, int offset, FILE_READ_HD handler, void
+     ctrl_dat->end_of_file = 0;
+     ctrl_dat->handler = handler;
+     ctrl_dat->client_data = client_data;
++#if USE_ASYNC_IO
++    diskHandleRead(fd, ctrl_dat);
++#else
+     commSetSelect(fd,
+ 	COMM_SELECT_READ,
+ 	(PF) diskHandleRead,
+ 	(void *) ctrl_dat,
+ 	0);
++#endif
+     return DISK_OK;
+ }
+ 
+@@ -437,29 +623,56 @@ static int
+ diskHandleWalk(int fd, dwalk_ctrl * walk_dat)
+ {
+     int len;
+-    int end_pos;
+-    int st_pos;
+-    int used_bytes;
+-    LOCAL_ARRAY(char, temp_line, DISK_LINE_LEN);
++    disk_ctrl_t *ctrlp;
++    ctrlp = xcalloc(1, sizeof(disk_ctrl_t));
++    ctrlp->fd = fd;
++    ctrlp->data = (void *) walk_dat;
+ 
+     lseek(fd, walk_dat->offset, SEEK_SET);
+     file_table[fd].at_eof = NO;
++#if USE_ASYNC_IO
++    aioRead(fd, walk_dat->buf,
++	DISK_LINE_LEN - 1,
++	diskHandleWalkComplete,
++	(void *) ctrlp);
++    return DISK_OK;
++#else
+     len = read(fd, walk_dat->buf, DISK_LINE_LEN - 1);
+-
+-    if (len < 0)
+-	switch (errno) {
+-#if EAGAIN != EWOULDBLOCK
+-	case EAGAIN:
++    return diskHandleWalkComplete(ctrlp, len, errno);
+ #endif
+-	case EWOULDBLOCK:
+-	    break;
+-	default:
+-	    debug(50, 1, "diskHandleWalk: FD %d: error readingd: %s\n",
+-		fd, xstrerror());
+-	    walk_dat->handler(fd, DISK_ERROR, walk_dat->client_data);
+-	    safe_free(walk_dat->buf);
+-	    safe_free(walk_dat);
+-	    return DISK_ERROR;
++}
++
++
++static int
++diskHandleWalkComplete(void *data, int retcode, int errcode)
++{
++    disk_ctrl_t *ctrlp = (disk_ctrl_t *) data;
++    dwalk_ctrl *walk_dat;
++    int fd;
++    int len;
++    LOCAL_ARRAY(char, temp_line, DISK_LINE_LEN);
++    int end_pos;
++    int st_pos;
++    int used_bytes;
++
++    walk_dat = (dwalk_ctrl *) ctrlp->data;
++    fd = ctrlp->fd;
++    len = retcode;
++    errno = errcode;
++    xfree(data);
++
++    if (len < 0) {
++	if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
++	    commSetSelect(fd, COMM_SELECT_READ, (PF) diskHandleWalk,
++		(void *) walk_dat, 0);
++	    return DISK_OK;
++	}
++	debug(50, 1, "diskHandleWalk: FD %d: error readingd: %s\n",
++	    fd, xstrerror());
++	walk_dat->handler(fd, DISK_ERROR, walk_dat->client_data);
++	safe_free(walk_dat->buf);
++	safe_free(walk_dat);
++	return DISK_ERROR;
+     } else if (len == 0) {
+ 	/* EOF */
+ 	walk_dat->handler(fd, DISK_EOF, walk_dat->client_data);
+@@ -520,9 +733,13 @@ file_walk(int fd,
+     walk_dat->line_handler = line_handler;
+     walk_dat->line_data = line_data;
+ 
++#if USE_ASYNC_IO
++    diskHandleWalk(fd, walk_dat);
++#else
+     commSetSelect(fd, COMM_SELECT_READ, (PF) diskHandleWalk,
+ 	(void *) walk_dat,
+ 	0);
++#endif
+     return DISK_OK;
+ }
+ 
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: fqdncache.cc,v 1.45 1997/02/07 04:57:13 wessels Exp $
++ * $Id: fqdncache.cc,v 1.46 1997/02/26 19:46:12 wessels Exp $
+  *
+  * DEBUG: section 35    FQDN Cache
+  * AUTHOR: Harvest Derived
+@@ -526,6 +526,13 @@ fqdncache_dnsHandleRead(int fd, void *data)
+     debug(35, 5, "fqdncache_dnsHandleRead: Result from DNS ID %d (%d bytes)\n",
+ 	dnsData->id, len);
+     if (len <= 0) {
++	if (len < 0 && (errno == EINTR || errno == EWOULDBLOCK || errno == EAGAIN)) {
++	    commSetSelect(fd,
++		COMM_SELECT_READ,
++		fqdncache_dnsHandleRead,
++		dnsData, 0);
++	    return;
++	}
+ 	debug(35, dnsData->flags & DNS_FLAG_CLOSING ? 5 : 1,
+ 	    "FD %d: Connection from DNSSERVER #%d is closed, disabling\n",
+ 	    fd, dnsData->id);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: ftp.cc,v 1.94 1997/01/13 19:29:12 wessels Exp $
++ * $Id: ftp.cc,v 1.95 1997/02/26 19:46:13 wessels Exp $
+  *
+  * DEBUG: section 9     File Transfer Protocol (FTP)
+  * AUTHOR: Harvest Derived
+@@ -128,11 +128,19 @@ typedef struct _Ftpdata {
+     ConnectStateData connectState;
+ } FtpStateData;
+ 
++typedef struct ftp_ctrl_t {
++    int unusedfd;
++    char *url;
++    request_t *request;
++    StoreEntry *entry;
++} ftp_ctrl_t;
++
+ /* Local functions */
+ static const char *ftpTransferMode _PARAMS((const char *));
+ static char *ftpGetBasicAuth _PARAMS((const char *));
+ static int ftpReadReply _PARAMS((int, FtpStateData *));
+ static int ftpStateFree _PARAMS((int, FtpStateData *));
++static void ftpStartComplete _PARAMS((void *, int));
+ static void ftpConnectDone _PARAMS((int fd, int status, void *data));
+ static void ftpLifetimeExpire _PARAMS((int, FtpStateData *));
+ static void ftpProcessReplyHeader _PARAMS((FtpStateData *, const char *, int));
+@@ -325,7 +333,7 @@ ftpReadReply(int fd, FtpStateData * data)
+     }
+     if (len < 0) {
+ 	debug(50, 1, "ftpReadReply: read error: %s\n", xstrerror());
+-	if (errno == EAGAIN || errno == EWOULDBLOCK) {
++	if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+ 	    /* reinstall handlers */
+ 	    /* XXX This may loop forever */
+ 	    commSetSelect(fd, COMM_SELECT_READ,
+@@ -547,22 +555,43 @@ ftpGetBasicAuth(const char *req_hdr)
+ int
+ ftpStart(int unusedfd, const char *url, request_t * request, StoreEntry * entry)
+ {
+-    LOCAL_ARRAY(char, realm, 8192);
+-    FtpStateData *ftpData = NULL;
+-    char *req_hdr = entry->mem_obj->mime_hdr;
+-    char *response;
+-    char *auth;
+-
++    ftp_ctrl_t *ctrlp;
+     debug(9, 3, "FtpStart: FD %d '%s'\n", unusedfd, url);
+-
+     if (ftpget_server_write < 0) {
+ 	squid_error_entry(entry, ERR_FTP_DISABLED, NULL);
+ 	return COMM_ERROR;
+     }
++    ctrlp = xmalloc(sizeof(ftp_ctrl_t));
++    ctrlp->unusedfd = unusedfd;
++    ctrlp->url = xstrdup(url);
++    ctrlp->request = request;
++    ctrlp->entry = entry;
++    storeLockObject(entry, ftpStartComplete, ctrlp);
++    return COMM_OK;
++}
++
++static void
++ftpStartComplete(void *data, int status)
++{
++    ftp_ctrl_t *ctrlp = (ftp_ctrl_t *) data;
++    LOCAL_ARRAY(char, realm, 8192);
++    int unusedfd;
++    char *url;
++    request_t *request;
++    StoreEntry *entry;
++    FtpStateData *ftpData;
++    char *req_hdr;
++    char *response;
++    char *auth;
+     ftpData = xcalloc(1, sizeof(FtpStateData));
+-    storeLockObject(ftpData->entry = entry, NULL, NULL);
++    unusedfd = ctrlp->unusedfd;
++    url = ctrlp->url;
++    request = ctrlp->request;
++    entry = ctrlp->entry;
++    ftpData->entry = entry;
++    xfree(ctrlp);
++    req_hdr = ctrlp->entry->mem_obj->mime_hdr;
+     ftpData->request = requestLink(request);
+-
+     /* Parse login info. */
+     if ((auth = ftpGetBasicAuth(req_hdr))) {
+ 	ftp_login_parser(auth, ftpData);
+@@ -582,14 +611,13 @@ ftpStart(int unusedfd, const char *url, request_t * request, StoreEntry * entry)
+ 	    httpParseReplyHeaders(response, entry->mem_obj->reply);
+ 	    storeComplete(entry);
+ 	    ftpStateFree(-1, ftpData);
+-	    return COMM_OK;
++	    xfree(url);
++	    return;
+ 	}
+     }
+-
+     debug(9, 5, "FtpStart: FD %d, host=%s, path=%s, user=%s, passwd=%s\n",
+ 	unusedfd, ftpData->request->host, ftpData->request->urlpath,
+ 	ftpData->user, ftpData->password);
+-
+     ftpData->ftp_fd = comm_open(SOCK_STREAM,
+ 	0,
+ 	local_addr,
+@@ -599,23 +627,23 @@ ftpStart(int unusedfd, const char *url, request_t * request, StoreEntry * entry)
+     if (ftpData->ftp_fd == COMM_ERROR) {
+ 	squid_error_entry(entry, ERR_CONNECT_FAIL, xstrerror());
+ 	ftpStateFree(-1, ftpData);
+-	return COMM_ERROR;
++	xfree(url);
++	return;
+     }
+     /* Pipe/socket created ok */
+-
+     /* register close handler */
+     comm_add_close_handler(ftpData->ftp_fd,
+ 	(PF) ftpStateFree,
+ 	(void *) ftpData);
+-
+     /* Now connect ... */
+     ftpData->connectState.fd = ftpData->ftp_fd;
+     ftpData->connectState.host = localhost;
+     ftpData->connectState.port = ftpget_port;
+     ftpData->connectState.handler = ftpConnectDone;
+     ftpData->connectState.data = ftpData;
+     comm_nbconnect(ftpData->ftp_fd, &ftpData->connectState);
+-    return COMM_OK;
++    xfree(url);
++    return;
+ }
+ 
+ static void
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: gopher.cc,v 1.70 1996/12/03 20:26:53 wessels Exp $
++ * $Id: gopher.cc,v 1.71 1997/02/26 19:46:13 wessels Exp $
+  *
+  * DEBUG: section 10    Gopher
+  * AUTHOR: Harvest Derived
+@@ -159,6 +159,12 @@ typedef struct gopher_ds {
+     ConnectStateData connectState;
+ } GopherStateData;
+ 
++typedef struct gopher_ctrl_t {
++    int unusedfd;
++    char *url;
++    StoreEntry *entry;
++} gopher_ctrl_t;
++
+ static int gopherStateFree _PARAMS((int fd, GopherStateData *));
+ static void gopher_mime_content _PARAMS((char *buf, const char *name, const char *def));
+ static void gopherMimeCreate _PARAMS((GopherStateData *));
+@@ -177,6 +183,7 @@ static void gopherSendComplete(int fd,
+     int size,
+     int errflag,
+     void *data);
++static void gopherStartComplete _PARAMS((void *, int));
+ static void gopherSendRequest _PARAMS((int fd, GopherStateData *));
+ static GopherStateData *CreateGopherStateData _PARAMS((void));
+ static void gopherConnectDone _PARAMS((int fd, int status, void *data));
+@@ -771,7 +778,7 @@ gopherReadReply(int fd, GopherStateData * data)
+     }
+     if (len < 0) {
+ 	debug(50, 1, "gopherReadReply: error reading: %s\n", xstrerror());
+-	if (errno == EAGAIN || errno == EWOULDBLOCK) {
++	if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+ 	    /* reinstall handlers */
+ 	    /* XXX This may loop forever */
+ 	    commSetSelect(fd,
+@@ -938,20 +945,39 @@ gopherSendRequest(int fd, GopherStateData * data)
+ int
+ gopherStart(int unusedfd, const char *url, StoreEntry * entry)
+ {
+-    /* Create state structure. */
+-    int sock;
+-    GopherStateData *data = CreateGopherStateData();
++    gopher_ctrl_t *ctrlp;
++    ctrlp = xmalloc(sizeof(gopher_ctrl_t));
++    ctrlp->unusedfd = unusedfd;
++    ctrlp->url = xstrdup(url);
++    ctrlp->entry = entry;
++    storeLockObject(entry, gopherStartComplete, ctrlp);
++    return COMM_OK;
++}
+ 
+-    storeLockObject(data->entry = entry, NULL, NULL);
+ 
++static void
++gopherStartComplete(void *datap, int status)
++{
++    gopher_ctrl_t *ctrlp = (gopher_ctrl_t *) datap;
++    /* Create state structure. */
++    GopherStateData *data = CreateGopherStateData();
++    int sock;
++    int unusedfd;
++    char *url;
++    StoreEntry *entry;
++    unusedfd = ctrlp->unusedfd;
++    url = ctrlp->url;
++    entry = ctrlp->entry;
++    xfree(ctrlp);
++    data->entry = entry;
+     debug(10, 3, "gopherStart: url: %s\n", url);
+-
+     /* Parse url. */
+     if (gopher_url_parser(url, data->host, &data->port,
+ 	    &data->type_id, data->request)) {
+ 	squid_error_entry(entry, ERR_INVALID_URL, NULL);
+ 	gopherStateFree(-1, data);
+-	return COMM_ERROR;
++	xfree(url);
++	return;
+     }
+     /* Create socket. */
+     sock = comm_open(SOCK_STREAM,
+@@ -964,28 +990,28 @@ gopherStart(int unusedfd, const char *url, StoreEntry * entry)
+ 	debug(10, 4, "gopherStart: Failed because we're out of sockets.\n");
+ 	squid_error_entry(entry, ERR_NO_FDS, xstrerror());
+ 	gopherStateFree(-1, data);
+-	return COMM_ERROR;
++	xfree(url);
++	return;
+     }
+     comm_add_close_handler(sock,
+ 	(PF) gopherStateFree,
+ 	(void *) data);
+-
+     /* check if IP is already in cache. It must be. 
+      * It should be done before this route is called. 
+      * Otherwise, we cannot check return code for connect. */
+     if (!ipcache_gethostbyname(data->host, 0)) {
+ 	debug(10, 4, "gopherStart: Called without IP entry in ipcache. OR lookup failed.\n");
+ 	squid_error_entry(entry, ERR_DNS_FAIL, dns_error_message);
+ 	comm_close(sock);
+-	return COMM_ERROR;
++	xfree(url);
++	return;
+     }
+     if (((data->type_id == GOPHER_INDEX) || (data->type_id == GOPHER_CSO))
+ 	&& (strchr(data->request, '?') == NULL)
+ 	&& (BIT_TEST(entry->flag, ENTRY_HTML))) {
+ 	/* Index URL without query word */
+ 	/* We have to generate search page back to client. No need for connection */
+ 	gopherMimeCreate(data);
+-
+ 	if (data->type_id == GOPHER_INDEX) {
+ 	    data->conversion = HTML_INDEX_PAGE;
+ 	} else {
+@@ -998,15 +1024,17 @@ gopherStart(int unusedfd, const char *url, StoreEntry * entry)
+ 	gopherToHTML(data, (char *) NULL, 0);
+ 	storeComplete(entry);
+ 	comm_close(sock);
+-	return COMM_OK;
++	xfree(url);
++	return;
+     }
+     data->connectState.fd = sock;
+     data->connectState.host = data->host;
+     data->connectState.port = data->port;
+     data->connectState.handler = gopherConnectDone;
+     data->connectState.data = data;
+     comm_nbconnect(sock, &data->connectState);
+-    return COMM_OK;
++    xfree(url);
++    return;
+ }
+ 
+ static void
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: http.cc,v 1.149 1997/02/24 20:22:10 wessels Exp $
++ * $Id: http.cc,v 1.150 1997/02/26 19:46:14 wessels Exp $
+  *
+  * DEBUG: section 11    Hypertext Transfer Protocol (HTTP)
+  * AUTHOR: Harvest Derived
+@@ -158,6 +158,22 @@ typedef enum {
+     HDR_MISC_END
+ } http_hdr_misc_t;
+ 
++typedef struct proxy_ctrl_t {
++    int sock;
++    char *url;
++    request_t *orig_request;
++    StoreEntry *entry;
++    peer *e;
++} proxy_ctrl_t;
++
++typedef struct http_ctrl_t {
++    int sock;
++    request_t *request;
++    char *req_hdr;
++    int req_hdr_sz;
++    StoreEntry *entry;
++} http_ctrl_t;
++
+ char *HttpServerCCStr[] =
+ {
+     "public",
+@@ -207,6 +223,8 @@ static void httpMakePrivate _PARAMS((StoreEntry *));
+ static void httpCacheNegatively _PARAMS((StoreEntry *));
+ static void httpReadReply _PARAMS((int fd, void *));
+ static void httpSendComplete _PARAMS((int fd, char *, int, int, void *));
++static void proxyhttpStartComplete _PARAMS((void *, int));
++static void httpStartComplete _PARAMS((void *, int));
+ static void httpSendRequest _PARAMS((int fd, void *));
+ static void httpConnect _PARAMS((int fd, const ipcache_addrs *, void *));
+ static void httpConnectDone _PARAMS((int fd, int status, void *data));
+@@ -601,9 +619,7 @@ httpReadReply(int fd, void *data)
+ 	IOStats.Http.read_hist[bin]++;
+     }
+     if (len < 0) {
+-	debug(50, 2, "httpReadReply: FD %d: read failure: %s.\n",
+-	    fd, xstrerror());
+-	if (errno == EAGAIN || errno == EWOULDBLOCK) {
++	if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+ 	    /* reinstall handlers */
+ 	    /* XXX This may loop forever */
+ 	    commSetSelect(fd, COMM_SELECT_READ,
+@@ -616,6 +632,8 @@ httpReadReply(int fd, void *data)
+ 	    squid_error_entry(entry, ERR_READ_ERROR, xstrerror());
+ 	    comm_close(fd);
+ 	}
++	debug(50, 2, "httpReadReply: FD %d: read failure: %s.\n",
++	    fd, xstrerror());
+     } else if (len == 0 && entry->mem_obj->e_current_len == 0) {
+ 	httpState->eof = 1;
+ 	squid_error_entry(entry,
+@@ -639,15 +657,15 @@ httpReadReply(int fd, void *data)
+ 	if (httpState->reply_hdr_state < 2)
+ 	    httpProcessReplyHeader(httpState, buf, len);
+ 	storeAppend(entry, buf, len);
+-	commSetSelect(fd,
+-	    COMM_SELECT_READ,
+-	    httpReadReply,
+-	    (void *) httpState, 0);
+ 	commSetSelect(fd,
+ 	    COMM_SELECT_TIMEOUT,
+ 	    httpReadReplyTimeout,
+ 	    (void *) httpState,
+ 	    Config.readTimeout);
++	commSetSelect(fd,
++	    COMM_SELECT_READ,
++	    httpReadReply,
++	    (void *) httpState, 0);
+     }
+ }
+ 
+@@ -880,18 +898,14 @@ proxyhttpStart(const char *url,
+     StoreEntry * entry,
+     peer * e)
+ {
++    proxy_ctrl_t *ctrlp;
+     int sock;
+-    HttpStateData *httpState = NULL;
+-    request_t *request = NULL;
+-
+     debug(11, 3, "proxyhttpStart: \"%s %s\"\n",
+ 	RequestMethodStr[orig_request->method], url);
+     debug(11, 10, "proxyhttpStart: HTTP request header:\n%s\n",
+ 	entry->mem_obj->mime_hdr);
+-
+     if (e->options & NEIGHBOR_PROXY_ONLY)
+ 	storeStartDeleteBehind(entry);
+-
+     /* Create socket. */
+     sock = comm_open(SOCK_STREAM,
+ 	0,
+@@ -904,8 +918,39 @@ proxyhttpStart(const char *url,
+ 	squid_error_entry(entry, ERR_NO_FDS, xstrerror());
+ 	return COMM_ERROR;
+     }
++    ctrlp = xmalloc(sizeof(proxy_ctrl_t));
++    ctrlp->sock = sock;
++    ctrlp->url = xstrdup(url);
++    ctrlp->orig_request = orig_request;
++    ctrlp->entry = entry;
++    ctrlp->e = e;
++    storeLockObject(entry, proxyhttpStartComplete, ctrlp);
++    return COMM_OK;
++}
++
++
++static void
++proxyhttpStartComplete(void *data, int status)
++{
++    proxy_ctrl_t *ctrlp = (proxy_ctrl_t *) data;
++    int sock;
++    HttpStateData *httpState = NULL;
++    request_t *request = NULL;
++    char *url;
++    request_t *orig_request;
++    StoreEntry *entry;
++    peer *e;
++
++    sock = ctrlp->sock;
++    url = ctrlp->url;
++    orig_request = ctrlp->orig_request;
++    entry = ctrlp->entry;
++    e = ctrlp->e;
++    xfree(ctrlp);
++
+     httpState = xcalloc(1, sizeof(HttpStateData));
+-    storeLockObject(httpState->entry = entry, NULL, NULL);
++    httpState->entry = entry;
++
+     httpState->req_hdr = entry->mem_obj->mime_hdr;
+     httpState->req_hdr_sz = entry->mem_obj->mime_hdr_sz;
+     request = get_free_request_t();
+@@ -925,7 +970,8 @@ proxyhttpStart(const char *url,
+ 	sock,
+ 	httpConnect,
+ 	httpState);
+-    return COMM_OK;
++    xfree(url);
++    return;
+ }
+ 
+ static void
+@@ -982,14 +1028,12 @@ httpStart(char *url,
+     int req_hdr_sz,
+     StoreEntry * entry)
+ {
++    http_ctrl_t *ctrlp;
+     /* Create state structure. */
+     int sock;
+-    HttpStateData *httpState = NULL;
+-
+     debug(11, 3, "httpStart: \"%s %s\"\n",
+ 	RequestMethodStr[request->method], url);
+     debug(11, 10, "httpStart: req_hdr '%s'\n", req_hdr);
+-
+     /* Create socket. */
+     sock = comm_open(SOCK_STREAM,
+ 	0,
+@@ -1002,8 +1046,38 @@ httpStart(char *url,
+ 	squid_error_entry(entry, ERR_NO_FDS, xstrerror());
+ 	return COMM_ERROR;
+     }
++    ctrlp = xmalloc(sizeof(http_ctrl_t));
++    ctrlp->sock = sock;
++    ctrlp->request = request;
++    ctrlp->req_hdr = req_hdr;
++    ctrlp->req_hdr_sz = req_hdr_sz;
++    ctrlp->entry = entry;
++    storeLockObject(entry, httpStartComplete, ctrlp);
++    return COMM_OK;
++}
++
++
++static void
++httpStartComplete(void *data, int status)
++{
++    http_ctrl_t *ctrlp = (http_ctrl_t *) data;
++    HttpStateData *httpState = NULL;
++    int sock;
++    request_t *request;
++    char *req_hdr;
++    int req_hdr_sz;
++    StoreEntry *entry;
++
++    sock = ctrlp->sock;
++    request = ctrlp->request;
++    req_hdr = ctrlp->req_hdr;
++    req_hdr_sz = ctrlp->req_hdr_sz;
++    entry = ctrlp->entry;
++    xfree(ctrlp);
++
+     httpState = xcalloc(1, sizeof(HttpStateData));
+-    storeLockObject(httpState->entry = entry, NULL, NULL);
++    httpState->entry = entry;
++
+     httpState->req_hdr = req_hdr;
+     httpState->req_hdr_sz = req_hdr_sz;
+     httpState->request = requestLink(request);
+@@ -1014,7 +1088,6 @@ httpStart(char *url,
+ 	sock,
+ 	httpConnect,
+ 	httpState);
+-    return COMM_OK;
+ }
+ 
+ void
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: icmp.cc,v 1.30 1996/12/04 17:50:59 wessels Exp $
++ * $Id: icmp.cc,v 1.31 1997/02/26 19:46:15 wessels Exp $
+  *
+  * DEBUG: section 37    ICMP Routines
+  * AUTHOR: Duane Wessels
+@@ -148,7 +148,7 @@ icmpSend(int fd, icmpQueueData * queue)
+ 	    queue->len,
+ 	    0);
+ 	if (x < 0) {
+-	    if (errno == EWOULDBLOCK || errno == EAGAIN)
++	    if (errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR)
+ 		break;		/* don't de-queue */
+ 	    debug(50, 0, "icmpSend: send: %s\n", xstrerror());
+ 	    if (errno == ECONNREFUSED) {
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: ipcache.cc,v 1.106 1997/02/24 23:42:00 wessels Exp $
++ * $Id: ipcache.cc,v 1.107 1997/02/26 19:46:17 wessels Exp $
+  *
+  * DEBUG: section 14    IP Cache
+  * AUTHOR: Harvest Derived
+@@ -572,6 +572,13 @@ ipcache_dnsHandleRead(int fd, dnsserver_t * dnsData)
+     debug(14, 5, "ipcache_dnsHandleRead: Result from DNS ID %d (%d bytes)\n",
+ 	dnsData->id, len);
+     if (len <= 0) {
++	if (len < 0 && (errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR)) {
++	    commSetSelect(fd,
++		COMM_SELECT_READ,
++		(PF) ipcache_dnsHandleRead,
++		dnsData, 0);
++	    return 0;
++	}
+ 	debug(14, dnsData->flags & DNS_FLAG_CLOSING ? 5 : 1,
+ 	    "FD %d: Connection from DNSSERVER #%d is closed, disabling\n",
+ 	    fd, dnsData->id);
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: neighbors.cc,v 1.123 1997/02/25 19:18:21 wessels Exp $
++ * $Id: neighbors.cc,v 1.124 1997/02/26 19:46:18 wessels Exp $
+  *
+  * DEBUG: section 15    Neighbor Routines
+  * AUTHOR: Harvest Derived
+@@ -121,7 +121,7 @@ static u_short echo_port;
+ 
+ static int NLateReplies = 0;
+ static int NObjectsQueried = 0;
+-static int MulticastFudgeFactor = 0;
++static int MulticastFudgeFactor = 1;
+ 
+ static struct {
+     int n;
+@@ -221,6 +221,8 @@ peerAllowedToUse(const peer * e, request_t * request)
+     const struct _acl_list *a = NULL;
+     aclCheck_t checklist;
+ 
++    if (request == NULL)
++	fatal_dump("peerAllowedToUse: NULL request");
+     if (BIT_TEST(request->flags, REQ_NOCACHE))
+ 	if (neighborType(e, request) == PEER_SIBLING)
+ 	    return 0;
+@@ -433,7 +435,7 @@ neighbors_open(int fd)
+ }
+ 
+ int
+-neighborsUdpPing(request_t *request, StoreEntry *entry)
++neighborsUdpPing(request_t * request, StoreEntry * entry)
+ {
+     char *host = request->host;
+     char *url = entry->url;
+@@ -447,6 +449,7 @@ neighborsUdpPing(request_t *request, StoreEntry *entry)
+     icp_common_t *query;
+     int ICP_queries_sent = 0;
+     int ICP_mcasts_sent = 0;
++    int peers_pinged = 0;
+ 
+     if (Peers.peers_head == NULL)
+ 	return 0;
+@@ -471,6 +474,7 @@ neighborsUdpPing(request_t *request, StoreEntry *entry)
+ 	debug(15, 5, "neighborsUdpPing: Peer %s\n", e->host);
+ 	if (!peerWouldBePinged(e, request))
+ 	    continue;		/* next peer */
++	peers_pinged++;
+ 	debug(15, 4, "neighborsUdpPing: pinging peer %s for '%s'\n",
+ 	    e->host, url);
+ 	if (e->type == PEER_MULTICAST)
+@@ -532,7 +536,7 @@ neighborsUdpPing(request_t *request, StoreEntry *entry)
+     if (Peers.n) {
+ 	if (Config.sourcePing) {
+ 	    debug(15, 6, "neighborsUdpPing: Source Ping is disabled.\n");
+-	} else if ((ia = ipcache_gethostbyname(host, IP_BLOCKING_LOOKUP))) {
++	} else if ((ia = ipcache_gethostbyname(host, 0))) {
+ 	    debug(15, 6, "neighborsUdpPing: Source Ping: to %s for '%s'\n",
+ 		host, url);
+ 	    echo_hdr.reqnum = reqnum;
+@@ -559,7 +563,7 @@ neighborsUdpPing(request_t *request, StoreEntry *entry)
+ 	NObjectsQueried++;
+     if ((ICP_mcasts_sent))
+ 	mem->e_pings_n_pings += MulticastFudgeFactor;
+-    return mem->e_pings_n_pings;
++    return peers_pinged;
+ }
+ 
+ static void
+@@ -639,7 +643,7 @@ neighborsUdpAck(int fd, const char *url, icp_common_t * header, const struct soc
+ 	neighborCountIgnored(e, opcode);
+ 	return;
+     }
+-    if (BIT_TEST(e->options, NEIGHBOR_MCAST_RESPONDER)) {
++    if (e && BIT_TEST(e->options, NEIGHBOR_MCAST_RESPONDER)) {
+ 	if (!peerHTTPOkay(e, mem->request)) {
+ 	    neighborCountIgnored(e, opcode);
+ 	    return;
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: peer_select.cc,v 1.1 1997/02/26 03:08:52 wessels Exp $
++ * $Id: peer_select.cc,v 1.2 1997/02/26 19:46:19 wessels Exp $
+  *
+  * DEBUG: section 44    Peer Selection Algorithm
+  * AUTHOR: Duane Wessels
+@@ -141,15 +141,15 @@ peerSelect(int fd, request_t * request, StoreEntry * entry)
+     peer *p;
+     hier_code code;
+     int direct = peerSelectDirect(request);
+-    debug(44,3,"peerSelect: '%s'\n", entry->url);
++    debug(44, 3, "peerSelect: '%s'\n", entry->url);
+     if (direct == DIRECT_YES) {
+-        debug(44,3,"peerSelect: direct == DIRECT_YES --> HIER_DIRECT\n");
++	debug(44, 3, "peerSelect: direct == DIRECT_YES --> HIER_DIRECT\n");
+ 	hierarchyNote(request, HIER_DIRECT, 0, request->host);
+ 	protoStart(fd, entry, NULL, request);
+ 	return;
+     }
+     if (peerSelectIcpPing(request, direct, entry)) {
+-        debug(44,3,"peerSelect: Doing ICP pings\n");
++	debug(44, 3, "peerSelect: Doing ICP pings\n");
+ 	/* call neighborUdpPing and start timeout routine */
+ 	if (neighborsUdpPing(request, entry)) {
+ 	    entry->ping_status = PING_WAITING;
+@@ -163,8 +163,8 @@ peerSelect(int fd, request_t * request, StoreEntry * entry)
+ 	debug_trap("peerSelect: neighborsUdpPing returned 0");
+     }
+     if ((p = peerGetSomeParent(request, &code))) {
+-        debug(44,3,"peerSelect: Got some parent %s/%s\n",
+-		hier_strings[code], p->host);
++	debug(44, 3, "peerSelect: Got some parent %s/%s\n",
++	    hier_strings[code], p->host);
+ 	hierarchyNote(request, code, 0, p->host);
+ 	protoStart(fd, entry, p, request);
+     }
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: send-announce.cc,v 1.28 1997/02/04 17:50:46 wessels Exp $
++ * $Id: send-announce.cc,v 1.29 1997/02/26 19:46:20 wessels Exp $
+  *
+  * DEBUG: section 27    Cache Announcer
+  * AUTHOR: Duane Wessels
+@@ -72,7 +72,7 @@ send_announce(void *unused)
+     l = strlen(sndbuf);
+ 
+     if ((file = Config.Announce.file)) {
+-	fd = file_open(file, NULL, O_RDONLY);
++	fd = file_open(file, NULL, O_RDONLY, NULL, NULL);
+ 	if (fd > -1 && (n = read(fd, sndbuf + l, BUFSIZ - l - 1)) > 0) {
+ 	    l += n;
+ 	    sndbuf[l] = '\0';
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: squid.h,v 1.96 1997/02/25 19:18:24 wessels Exp $
++ * $Id: squid.h,v 1.97 1997/02/26 19:46:21 wessels Exp $
+  *
+  * AUTHOR: Duane Wessels
+  *
+@@ -261,7 +261,7 @@ typedef unsigned long u_num32;
+ #include <regex.h>
+ #endif
+ 
+-typedef void (*SIH) (int, void *);	/* swap in */
++typedef void (*SIH) (void *, int);	/* swap in */
+ typedef int (*QS) (const void *, const void *);
+ 
+ #include "cache_cf.h"
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: ssl.cc,v 1.39 1997/02/25 19:18:24 wessels Exp $
++ * $Id: ssl.cc,v 1.40 1997/02/26 19:46:22 wessels Exp $
+  *
+  * DEBUG: section 26    Secure Sockets Layer Proxy
+  * AUTHOR: Duane Wessels
+@@ -143,7 +143,7 @@ sslReadServer(int fd, void *data)
+     if (len < 0) {
+ 	debug(50, 1, "sslReadServer: FD %d: read failure: %s\n",
+ 	    sslState->server.fd, xstrerror());
+-	if (errno == EAGAIN || errno == EWOULDBLOCK) {
++	if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+ 	    /* reinstall handlers */
+ 	    /* XXX This may loop forever */
+ 	    commSetSelect(sslState->server.fd,
+@@ -183,7 +183,7 @@ sslReadClient(int fd, void *data)
+     if (len < 0) {
+ 	debug(50, 1, "sslReadClient: FD %d: read failure: %s\n",
+ 	    fd, xstrerror());
+-	if (errno == EAGAIN || errno == EWOULDBLOCK) {
++	if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+ 	    /* reinstall handlers */
+ 	    /* XXX This may loop forever */
+ 	    commSetSelect(sslState->client.fd,
+@@ -217,6 +217,13 @@ sslWriteServer(int fd, void *data)
+ 	sslState->client.len - sslState->client.offset);
+     debug(26, 5, "sslWriteServer FD %d, wrote %d bytes\n", fd, len);
+     if (len < 0) {
++	if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK) {
++	    commSetSelect(sslState->server.fd,
++		COMM_SELECT_WRITE,
++		sslWriteServer,
++		(void *) sslState, 0);
++	    return;
++	}
+ 	debug(50, 2, "sslWriteServer: FD %d: write failure: %s.\n",
+ 	    sslState->server.fd, xstrerror());
+ 	sslClose(sslState);
+@@ -257,6 +264,13 @@ sslWriteClient(int fd, void *data)
+ 	sslState->server.len - sslState->server.offset);
+     debug(26, 5, "sslWriteClient FD %d, wrote %d bytes\n", fd, len);
+     if (len < 0) {
++	if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK) {
++	    commSetSelect(sslState->client.fd,
++		COMM_SELECT_WRITE,
++		sslWriteClient,
++		(void *) sslState, 0);
++	    return;
++	}
+ 	debug(50, 2, "sslWriteClient: FD %d: write failure: %s.\n",
+ 	    sslState->client.fd, xstrerror());
+ 	sslClose(sslState);
+@@ -295,11 +309,11 @@ sslConnected(int fd, void *data)
+     strcpy(sslState->server.buf, conn_established);
+     sslState->server.len = strlen(conn_established);
+     sslState->server.offset = 0;
++    comm_set_fd_lifetime(fd, 86400);	/* extend lifetime */
+     commSetSelect(sslState->client.fd,
+ 	COMM_SELECT_WRITE,
+ 	sslWriteClient,
+ 	(void *) sslState, 0);
+-    comm_set_fd_lifetime(fd, 86400);	/* extend lifetime */
+     commSetSelect(sslState->client.fd,
+ 	COMM_SELECT_READ,
+ 	sslReadClient,
+@@ -473,11 +487,11 @@ sslProxyConnected(int fd, void *data)
+     debug(26, 3, "sslProxyConnected: Sending 'CONNECT %s HTTP/1.0'\n", sslState->url);
+     sslState->client.len = strlen(sslState->client.buf);
+     sslState->client.offset = 0;
++    comm_set_fd_lifetime(fd, 86400);	/* extend lifetime */
+     commSetSelect(sslState->server.fd,
+ 	COMM_SELECT_WRITE,
+ 	sslWriteServer,
+ 	(void *) sslState, 0);
+-    comm_set_fd_lifetime(fd, 86400);	/* extend lifetime */
+     commSetSelect(sslState->server.fd,
+ 	COMM_SELECT_READ,
+ 	sslReadServer,
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: stat.cc,v 1.126 1997/02/24 23:43:14 wessels Exp $
++ * $Id: stat.cc,v 1.127 1997/02/26 19:46:22 wessels Exp $
+  *
+  * DEBUG: section 18    Cache Manager Statistics
+  * AUTHOR: Harvest Derived
+@@ -488,7 +488,7 @@ log_get_start(const cacheinfo * obj, StoreEntry * sentry)
+ 	storeComplete(sentry);
+ 	return;
+     }
+-    fd = file_open(obj->logfilename, NULL, O_RDONLY);
++    fd = file_open(obj->logfilename, NULL, O_RDONLY, NULL, NULL);
+     if (fd < 0) {
+ 	debug(50, 0, "Cannot open logfile: %s: %s\n",
+ 	    obj->logfilename, xstrerror());
+@@ -535,7 +535,7 @@ squid_get_start(const cacheinfo * obj, StoreEntry * sentry)
+ 
+     data = xcalloc(1, sizeof(squid_read_data_t));
+     data->sentry = sentry;
+-    data->fd = file_open(ConfigFile, NULL, O_RDONLY);
++    data->fd = file_open(ConfigFile, NULL, O_RDONLY, NULL, NULL);
+     storeAppendPrintf(sentry, open_bracket);
+     file_walk(data->fd, (FILE_WALK_HD) squidReadEndHandler, (void *) data,
+ 	(FILE_WALK_LHD) squidReadHandler, (void *) data);
+@@ -606,9 +606,9 @@ server_list(const cacheinfo * obj, StoreEntry * sentry)
+     storeAppendPrintf(sentry, close_bracket);
+ }
+ 
+-#if XMALLOC_STATISTICS
++#ifdef XMALLOC_STATISTICS
+ static void
+-info_get_mallstat(int size, number, StoreEntry * sentry)
++info_get_mallstat(int size, int number, StoreEntry * sentry)
+ {
+     if (number > 0)
+ 	storeAppendPrintf(sentry, "{\t%d = %d}\n", size, number);
+@@ -1161,7 +1161,7 @@ log_enable(cacheinfo * obj, StoreEntry * sentry)
+ 	obj->logfile_status = LOG_ENABLE;
+ 
+ 	/* open the logfile */
+-	obj->logfile_fd = file_open(obj->logfilename, NULL, O_WRONLY | O_CREAT);
++	obj->logfile_fd = file_open(obj->logfilename, NULL, O_WRONLY | O_CREAT, NULL, NULL);
+ 	if (obj->logfile_fd == DISK_ERROR) {
+ 	    debug(18, 0, "Cannot open logfile: %s\n", obj->logfilename);
+ 	    obj->logfile_status = LOG_DISABLE;
+@@ -1194,7 +1194,7 @@ log_clear(cacheinfo * obj, StoreEntry * sentry)
+     unlink(obj->logfilename);
+ 
+     /* reopen it anyway */
+-    obj->logfile_fd = file_open(obj->logfilename, NULL, O_WRONLY | O_CREAT);
++    obj->logfile_fd = file_open(obj->logfilename, NULL, O_WRONLY | O_CREAT, NULL, NULL);
+     if (obj->logfile_fd == DISK_ERROR) {
+ 	debug(18, 0, "Cannot open logfile: %s\n", obj->logfilename);
+ 	obj->logfile_status = LOG_DISABLE;
+@@ -1287,7 +1287,7 @@ stat_init(cacheinfo ** object, const char *logfilename)
+     if (logfilename) {
+ 	memset(obj->logfilename, '0', SQUID_MAXPATHLEN);
+ 	xstrncpy(obj->logfilename, logfilename, SQUID_MAXPATHLEN);
+-	obj->logfile_fd = file_open(obj->logfilename, NULL, O_WRONLY | O_CREAT);
++	obj->logfile_fd = file_open(obj->logfilename, NULL, O_WRONLY | O_CREAT, NULL, NULL);
+ 	if (obj->logfile_fd == DISK_ERROR) {
+ 	    debug(50, 0, "%s: %s\n", obj->logfilename, xstrerror());
+ 	    fatal("Cannot open logfile.");
+@@ -1373,7 +1373,7 @@ stat_rotate_log(void)
+     /* Close and reopen the log.  It may have been renamed "manually"
+      * before HUP'ing us. */
+     file_close(HTTPCacheInfo->logfile_fd);
+-    HTTPCacheInfo->logfile_fd = file_open(fname, NULL, O_WRONLY | O_CREAT);
++    HTTPCacheInfo->logfile_fd = file_open(fname, NULL, O_WRONLY | O_CREAT, NULL, NULL);
+     if (HTTPCacheInfo->logfile_fd == DISK_ERROR) {
+ 	debug(18, 0, "stat_rotate_log: Cannot open logfile: %s\n", fname);
+ 	HTTPCacheInfo->logfile_status = LOG_DISABLE;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: stmem.cc,v 1.37 1997/01/07 20:31:25 wessels Exp $
++ * $Id: stmem.cc,v 1.38 1997/02/26 19:46:23 wessels Exp $
+  *
+  * DEBUG: section 19    Memory Primitives
+  * AUTHOR: Harvest Derived
+@@ -265,7 +265,8 @@ memCopy(const mem_ptr mem, int offset, char *buf, int size)
+     debug(19, 6, "memCopy: offset %d: size %d\n", offset, size);
+ 
+     if (p == NULL)
+-	fatal_dump("memCopy: NULL mem_node");
++	return -1;
++    /*      fatal_dump("memCopy: NULL mem_node"); *//* Can happen on async */
+ 
+     if (size <= 0)
+ 	return size;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: store.cc,v 1.212 1997/02/25 16:09:13 wessels Exp $
++ * $Id: store.cc,v 1.213 1997/02/26 19:46:24 wessels Exp $
+  *
+  * DEBUG: section 20    Storeage Manager
+  * AUTHOR: Harvest Derived
+@@ -201,6 +201,40 @@ struct _bucketOrder {
+     int index;
+ };
+ 
++typedef struct storeCleanList {
++    char *key;
++    struct storeCleanList *next;
++} storeCleanList;
++
++typedef void (*VCB) _PARAMS((void *, int));
++
++typedef struct valid_ctrl_t {
++    struct stat *sb;
++    StoreEntry *e;
++    VCB callback;
++    void *callback_data;
++} valid_ctrl_t;
++
++typedef struct swapin_ctrl_t {
++    StoreEntry *e;
++    char *path;
++    SIH callback;
++    void *callback_data;
++} swapin_ctrl_t;
++
++typedef struct lock_ctrl_t {
++    SIH callback;
++    void *callback_data;
++    StoreEntry *e;
++} lock_ctrl_t;
++
++typedef struct swapout_ctrl_t {
++    char *swapfilename;
++    int oldswapstatus;
++    StoreEntry *e;
++    int swapfileno;
++} swapout_ctrl_t;
++
+ /* initializtion flag */
+ int store_rebuilding = STORE_REBUILDING_SLOW;
+ 
+@@ -210,24 +244,37 @@ static char *storeSwapFullPath _PARAMS((int, char *));
+ static HashID storeCreateHashTable _PARAMS((int (*)_PARAMS((const char *, const char *))));
+ static int compareLastRef _PARAMS((StoreEntry **, StoreEntry **));
+ static int compareSize _PARAMS((StoreEntry **, StoreEntry **));
+-static int compareBucketOrder _PARAMS((struct _bucketOrder *, struct _bucketOrder *));
++static int compareBucketOrder _PARAMS((struct _bucketOrder *,
++	struct _bucketOrder *));
+ static int storeAddSwapDisk _PARAMS((const char *));
+ static int storeCheckExpired _PARAMS((const StoreEntry *));
+ static int storeCheckPurgeMem _PARAMS((const StoreEntry *));
+ static int storeClientListSearch _PARAMS((const MemObject *, int));
+ static int storeCopy _PARAMS((const StoreEntry *, int, int, char *, int *));
++static void storeLockObjectComplete _PARAMS((void *, int));
+ static int storeEntryLocked _PARAMS((const StoreEntry *));
+ static int storeEntryValidLength _PARAMS((const StoreEntry *));
+ static void storeGetMemSpace _PARAMS((int));
+ static int storeHashDelete _PARAMS((StoreEntry *));
+ static int storeShouldPurgeMem _PARAMS((const StoreEntry *));
+-static int storeSwapInHandle _PARAMS((int, const char *, int, int, StoreEntry *));
++static int storeSwapInHandle _PARAMS((int,
++	const char *,
++	int,
++	int,
++	StoreEntry *));
+ static int storeSwapInStart _PARAMS((StoreEntry *, SIH, void *));
++static void storeSwapInValidateComplete _PARAMS((void *, int));
++static void storeSwapInStartComplete _PARAMS((void *, int));
+ static int swapInError _PARAMS((int, StoreEntry *));
+ static mem_ptr new_MemObjectData _PARAMS((void));
+ static MemObject *new_MemObject _PARAMS((void));
+ static StoreEntry *new_StoreEntry _PARAMS((int));
+-static StoreEntry *storeAddDiskRestore _PARAMS((const char *, int, int, time_t, time_t, time_t));
++static StoreEntry *storeAddDiskRestore _PARAMS((const char *,
++	int,
++	int,
++	time_t,
++	time_t,
++	time_t));
+ static StoreEntry *storeGetInMemFirst _PARAMS((void));
+ static StoreEntry *storeGetInMemNext _PARAMS((void));
+ static unsigned int storeGetBucketNum _PARAMS((void));
+@@ -240,11 +287,17 @@ static void storeSanityCheck _PARAMS((void));
+ static void storeSetMemStatus _PARAMS((StoreEntry *, mem_status_t));
+ static void storeStartRebuildFromDisk _PARAMS((void));
+ static void storeSwapLog _PARAMS((const StoreEntry *));
++static void storeSwapOutStart _PARAMS((StoreEntry * e));
++static void storeSwapOutStartComplete _PARAMS((void *, int));
+ static void storeSwapOutHandle _PARAMS((int, int, StoreEntry *));
+ static void storeHashMemInsert _PARAMS((StoreEntry *));
+ static void storeHashMemDelete _PARAMS((StoreEntry *));
+ static void storeSetPrivateKey _PARAMS((StoreEntry *));
+ static void storeDoRebuildFromDisk _PARAMS((void *data));
++static void storeCleanup _PARAMS((void *data));
++static void storeCleanupComplete _PARAMS((void *data, int));
++static void storeValidate _PARAMS((StoreEntry *, void (*)(), void *));
++static void storeValidateComplete _PARAMS((void *data, int, int));
+ static void storeRebuiltFromDisk _PARAMS((struct storeRebuild_data * data));
+ static unsigned int getKeyCounter _PARAMS((void));
+ 
+@@ -286,6 +339,9 @@ static int store_maintain_buckets;
+ int scan_revolutions;
+ static struct _bucketOrder *MaintBucketsOrder = NULL;
+ 
++/* Slow/Fast rebuild status parameter */
++static int store_validating = 1;
++
+ static MemObject *
+ new_MemObject(void)
+ {
+@@ -294,6 +350,7 @@ new_MemObject(void)
+     mem->reply->date = -2;
+     mem->reply->expires = -2;
+     mem->reply->last_modified = -2;
++    mem->request = NULL;
+     meta_data.mem_obj_count++;
+     meta_data.misc += sizeof(struct _http_reply);
+     debug(20, 3, "new_MemObject: returning %p\n", mem);
+@@ -524,45 +581,47 @@ storePurgeMem(StoreEntry * e)
+  * storeAbort()
+  * {http,ftp,gopher,wais}Start()
+  */
+-int
+-storeLockObject(StoreEntry * e, SIH handler, void *data)
++void
++storeLockObject(StoreEntry * e, SIH callback, void *callback_data)
+ {
+-    int status = 0;
++    lock_ctrl_t *ctrlp;
+     e->lock_count++;
+     debug(20, 3, "storeLockObject: key '%s' count=%d\n",
+ 	e->key, (int) e->lock_count);
+     if (e->mem_status != NOT_IN_MEMORY)
+-	/* ok, its either IN_MEMORY or SWAPPING_IN */
+-	debug(20, 5, "storeLockObject: OK: mem_status is %s\n", memStatusStr[e->mem_status]);
++	(void) 0;
+     else if (e->swap_status == SWAP_OK)
+-	/* ok, its NOT_IN_MEMORY, but its swapped out */
+-	debug(20, 5, "storeLockObject: OK: swap_status is %s\n", swapStatusStr[e->swap_status]);
++	(void) 0;
+     else if (e->store_status == STORE_PENDING)
+-	/* ok, we're reading it in right now */
+-	debug(20, 5, "storeLockObject: OK: store_status is %s\n", storeStatusStr[e->store_status]);
++	(void) 0;
+     else
+ 	fatal_dump(storeDescribeStatus(e));
+     e->lastref = squid_curtime;
+     /* If the object is NOT_IN_MEMORY, fault it in. */
+-    if ((e->mem_status == NOT_IN_MEMORY) && (e->swap_status == SWAP_OK)) {
++    if (e->mem_status == NOT_IN_MEMORY && e->swap_status == SWAP_OK) {
+ 	/* object is in disk and no swapping daemon running. Bring it in. */
+-	if ((status = storeSwapInStart(e, handler, data)) < 0) {
+-	    /* We couldn't find or couldn't open object's swapfile.
+-	     * So, return a -1 here, indicating that we will treat
+-	     * the reference like a MISS_TTL, force a keychange and
+-	     storeRelease.  */
+-	    e->lock_count--;
+-	}
+-    } else if (e->mem_status == IN_MEMORY && handler) {
+-	/* its already in memory, so call the handler */
+-	handler(0, data);
+-    } else if (handler) {
+-	/* The object is probably in state SWAPPING_IN, not much we can do.
+-	 * Instead of returning failure here, we should have a list of complete
+-	 * handlers which we could append to... */
+-	handler(1, data);
++	if (callback == NULL)
++	    debug(20, 0, "storeLockObject: NULL callback\n");
++	ctrlp = xmalloc(sizeof(lock_ctrl_t));
++	ctrlp->callback = callback;
++	ctrlp->callback_data = callback_data;
++	ctrlp->e = e;
++	storeSwapInStart(e, storeLockObjectComplete, ctrlp);
++    } else {
++	if (callback)
++	    (callback) (callback_data, 0);
+     }
+-    return status;
++}
++
++static void
++storeLockObjectComplete(void *data, int status)
++{
++    lock_ctrl_t *ctrlp = (lock_ctrl_t *) data;
++    if (status < 0)
++	ctrlp->e->lock_count--;
++    if (ctrlp->callback)
++	(ctrlp->callback) (ctrlp->callback_data, status);
++    xfree(ctrlp);
+ }
+ 
+ void
+@@ -807,6 +866,7 @@ storeCreateEntry(const char *url,
+     e->lastref = squid_curtime;
+     e->timestamp = 0;		/* set in storeTimestampsSet() */
+     e->ping_status = PING_NONE;
++    BIT_SET(e->flag, ENTRY_VALIDATED);
+ 
+     /* allocate client list */
+     mem->nclients = MIN_CLIENT;
+@@ -853,6 +913,7 @@ storeAddDiskRestore(const char *url, int file_number, int size, time_t expires,
+     e->expires = expires;
+     e->lastmod = lastmod;
+     e->ping_status = PING_NONE;
++    BIT_RESET(e->flag, ENTRY_VALIDATED);
+     return e;
+ }
+ 
+@@ -1062,7 +1123,6 @@ swappath(int n)
+     return *(CacheDirs + (n % ncache_dirs));
+ }
+ 
+-
+ /* return full name to swapfile */
+ static char *
+ storeSwapFullPath(int fn, char *fullpath)
+@@ -1084,36 +1144,24 @@ static int
+ storeSwapInHandle(int fd_notused, const char *buf, int len, int flag, StoreEntry * e)
+ {
+     MemObject *mem = e->mem_obj;
+-    SIH handler = NULL;
+-    void *data = NULL;
+     debug(20, 2, "storeSwapInHandle: '%s'\n", e->key);
+-
+     if ((flag < 0) && (flag != DISK_EOF)) {
+ 	debug(20, 0, "storeSwapInHandle: SwapIn failure (err code = %d).\n", flag);
+ 	put_free_8k_page(mem->e_swap_buf);
+ 	storeSetMemStatus(e, NOT_IN_MEMORY);
+ 	file_close(mem->swapin_fd);
+ 	swapInError(-1, e);	/* Invokes storeAbort() and completes the I/O */
+-	if ((handler = mem->swapin_complete_handler) != NULL) {
+-	    data = mem->swapin_complete_data;
+-	    mem->swapin_complete_handler = NULL;
+-	    mem->swapin_complete_data = NULL;
+-	    handler(2, data);
+-	}
+ 	return -1;
+     }
+     debug(20, 5, "storeSwapInHandle: e->swap_offset   = %d\n", mem->swap_offset);
+     debug(20, 5, "storeSwapInHandle: e->e_current_len = %d\n", mem->e_current_len);
+     debug(20, 5, "storeSwapInHandle: e->object_len    = %d\n", e->object_len);
+-
+     if (len && mem->swap_offset == 0)
+ 	httpParseReplyHeaders(buf, mem->reply);
+     /* Assumes we got all the headers in one read() */
+-
+     /* always call these, even if len == 0 */
+     mem->swap_offset += len;
+     storeAppend(e, buf, len);
+-
+     if (mem->e_current_len < e->object_len && flag != DISK_EOF) {
+ 	/* some more data to swap in, reschedule */
+ 	file_read(mem->swapin_fd,
+@@ -1141,12 +1189,6 @@ storeSwapInHandle(int fd_notused, const char *buf, int len, int flag, StoreEntry
+     }
+     e->lock_count++;		/* lock while calling handler */
+     InvokeHandlers(e);		/* once more after mem_status state change */
+-    if ((handler = mem->swapin_complete_handler) != NULL) {
+-	data = mem->swapin_complete_data;
+-	mem->swapin_complete_handler = NULL;
+-	mem->swapin_complete_data = NULL;
+-	handler(0, data);	/* handler might call storeRelease() */
+-    }
+     e->lock_count--;
+     if (BIT_TEST(e->flag, RELEASE_REQUEST)) {
+ 	storeRelease(e);
+@@ -1159,12 +1201,9 @@ storeSwapInHandle(int fd_notused, const char *buf, int len, int flag, StoreEntry
+ 
+ /* start swapping in */
+ static int
+-storeSwapInStart(StoreEntry * e, SIH swapin_complete_handler, void *swapin_complete_data)
++storeSwapInStart(StoreEntry * e, SIH callback, void *callback_data)
+ {
+-    int fd;
+-    char *path = NULL;
+-    MemObject *mem = NULL;
+-
++    swapin_ctrl_t *ctrlp;
+     /* sanity check! */
+     if (e->swap_status != SWAP_OK) {
+ 	debug_trap("storeSwapInStart: bad swap_status");
+@@ -1176,33 +1215,76 @@ storeSwapInStart(StoreEntry * e, SIH swapin_complete_handler, void *swapin_compl
+ 	debug_trap("storeSwapInStart: mem_obj already present");
+ 	return -1;
+     }
+-    e->mem_obj = mem = new_MemObject();
++    ctrlp = xmalloc(sizeof(swapin_ctrl_t));
++    ctrlp->e = e;
++    ctrlp->callback = callback;
++    ctrlp->callback_data = callback_data;
++    if (BIT_TEST(e->flag, ENTRY_VALIDATED)) {
++	storeSwapInValidateComplete(ctrlp, 0);
++	return 0;
++    }
++    storeValidate(e, storeSwapInValidateComplete, ctrlp);
++    return 0;
++}
+ 
+-    path = storeSwapFullPath(e->swap_file_number, NULL);
+-    if ((fd = file_open(path, NULL, O_RDONLY)) < 0) {
+-	debug(20, 0, "storeSwapInStart: Failed for '%s'\n", e->url);
++
++static void
++storeSwapInValidateComplete(void *data, int status)
++{
++    swapin_ctrl_t *ctrlp = (swapin_ctrl_t *) data;
++    char *path;
++    StoreEntry *e;
++    e = ctrlp->e;
++    if (!BIT_TEST(e->flag, ENTRY_VALIDATED)) {
+ 	storeSetMemStatus(e, NOT_IN_MEMORY);
+ 	/* Invoke a store abort that should free the memory object */
+-	return -1;
++	(ctrlp->callback) (ctrlp->callback_data, -1);
++	xfree(ctrlp);
++	return;
+     }
++    path = storeSwapFullPath(e->swap_file_number, NULL);
++    ctrlp->path = xstrdup(path);
++    file_open(path, NULL, O_RDONLY, storeSwapInStartComplete, ctrlp);
++}
++
++static void
++storeSwapInStartComplete(void *data, int fd)
++{
++    MemObject *mem = NULL;
++    swapin_ctrl_t *ctrlp = (swapin_ctrl_t *) data;
++    StoreEntry *e = ctrlp->e;
++    if (fd < 0) {
++	debug(20, 0, "storeSwapInStartComplete: Failed for '%s'\n", e->url);
++	if (!e->mem_obj)
++	    storeSetMemStatus(e, NOT_IN_MEMORY);
++	/* Invoke a store abort that should free the memory object */
++	(ctrlp->callback) (ctrlp->callback_data, -1);
++	xfree(ctrlp->path);
++	xfree(ctrlp);
++	return;
++    }
++    if (e->mem_obj)
++	fatal_dump("storeSwapInStartComplete already exists");
++    if (e->swap_status != SWAP_OK)
++	fatal_dump("storeSwapInStartComplete: bad swap_status");
++    storeSetMemStatus(e, SWAPPING_IN);
++    mem = e->mem_obj = new_MemObject();
+     mem->swapin_fd = (short) fd;
+     debug(20, 5, "storeSwapInStart: initialized swap file '%s' for '%s'\n",
+-	path, e->url);
+-    storeSetMemStatus(e, SWAPPING_IN);
++	ctrlp->path, e->url);
+     mem->data = new_MemObjectData();
+     mem->swap_offset = 0;
+     mem->e_swap_buf = get_free_8k_page();
+-
+     /* start swapping daemon */
+     file_read(fd,
+ 	mem->e_swap_buf,
+ 	SWAP_BUF,
+ 	mem->swap_offset,
+ 	(FILE_READ_HD) storeSwapInHandle,
+ 	(void *) e);
+-    mem->swapin_complete_handler = swapin_complete_handler;
+-    mem->swapin_complete_data = swapin_complete_data;
+-    return 0;
++    (ctrlp->callback) (ctrlp->callback_data, 0);
++    xfree(ctrlp->path);
++    xfree(ctrlp);
+ }
+ 
+ static void
+@@ -1229,7 +1311,6 @@ static void
+ storeSwapOutHandle(int fd, int flag, StoreEntry * e)
+ {
+     MemObject *mem = e->mem_obj;
+-
+     debug(20, 3, "storeSwapOutHandle: '%s'\n", e->key);
+     if (mem == NULL) {
+ 	debug(20, 0, "%s\n", storeToString(e));
+@@ -1259,7 +1340,6 @@ storeSwapOutHandle(int fd, int flag, StoreEntry * e)
+     debug(20, 6, "storeSwapOutHandle: e->e_swap_buf_len = %d\n", mem->e_swap_buf_len);
+     debug(20, 6, "storeSwapOutHandle: e->object_len     = %d\n", e->object_len);
+     debug(20, 6, "storeSwapOutHandle: store_swap_size   = %dk\n", store_swap_size);
+-
+     mem->swap_offset += mem->e_swap_buf_len;
+     /* round up */
+     store_swap_size += ((mem->e_swap_buf_len + 1023) >> 10);
+@@ -1288,11 +1368,20 @@ storeSwapOutHandle(int fd, int flag, StoreEntry * e)
+ 	return;
+     }
+     /* write some more data, reschedule itself. */
+-    storeCopy(e,
+-	mem->swap_offset,
+-	SWAP_BUF,
+-	mem->e_swap_buf,
+-	&(mem->e_swap_buf_len));
++    if (storeCopy(e, mem->swap_offset, SWAP_BUF, mem->e_swap_buf, &(mem->e_swap_buf_len)) < 0) {
++	debug(20, 1, "storeSwapOutHandle: SwapOut failure (err code = %d).\n",
++	    flag);
++	e->swap_status = NO_SWAP;
++	put_free_8k_page(mem->e_swap_buf);
++	file_close(fd);
++	if (e->swap_file_number != -1) {
++	    file_map_bit_reset(e->swap_file_number);
++	    safeunlink(storeSwapFullPath(e->swap_file_number, NULL), 0);
++	    e->swap_file_number = -1;
++	}
++	storeRelease(e);
++	return;
++    }
+     file_write(mem->swapout_fd,
+ 	mem->e_swap_buf,
+ 	mem->e_swap_buf_len,
+@@ -1302,41 +1391,81 @@ storeSwapOutHandle(int fd, int flag, StoreEntry * e)
+     return;
+ }
+ 
+-
+ /* start swapping object to disk */
+-static int
++static void
+ storeSwapOutStart(StoreEntry * e)
+ {
+-    int fd;
+-    int x;
++    swapout_ctrl_t *ctrlp;
+     LOCAL_ARRAY(char, swapfilename, SQUID_MAXPATHLEN);
+-    MemObject *mem = e->mem_obj;
+     /* Suggest a new swap file number */
+     swapfileno = (swapfileno + 1) % (MAX_SWAP_FILE);
+     /* Record the number returned */
+     swapfileno = file_map_allocate(swapfileno);
+     storeSwapFullPath(swapfileno, swapfilename);
+-    fd = file_open(swapfilename, NULL, O_WRONLY | O_CREAT | O_TRUNC);
++    ctrlp = xmalloc(sizeof(swapout_ctrl_t));
++    ctrlp->swapfilename = xstrdup(swapfilename);
++    ctrlp->e = e;
++    ctrlp->oldswapstatus = e->swap_status;
++    ctrlp->swapfileno = swapfileno;
++    e->swap_status = SWAPPING_OUT;
++    file_open(swapfilename,
++	NULL,
++	O_WRONLY | O_CREAT | O_TRUNC,
++	storeSwapOutStartComplete,
++	ctrlp);
++}
++
++static void
++storeSwapOutStartComplete(void *data, int fd)
++{
++    swapout_ctrl_t *ctrlp = (swapout_ctrl_t *) data;
++    int x;
++    int oldswapstatus;
++    MemObject *mem;
++    char *swapfilename;
++    StoreEntry *e;
++    int swapno;
++    swapfilename = ctrlp->swapfilename;
++    e = ctrlp->e;
++    oldswapstatus = ctrlp->oldswapstatus;
++    swapno = ctrlp->swapfileno;
++    xfree(ctrlp);
+     if (fd < 0) {
+ 	debug(20, 0, "storeSwapOutStart: Unable to open swapfile: %s\n",
+ 	    swapfilename);
+-	file_map_bit_reset(swapfileno);
++	file_map_bit_reset(swapno);
+ 	e->swap_file_number = -1;
+-	return -1;
++	if (e->swap_status == SWAPPING_OUT)
++	    e->swap_status = oldswapstatus;
++	xfree(swapfilename);
++	return;
+     }
++    mem = e->mem_obj;
+     mem->swapout_fd = (short) fd;
+     debug(20, 5, "storeSwapOutStart: Begin SwapOut '%s' to FD %d FILE %s.\n",
+ 	e->url, fd, swapfilename);
+-    e->swap_file_number = swapfileno;
++    e->swap_file_number = swapno;
+     e->swap_status = SWAPPING_OUT;
+     mem->swap_offset = 0;
+     mem->e_swap_buf = get_free_8k_page();
+     mem->e_swap_buf_len = 0;
+-    storeCopy(e,
++    x = storeCopy(e,
+ 	0,
+ 	SWAP_BUF,
+ 	mem->e_swap_buf,
+ 	&mem->e_swap_buf_len);
++    if (x < 0) {
++	debug(20, 1, "storeCopy returned %d for '%s'\n", x, e->key);
++	e->swap_file_number = -1;
++	file_close(fd);
++	file_map_bit_reset(e->swap_file_number);
++	e->swap_file_number = -1;
++	safeunlink(swapfilename, 1);
++	if (e->swap_status == SWAPPING_OUT)
++	    e->swap_status = oldswapstatus;
++	xfree(swapfilename);
++	return;
++    }
+     /* start swapping daemon */
+     x = file_write(mem->swapout_fd,
+ 	mem->e_swap_buf,
+@@ -1346,11 +1475,10 @@ storeSwapOutStart(StoreEntry * e)
+ 	NULL);
+     if (x != DISK_OK)
+ 	fatal_dump(NULL);	/* This shouldn't happen */
+-    return 0;
++    xfree(swapfilename);
+ }
+ 
+ /* recreate meta data from disk image in swap directory */
+-
+ /* Add one swap file at a time from disk storage */
+ static void
+ storeDoRebuildFromDisk(void *data)
+@@ -1366,16 +1494,13 @@ storeDoRebuildFromDisk(void *data)
+     int scan2;
+     int scan3;
+     int scan4;
+-    struct stat sb;
+     off_t size;
+     int sfileno = 0;
+     int count;
+     int x;
+-
+     /* load a number of objects per invocation */
+     for (count = 0; count < rebuildData->speed; count++) {
+ 	if (fgets(rebuildData->line_in, 4095, rebuildData->log) == NULL) {
+-	    /* We are done */
+ 	    diskWriteIsComplete(swaplog_fd);
+ 	    storeRebuiltFromDisk(rebuildData);
+ 	    return;
+@@ -1402,42 +1527,18 @@ storeDoRebuildFromDisk(void *data)
+ 	    &scan3,		/* last modified */
+ 	    &scan4,		/* size */
+ 	    url);		/* url */
+-	if (x > 0)
+-	    storeSwapFullPath(sfileno, swapfile);
+-	if (x != 6) {
+-	    if (opt_unlink_on_reload && swapfile[0])
+-		safeunlink(swapfile, 0);
++	if (x != 6)
+ 	    continue;
+-	}
++	if (sfileno < 0)
++	    continue;
++	storeSwapFullPath(sfileno, swapfile);
+ 	if (sfileno < 0 || sfileno >= MAX_SWAP_FILE)
+ 	    continue;
+ 	timestamp = (time_t) scan1;
+ 	expires = (time_t) scan2;
+ 	lastmod = (time_t) scan3;
+ 	size = (off_t) scan4;
+ 
+-	if (store_rebuilding != STORE_REBUILDING_FAST) {
+-	    if (stat(swapfile, &sb) < 0) {
+-		debug(50, 3, "storeRebuildFromDisk: Swap file missing: '%s': %s: %s.\n", url, swapfile, xstrerror());
+-		if (opt_unlink_on_reload)
+-		    safeunlink(swapfile, 1);
+-		continue;
+-	    }
+-	    /* Empty swap file? */
+-	    if (sb.st_size == 0) {
+-		if (opt_unlink_on_reload)
+-		    safeunlink(swapfile, 1);
+-		continue;
+-	    }
+-	    /* Wrong size? */
+-	    if (sb.st_size != size) {
+-		/* this log entry doesn't correspond to this file */
+-		rebuildData->clashcount++;
+-		continue;
+-	    }
+-	    debug(20, 9, "storeRebuildFromDisk: swap file exists: '%s': %s\n",
+-		url, swapfile);
+-	}
+ 	if ((e = storeGet(url))) {
+ 	    if (e->timestamp > timestamp) {
+ 		/* already have a newer object in memory, throw old one away */
+@@ -1481,13 +1582,123 @@ storeDoRebuildFromDisk(void *data)
+     eventAdd("storeRebuild", storeDoRebuildFromDisk, rebuildData, 0);
+ }
+ 
++
++static void
++storeCleanup(void *data)
++{
++    static storeCleanList *list = NULL;
++    storeCleanList *curr;
++    static int bucketnum = -1;
++    static int validnum = 0;
++    StoreEntry *e;
++    hash_link *link_ptr = NULL;
++    if (list == NULL) {
++	if (++bucketnum >= store_buckets) {
++	    debug(20, 1, "  Completed Validation Procedure\n");
++	    debug(20, 1, "  Validated %d Entries\n", validnum);
++	    store_validating = 0;
++	    return;
++	}
++	link_ptr = hash_get_bucket(store_table, bucketnum);
++	for (; link_ptr; link_ptr = link_ptr->next) {
++	    e = (StoreEntry *) link_ptr;
++	    if ((curr = xcalloc(1, sizeof(storeCleanList))) == NULL)
++		break;
++	    curr->key = xstrdup(e->key);
++	    curr->next = list;
++	    list = curr;
++	}
++    }
++    if (list == NULL) {
++	eventAdd("storeCleanup", storeCleanup, NULL, 0);
++	return;
++    }
++    curr = list;
++    list = list->next;
++    e = (StoreEntry *) hash_lookup(store_table, curr->key);
++    if (e == NULL) {
++	xfree(curr->key);
++	xfree(curr);
++	eventAdd("storeCleanup", storeCleanup, NULL, 0);
++	return;
++    }
++    validnum++;
++    if ((validnum % 4096) == 0)
++	debug(20, 1, "  %7d Entries Validated so far.\n", validnum);
++    if (BIT_TEST(e->flag, ENTRY_VALIDATED)) {
++	xfree(curr->key);
++	xfree(curr);
++	eventAdd("storeCleanup", storeCleanup, NULL, 0);
++	return;
++    }
++    storeValidate(e, storeCleanupComplete, e);
++    xfree(curr->key);
++    xfree(curr);
++    eventAdd("storeCleanup", storeCleanup, NULL, 0);
++}
++
++
++static void
++storeCleanupComplete(void *data, int status)
++{
++    StoreEntry *e = data;
++    if (!BIT_TEST(e->flag, ENTRY_VALIDATED))
++	storeRelease(e);
++}
++
++static void
++storeValidate(StoreEntry * e, VCB callback, void *callback_data)
++{
++    valid_ctrl_t *ctrlp;
++    char *path;
++    struct stat *sb;
++    if (e->swap_file_number < 0) {
++	BIT_RESET(e->flag, ENTRY_VALIDATED);
++	(callback) (callback_data, -1);
++	return;
++    }
++    path = storeSwapFullPath(e->swap_file_number, NULL);
++    sb = xmalloc(sizeof(struct stat));
++    ctrlp = xmalloc(sizeof(valid_ctrl_t));
++    ctrlp->sb = sb;
++    ctrlp->e = e;
++    ctrlp->callback = callback;
++    ctrlp->callback_data = callback_data;
++#if USE_ASYNC_IO
++    aioStat(path, sb, storeValidateComplete, ctrlp);
++#else
++    storeValidateComplete(ctrlp, stat(path, sb), errno);
++#endif
++    return;
++}
++
++static void
++storeValidateComplete(void *data, int retcode, int errcode)
++{
++    valid_ctrl_t *ctrlp = data;
++    struct stat *sb = ctrlp->sb;
++    StoreEntry *e = ctrlp->e;
++    char *path;
++    if (retcode < 0 && errcode == EWOULDBLOCK) {
++	path = storeSwapFullPath(e->swap_file_number, NULL);
++	retcode = stat(path, sb);
++    }
++    if (retcode < 0 || sb->st_size == 0 || sb->st_size != e->object_len)
++	BIT_RESET(e->flag, ENTRY_VALIDATED);
++    else
++	BIT_SET(e->flag, ENTRY_VALIDATED);
++    errno = errcode;
++    (ctrlp->callback) (ctrlp->callback_data, retcode);
++    xfree(sb);
++    xfree(ctrlp);
++}
++
+ /* meta data recreated from disk image in swap directory */
+ static void
+ storeRebuiltFromDisk(struct storeRebuild_data *data)
+ {
+     time_t r;
+     time_t stop;
+-
+     stop = getCurrentTime();
+     r = stop - data->start;
+     debug(20, 1, "Finished rebuilding storage from disk image.\n");
+@@ -1499,9 +1710,7 @@ storeRebuiltFromDisk(struct storeRebuild_data *data)
+     debug(20, 1, "  Took %d seconds (%6.1lf objects/sec).\n",
+ 	r > 0 ? r : 0, (double) data->objcount / (r > 0 ? r : 1));
+     debug(20, 1, "  store_swap_size = %dk\n", store_swap_size);
+-
+     store_rebuilding = STORE_NOT_REBUILDING;
+-
+     fclose(data->log);
+     safe_free(data);
+     sprintf(tmp_filename, "%s.new", swaplog_file);
+@@ -1511,8 +1720,12 @@ storeRebuiltFromDisk(struct storeRebuild_data *data)
+ 	fatal_dump("storeRebuiltFromDisk: rename failed");
+     }
+     file_close(swaplog_fd);
+-    if ((swaplog_fd = file_open(swaplog_file, NULL, O_WRONLY | O_CREAT)) < 0)
++    if ((swaplog_fd = file_open(swaplog_file, NULL, O_WRONLY | O_CREAT, NULL, NULL)) < 0)
+ 	fatal_dump("storeRebuiltFromDisk: file_open(swaplog_file) failed");
++    if (store_validating) {
++	debug(20, 1, "Beginning Validation Procedure\n");
++	eventAdd("storeCleanup", storeCleanup, NULL, 0);
++    }
+ }
+ 
+ static void
+@@ -1549,7 +1762,7 @@ storeStartRebuildFromDisk(void)
+     if (swaplog_fd > -1)
+ 	file_close(swaplog_fd);
+     sprintf(tmp_filename, "%s.new", swaplog_file);
+-    swaplog_fd = file_open(tmp_filename, NULL, O_WRONLY | O_CREAT | O_TRUNC);
++    swaplog_fd = file_open(tmp_filename, NULL, O_WRONLY | O_CREAT | O_TRUNC, NULL, NULL);
+     debug(20, 3, "swaplog_fd %d is now '%s'\n", swaplog_fd, tmp_filename);
+     if (swaplog_fd < 0) {
+ 	debug(50, 0, "storeStartRebuildFromDisk: %s: %s\n",
+@@ -1563,11 +1776,13 @@ storeStartRebuildFromDisk(void)
+ 	fatal(tmp_error_buf);
+     }
+     debug(20, 3, "data->log %d is now '%s'\n", fileno(data->log), swaplog_file);
+-    if (store_rebuilding == STORE_REBUILDING_FAST)
++    if (store_rebuilding == STORE_REBUILDING_FAST) {
++	store_validating = 0;
+ 	debug(20, 1, "Rebuilding in FAST MODE.\n");
+-
++    }
+     memset(data->line_in, '\0', 4096);
+-    data->speed = store_rebuilding == STORE_REBUILDING_FAST ? 50 : 5;
++    /* data->speed = store_rebuilding == STORE_REBUILDING_FAST ? 50 : 5; */
++    data->speed = 50;
+ 
+     /* Start reading the log file */
+     if (opt_foreground_rebuild) {
+@@ -1786,6 +2001,8 @@ storeGetMemSpace(int size)
+     for (e = storeGetInMemFirst(); e; e = storeGetInMemNext()) {
+ 	if (list_count == meta_data.mem_obj_count)
+ 	    break;
++	if (storeEntryLocked(e))
++	    continue;
+ 	if (storeCheckExpired(e)) {
+ 	    debug(20, 2, "storeGetMemSpace: Expired: %s\n", e->url);
+ 	    n_expired++;
+@@ -1887,8 +2104,8 @@ storeGetBucketNum(void)
+ #define SWAP_MAX_HELP (store_buckets/2)
+ 
+ /* The maximum objects to scan for maintain storage space */
+-#define SWAP_LRUSCAN_COUNT	256
+-#define SWAP_LRU_REMOVE_COUNT	8
++#define SWAP_LRUSCAN_COUNT	1024
++#define SWAP_LRU_REMOVE_COUNT	64
+ 
+ /* Clear Swap storage to accommodate the given object len */
+ int
+@@ -1938,6 +2155,8 @@ storeGetSwapSpace(int size)
+ 	    scanned++;
+ 	    next = link_ptr->next;
+ 	    e = (StoreEntry *) link_ptr;
++	    if (!BIT_TEST(e->flag, ENTRY_VALIDATED))
++		continue;
+ 	    if (storeCheckExpired(e)) {
+ 		debug(20, 3, "storeGetSwapSpace: Expired '%s'\n", e->url);
+ 		expired_in_one_bucket += storeRelease(e);
+@@ -2144,7 +2363,8 @@ storeCopy(const StoreEntry * e, int stateoffset, int maxSize, char *buf, int *si
+ 	*size, stateoffset);
+ 
+     if (*size > 0)
+-	(void) e->mem_obj->data->mem_copy(e->mem_obj->data, stateoffset, buf, *size);
++	if (e->mem_obj->data->mem_copy(e->mem_obj->data, stateoffset, buf, *size) < 0)
++	    return -1;
+ 
+     return *size;
+ }
+@@ -2251,7 +2471,8 @@ storeClientCopy(StoreEntry * e,
+     /* update the lowest requested offset */
+     mem->clients[ci].last_offset = stateoffset + sz;
+     if (sz > 0)
+-	(void) mem->data->mem_copy(mem->data, stateoffset, buf, sz);
++	if (mem->data->mem_copy(mem->data, stateoffset, buf, sz) < 0)
++	    return -1;
+     /* see if we can get rid of some data if we are in "delete behind" mode . */
+     if (BIT_TEST(e->flag, DELETE_BEHIND))
+ 	storeDeleteBehind(e);
+@@ -2444,7 +2665,7 @@ storeInit(void)
+     if (strcmp((fname = Config.Log.store), "none") == 0)
+ 	storelog_fd = -1;
+     else
+-	storelog_fd = file_open(fname, NULL, O_WRONLY | O_CREAT);
++	storelog_fd = file_open(fname, NULL, O_WRONLY | O_CREAT, NULL, NULL);
+     if (storelog_fd < 0)
+ 	debug(20, 1, "Store logging disabled\n");
+     for (w = Config.cache_dirs; w; w = w->next)
+@@ -2455,7 +2676,7 @@ storeInit(void)
+ 	xstrncpy(swaplog_file, Config.Log.swap, SQUID_MAXPATHLEN);
+     else
+ 	sprintf(swaplog_file, "%s/log", swappath(0));
+-    swaplog_fd = file_open(swaplog_file, NULL, O_WRONLY | O_CREAT);
++    swaplog_fd = file_open(swaplog_file, NULL, O_WRONLY | O_CREAT, NULL, NULL);
+     debug(20, 3, "swaplog_fd %d is now '%s'\n", swaplog_fd, swaplog_file);
+     if (swaplog_fd < 0) {
+ 	sprintf(tmp_error_buf, "Cannot open swap logfile: %s", swaplog_file);
+@@ -2583,6 +2804,10 @@ storeMaintainSwapSpace(void *unused)
+     }
+     debug(51, rm_obj ? 2 : 9, "Removed %d of %d objects from bucket %d\n",
+ 	rm_obj, scan_obj, (int) b->bucket);
++    /* Don't remove stuff if we're still validating - we could remove good
++     * stuff when we don't want to */
++    if (store_validating)
++	return;
+     /* Scan row of hash table each second and free storage if we're
+      * over the high-water mark */
+     storeGetSwapSpace(0);
+@@ -2598,9 +2823,9 @@ int
+ storeWriteCleanLog(void)
+ {
+     StoreEntry *e = NULL;
+-    FILE *fp = NULL;
++    int fd = -1;
++    char line[16384];
+     int n = 0;
+-    int x = 0;
+     time_t start, stop, r;
+     struct stat sb;
+ 
+@@ -2610,15 +2835,18 @@ storeWriteCleanLog(void)
+ 	return 0;
+     }
+     debug(20, 1, "storeWriteCleanLog: Starting...\n");
++    sprintf(tmp_filename, "%s-last-clean", swaplog_file);
++    unlink(tmp_filename);
+     start = getCurrentTime();
+     sprintf(tmp_filename, "%s_clean", swaplog_file);
+-    if ((fp = fopen(tmp_filename, "a+")) == NULL) {
++    unlink(tmp_filename);
++    if ((fd = open(tmp_filename, O_WRONLY | O_APPEND | O_CREAT | O_TRUNC, 0644)) < 0) {
+ 	debug(50, 0, "storeWriteCleanLog: %s: %s\n", tmp_filename, xstrerror());
+ 	return 0;
+     }
+ #if HAVE_FCHMOD
+     if (stat(swaplog_file, &sb) == 0)
+-	fchmod(fileno(fp), sb.st_mode);
++	fchmod(fd, sb.st_mode);
+ #endif
+     for (e = storeGetFirst(); e; e = storeGetNext()) {
+ 	if (e->swap_file_number < 0)
+@@ -2631,17 +2859,17 @@ storeWriteCleanLog(void)
+ 	    continue;
+ 	if (BIT_TEST(e->flag, KEY_PRIVATE))
+ 	    continue;
+-	x = fprintf(fp, "%08x %08x %08x %08x %9d %s\n",
++	sprintf(line, "%08x %08x %08x %08x %9d %s\n",
+ 	    (int) e->swap_file_number,
+ 	    (int) e->timestamp,
+ 	    (int) e->expires,
+ 	    (int) e->lastmod,
+ 	    e->object_len,
+ 	    e->url);
+-	if (x < 0) {
++	if (write(fd, line, strlen(line)) < 0) {
+ 	    debug(50, 0, "storeWriteCleanLog: %s: %s\n", tmp_filename, xstrerror());
+ 	    debug(20, 0, "storeWriteCleanLog: Current swap logfile not replaced.\n");
+-	    fclose(fp);
++	    close(fd);
+ 	    safeunlink(tmp_filename, 0);
+ 	    return 0;
+ 	}
+@@ -2650,7 +2878,7 @@ storeWriteCleanLog(void)
+ 	    debug(20, 1, "  %7d lines written so far.\n", n);
+ 	}
+     }
+-    if (fclose(fp) < 0) {
++    if (close(fd) < 0) {
+ 	debug(50, 0, "storeWriteCleanLog: %s: %s\n", tmp_filename, xstrerror());
+ 	debug(20, 0, "storeWriteCleanLog: Current swap logfile not replaced.\n");
+ 	safeunlink(tmp_filename, 0);
+@@ -2662,7 +2890,7 @@ storeWriteCleanLog(void)
+ 	return 0;
+     }
+     file_close(swaplog_fd);
+-    swaplog_fd = file_open(swaplog_file, NULL, O_WRONLY | O_CREAT);
++    swaplog_fd = file_open(swaplog_file, NULL, O_WRONLY | O_CREAT, NULL, NULL);
+     if (swaplog_fd < 0) {
+ 	sprintf(tmp_error_buf, "Cannot open swap logfile: %s", swaplog_file);
+ 	fatal(tmp_error_buf);
+@@ -2673,9 +2901,11 @@ storeWriteCleanLog(void)
+     debug(20, 1, "  Took %d seconds (%6.1lf lines/sec).\n",
+ 	r > 0 ? r : 0, (double) n / (r > 0 ? r : 1));
+ 
+-    /* touch a timestamp file */
+-    sprintf(tmp_filename, "%s-last-clean", swaplog_file);
+-    file_close(file_open(tmp_filename, NULL, O_WRONLY | O_CREAT | O_TRUNC));
++    /* touch a timestamp file if we're not still validating */
++    if (!store_validating) {
++	sprintf(tmp_filename, "%s-last-clean", swaplog_file);
++	file_close(file_open(tmp_filename, NULL, O_WRONLY | O_CREAT | O_TRUNC, NULL, NULL));
++    }
+     return n;
+ }
+ 
+@@ -2739,7 +2969,7 @@ storeRotateLog(void)
+ 	sprintf(to, "%s.%d", fname, 0);
+ 	rename(fname, to);
+     }
+-    storelog_fd = file_open(fname, NULL, O_WRONLY | O_CREAT);
++    storelog_fd = file_open(fname, NULL, O_WRONLY | O_CREAT, NULL, NULL);
+     if (storelog_fd < 0) {
+ 	debug(50, 0, "storeRotateLog: %s: %s\n", fname, xstrerror());
+ 	debug(20, 1, "Store logging disabled\n");
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: tools.cc,v 1.96 1997/02/24 23:43:15 wessels Exp $
++ * $Id: tools.cc,v 1.97 1997/02/26 19:46:26 wessels Exp $
+  *
+  * DEBUG: section 21    Misc Functions
+  * AUTHOR: Harvest Derived
+@@ -122,6 +122,9 @@ Thanks!\n"
+ 
+ static void fatal_common _PARAMS((const char *));
+ static void mail_warranty _PARAMS((void));
++#if USE_ASYNC_IO
++static void safeunlinkComplete _PARAMS((void *data, int retcode, int errcode));
++#endif
+ 
+ #ifdef _SQUID_SOLARIS_
+ int getrusage _PARAMS((int, struct rusage *));
+@@ -459,16 +462,33 @@ getMyHostname(void)
+     return host;
+ }
+ 
+-int
++void
+ safeunlink(const char *s, int quiet)
+ {
+-    int err;
+-    if ((err = unlink(s)) < 0)
+-	if (!quiet)
+-	    debug(50, 1, "safeunlink: Couldn't delete %s. %s\n", s, xstrerror());
+-    return (err);
++#if USE_ASYNC_IO
++    aioUnlink(s,
++	quiet ? NULL : safeunlinkComplete,
++	quiet ? NULL : xstrdup(s));
++#else
++    if (unlink(s) < 0 && !quiet)
++	debug(50, 1, "safeunlink: Couldn't delete %s. %s\n", s, xstrerror());
++#endif
+ }
+ 
++#if USE_ASYNC_IO
++static void
++safeunlinkComplete(void *data, int retcode, int errcode)
++{
++    char *s = data;
++    if (retcode < 0) {
++	errno = errcode;
++	debug(50, 1, "safeunlink: Couldn't delete %s. %s\n", s, xstrerror());
++	errno = 0;
++    }
++    xfree(s);
++}
++#endif
++
+ /* leave a privilegied section. (Give up any privilegies)
+  * Routines that need privilegies can rap themselves in enter_suid()
+  * and leave_suid()
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: tunnel.cc,v 1.39 1997/02/25 19:18:24 wessels Exp $
++ * $Id: tunnel.cc,v 1.40 1997/02/26 19:46:22 wessels Exp $
+  *
+  * DEBUG: section 26    Secure Sockets Layer Proxy
+  * AUTHOR: Duane Wessels
+@@ -143,7 +143,7 @@ sslReadServer(int fd, void *data)
+     if (len < 0) {
+ 	debug(50, 1, "sslReadServer: FD %d: read failure: %s\n",
+ 	    sslState->server.fd, xstrerror());
+-	if (errno == EAGAIN || errno == EWOULDBLOCK) {
++	if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+ 	    /* reinstall handlers */
+ 	    /* XXX This may loop forever */
+ 	    commSetSelect(sslState->server.fd,
+@@ -183,7 +183,7 @@ sslReadClient(int fd, void *data)
+     if (len < 0) {
+ 	debug(50, 1, "sslReadClient: FD %d: read failure: %s\n",
+ 	    fd, xstrerror());
+-	if (errno == EAGAIN || errno == EWOULDBLOCK) {
++	if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+ 	    /* reinstall handlers */
+ 	    /* XXX This may loop forever */
+ 	    commSetSelect(sslState->client.fd,
+@@ -217,6 +217,13 @@ sslWriteServer(int fd, void *data)
+ 	sslState->client.len - sslState->client.offset);
+     debug(26, 5, "sslWriteServer FD %d, wrote %d bytes\n", fd, len);
+     if (len < 0) {
++	if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK) {
++	    commSetSelect(sslState->server.fd,
++		COMM_SELECT_WRITE,
++		sslWriteServer,
++		(void *) sslState, 0);
++	    return;
++	}
+ 	debug(50, 2, "sslWriteServer: FD %d: write failure: %s.\n",
+ 	    sslState->server.fd, xstrerror());
+ 	sslClose(sslState);
+@@ -257,6 +264,13 @@ sslWriteClient(int fd, void *data)
+ 	sslState->server.len - sslState->server.offset);
+     debug(26, 5, "sslWriteClient FD %d, wrote %d bytes\n", fd, len);
+     if (len < 0) {
++	if (errno == EAGAIN || errno == EINTR || errno == EWOULDBLOCK) {
++	    commSetSelect(sslState->client.fd,
++		COMM_SELECT_WRITE,
++		sslWriteClient,
++		(void *) sslState, 0);
++	    return;
++	}
+ 	debug(50, 2, "sslWriteClient: FD %d: write failure: %s.\n",
+ 	    sslState->client.fd, xstrerror());
+ 	sslClose(sslState);
+@@ -295,11 +309,11 @@ sslConnected(int fd, void *data)
+     strcpy(sslState->server.buf, conn_established);
+     sslState->server.len = strlen(conn_established);
+     sslState->server.offset = 0;
++    comm_set_fd_lifetime(fd, 86400);	/* extend lifetime */
+     commSetSelect(sslState->client.fd,
+ 	COMM_SELECT_WRITE,
+ 	sslWriteClient,
+ 	(void *) sslState, 0);
+-    comm_set_fd_lifetime(fd, 86400);	/* extend lifetime */
+     commSetSelect(sslState->client.fd,
+ 	COMM_SELECT_READ,
+ 	sslReadClient,
+@@ -473,11 +487,11 @@ sslProxyConnected(int fd, void *data)
+     debug(26, 3, "sslProxyConnected: Sending 'CONNECT %s HTTP/1.0'\n", sslState->url);
+     sslState->client.len = strlen(sslState->client.buf);
+     sslState->client.offset = 0;
++    comm_set_fd_lifetime(fd, 86400);	/* extend lifetime */
+     commSetSelect(sslState->server.fd,
+ 	COMM_SELECT_WRITE,
+ 	sslWriteServer,
+ 	(void *) sslState, 0);
+-    comm_set_fd_lifetime(fd, 86400);	/* extend lifetime */
+     commSetSelect(sslState->server.fd,
+ 	COMM_SELECT_READ,
+ 	sslReadServer,
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: useragent.cc,v 1.4 1997/01/31 21:16:51 wessels Exp $
++ * $Id: useragent.cc,v 1.5 1997/02/26 19:46:27 wessels Exp $
+  *
+  * DEBUG: section 40    User-Agent logging
+  * AUTHOR: Joe Ramey <ramey@csc.ti.com>
+@@ -48,7 +48,7 @@ useragentOpenLog(void)
+ 	cache_useragent_log = NULL;
+     }
+     if (fname && strcmp(fname, "none") != 0) {
+-	log_fd = file_open(fname, NULL, O_WRONLY | O_CREAT | O_APPEND);
++	log_fd = file_open(fname, NULL, O_WRONLY | O_CREAT | O_APPEND, NULL, NULL);
+ 	if (log_fd < 0) {
+ 	    debug(50, 0, "useragentOpenLog: %s: %s\n", fname, xstrerror());
+ 	} else if ((cache_useragent_log = fdopen(log_fd, "a")) == NULL) {
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: wais.cc,v 1.59 1996/11/30 23:09:57 wessels Exp $
++ * $Id: wais.cc,v 1.60 1997/02/26 19:46:28 wessels Exp $
+  *
+  * DEBUG: section 24    WAIS Relay
+  * AUTHOR: Harvest Derived
+@@ -120,6 +120,7 @@ typedef struct {
+ } WaisStateData;
+ 
+ static int waisStateFree _PARAMS((int, WaisStateData *));
++static void waisStartComplete _PARAMS((void *, int));
+ static void waisReadReplyTimeout _PARAMS((int, WaisStateData *));
+ static void waisLifetimeExpire _PARAMS((int, WaisStateData *));
+ static void waisReadReply _PARAMS((int, WaisStateData *));
+@@ -230,7 +231,7 @@ waisReadReply(int fd, WaisStateData * waisState)
+     }
+     if (len < 0) {
+ 	debug(50, 1, "waisReadReply: FD %d: read failure: %s.\n", xstrerror());
+-	if (errno == EAGAIN || errno == EWOULDBLOCK) {
++	if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+ 	    /* reinstall handlers */
+ 	    /* XXX This may loop forever */
+ 	    commSetSelect(fd, COMM_SELECT_READ,
+@@ -333,7 +334,6 @@ waisStart(int unusedfd, const char *url, method_t method, char *mime_hdr, StoreE
+ {
+     WaisStateData *waisState = NULL;
+     int fd;
+-
+     debug(24, 3, "waisStart: \"%s %s\"\n", RequestMethodStr[method], url);
+     debug(24, 4, "            header: %s\n", mime_hdr);
+     if (!Config.Wais.relayHost) {
+@@ -353,21 +353,30 @@ waisStart(int unusedfd, const char *url, method_t method, char *mime_hdr, StoreE
+ 	return COMM_ERROR;
+     }
+     waisState = xcalloc(1, sizeof(WaisStateData));
+-    storeLockObject(waisState->entry = entry, NULL, NULL);
+     waisState->method = method;
+     waisState->relayhost = Config.Wais.relayHost;
+     waisState->relayport = Config.Wais.relayPort;
+     waisState->mime_hdr = mime_hdr;
+     waisState->fd = fd;
++    waisState->entry = entry;
+     xstrncpy(waisState->request, url, MAX_URL);
++    storeLockObject(entry, waisStartComplete, waisState);
++    return COMM_OK;
++}
++
++
++static void
++waisStartComplete(void *data, int status)
++{
++    WaisStateData *waisState = (WaisStateData *) data;
++
+     comm_add_close_handler(waisState->fd,
+ 	(PF) waisStateFree,
+ 	(void *) waisState);
+     ipcache_nbgethostbyname(waisState->relayhost,
+ 	waisState->fd,
+ 	waisConnect,
+ 	waisState);
+-    return COMM_OK;
+ }
+ 
+ 

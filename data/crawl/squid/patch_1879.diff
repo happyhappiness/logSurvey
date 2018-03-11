@@ -1,0 +1,820 @@
+@@ -1,6 +1,21 @@
+ Changes to squid-1.2.alpha1 ():
+ 
+ 	- Unified peer selection algorithm.
++	- aiops.c and aiops.h are a threaded implementation of
++	  asynchronous file operations (Stewart Forster).
++	- async_io.c and async_io.h are complete rewrites of the old
++	  versions (Stewart Forster).
++	- I have rewritten all disk file operations of squid to support
++	  the idea of callbacks except where not required (Stewart
++	  Forster).
++	- UDP_HIT_OBJ not support removed.
++	- Background validation of 'tainted' swap log entries (Stewart
++	  Forster).
++	- Modified storeWriteCleanLog to create the log file using the
++	  open/write rather than fopen/printf (Stewart Forster).
++	- Added the EINTR error response to handle badly interrupted
++	  system calls (Stewart Forster).
++
+ 
+ Changes to squid-1.1.7 (February 25 1997):
+ 
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: acl.cc,v 1.86 1997/02/26 20:49:05 wessels Exp $
++ * $Id: acl.cc,v 1.87 1997/02/27 02:57:04 wessels Exp $
+  *
+  * DEBUG: section 28    Access Control
+  * AUTHOR: Duane Wessels
+@@ -59,6 +59,13 @@ static int aclMatchIp _PARAMS((void *dataptr, struct in_addr c));
+ static int aclMatchDomainList _PARAMS((void *dataptr, const char *));
+ static squid_acl aclType _PARAMS((const char *s));
+ static int decode_addr _PARAMS((const char *, struct in_addr *, struct in_addr *));
++static void aclCheck _PARAMS((aclCheck_t * checklist));
++
++static void aclCheckCallback _PARAMS((aclCheck_t * checklist, int answer));
++static void aclLookupDstIPDone _PARAMS((int fd, const ipcache_addrs * ia, void *data));
++static void aclLookupSrcFQDNDone _PARAMS((int fd, const char *fqdn, void *data));
++static void aclLookupDstFQDNDone _PARAMS((int fd, const char *fqdn, void *data));
++
+ 
+ #if defined(USE_SPLAY_TREE)
+ static int aclIpNetworkCompare _PARAMS((const void *, splayNode *));
+@@ -1041,8 +1048,7 @@ aclMatchAcl(struct _acl *acl, aclCheck_t * checklist)
+ 	ia = ipcache_gethostbyname(r->host, IP_LOOKUP_IF_MISS);
+ 	if (ia) {
+ 	    for (k = 0; k < (int) ia->count; k++) {
+-		checklist->dst_addr = ia->in_addrs[k];
+-		if (aclMatchIp(&acl->data, checklist->dst_addr))
++		if (aclMatchIp(&acl->data, ia->in_addrs[k]))
+ 		    return 1;
+ 	    }
+ 	    return 0;
+@@ -1135,22 +1141,130 @@ aclMatchAclList(const struct _acl_list *list, aclCheck_t * checklist)
+ }
+ 
+ int
+-aclCheck(const struct _acl_access *A, aclCheck_t * checklist)
++aclCheckFast(const struct _acl_access *A, aclCheck_t * checklist)
+ {
+     int allow = 0;
+-
+     while (A) {
++        allow = A->allow;
++        if (aclMatchAclList(A->acl_list, checklist))
++            return allow;
++        A = A->next;
++    }
++    return !allow;
++}
++
++static void
++aclCheck(aclCheck_t * checklist)
++{
++    int allow = 0;
++    const struct _acl_access *A;
++    ipcache_addrs *ia = NULL;
++    int match;
++    while ((A = checklist->access_list)) {
+ 	debug(28, 3, "aclCheck: checking '%s'\n", A->cfgline);
+ 	allow = A->allow;
+-	if (aclMatchAclList(A->acl_list, checklist)) {
++	match = aclMatchAclList(A->acl_list, checklist);
++        if (checklist->state[ACL_DST_IP] == ACL_LOOKUP_NEED) {
++            checklist->state[ACL_DST_IP] = ACL_LOOKUP_PENDING;
++            ipcache_nbgethostbyname(checklist->request->host,
++                -1,
++                aclLookupDstIPDone,
++                checklist);
++            return;
++        } else if (checklist->state[ACL_SRC_DOMAIN] == ACL_LOOKUP_NEED) {
++            checklist->state[ACL_SRC_DOMAIN] = ACL_LOOKUP_PENDING;
++            fqdncache_nbgethostbyaddr(checklist->src_addr,
++                -1,
++                aclLookupSrcFQDNDone,
++                checklist);
++            return;
++        } else if (checklist->state[ACL_DST_DOMAIN] == ACL_LOOKUP_NEED) {
++            if ((ia = ipcacheCheckNumeric(checklist->request->host)) != NULL) {
++                checklist->state[ACL_DST_DOMAIN] = ACL_LOOKUP_PENDING;
++                fqdncache_nbgethostbyaddr(ia->in_addrs[0],
++                    -1,
++                    aclLookupDstFQDNDone,
++                    checklist);
++	    } else {
++                checklist->state[ACL_DST_DOMAIN] = ACL_LOOKUP_DONE;
++	    }
++            return;
++        }
++	if (match) {
+ 	    debug(28, 3, "aclCheck: match found, returning %d\n", allow);
+-	    return allow;
++    	    aclCheckCallback(checklist, !allow);
++	    return;
+ 	}
+-	A = A->next;
++	checklist->access_list  = A->next;
+     }
+-    return !allow;
++    aclCheckCallback(checklist, !allow);
++}
++
++
++static void
++aclCheckCallback(aclCheck_t * checklist, int answer)
++{
++	checklist->callback(answer, checklist->callback_data);
++	requestUnlink(checklist->request);
++	xfree(checklist);
++}
++
++static void
++aclLookupDstIPDone(int fd, const ipcache_addrs * ia, void *data)
++{
++	aclCheck_t * checklist = data;
++	checklist->state[ACL_DST_IP] = ACL_LOOKUP_DONE;
++	aclCheck(checklist);
+ }
+ 
++static void
++aclLookupSrcFQDNDone(int fd, const char *fqdn, void *data)
++{
++	aclCheck_t * checklist = data;
++	checklist->state[ACL_SRC_DOMAIN] = ACL_LOOKUP_DONE;
++	aclCheck(checklist);
++}
++
++static void
++aclLookupDstFQDNDone(int fd, const char *fqdn, void *data)
++{
++    aclCheck_t * checklist = data;
++    checklist->state[ACL_SRC_DOMAIN] = ACL_LOOKUP_DONE;
++    aclCheck(checklist);
++}
++
++void
++aclNBCheck(const struct _acl_access *A,
++	request_t *request,
++	struct in_addr src_addr,
++	char *user_agent,
++	char *ident,
++	PF callback,
++	void *callback_data)
++{
++	aclCheck_t *checklist = xcalloc(1, sizeof(aclCheck_t));;
++	checklist->access_list = A;
++	checklist->request = requestLink(request);
++	checklist->src_addr = src_addr;
++	if (user_agent)
++	    xstrncpy(checklist->browser, user_agent, BROWSERNAMELEN);
++	if (ident)
++	    xstrncpy(checklist->ident, ident, ICP_IDENT_SZ);
++	checklist->callback = callback;
++	checklist->callback_data = callback_data;
++	aclCheck(checklist);
++}
++
++
++
++
++
++
++
++
++
++
++
+ /*********************/
+ /* Destroy functions */
+ /*********************/
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: client_side.cc,v 1.92 1997/02/26 20:49:08 wessels Exp $
++ * $Id: client_side.cc,v 1.93 1997/02/27 02:57:05 wessels Exp $
+  *
+  * DEBUG: section 33    Client-side Routines
+  * AUTHOR: Duane Wessels
+@@ -33,54 +33,9 @@
+ 
+ static void clientRedirectDone _PARAMS((void *data, char *result));
+ static void icpHandleIMSReply _PARAMS((int fd, StoreEntry * entry, void *data));
+-static void clientLookupDstIPDone _PARAMS((int fd, const ipcache_addrs *, void *data));
+-static void clientLookupSrcFQDNDone _PARAMS((int fd, const char *fqdn, void *data));
+-static void clientLookupDstFQDNDone _PARAMS((int fd, const char *fqdn, void *data));
+ static int clientGetsOldEntry _PARAMS((StoreEntry * new, StoreEntry * old, request_t * request));
+ static int checkAccelOnly _PARAMS((icpStateData * icpState));
+ 
+-
+-static void
+-clientLookupDstIPDone(int fd, const ipcache_addrs * ia, void *data)
+-{
+-    icpStateData *icpState = data;
+-    debug(33, 5, "clientLookupDstIPDone: FD %d, '%s'\n",
+-	fd,
+-	icpState->url);
+-    icpState->aclChecklist->state[ACL_DST_IP] = ACL_LOOKUP_DONE;
+-    if (ia) {
+-	icpState->aclChecklist->dst_addr = ia->in_addrs[0];
+-	debug(33, 5, "clientLookupDstIPDone: %s is %s\n",
+-	    icpState->request->host,
+-	    inet_ntoa(icpState->aclChecklist->dst_addr));
+-    }
+-    clientAccessCheck(icpState, icpState->aclHandler);
+-}
+-
+-static void
+-clientLookupSrcFQDNDone(int fd, const char *fqdn, void *data)
+-{
+-    icpStateData *icpState = data;
+-    debug(33, 5, "clientLookupSrcFQDNDone: FD %d, '%s', FQDN %s\n",
+-	fd,
+-	icpState->url,
+-	fqdn ? fqdn : "NULL");
+-    icpState->aclChecklist->state[ACL_SRC_DOMAIN] = ACL_LOOKUP_DONE;
+-    clientAccessCheck(icpState, icpState->aclHandler);
+-}
+-
+-static void
+-clientLookupDstFQDNDone(int fd, const char *fqdn, void *data)
+-{
+-    icpStateData *icpState = data;
+-    debug(33, 5, "clientLookupDstFQDNDone: FD %d, '%s', FQDN %s\n",
+-	fd,
+-	icpState->url,
+-	fqdn ? fqdn : "NULL");
+-    icpState->aclChecklist->state[ACL_SRC_DOMAIN] = ACL_LOOKUP_DONE;
+-    clientAccessCheck(icpState, icpState->aclHandler);
+-}
+-
+ static void
+ clientLookupIdentDone(void *data)
+ {
+@@ -133,34 +88,14 @@ checkAccelOnly(icpStateData * icpState)
+ }
+ 
+ void
+-clientAccessCheck(icpStateData * icpState, void (*handler) (icpStateData *, int))
++clientAccessCheck(icpStateData * icpState, PF handler)
+ {
+-    int answer = 1;
+-    aclCheck_t *ch = NULL;
+-    char *browser = NULL;
+-    const ipcache_addrs *ia = NULL;
+-
++    char *browser;
+     if (Config.identLookup && icpState->ident.state == IDENT_NONE) {
+ 	icpState->aclHandler = handler;
+ 	identStart(-1, icpState, clientLookupIdentDone);
+ 	return;
+     }
+-    if (icpState->aclChecklist == NULL) {
+-	icpState->aclChecklist = xcalloc(1, sizeof(aclCheck_t));
+-	icpState->aclChecklist->src_addr = icpState->peer.sin_addr;
+-	icpState->aclChecklist->request = requestLink(icpState->request);
+-	browser = mime_get_header(icpState->request_hdr, "User-Agent");
+-	if (browser != NULL) {
+-	    xstrncpy(icpState->aclChecklist->browser, browser, BROWSERNAMELEN);
+-	} else {
+-	    icpState->aclChecklist->browser[0] = '\0';
+-	}
+-	xstrncpy(icpState->aclChecklist->ident,
+-	    icpState->ident.ident,
+-	    ICP_IDENT_SZ);
+-    }
+-    /* This so we can have SRC ACLs for cache_host_acl. */
+-    icpState->request->client_addr = icpState->peer.sin_addr;
+ #if USE_PROXY_AUTH
+     if (clientProxyAuthCheck(icpState) == 0) {
+ 	char *wbuf = NULL;
+@@ -177,47 +112,24 @@ clientAccessCheck(icpStateData * icpState, void (*handler) (icpStateData *, int)
+ 	return;
+     }
+ #endif /* USE_PROXY_AUTH */
+-
+-    ch = icpState->aclChecklist;
+-    icpState->aclHandler = handler;
+     if (checkAccelOnly(icpState)) {
+-	answer = 0;
+-    } else {
+-	answer = aclCheck(Config.accessList.HTTP, ch);
+-	if (ch->state[ACL_DST_IP] == ACL_LOOKUP_NEED) {
+-	    ch->state[ACL_DST_IP] = ACL_LOOKUP_PENDING;		/* first */
+-	    ipcache_nbgethostbyname(icpState->request->host,
+-		icpState->fd,
+-		clientLookupDstIPDone,
+-		icpState);
+-	    return;
+-	} else if (ch->state[ACL_SRC_DOMAIN] == ACL_LOOKUP_NEED) {
+-	    ch->state[ACL_SRC_DOMAIN] = ACL_LOOKUP_PENDING;	/* first */
+-	    fqdncache_nbgethostbyaddr(icpState->peer.sin_addr,
+-		icpState->fd,
+-		clientLookupSrcFQDNDone,
+-		icpState);
+-	    return;
+-	} else if (ch->state[ACL_DST_DOMAIN] == ACL_LOOKUP_NEED) {
+-	    ch->state[ACL_DST_DOMAIN] = ACL_LOOKUP_PENDING;	/* first */
+-	    ia = ipcacheCheckNumeric(icpState->request->host);
+-	    if (ia != NULL)
+-		fqdncache_nbgethostbyaddr(ia->in_addrs[0],
+-		    icpState->fd,
+-		    clientLookupDstFQDNDone,
+-		    icpState);
+-	    return;
+-	}
++        clientAccessCheckDone(0, icpState);
++	return;
+     }
+-    requestUnlink(icpState->aclChecklist->request);
+-    safe_free(icpState->aclChecklist);
+-    icpState->aclHandler = NULL;
+-    handler(icpState, answer);
++    browser = mime_get_header(icpState->request_hdr, "User-Agent"),
++    aclNBCheck(Config.accessList.HTTP,
++	icpState->request,
++	icpState->peer.sin_addr,
++	browser,
++	icpState->ident.ident,
++	handler,
++	icpState);
+ }
+ 
+ void
+-clientAccessCheckDone(icpStateData * icpState, int answer)
++clientAccessCheckDone(int answer, void *data)
+ {
++    icpStateData * icpState = data;
+     int fd = icpState->fd;
+     char *buf = NULL;
+     char *redirectUrl = NULL;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: ftp.cc,v 1.95 1997/02/26 19:46:13 wessels Exp $
++ * $Id: ftp.cc,v 1.96 1997/02/27 02:57:06 wessels Exp $
+  *
+  * DEBUG: section 9     File Transfer Protocol (FTP)
+  * AUTHOR: Harvest Derived
+@@ -129,8 +129,6 @@ typedef struct _Ftpdata {
+ } FtpStateData;
+ 
+ typedef struct ftp_ctrl_t {
+-    int unusedfd;
+-    char *url;
+     request_t *request;
+     StoreEntry *entry;
+ } ftp_ctrl_t;
+@@ -553,17 +551,15 @@ ftpGetBasicAuth(const char *req_hdr)
+ 
+ 
+ int
+-ftpStart(int unusedfd, const char *url, request_t * request, StoreEntry * entry)
++ftpStart(request_t * request, StoreEntry * entry)
+ {
+     ftp_ctrl_t *ctrlp;
+-    debug(9, 3, "FtpStart: FD %d '%s'\n", unusedfd, url);
++    debug(9, 3, "FtpStart: '%s'\n", entry->url);
+     if (ftpget_server_write < 0) {
+ 	squid_error_entry(entry, ERR_FTP_DISABLED, NULL);
+ 	return COMM_ERROR;
+     }
+     ctrlp = xmalloc(sizeof(ftp_ctrl_t));
+-    ctrlp->unusedfd = unusedfd;
+-    ctrlp->url = xstrdup(url);
+     ctrlp->request = request;
+     ctrlp->entry = entry;
+     storeLockObject(entry, ftpStartComplete, ctrlp);
+@@ -573,24 +569,18 @@ ftpStart(int unusedfd, const char *url, request_t * request, StoreEntry * entry)
+ static void
+ ftpStartComplete(void *data, int status)
+ {
+-    ftp_ctrl_t *ctrlp = (ftp_ctrl_t *) data;
+     LOCAL_ARRAY(char, realm, 8192);
+-    int unusedfd;
+-    char *url;
+-    request_t *request;
+-    StoreEntry *entry;
+-    FtpStateData *ftpData;
++    ftp_ctrl_t *ctrlp = data;
++    request_t * request = ctrlp->request;
++    StoreEntry *entry = ctrlp->entry;
++    char *url = entry->url;
++    FtpStateData *ftpData = xcalloc(1, sizeof(FtpStateData));
+     char *req_hdr;
+     char *response;
+     char *auth;
+-    ftpData = xcalloc(1, sizeof(FtpStateData));
+-    unusedfd = ctrlp->unusedfd;
+-    url = ctrlp->url;
+-    request = ctrlp->request;
+-    entry = ctrlp->entry;
+     ftpData->entry = entry;
+     xfree(ctrlp);
+-    req_hdr = ctrlp->entry->mem_obj->mime_hdr;
++    req_hdr = entry->mem_obj->mime_hdr;
+     ftpData->request = requestLink(request);
+     /* Parse login info. */
+     if ((auth = ftpGetBasicAuth(req_hdr))) {
+@@ -615,8 +605,8 @@ ftpStartComplete(void *data, int status)
+ 	    return;
+ 	}
+     }
+-    debug(9, 5, "FtpStart: FD %d, host=%s, path=%s, user=%s, passwd=%s\n",
+-	unusedfd, ftpData->request->host, ftpData->request->urlpath,
++    debug(9, 5, "FtpStart: host=%s, path=%s, user=%s, passwd=%s\n",
++	ftpData->request->host, ftpData->request->urlpath,
+ 	ftpData->user, ftpData->password);
+     ftpData->ftp_fd = comm_open(SOCK_STREAM,
+ 	0,
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: gopher.cc,v 1.71 1997/02/26 19:46:13 wessels Exp $
++ * $Id: gopher.cc,v 1.72 1997/02/27 02:57:08 wessels Exp $
+  *
+  * DEBUG: section 10    Gopher
+  * AUTHOR: Harvest Derived
+@@ -159,12 +159,6 @@ typedef struct gopher_ds {
+     ConnectStateData connectState;
+ } GopherStateData;
+ 
+-typedef struct gopher_ctrl_t {
+-    int unusedfd;
+-    char *url;
+-    StoreEntry *entry;
+-} gopher_ctrl_t;
+-
+ static int gopherStateFree _PARAMS((int fd, GopherStateData *));
+ static void gopher_mime_content _PARAMS((char *buf, const char *name, const char *def));
+ static void gopherMimeCreate _PARAMS((GopherStateData *));
+@@ -943,32 +937,20 @@ gopherSendRequest(int fd, GopherStateData * data)
+ }
+ 
+ int
+-gopherStart(int unusedfd, const char *url, StoreEntry * entry)
++gopherStart(StoreEntry * entry)
+ {
+-    gopher_ctrl_t *ctrlp;
+-    ctrlp = xmalloc(sizeof(gopher_ctrl_t));
+-    ctrlp->unusedfd = unusedfd;
+-    ctrlp->url = xstrdup(url);
+-    ctrlp->entry = entry;
+-    storeLockObject(entry, gopherStartComplete, ctrlp);
++    storeLockObject(entry, gopherStartComplete, entry);
+     return COMM_OK;
+ }
+ 
+ 
+ static void
+ gopherStartComplete(void *datap, int status)
+ {
+-    gopher_ctrl_t *ctrlp = (gopher_ctrl_t *) datap;
+-    /* Create state structure. */
++    StoreEntry *entry = datap;
++    char *url = entry->url;
+     GopherStateData *data = CreateGopherStateData();
+     int sock;
+-    int unusedfd;
+-    char *url;
+-    StoreEntry *entry;
+-    unusedfd = ctrlp->unusedfd;
+-    url = ctrlp->url;
+-    entry = ctrlp->entry;
+-    xfree(ctrlp);
+     data->entry = entry;
+     debug(10, 3, "gopherStart: url: %s\n", url);
+     /* Parse url. */
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: http.cc,v 1.150 1997/02/26 19:46:14 wessels Exp $
++ * $Id: http.cc,v 1.151 1997/02/27 02:57:09 wessels Exp $
+  *
+  * DEBUG: section 11    Hypertext Transfer Protocol (HTTP)
+  * AUTHOR: Harvest Derived
+@@ -160,7 +160,6 @@ typedef enum {
+ 
+ typedef struct proxy_ctrl_t {
+     int sock;
+-    char *url;
+     request_t *orig_request;
+     StoreEntry *entry;
+     peer *e;
+@@ -248,7 +247,7 @@ httpStateFree(int fd, void *data)
+ }
+ 
+ int
+-httpCachable(const char *url, int method)
++httpCachable(method_t method)
+ {
+     /* GET and HEAD are cachable. Others are not. */
+     if (method != METHOD_GET && method != METHOD_HEAD)
+@@ -893,15 +892,14 @@ httpSendRequest(int fd, void *data)
+ }
+ 
+ int
+-proxyhttpStart(const char *url,
+-    request_t * orig_request,
++proxyhttpStart(request_t * orig_request,
+     StoreEntry * entry,
+     peer * e)
+ {
+     proxy_ctrl_t *ctrlp;
+     int sock;
+     debug(11, 3, "proxyhttpStart: \"%s %s\"\n",
+-	RequestMethodStr[orig_request->method], url);
++	RequestMethodStr[orig_request->method], entry->url);
+     debug(11, 10, "proxyhttpStart: HTTP request header:\n%s\n",
+ 	entry->mem_obj->mime_hdr);
+     if (e->options & NEIGHBOR_PROXY_ONLY)
+@@ -912,15 +910,14 @@ proxyhttpStart(const char *url,
+ 	Config.Addrs.tcp_outgoing,
+ 	0,
+ 	COMM_NONBLOCKING,
+-	url);
++	entry->url);
+     if (sock == COMM_ERROR) {
+ 	debug(11, 4, "proxyhttpStart: Failed because we're out of sockets.\n");
+ 	squid_error_entry(entry, ERR_NO_FDS, xstrerror());
+ 	return COMM_ERROR;
+     }
+     ctrlp = xmalloc(sizeof(proxy_ctrl_t));
+     ctrlp->sock = sock;
+-    ctrlp->url = xstrdup(url);
+     ctrlp->orig_request = orig_request;
+     ctrlp->entry = entry;
+     ctrlp->e = e;
+@@ -932,25 +929,17 @@ proxyhttpStart(const char *url,
+ static void
+ proxyhttpStartComplete(void *data, int status)
+ {
+-    proxy_ctrl_t *ctrlp = (proxy_ctrl_t *) data;
+-    int sock;
++    proxy_ctrl_t *ctrlp = data;
++    int sock = ctrlp->sock;
++    request_t *orig_request = ctrlp->orig_request;
++    StoreEntry *entry = ctrlp->entry;
++    peer *e = ctrlp->e;
++    char *url = entry->url;
+     HttpStateData *httpState = NULL;
+     request_t *request = NULL;
+-    char *url;
+-    request_t *orig_request;
+-    StoreEntry *entry;
+-    peer *e;
+-
+-    sock = ctrlp->sock;
+-    url = ctrlp->url;
+-    orig_request = ctrlp->orig_request;
+-    entry = ctrlp->entry;
+-    e = ctrlp->e;
+     xfree(ctrlp);
+-
+     httpState = xcalloc(1, sizeof(HttpStateData));
+     httpState->entry = entry;
+-
+     httpState->req_hdr = entry->mem_obj->mime_hdr;
+     httpState->req_hdr_sz = entry->mem_obj->mime_hdr_sz;
+     request = get_free_request_t();
+@@ -1022,25 +1011,23 @@ httpConnectDone(int fd, int status, void *data)
+ }
+ 
+ int
+-httpStart(char *url,
+-    request_t * request,
++httpStart(request_t * request,
+     char *req_hdr,
+     int req_hdr_sz,
+     StoreEntry * entry)
+ {
+     http_ctrl_t *ctrlp;
+-    /* Create state structure. */
+     int sock;
+     debug(11, 3, "httpStart: \"%s %s\"\n",
+-	RequestMethodStr[request->method], url);
++	RequestMethodStr[request->method], entry->url);
+     debug(11, 10, "httpStart: req_hdr '%s'\n", req_hdr);
+     /* Create socket. */
+     sock = comm_open(SOCK_STREAM,
+ 	0,
+ 	Config.Addrs.tcp_outgoing,
+ 	0,
+ 	COMM_NONBLOCKING,
+-	url);
++	entry->url);
+     if (sock == COMM_ERROR) {
+ 	debug(11, 4, "httpStart: Failed because we're out of sockets.\n");
+ 	squid_error_entry(entry, ERR_NO_FDS, xstrerror());
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: neighbors.cc,v 1.125 1997/02/26 20:49:11 wessels Exp $
++ * $Id: neighbors.cc,v 1.126 1997/02/27 02:57:12 wessels Exp $
+  *
+  * DEBUG: section 15    Neighbor Routines
+  * AUTHOR: Harvest Derived
+@@ -764,7 +764,7 @@ neighborsUdpAck(int fd, const char *url, icp_common_t * header, const struct soc
+ 	debug(15, 6, "neighborsUdpAck: All replies received.\n");
+ 	/* pass in fd=0 here so protoStart() looks up the real FD
+ 	 * and resets the timeout handler */
+-	peerSelect(0, entry->mem_obj->request, entry);
++	peerSelectStart(0, entry->mem_obj->request, entry);
+     }
+ }
+ 
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: peer_select.cc,v 1.3 1997/02/26 20:49:12 wessels Exp $
++ * $Id: peer_select.cc,v 1.4 1997/02/27 02:57:13 wessels Exp $
+  *
+  * DEBUG: section 44    Peer Selection Algorithm
+  * AUTHOR: Duane Wessels
+@@ -31,30 +31,20 @@
+ #include "squid.h"
+ 
+ static struct {
+-	int timeouts;
++    int timeouts;
+ } PeerStats;
+ 
+-int
+-peerSelectDirect(request_t * request)
+-{
+-    int answer;
+-    aclCheck_t ch;
+-    const ipcache_addrs *ia = ipcache_gethostbyname(request->host, 0);
+-    memset(&ch, '\0', sizeof(aclCheck_t));
+-    ch.request = requestLink(request);
+-    ch.dst_addr = ia->in_addrs[ia->cur];
+-    ch.src_addr = request->client_addr;
+-    answer = aclCheck(Config.accessList.NeverDirect, &ch);
+-    requestUnlink(ch.request);
+-    if (answer)
+-	return DIRECT_NO;
+-    answer = aclCheck(Config.accessList.AlwaysDirect, &ch);
+-    if (answer)
+-	return DIRECT_YES;
+-    if (ia == NULL)
+-	return DIRECT_NO;
+-    return DIRECT_MAYBE;
+-}
++typedef struct _peer_ctrl_t {
++    int fd;
++    request_t *request;
++    StoreEntry *entry;
++    int always_direct;
++    int never_direct;
++    int timeout;
++} peer_ctrl_t;
++
++
++static void peerSelect _PARAMS((peer_ctrl_t *));
+ 
+ int
+ peerSelectIcpPing(request_t * request, int direct, StoreEntry * entry)
+@@ -109,14 +99,71 @@ peerGetSomeParent(request_t * request, hier_code * code)
+ }
+ 
+ void
+-peerSelect(int fd, request_t * request, StoreEntry * entry)
++peerSelectStart(int fd, request_t * request, StoreEntry * entry)
++{
++    peer_ctrl_t *ctrl = xcalloc(1, sizeof(peer_ctrl_t));
++    ctrl->request = request;
++    ctrl->entry = entry;
++    ctrl->fd = fd;
++    peerSelect(ctrl);
++}
++
++static void
++peerCheckNeverDirectDone(int answer, void *data)
++{
++    peer_ctrl_t *ctrl = data;
++    debug(44, 3, "peerCheckNeverDirectDone: %d\n", answer);
++    ctrl->never_direct = answer ? 1 : -1;
++    peerSelect(ctrl);
++}
++
++static void
++peerCheckAlwaysDirectDone(int answer, void *data)
++{
++    peer_ctrl_t *ctrl = data;
++    debug(44, 3, "peerCheckAlwaysDirectDone: %d\n", answer);
++    ctrl->always_direct = answer ? 1 : -1;
++    peerSelect(ctrl);
++}
++
++void
++peerSelect(peer_ctrl_t * ctrl)
+ {
+     peer *p;
+     hier_code code;
+-    int direct = peerSelectDirect(request);
++    StoreEntry *entry = ctrl->entry;
++    request_t *request = ctrl->request;
++    int fd = ctrl->fd;
++    int direct;
+     debug(44, 3, "peerSelect: '%s'\n", entry->url);
++    if (ctrl->never_direct == 0) {
++	aclNBCheck(Config.accessList.NeverDirect,
++	    request,
++	    request->client_addr,
++	    NULL,		/* user agent */
++	    NULL,		/* ident */
++	    peerCheckNeverDirectDone,
++	    ctrl);
++	return;
++    } else if (ctrl->never_direct > 0) {
++	direct = DIRECT_NO;
++    } else if (ctrl->always_direct == 0) {
++	aclNBCheck(Config.accessList.AlwaysDirect,
++	    request,
++	    request->client_addr,
++	    NULL,		/* user agent */
++	    NULL,		/* ident */
++	    peerCheckAlwaysDirectDone,
++	    ctrl);
++	return;
++    } else if (ctrl->always_direct > 0) {
++	direct = DIRECT_YES;
++    } else {
++	direct = DIRECT_MAYBE;
++    }
++    debug(44, 3, "peerSelect: direct = %d\n", direct);
+     if (direct == DIRECT_YES) {
+-	debug(44, 3, "peerSelect: direct == DIRECT_YES --> HIER_DIRECT\n");
++	debug(44, 3, "peerSelect: HIER_DIRECT\n");
+ 	hierarchyNote(request, HIER_DIRECT, 0, request->host);
+ 	protoStart(fd, entry, NULL, request);
+ 	return;
+@@ -129,7 +176,7 @@ peerSelect(int fd, request_t * request, StoreEntry * entry)
+ 	    commSetSelect(fd,
+ 		COMM_SELECT_TIMEOUT,
+ 		peerPingTimeout,
+-		(void *) entry,
++		(void *) ctrl,
+ 		Config.neighborTimeout);
+ 	    return;
+ 	}
+@@ -146,14 +193,16 @@ peerSelect(int fd, request_t * request, StoreEntry * entry)
+ void
+ peerPingTimeout(int fd, void *data)
+ {
+-	StoreEntry *entry = data;
+-	debug(44,3,"peerPingTimeout: '%s'\n", entry->url);
+-	PeerStats.timeouts++;
+-	peerSelect(fd, entry->mem_obj->request, entry);
++    peer_ctrl_t *ctrl = data;
++    StoreEntry *entry = ctrl->entry;
++    debug(44, 3, "peerPingTimeout: '%s'\n", entry->url);
++    PeerStats.timeouts++;
++    ctrl->timeout = 1;
++    peerSelect(ctrl);
+ }
+ 
+ void
+ peerSelectInit(void)
+ {
+-	memset(&PeerStats, '\0', sizeof(PeerStats));
++    memset(&PeerStats, '\0', sizeof(PeerStats));
+ }
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: squid.h,v 1.97 1997/02/26 19:46:21 wessels Exp $
++ * $Id: squid.h,v 1.98 1997/02/27 02:57:16 wessels Exp $
+  *
+  * AUTHOR: Duane Wessels
+  *
+@@ -347,11 +347,10 @@ extern char ThisCache[];	/* main.c */
+ 
+ #define  CONNECT_PORT        443
+ 
+-extern int objcacheStart _PARAMS((int, const char *, StoreEntry *));
+ extern void send_announce _PARAMS((void *unused));
+ extern int sslStart _PARAMS((int fd, const char *, request_t *, char *, int *sz));
+ extern const char *storeToString _PARAMS((const StoreEntry *));
+-extern int waisStart _PARAMS((int, const char *, method_t, char *, StoreEntry *));
++extern int waisStart _PARAMS((method_t, char *, StoreEntry *));
+ extern void storeDirClean _PARAMS((void *unused));
+ extern int passStart _PARAMS((int fd,
+ 	const char *url,
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: wais.cc,v 1.60 1997/02/26 19:46:28 wessels Exp $
++ * $Id: wais.cc,v 1.61 1997/02/27 02:57:17 wessels Exp $
+  *
+  * DEBUG: section 24    WAIS Relay
+  * AUTHOR: Harvest Derived
+@@ -330,10 +330,11 @@ waisSendRequest(int fd, WaisStateData * waisState)
+ }
+ 
+ int
+-waisStart(int unusedfd, const char *url, method_t method, char *mime_hdr, StoreEntry * entry)
++waisStart(method_t method, char *mime_hdr, StoreEntry * entry)
+ {
+     WaisStateData *waisState = NULL;
+     int fd;
++    char *url = entry->url;
+     debug(24, 3, "waisStart: \"%s %s\"\n", RequestMethodStr[method], url);
+     debug(24, 4, "            header: %s\n", mime_hdr);
+     if (!Config.Wais.relayHost) {

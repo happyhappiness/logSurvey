@@ -1,1102 +1,1048 @@
-@@ -220,27 +220,6 @@ ClientSocketContext::getConn() const
-     return http->getConn();
+@@ -157,22 +157,3 @@ Auth::Config::done()
+     keyExtrasLine.clean();
+ }
+ 
+-Auth::User::Pointer
+-Auth::Config::findUserInCache(const char *nameKey, Auth::Type authType)
+-{
+-    AuthUserHashPointer *usernamehash;
+-    debugs(29, 9, "Looking for user '" << nameKey << "'");
+-
+-    if (nameKey && (usernamehash = static_cast<AuthUserHashPointer *>(hash_lookup(proxy_auth_username_cache, nameKey)))) {
+-        while (usernamehash) {
+-            if ((usernamehash->user()->auth_type == authType) &&
+-                    !strcmp(nameKey, (char const *)usernamehash->key))
+-                return usernamehash->user();
+-
+-            usernamehash = static_cast<AuthUserHashPointer *>(usernamehash->next);
+-        }
+-    }
+-
+-    return NULL;
+-}
+-
+@@ -108,9 +108,6 @@ class Config
+     /** add headers as needed when challenging for auth */
+     virtual void fixHeader(UserRequest::Pointer, HttpReply *, Http::HdrType, HttpRequest *) = 0;
+ 
+-    /// Find any existing user credentials in the authentication cache by name and type.
+-    virtual Auth::User::Pointer findUserInCache(const char *nameKey, Auth::Type type);
+-
+     /** prepare to handle requests */
+     virtual void init(Config *) = 0;
+ 
+@@ -0,0 +1,151 @@
++/*
++ * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++/* DEBUG: section 29    Authenticator */
++
++#include "squid.h"
++#include "acl/Gadgets.h"
++#include "auth/CredentialsCache.h"
++#include "base/RunnersRegistry.h"
++#include "Debug.h"
++#include "event.h"
++#include "SquidConfig.h"
++#include "SquidTime.h"
++
++namespace Auth {
++
++class CredentialCacheRr : public RegisteredRunner
++{
++public:
++    explicit CredentialCacheRr(const char *n, CredentialsCache * const c) :
++        name(n),
++        whichCache(c)
++    {}
++
++    virtual ~CredentialCacheRr() {
++        debugs(29, 5, "Terminating Auth credentials cache: " << name);
++        // invalidate the CBDATA reference.
++        // causes Auth::*::User::Cache() to produce nil / invalid pointer
++        delete whichCache.get();
++    }
++
++    virtual void endingShutdown() override {
++        debugs(29, 5, "Clearing Auth credentials cache: " << name);
++        whichCache->reset();
++    }
++
++    virtual void syncConfig() override {
++        debugs(29, 5, "Reconfiguring Auth credentials cache: " << name);
++        whichCache->doConfigChangeCleanup();
++    }
++
++private:
++    /// name of the cache being managed, for logs
++    const char *name;
++
++    /// reference to the scheme cache which is being managed
++    CbcPointer<CredentialsCache> whichCache;
++};
++
++CBDATA_CLASS_INIT(CredentialsCache);
++
++CredentialsCache::CredentialsCache(const char *name, const char * const prettyEvName) :
++    gcScheduled_(false),
++    cacheCleanupEventName(prettyEvName)
++{
++    debugs(29, 5, "initializing " << name << " credentials cache");
++    RegisterRunner(new Auth::CredentialCacheRr(name, this));
++}
++
++Auth::User::Pointer
++CredentialsCache::lookup(const SBuf &userKey) const
++{
++    debugs(29, 6, "lookup for " << userKey);
++    auto p = store_.find(userKey);
++    if (p == store_.end())
++        return User::Pointer(nullptr);
++    return p->second;
++}
++
++void
++CredentialsCache::Cleanup(void *data)
++{
++    debugs(29, 5, "checkpoint");
++    // data is this in disguise
++    CredentialsCache *self = static_cast<CredentialsCache *>(data);
++    self->cleanup();
++}
++
++void
++CredentialsCache::cleanup()
++{
++    // cache entries with expiretime <= expirationTime are to be evicted
++    const time_t expirationTime =  current_time.tv_sec - ::Config.authenticateTTL;
++
++    const auto end = store_.end();
++    for (auto i = store_.begin(); i != end;) {
++        debugs(29, 6, "considering " << i->first << "(expires in " <<
++               (expirationTime - i->second->expiretime) << " sec)");
++        if (i->second->expiretime <= expirationTime) {
++            debugs(29, 6, "evicting " << i->first);
++            i = store_.erase(i); //erase advances i
++        } else {
++            ++i;
++        }
++    }
++    scheduleCleanup();
++}
++
++void
++CredentialsCache::insert(const SBuf &userKey, Auth::User::Pointer anAuth_user)
++{
++    debugs(29, 6, "adding " << userKey << " (" << anAuth_user->username() << ")");
++    store_[userKey] = anAuth_user;
++    scheduleCleanup();
++}
++
++// generates the list of cached usernames in a format that is convenient
++// to merge with equivalent lists obtained from other CredentialsCaches.
++std::vector<Auth::User::Pointer>
++CredentialsCache::sortedUsersList() const
++{
++    std::vector<Auth::User::Pointer> rv(size(), nullptr);
++    std::transform(store_.begin(), store_.end(), rv.begin(),
++    [](StoreType::value_type v) { return v.second; }
++                  );
++    std::sort(rv.begin(), rv.end(),
++    [](const Auth::User::Pointer &lhs, const Auth::User::Pointer &rhs) {
++        return strcmp(lhs->username(), rhs->username()) < 0;
++    }
++             );
++    return rv;
++}
++
++void
++CredentialsCache::scheduleCleanup()
++{
++    if (!gcScheduled_ && store_.size()) {
++        gcScheduled_ = true;
++        eventAdd(cacheCleanupEventName, &CredentialsCache::Cleanup,
++                 this, ::Config.authenticateGCInterval, 1);
++    }
++}
++
++void
++CredentialsCache::doConfigChangeCleanup()
++{
++    // purge expired entries entirely
++    cleanup();
++    // purge the ACL match data stored in the credentials
++    for (auto i : store_) {
++        aclCacheMatchFlush(&i.second->proxy_match_cache);
++    }
++}
++
++} /* namespace Auth */
++
+@@ -0,0 +1,82 @@
++/*
++ * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
++ *
++ * Squid software is distributed under GPLv2+ license and includes
++ * contributions from numerous individuals and organizations.
++ * Please see the COPYING and CONTRIBUTORS files for details.
++ */
++
++#ifndef SQUID_SRC_AUTH_CREDENTIALSCACHE_H
++#define SQUID_SRC_AUTH_CREDENTIALSCACHE_H
++
++#include "auth/User.h"
++#include "cbdata.h"
++#include "SBufAlgos.h"
++
++#include <unordered_map>
++
++namespace Auth {
++
++/// Cache of Auth::User credentials, keyed by Auth::User::userKey
++class CredentialsCache
++{
++private:
++    CBDATA_CLASS(CredentialsCache);
++
++    /// key is User::userKey(), mapped value is User::Pointer
++    typedef std::unordered_map<SBuf, Auth::User::Pointer> StoreType;
++
++public:
++    explicit CredentialsCache(const char *name, const char * const eventName);
++
++    ~CredentialsCache() = default;
++    CredentialsCache(const CredentialsCache&) = delete;
++    CredentialsCache& operator=(const CredentialsCache&) = delete;
++
++    /// \returns a pointer to cached credentials, or nil if none found
++    Auth::User::Pointer lookup(const SBuf &userKey) const;
++
++    /// add an user to the cache with the provided key
++    void insert(const SBuf &userKey, Auth::User::Pointer anAuth_user);
++
++    /// clear cache
++    void reset() { store_.clear(); }
++
++    /// \returns number of cached usernames
++    size_t size() const { return store_.size(); }
++
++    /** periodic cleanup function, removes timed-out entries
++     *
++     * Must be static to support EVH interface. Argument will be this
++     */
++    static void Cleanup(void *);
++
++    /// cache garbage collection, removes timed-out entries
++    void cleanup();
++
++    /**
++     * Cleanup cache data after a reconfiguration has occured.
++     * Similar to cleanup() but also flushes stale config dependent
++     * state from retained entries.
++     */
++    void doConfigChangeCleanup();
++
++    /// \returns alphanumerically sorted list of usernames
++    std::vector<Auth::User::Pointer> sortedUsersList() const;
++
++private:
++    void scheduleCleanup();
++
++    /// whether a cleanup (garbage collection) event has been scheduled
++    bool gcScheduled_;
++
++    StoreType store_;
++
++    // c-string raw pointer used as event name
++    const char * const cacheCleanupEventName;
++};
++
++} /* namespace Auth */
++
++#endif /* SQUID_SRC_AUTH_CREDENTIALSCACHE_H */
++
+@@ -16,8 +16,13 @@
+ #include "acl/Acl.h"
+ #include "acl/FilledChecklist.h"
+ #include "auth/AclProxyAuth.h"
++#include "auth/basic/User.h"
+ #include "auth/Config.h"
++#include "auth/CredentialsCache.h"
++#include "auth/digest/User.h"
+ #include "auth/Gadgets.h"
++#include "auth/negotiate/User.h"
++#include "auth/ntlm/User.h"
+ #include "auth/Scheme.h"
+ #include "auth/User.h"
+ #include "auth/UserRequest.h"
+@@ -64,10 +69,6 @@ authenticateRegisterWithCacheManager(Auth::ConfigVector * config)
+ void
+ authenticateInit(Auth::ConfigVector * config)
+ {
+-    /* Do this first to clear memory and remove dead state on a reconfigure */
+-    if (proxy_auth_username_cache)
+-        Auth::User::CachedACLsReset();
+-
+     /* If we do not have any auth config state to create stop now. */
+     if (!config)
+         return;
+@@ -79,9 +80,6 @@ authenticateInit(Auth::ConfigVector * config)
+             schemeCfg->init(schemeCfg);
+     }
+ 
+-    if (!proxy_auth_username_cache)
+-        Auth::User::cacheInit();
+-
+     authenticateRegisterWithCacheManager(config);
+ }
+ 
+@@ -96,16 +94,9 @@ authenticateRotate(void)
+ void
+ authenticateReset(void)
+ {
+-    debugs(29, 2, HERE << "Reset authentication State.");
+-
+-    /* free all username cache entries */
+-    hash_first(proxy_auth_username_cache);
+-    AuthUserHashPointer *usernamehash;
+-    while ((usernamehash = ((AuthUserHashPointer *) hash_next(proxy_auth_username_cache)))) {
+-        debugs(29, 5, HERE << "Clearing entry for user: " << usernamehash->user()->username());
+-        hash_remove_link(proxy_auth_username_cache, (hash_link *)usernamehash);
+-        delete usernamehash;
+-    }
++    debugs(29, 2, "Reset authentication State.");
++
++    // username cache is cleared via Runner registry
+ 
+     /* schedule shutdown of the helpers */
+     authenticateRotate();
+@@ -114,17 +105,32 @@ authenticateReset(void)
+     Auth::TheConfig.clear();
+ }
+ 
+-AuthUserHashPointer::AuthUserHashPointer(Auth::User::Pointer anAuth_user):
+-    auth_user(anAuth_user)
++std::vector<Auth::User::Pointer>
++authenticateCachedUsersList()
+ {
+-    key = (void *)anAuth_user->userKey();
+-    next = NULL;
+-    hash_join(proxy_auth_username_cache, (hash_link *) this);
+-}
+-
+-Auth::User::Pointer
+-AuthUserHashPointer::user() const
+-{
+-    return auth_user;
++    auto aucp_compare = [=](const Auth::User::Pointer lhs, const Auth::User::Pointer rhs) {
++        return lhs->userKey() < rhs->userKey();
++    };
++    std::vector<Auth::User::Pointer> v1, v2, rv, u1, u2;
++    if (Auth::Config::Find("basic") != nullptr)
++        u1 = Auth::Basic::User::Cache()->sortedUsersList();
++    if (Auth::Config::Find("digest") != nullptr)
++        u2 = Auth::Digest::User::Cache()->sortedUsersList();
++    v1.reserve(u1.size()+u2.size());
++    std::merge(u1.begin(), u1.end(),u2.begin(), u2.end(),
++               std::back_inserter(v1), aucp_compare);
++    u1.clear();
++    u2.clear();
++    if (Auth::Config::Find("negotiate") != nullptr)
++        u1 = Auth::Negotiate::User::Cache()->sortedUsersList();
++    if (Auth::Config::Find("ntlm") != nullptr)
++        u2 = Auth::Ntlm::User::Cache()->sortedUsersList();
++    v2.reserve(u1.size()+u2.size());
++    std::merge(u1.begin(), u1.end(),u2.begin(), u2.end(),
++               std::back_inserter(v2), aucp_compare);
++    rv.reserve(v1.size()+v2.size());
++    std::merge(v1.begin(), v1.end(),v2.begin(), v2.end(),
++               std::back_inserter(rv), aucp_compare);
++    return rv;
+ }
+ 
+@@ -15,32 +15,6 @@
+ #include "auth/User.h"
+ #include "hash.h"
+ 
+-/**
+- \ingroup AuthAPI
+- *
+- * This is used to link AuthUsers objects into the username cache.
+- * Because some schemes may link in aliases to a user,
+- * the link is not part of the AuthUser structure itself.
+- *
+- * Code must not hold onto copies of these objects.
+- * They may exist only so long as the AuthUser being referenced
+- * is recorded in the cache. Any caller using hash_remove_link
+- * must then delete the AuthUserHashPointer.
+- */
+-class AuthUserHashPointer : public hash_link
+-{
+-    MEMPROXY_CLASS(AuthUserHashPointer);
+-
+-public:
+-    AuthUserHashPointer(Auth::User::Pointer);
+-    ~AuthUserHashPointer() { auth_user = NULL; };
+-
+-    Auth::User::Pointer user() const;
+-
+-private:
+-    Auth::User::Pointer auth_user;
+-};
+-
+ namespace Auth
+ {
+ class Scheme;
+@@ -81,6 +55,8 @@ int authenticateSchemeCount(void);
+ /// \ingroup AuthAPI
+ void authenticateOnCloseConnection(ConnStateData * conn);
+ 
++std::vector<Auth::User::Pointer> authenticateCachedUsersList();
++
+ #endif /* USE_AUTH */
+ #endif /* SQUID_AUTH_GADGETS_H */
+ 
+@@ -21,6 +21,8 @@ libauth_la_SOURCES = \
+ 	Type.cc \
+ 	Config.cc \
+ 	Config.h \
++	CredentialsCache.h \
++	CredentialsCache.cc \
+ 	CredentialState.cc \
+ 	CredentialState.h \
+ 	Gadgets.cc \
+@@ -12,6 +12,7 @@
+ #include "acl/Acl.h"
+ #include "acl/Gadgets.h"
+ #include "auth/Config.h"
++#include "auth/CredentialsCache.h"
+ #include "auth/Gadgets.h"
+ #include "auth/User.h"
+ #include "auth/UserRequest.h"
+@@ -21,8 +22,6 @@
+ #include "SquidTime.h"
+ #include "Store.h"
+ 
+-time_t Auth::User::last_discard = 0;
+-
+ Auth::User::User(Auth::Config *aConfig, const char *aRequestRealm) :
+     auth_type(Auth::AUTH_UNKNOWN),
+     config(aConfig),
+@@ -138,82 +137,6 @@ Auth::User::~User()
+     auth_type = Auth::AUTH_UNKNOWN;
+ }
+ 
+-void
+-Auth::User::cacheInit(void)
+-{
+-    if (!proxy_auth_username_cache) {
+-        /* First time around, 7921 should be big enough */
+-        proxy_auth_username_cache = hash_create((HASHCMP *) strcmp, 7921, hash_string);
+-        assert(proxy_auth_username_cache);
+-        eventAdd("User Cache Maintenance", cacheCleanup, NULL, ::Config.authenticateGCInterval, 1);
+-        last_discard = squid_curtime;
+-    }
+-}
+-
+-void
+-Auth::User::CachedACLsReset()
+-{
+-    /*
+-     * This must complete all at once, because we are ensuring correctness.
+-     */
+-    AuthUserHashPointer *usernamehash;
+-    Auth::User::Pointer auth_user;
+-    debugs(29, 3, HERE << "Flushing the ACL caches for all users.");
+-    hash_first(proxy_auth_username_cache);
+-
+-    while ((usernamehash = ((AuthUserHashPointer *) hash_next(proxy_auth_username_cache)))) {
+-        auth_user = usernamehash->user();
+-        /* free cached acl results */
+-        aclCacheMatchFlush(&auth_user->proxy_match_cache);
+-    }
+-
+-    debugs(29, 3, HERE << "Finished.");
+-}
+-
+-void
+-Auth::User::cacheCleanup(void *)
+-{
+-    /*
+-     * We walk the hash by username as that is the unique key we use.
+-     * For big hashs we could consider stepping through the cache, 100/200
+-     * entries at a time. Lets see how it flys first.
+-     */
+-    AuthUserHashPointer *usernamehash;
+-    Auth::User::Pointer auth_user;
+-    char const *username = NULL;
+-    debugs(29, 3, HERE << "Cleaning the user cache now");
+-    debugs(29, 3, HERE << "Current time: " << current_time.tv_sec);
+-    hash_first(proxy_auth_username_cache);
+-
+-    while ((usernamehash = ((AuthUserHashPointer *) hash_next(proxy_auth_username_cache)))) {
+-        auth_user = usernamehash->user();
+-        username = auth_user->username();
+-
+-        /* if we need to have indedendent expiry clauses, insert a module call
+-         * here */
+-        debugs(29, 4, HERE << "Cache entry:\n\tType: " <<
+-               auth_user->auth_type << "\n\tUsername: " << username <<
+-               "\n\texpires: " <<
+-               (long int) (auth_user->expiretime + ::Config.authenticateTTL) <<
+-               "\n\treferences: " << auth_user->LockCount());
+-
+-        if (auth_user->expiretime + ::Config.authenticateTTL <= current_time.tv_sec) {
+-            debugs(29, 5, HERE << "Removing user " << username << " from cache due to timeout.");
+-
+-            /* Old credentials are always removed. Existing users must hold their own
+-             * Auth::User::Pointer to the credentials. Cache exists only for finding
+-             * and re-using current valid credentials.
+-             */
+-            hash_remove_link(proxy_auth_username_cache, usernamehash);
+-            delete usernamehash;
+-        }
+-    }
+-
+-    debugs(29, 3, HERE << "Finished cleaning the user cache.");
+-    eventAdd("User Cache Maintenance", cacheCleanup, NULL, ::Config.authenticateGCInterval, 1);
+-    last_discard = squid_curtime;
+-}
+-
+ void
+ Auth::User::clearIp()
+ {
+@@ -315,48 +238,29 @@ Auth::User::BuildUserKey(const char *username, const char *realm)
+     return key;
  }
  
 -/**
-- * This routine should be called to grow the in.buf and then
-- * call Comm::Read().
+- * Add the Auth::User structure to the username cache.
 - */
 -void
--ConnStateData::readSomeData()
+-Auth::User::addToNameCache()
 -{
--    if (reading())
--        return;
--
--    debugs(33, 4, HERE << clientConnection << ": reading request...");
--
--    // we can only read if there is more than 1 byte of space free
--    if (Config.maxRequestBufferSize - in.buf.length() < 2)
--        return;
--
--    typedef CommCbMemFunT<ConnStateData, CommIoCbParams> Dialer;
--    reader = JobCallback(33, 5, Dialer, this, ConnStateData::clientReadRequest);
--    Comm::Read(clientConnection, reader);
+-    /* AuthUserHashPointer will self-register with the username cache */
+-    new AuthUserHashPointer(this);
 -}
 -
+ /**
+  * Dump the username cache statictics for viewing...
+  */
  void
- ClientSocketContext::removeFromConnectionList(ConnStateData * conn)
+-Auth::User::UsernameCacheStats(StoreEntry *output)
++Auth::User::CredentialsCacheStats(StoreEntry *output)
  {
-@@ -816,15 +795,13 @@ ConnStateData::swanSong()
- 
-     unpinConnection(true);
- 
--    if (Comm::IsConnOpen(clientConnection))
--        clientConnection->close();
-+    Server::swanSong(); // closes the client connection
- 
- #if USE_AUTH
-     // NP: do this bit after closing the connections to avoid side effects from unwanted TCP RST
-     setAuth(NULL, "ConnStateData::SwanSong cleanup");
- #endif
- 
--    BodyProducer::swanSong();
-     flags.swanSang = true;
- }
- 
-@@ -849,6 +826,8 @@ ConnStateData::~ConnStateData()
-     if (bodyPipe != NULL)
-         stopProducingFor(bodyPipe, false);
- 
-+    delete bodyParser; // TODO: pool
-+
- #if USE_OPENSSL
-     delete sslServerBump;
- #endif
-@@ -1815,7 +1794,7 @@ ConnStateData::stopSending(const char *error)
-     if (!stoppedReceiving()) {
-         if (const int64_t expecting = mayNeedToReadMoreBody()) {
-             debugs(33, 5, HERE << "must still read " << expecting <<
--                   " request body bytes with " << in.buf.length() << " unused");
-+                   " request body bytes with " << inBuf.length() << " unused");
-             return; // wait for the request receiver to finish reading
-         }
+-    AuthUserHashPointer *usernamehash;
+-
+-    /* overview of username cache */
+-    storeAppendPrintf(output, "Cached Usernames: %d of %d\n", proxy_auth_username_cache->count, proxy_auth_username_cache->size);
+-    storeAppendPrintf(output, "Next Garbage Collection in %d seconds.\n",
+-                      static_cast<int32_t>(last_discard + ::Config.authenticateGCInterval - squid_curtime));
+-
+-    /* cache dump column titles */
+-    storeAppendPrintf(output, "\n%-15s %-9s %-9s %-9s %s\n",
++    auto userlist = authenticateCachedUsersList();
++    storeAppendPrintf(output, "Cached Usernames: %d", static_cast<int32_t>(userlist.size()));
++    storeAppendPrintf(output, "\n%-15s %-9s %-9s %-9s %s\t%s\n",
+                       "Type",
+                       "State",
+                       "Check TTL",
+                       "Cache TTL",
+-                      "Username");
++                      "Username", "Key");
+     storeAppendPrintf(output, "--------------- --------- --------- --------- ------------------------------\n");
+-
+-    hash_first(proxy_auth_username_cache);
+-    while ((usernamehash = ((AuthUserHashPointer *) hash_next(proxy_auth_username_cache)))) {
+-        Auth::User::Pointer auth_user = usernamehash->user();
+-
+-        storeAppendPrintf(output, "%-15s %-9s %-9d %-9d %s\n",
++    for ( auto auth_user : userlist ) {
++        storeAppendPrintf(output, "%-15s %-9s %-9d %-9d %s\t" SQUIDSBUFPH "\n",
+                           Auth::Type_str[auth_user->auth_type],
+                           CredentialState_str[auth_user->credentials()],
+                           auth_user->ttl(),
+                           static_cast<int32_t>(auth_user->expiretime - squid_curtime + ::Config.authenticateTTL),
+-                          auth_user->username()
++                          auth_user->username(),
++                          SQUIDSBUFPRINT(auth_user->userKey())
+                          );
      }
-@@ -1875,7 +1854,7 @@ ClientSocketContext *
- ConnStateData::abortRequestParsing(const char *const uri)
- {
-     ClientHttpRequest *http = new ClientHttpRequest(this);
--    http->req_sz = in.buf.length();
-+    http->req_sz = inBuf.length();
-     http->uri = xstrdup(uri);
-     setLogUri (http, uri);
-     ClientSocketContext *context = new ClientSocketContext(clientConnection, http);
-@@ -2161,12 +2140,12 @@ parseHttpRequest(ConnStateData *csd, const Http1::RequestParserPointer &hp)
- {
-     /* Attempt to parse the first line; this will define where the method, url, version and header begin */
-     {
--        const bool parsedOk = hp->parse(csd->in.buf);
-+        const bool parsedOk = hp->parse(csd->inBuf);
- 
-         if (csd->port->flags.isIntercepted() && Config.accessList.on_unsupported_protocol)
--            csd->preservedClientData = csd->in.buf;
-+            csd->preservedClientData = csd->inBuf;
-         // sync the buffers after parsing.
--        csd->in.buf = hp->remaining();
-+        csd->inBuf = hp->remaining();
- 
-         if (hp->needsMoreData()) {
-             debugs(33, 5, "Incomplete request, waiting for end of request line");
-@@ -2281,28 +2260,6 @@ parseHttpRequest(ConnStateData *csd, const Http1::RequestParserPointer &hp)
-     return result;
  }
+@@ -13,22 +13,22 @@
  
--bool
--ConnStateData::In::maybeMakeSpaceAvailable()
--{
--    if (buf.spaceSize() < 2) {
--        const SBuf::size_type haveCapacity = buf.length() + buf.spaceSize();
--        if (haveCapacity >= Config.maxRequestBufferSize) {
--            debugs(33, 4, "request buffer full: client_request_buffer_max_size=" << Config.maxRequestBufferSize);
--            return false;
--        }
--        if (haveCapacity == 0) {
--            // haveCapacity is based on the SBuf visible window of the MemBlob buffer, which may fill up.
--            // at which point bump the buffer back to default. This allocates a new MemBlob with any un-parsed bytes.
--            buf.reserveCapacity(CLIENT_REQ_BUF_SZ);
--        } else {
--            const SBuf::size_type wantCapacity = min(static_cast<SBuf::size_type>(Config.maxRequestBufferSize), haveCapacity*2);
--            buf.reserveCapacity(wantCapacity);
--        }
--        debugs(33, 2, "growing request buffer: available=" << buf.spaceSize() << " used=" << buf.length());
--    }
--    return (buf.spaceSize() >= 2);
--}
--
- void
- ConnStateData::addContextToQueue(ClientSocketContext * context)
+ #include "auth/CredentialState.h"
+ #include "auth/Type.h"
++#include "base/CbcPointer.h"
+ #include "base/RefCount.h"
+ #include "dlink.h"
+ #include "ip/Address.h"
+ #include "Notes.h"
+ #include "SBuf.h"
+ 
+-class AuthUserHashPointer;
+ class StoreEntry;
+ 
+ namespace Auth
  {
-@@ -2326,31 +2283,31 @@ ConnStateData::getConcurrentRequestCount() const
-     return result;
- }
  
--int
-+bool
- ConnStateData::connFinishedWithConn(int size)
- {
-     if (size == 0) {
--        if (getConcurrentRequestCount() == 0 && in.buf.isEmpty()) {
-+        if (getConcurrentRequestCount() == 0 && inBuf.isEmpty()) {
-             /* no current or pending requests */
-             debugs(33, 4, HERE << clientConnection << " closed");
--            return 1;
-+            return true;
-         } else if (!Config.onoff.half_closed_clients) {
-             /* admin doesn't want to support half-closed client sockets */
-             debugs(33, 3, HERE << clientConnection << " aborted (half_closed_clients disabled)");
-             notifyAllContexts(0); // no specific error implies abort
--            return 1;
-+            return true;
-         }
-     }
- 
--    return 0;
-+    return false;
- }
- 
- void
- ConnStateData::consumeInput(const size_t byteCount)
- {
--    assert(byteCount > 0 && byteCount <= in.buf.length());
--    in.buf.consume(byteCount);
--    debugs(33, 5, "in.buf has " << in.buf.length() << " unused bytes");
-+    assert(byteCount > 0 && byteCount <= inBuf.length());
-+    inBuf.consume(byteCount);
-+    debugs(33, 5, "inBuf has " << inBuf.length() << " unused bytes");
- }
- 
- void
-@@ -2809,15 +2766,15 @@ ConnStateData::parseProxyProtocolHeader()
-     // http://www.haproxy.org/download/1.5/doc/proxy-protocol.txt
- 
-     // detect and parse PROXY/2.0 protocol header
--    if (in.buf.startsWith(Proxy2p0magic))
-+    if (inBuf.startsWith(Proxy2p0magic))
-         return parseProxy2p0();
- 
-     // detect and parse PROXY/1.0 protocol header
--    if (in.buf.startsWith(Proxy1p0magic))
-+    if (inBuf.startsWith(Proxy1p0magic))
-         return parseProxy1p0();
- 
-     // detect and terminate other protocols
--    if (in.buf.length() >= Proxy2p0magic.length()) {
-+    if (inBuf.length() >= Proxy2p0magic.length()) {
-         // PROXY/1.0 magic is shorter, so we know that
-         // the input does not start with any PROXY magic
-         return proxyProtocolError("PROXY protocol error: invalid header");
-@@ -2834,7 +2791,7 @@ ConnStateData::parseProxyProtocolHeader()
- bool
- ConnStateData::parseProxy1p0()
- {
--    ::Parser::Tokenizer tok(in.buf);
-+    ::Parser::Tokenizer tok(inBuf);
-     tok.skip(Proxy1p0magic);
- 
-     // skip to first LF (assumes it is part of CRLF)
-@@ -2843,15 +2800,15 @@ ConnStateData::parseProxy1p0()
-     if (tok.prefix(line, lineContent, 107-Proxy1p0magic.length())) {
-         if (tok.skip('\n')) {
-             // found valid header
--            in.buf = tok.remaining();
-+            inBuf = tok.remaining();
-             needProxyProtocolHeader_ = false;
-             // reset the tokenizer to work on found line only.
-             tok.reset(line);
-         } else
-             return false; // no LF yet
- 
-     } else // protocol error only if there are more than 107 bytes prefix header
--        return proxyProtocolError(in.buf.length() > 107? "PROXY/1.0 error: missing CRLF" : NULL);
-+        return proxyProtocolError(inBuf.length() > 107? "PROXY/1.0 error: missing CRLF" : NULL);
- 
-     static const SBuf unknown("UNKNOWN"), tcpName("TCP");
-     if (tok.skip(tcpName)) {
-@@ -2928,34 +2885,34 @@ bool
- ConnStateData::parseProxy2p0()
- {
-     static const SBuf::size_type prefixLen = Proxy2p0magic.length();
--    if (in.buf.length() < prefixLen + 4)
-+    if (inBuf.length() < prefixLen + 4)
-         return false; // need more bytes
- 
--    if ((in.buf[prefixLen] & 0xF0) != 0x20) // version == 2 is mandatory
-+    if ((inBuf[prefixLen] & 0xF0) != 0x20) // version == 2 is mandatory
-         return proxyProtocolError("PROXY/2.0 error: invalid version");
- 
--    const char command = (in.buf[prefixLen] & 0x0F);
-+    const char command = (inBuf[prefixLen] & 0x0F);
-     if ((command & 0xFE) != 0x00) // values other than 0x0-0x1 are invalid
-         return proxyProtocolError("PROXY/2.0 error: invalid command");
- 
--    const char family = (in.buf[prefixLen+1] & 0xF0) >>4;
-+    const char family = (inBuf[prefixLen+1] & 0xF0) >>4;
-     if (family > 0x3) // values other than 0x0-0x3 are invalid
-         return proxyProtocolError("PROXY/2.0 error: invalid family");
- 
--    const char proto = (in.buf[prefixLen+1] & 0x0F);
-+    const char proto = (inBuf[prefixLen+1] & 0x0F);
-     if (proto > 0x2) // values other than 0x0-0x2 are invalid
-         return proxyProtocolError("PROXY/2.0 error: invalid protocol type");
- 
--    const char *clen = in.buf.rawContent() + prefixLen + 2;
-+    const char *clen = inBuf.rawContent() + prefixLen + 2;
-     uint16_t len;
-     memcpy(&len, clen, sizeof(len));
-     len = ntohs(len);
- 
--    if (in.buf.length() < prefixLen + 4 + len)
-+    if (inBuf.length() < prefixLen + 4 + len)
-         return false; // need more bytes
- 
--    in.buf.consume(prefixLen + 4); // 4 being the extra bytes
--    const SBuf extra = in.buf.consume(len);
-+    inBuf.consume(prefixLen + 4); // 4 being the extra bytes
-+    const SBuf extra = inBuf.consume(len);
-     needProxyProtocolHeader_ = false; // found successfully
- 
-     // LOCAL connections do nothing with the extras
-@@ -3045,10 +3002,10 @@ ConnStateData::clientParseRequests()
- 
-     // Loop while we have read bytes that are not needed for producing the body
-     // On errors, bodyPipe may become nil, but readMore will be cleared
--    while (!in.buf.isEmpty() && !bodyPipe && flags.readMore) {
-+    while (!inBuf.isEmpty() && !bodyPipe && flags.readMore) {
- 
-         /* Don't try to parse if the buffer is empty */
--        if (in.buf.isEmpty())
-+        if (inBuf.isEmpty())
-             break;
- 
-         /* Limit the number of concurrent requests */
-@@ -3078,8 +3035,8 @@ ConnStateData::clientParseRequests()
-             }
-         } else {
-             debugs(33, 5, clientConnection << ": not enough request data: " <<
--                   in.buf.length() << " < " << Config.maxRequestHeaderSize);
--            Must(in.buf.length() < Config.maxRequestHeaderSize);
-+                   inBuf.length() << " < " << Config.maxRequestHeaderSize);
-+            Must(inBuf.length() < Config.maxRequestHeaderSize);
-             break;
-         }
-     }
-@@ -3089,81 +3046,11 @@ ConnStateData::clientParseRequests()
- }
- 
- void
--ConnStateData::clientReadRequest(const CommIoCbParams &io)
-+ConnStateData::afterClientRead()
- {
--    debugs(33,5, io.conn);
--    Must(reading());
--    reader = NULL;
--
--    /* Bail out quickly on Comm::ERR_CLOSING - close handlers will tidy up */
--    if (io.flag == Comm::ERR_CLOSING) {
--        debugs(33,5, io.conn << " closing Bailout.");
--        return;
--    }
--
--    assert(Comm::IsConnOpen(clientConnection));
--    assert(io.conn->fd == clientConnection->fd);
--
--    /*
--     * Don't reset the timeout value here. The value should be
--     * counting Config.Timeout.request and applies to the request
--     * as a whole, not individual read() calls.
--     * Plus, it breaks our lame *HalfClosed() detection
--     */
--
--    in.maybeMakeSpaceAvailable();
--    CommIoCbParams rd(this); // will be expanded with ReadNow results
--    rd.conn = io.conn;
--    switch (Comm::ReadNow(rd, in.buf)) {
--    case Comm::INPROGRESS:
--        if (in.buf.isEmpty())
--            debugs(33, 2, io.conn << ": no data to process, " << xstrerr(rd.xerrno));
--        readSomeData();
--        return;
--
--    case Comm::OK:
--        statCounter.client_http.kbytes_in += rd.size;
--        if (!receivedFirstByte_)
--            receivedFirstByte();
--        // may comm_close or setReplyToError
--        if (!handleReadData())
--            return;
--
--        /* Continue to process previously read data */
--        break;
--
--    case Comm::ENDFILE: // close detected by 0-byte read
--        debugs(33, 5, io.conn << " closed?");
--
--        if (connFinishedWithConn(rd.size)) {
--            clientConnection->close();
--            return;
--        }
--
--        /* It might be half-closed, we can't tell */
--        fd_table[io.conn->fd].flags.socket_eof = true;
--        commMarkHalfClosed(io.conn->fd);
--        fd_note(io.conn->fd, "half-closed");
--
--        /* There is one more close check at the end, to detect aborted
--         * (partial) requests. At this point we can't tell if the request
--         * is partial.
--         */
--
--        /* Continue to process previously read data */
--        break;
--
--    // case Comm::COMM_ERROR:
--    default: // no other flags should ever occur
--        debugs(33, 2, io.conn << ": got flag " << rd.flag << "; " << xstrerr(rd.xerrno));
--        notifyAllContexts(rd.xerrno);
--        io.conn->close();
--        return;
--    }
--
-     /* Process next request */
-     if (getConcurrentRequestCount() == 0)
--        fd_note(io.fd, "Reading next request");
-+        fd_note(clientConnection->fd, "Reading next request");
- 
-     if (!clientParseRequests()) {
-         if (!isOpen())
-@@ -3176,8 +3063,8 @@ ConnStateData::clientReadRequest(const CommIoCbParams &io)
-          * be if we have an incomplete request.
-          * XXX: This duplicates ClientSocketContext::keepaliveNextRequest
-          */
--        if (getConcurrentRequestCount() == 0 && commIsHalfClosed(io.fd)) {
--            debugs(33, 5, HERE << io.conn << ": half-closed connection, no completed request parsed, connection closing.");
-+        if (getConcurrentRequestCount() == 0 && commIsHalfClosed(clientConnection->fd)) {
-+            debugs(33, 5, clientConnection << ": half-closed connection, no completed request parsed, connection closing.");
-             clientConnection->close();
-             return;
-         }
-@@ -3205,7 +3092,7 @@ ConnStateData::handleReadData()
- }
+ class Config;
++class CredentialsCache;
  
  /**
-- * called when new request body data has been buffered in in.buf
-+ * called when new request body data has been buffered in inBuf
-  * may close the connection if we were closing and piped everything out
-  *
-  * \retval false called comm_close or setReplyToError (the caller should bail)
-@@ -3216,14 +3103,14 @@ ConnStateData::handleRequestBodyData()
- {
-     assert(bodyPipe != NULL);
+- *  \ingroup AuthAPI
+  * This is the main user related structure. It stores user-related data,
+  * and is persistent across requests. It can even persist across
+  * multiple external authentications. One major benefit of preserving this
+@@ -40,10 +40,12 @@ class User : public RefCountable
+ public:
+     typedef RefCount<User> Pointer;
  
--    if (in.bodyParser) { // chunked encoding
-+    if (bodyParser) { // chunked encoding
-         if (const err_type error = handleChunkedRequestBody()) {
-             abortChunkedRequestBody(error);
-             return false;
-         }
-     } else { // identity encoding
-         debugs(33,5, HERE << "handling plain request body for " << clientConnection);
--        const size_t putSize = bodyPipe->putMoreData(in.buf.c_str(), in.buf.length());
-+        const size_t putSize = bodyPipe->putMoreData(inBuf.c_str(), inBuf.length());
-         if (putSize > 0)
-             consumeInput(putSize);
++protected:
++    User(Auth::Config *, const char *requestRealm);
++public:
++    virtual ~User();
++
+     /* extra fields for proxy_auth */
+-    /* auth_type and auth_module are deprecated. Do Not add new users of these fields.
+-     * Aim to remove shortly
+-     */
+     /** \deprecated this determines what scheme owns the user data. */
+     Auth::Type auth_type;
+     /** the config for this user */
+@@ -56,17 +58,14 @@ class User : public RefCountable
+     NotePairs notes;
  
-@@ -3253,17 +3140,17 @@ ConnStateData::handleRequestBodyData()
- err_type
- ConnStateData::handleChunkedRequestBody()
- {
--    debugs(33, 7, "chunked from " << clientConnection << ": " << in.buf.length());
-+    debugs(33, 7, "chunked from " << clientConnection << ": " << inBuf.length());
+ public:
+-    static void cacheInit();
+-    static void CachedACLsReset();
+     static SBuf BuildUserKey(const char *username, const char *realm);
  
-     try { // the parser will throw on errors
+     void absorb(Auth::User::Pointer from);
+-    virtual ~User();
+     char const *username() const { return username_; }
+     void username(char const *); ///< set stored username and userKey
  
--        if (in.buf.isEmpty()) // nothing to do
-+        if (inBuf.isEmpty()) // nothing to do
-             return ERR_NONE;
+     // NP: key is set at the same time as username_. Until then both are empty/NULL.
+-    const char *userKey() {return !userKey_.isEmpty() ? userKey_.c_str() : NULL;}
++    const SBuf userKey() const {return userKey_;}
  
-         BodyPipeCheckout bpc(*bodyPipe);
--        in.bodyParser->setPayloadBuffer(&bpc.buf);
--        const bool parsed = in.bodyParser->parse(in.buf);
--        in.buf = in.bodyParser->remaining(); // sync buffers
-+        bodyParser->setPayloadBuffer(&bpc.buf);
-+        const bool parsed = bodyParser->parse(inBuf);
-+        inBuf = bodyParser->remaining(); // sync buffers
-         bpc.checkIn();
+     /**
+      * How long these credentials are still valid for.
+@@ -79,8 +78,13 @@ class User : public RefCountable
+     void removeIp(Ip::Address);
+     void addIp(Ip::Address);
  
-         // dechunk then check: the size limit applies to _dechunked_ content
-@@ -3277,10 +3164,10 @@ ConnStateData::handleChunkedRequestBody()
-         }
+-    void addToNameCache();
+-    static void UsernameCacheStats(StoreEntry * output);
++    /// add the Auth::User to the protocol-specific username cache.
++    virtual void addToNameCache() = 0;
++    static void CredentialsCacheStats(StoreEntry * output);
++
++    // userKey ->Auth::User::Pointer cache
++    // must be reimplemented in subclasses
++    static CbcPointer<Auth::CredentialsCache> Cache();
  
-         // if chunk parser needs data, then the body pipe must need it too
--        Must(!in.bodyParser->needsMoreData() || bodyPipe->mayNeedMoreData());
-+        Must(!bodyParser->needsMoreData() || bodyPipe->mayNeedMoreData());
+     CredentialState credentials() const;
+     void credentials(CredentialState);
+@@ -96,16 +100,7 @@ class User : public RefCountable
+      */
+     CredentialState credentials_state;
  
-         // if parser needs more space and we can consume nothing, we will stall
--        Must(!in.bodyParser->needsMoreSpace() || bodyPipe->buf().hasContent());
-+        Must(!bodyParser->needsMoreSpace() || bodyPipe->buf().hasContent());
-     } catch (...) { // TODO: be more specific
-         debugs(33, 3, HERE << "malformed chunks" << bodyPipe->status());
-         return ERR_INVALID_REQ;
-@@ -3312,7 +3199,7 @@ ConnStateData::abortChunkedRequestBody(const err_type error)
-                                     repContext->http->uri,
-                                     CachePeer,
-                                     repContext->http->request,
--                                    in.buf, NULL);
-+                                    inBuf, NULL);
-         context->pullData();
-     } else {
-         // close or otherwise we may get stuck as nobody will notice the error?
-@@ -3385,6 +3272,8 @@ clientLifetimeTimeout(const CommTimeoutCbParams &io)
- 
- ConnStateData::ConnStateData(const MasterXaction::Pointer &xact) :
-     AsyncJob("ConnStateData"), // kids overwrite
-+    Server(xact),
-+    bodyParser(nullptr),
-     nrequests(0),
- #if USE_OPENSSL
-     sslBumpMode(Ssl::bumpEnd),
-@@ -3396,8 +3285,7 @@ ConnStateData::ConnStateData(const MasterXaction::Pointer &xact) :
-     signAlgorithm(Ssl::algSignTrusted),
- #endif
-     stoppedSending_(NULL),
--    stoppedReceiving_(NULL),
--    receivedFirstByte_(false)
-+    stoppedReceiving_(NULL)
- {
-     flags.readMore = true; // kids may overwrite
-     flags.swanSang = false;
-@@ -3410,9 +3298,6 @@ ConnStateData::ConnStateData(const MasterXaction::Pointer &xact) :
-     pinning.peer = NULL;
- 
-     // store the details required for creating more MasterXaction objects as new requests come in
--    clientConnection = xact->tcpClient;
--    port = xact->squidPort;
--    transferProtocol = port->transport; // default to the *_port protocol= setting. may change later.
-     log_addr = xact->tcpClient->remote;
-     log_addr.applyMask(Config.Addrs.client_netmask);
- 
-@@ -3739,7 +3624,7 @@ httpsSslBumpAccessCheckDone(allow_t answer, void *data)
-         debugs(33, 2, HERE << "sslBump not needed for " << connState->clientConnection);
-         connState->sslBumpMode = Ssl::bumpNone;
-     }
--    connState->fakeAConnectRequest("ssl-bump", connState->in.buf);
-+    connState->fakeAConnectRequest("ssl-bump", connState->inBuf);
- }
- 
- /** handle a new HTTPS connection */
-@@ -4244,8 +4129,8 @@ ConnStateData::splice()
- 
-         // reset the current protocol to HTTP/1.1 (was "HTTPS" for the bumping process)
-         transferProtocol = Http::ProtocolVersion();
--        // in.buf still has the "CONNECT ..." request data, reset it to SSL hello message
--        in.buf.append(rbuf.content(), rbuf.contentSize());
-+        // inBuf still has the "CONNECT ..." request data, reset it to SSL hello message
-+        inBuf.append(rbuf.content(), rbuf.contentSize());
-         ClientSocketContext::Pointer context = getCurrentContext();
-         ClientHttpRequest *http = context->http;
-         tunnelStart(http);
-@@ -4335,7 +4220,7 @@ ConnStateData::fakeAConnectRequest(const char *reason, const SBuf &payload)
-     retStr.append(connectHost);
-     retStr.append("\r\n\r\n");
-     retStr.append(payload);
--    in.buf = retStr;
-+    inBuf = retStr;
-     bool ret = handleReadData();
-     if (ret)
-         ret = clientParseRequests();
-@@ -4655,21 +4540,6 @@ ConnStateData::transparent() const
-     return clientConnection != NULL && (clientConnection->flags & (COMM_TRANSPARENT|COMM_INTERCEPTION));
- }
- 
--bool
--ConnStateData::reading() const
--{
--    return reader != NULL;
--}
+-protected:
+-    User(Auth::Config *, const char *requestRealm);
 -
+ private:
+-    /**
+-     * Garbage Collection for the username cache.
+-     */
+-    static void cacheCleanup(void *unused);
+-    static time_t last_discard; /// Time of last username cache garbage collection.
+-
+     /**
+      * DPW 2007-05-08
+      * The username_ memory will be allocated via
+@@ -17,6 +17,7 @@
+ #include "auth/basic/Scheme.h"
+ #include "auth/basic/User.h"
+ #include "auth/basic/UserRequest.h"
++#include "auth/CredentialsCache.h"
+ #include "auth/Gadgets.h"
+ #include "auth/State.h"
+ #include "cache_cf.h"
+@@ -246,7 +247,7 @@ Auth::Basic::Config::decode(char const *proxy_auth, const char *aRequestRealm)
+     /* now lookup and see if we have a matching auth_user structure in memory. */
+     Auth::User::Pointer auth_user;
+ 
+-    if ((auth_user = findUserInCache(lb->userKey(), Auth::AUTH_BASIC)) == NULL) {
++    if (!(auth_user = Auth::Basic::User::Cache()->lookup(lb->userKey()))) {
+         /* the user doesn't exist in the username cache yet */
+         /* save the credentials */
+         debugs(29, 9, HERE << "Creating new user '" << lb->username() << "'");
+@@ -9,6 +9,7 @@
+ #include "squid.h"
+ #include "auth/basic/Config.h"
+ #include "auth/basic/User.h"
++#include "auth/CredentialsCache.h"
+ #include "Debug.h"
+ #include "SquidConfig.h"
+ #include "SquidTime.h"
+@@ -79,3 +80,16 @@ Auth::Basic::User::updateCached(Auth::Basic::User *from)
+     }
+ }
+ 
++CbcPointer<Auth::CredentialsCache>
++Auth::Basic::User::Cache()
++{
++    static CbcPointer<Auth::CredentialsCache> p(new Auth::CredentialsCache("basic", "GC Basic user credentials"));
++    return p;
++}
++
++void
++Auth::Basic::User::addToNameCache()
++{
++    Cache()->insert(userKey(), this);
++}
++
+@@ -28,13 +28,17 @@ class User : public Auth::User
+ 
+ public:
+     User(Auth::Config *, const char *requestRealm);
+-    ~User();
++    virtual ~User();
+     bool authenticated() const;
+     bool valid() const;
+ 
+     /** Update the cached password for a username. */
+     void updateCached(User *from);
+-    virtual int32_t ttl() const;
++    virtual int32_t ttl() const override;
++
++    /* Auth::User API */
++    static CbcPointer<Auth::CredentialsCache> Cache();
++    virtual void addToNameCache() override;
+ 
+     char *passwd;
+ 
+@@ -13,6 +13,7 @@
+  * See acl.c for access control and client_side.c for auditing */
+ 
+ #include "squid.h"
++#include "auth/CredentialsCache.h"
+ #include "auth/digest/Config.h"
+ #include "auth/digest/Scheme.h"
+ #include "auth/digest/User.h"
+@@ -1042,7 +1043,7 @@ Auth::Digest::Config::decode(char const *proxy_auth, const char *aRequestRealm)
+     Auth::User::Pointer auth_user;
+ 
+     SBuf key = Auth::User::BuildUserKey(username, aRequestRealm);
+-    if (key.isEmpty() || (auth_user = findUserInCache(key.c_str(), Auth::AUTH_DIGEST)) == NULL) {
++    if (key.isEmpty() || !(auth_user = Auth::Digest::User::Cache()->lookup(key))) {
+         /* the user doesn't exist in the username cache yet */
+         debugs(29, 9, "Creating new digest user '" << username << "'");
+         digest_user = new Auth::Digest::User(this, aRequestRealm);
+@@ -37,7 +37,6 @@ Auth::Digest::Scheme::shutdownCleanup()
+     if (_instance == NULL)
+         return;
+ 
+-    PurgeCredentialsCache();
+     authenticateDigestNonceShutdown();
+ 
+     _instance = NULL;
+@@ -51,21 +50,3 @@ Auth::Digest::Scheme::createConfig()
+     return dynamic_cast<Auth::Config*>(digestCfg);
+ }
+ 
 -void
--ConnStateData::stopReading()
+-Auth::Digest::Scheme::PurgeCredentialsCache(void)
 -{
--    if (reading()) {
--        Comm::ReadCancel(clientConnection->fd, reader);
--        reader = NULL;
+-    AuthUserHashPointer *usernamehash;
+-
+-    debugs(29, 2, HERE << "Erasing Digest authentication credentials from username cache.");
+-    hash_first(proxy_auth_username_cache);
+-
+-    while ((usernamehash = static_cast<AuthUserHashPointer *>(hash_next(proxy_auth_username_cache)) )) {
+-        Auth::User::Pointer auth_user = usernamehash->user();
+-
+-        if (strcmp(auth_user->config->type(), "digest") == 0) {
+-            hash_remove_link(proxy_auth_username_cache, static_cast<hash_link*>(usernamehash));
+-            delete usernamehash;
+-        }
 -    }
 -}
 -
- BodyPipe::Pointer
- ConnStateData::expectRequestBody(int64_t size)
- {
-@@ -4691,7 +4561,7 @@ ConnStateData::mayNeedToReadMoreBody() const
-         return -1; // probably need to read more, but we cannot be sure
- 
-     const int64_t needToProduce = bodyPipe->unproducedSize();
--    const int64_t haveAvailable = static_cast<int64_t>(in.buf.length());
-+    const int64_t haveAvailable = static_cast<int64_t>(inBuf.length());
- 
-     if (needToProduce <= haveAvailable)
-         return 0; // we have read what we need (but are waiting for pipe space)
-@@ -4734,8 +4604,8 @@ ConnStateData::startDechunkingRequest()
- {
-     Must(bodyPipe != NULL);
-     debugs(33, 5, HERE << "start dechunking" << bodyPipe->status());
--    assert(!in.bodyParser);
--    in.bodyParser = new Http1::TeChunkedParser;
-+    assert(!bodyParser);
-+    bodyParser = new Http1::TeChunkedParser;
- }
- 
- /// put parsed content into input buffer and clean up
-@@ -4757,18 +4627,8 @@ ConnStateData::finishDechunkingRequest(bool withSuccess)
-         }
-     }
- 
--    delete in.bodyParser;
--    in.bodyParser = NULL;
--}
--
--ConnStateData::In::In() :
--    bodyParser(NULL),
--    buf()
--{}
--
--ConnStateData::In::~In()
--{
--    delete bodyParser; // TODO: pool
-+    delete bodyParser;
-+    bodyParser = NULL;
- }
- 
- void
-@@ -19,6 +19,7 @@
- #include "HttpControlMsg.h"
- #include "ipc/FdNotes.h"
- #include "SBuf.h"
-+#include "servers/Server.h"
- #if USE_AUTH
- #include "auth/UserRequest.h"
- #endif
-@@ -168,17 +169,21 @@ class ServerBump;
-  *
-  * If the above can be confirmed accurate we can call this object PipelineManager or similar
-  */
--class ConnStateData : public BodyProducer, public HttpControlMsgSink, public RegisteredRunner
-+class ConnStateData : public Server, public HttpControlMsgSink, public RegisteredRunner
- {
- 
- public:
-     explicit ConnStateData(const MasterXaction::Pointer &xact);
-     virtual ~ConnStateData();
- 
--    void readSomeData();
-+    /* ::Server API */
-+    virtual void notifyAllContexts(const int xerrno);
-+    virtual void receivedFirstByte();
-+    virtual bool handleReadData();
-+    virtual void afterClientRead();
-+
-     bool areAllContextsForThisConnection() const;
-     void freeAllContexts();
--    void notifyAllContexts(const int xerrno); ///< tell everybody about the err
-     /// Traffic parsing
-     bool clientParseRequests();
-     void readNextRequest();
-@@ -187,30 +192,10 @@ class ConnStateData : public BodyProducer, public HttpControlMsgSink, public Reg
-     int getConcurrentRequestCount() const;
-     bool isOpen() const;
- 
--    /// Update flags and timeout after the first byte received
--    void receivedFirstByte();
--
-     // HttpControlMsgSink API
-     virtual void sendControlMsg(HttpControlMsg msg);
- 
--    // Client TCP connection details from comm layer.
--    Comm::ConnectionPointer clientConnection;
--
--    /**
--     * The transfer protocol currently being spoken on this connection.
--     * HTTP/1 CONNECT and HTTP/2 SETTINGS offers the ability to change
--     * protocols on the fly.
--     */
--    AnyP::ProtocolVersion transferProtocol;
--
--    struct In {
--        In();
--        ~In();
--        bool maybeMakeSpaceAvailable();
--
--        Http1::TeChunkedParser *bodyParser; ///< parses chunked request body
--        SBuf buf;
--    } in;
-+    Http1::TeChunkedParser *bodyParser; ///< parses HTTP/1.1 chunked request body
- 
-     /** number of body bytes we need to comm_read for the "current" request
-      *
-@@ -264,12 +249,7 @@ class ConnStateData : public BodyProducer, public HttpControlMsgSink, public Reg
-         AsyncCall::Pointer closeHandler; /*The close handler for pinned server side connection*/
-     } pinning;
- 
--    /// Squid listening port details where this connection arrived.
--    AnyP::PortCfgPointer port;
--
-     bool transparent() const;
--    bool reading() const;
--    void stopReading(); ///< cancels comm_read if it is scheduled
- 
-     /// true if we stopped receiving the request
-     const char *stoppedReceiving() const { return stoppedReceiving_; }
-@@ -287,7 +267,6 @@ class ConnStateData : public BodyProducer, public HttpControlMsgSink, public Reg
-     virtual void noteMoreBodySpaceAvailable(BodyPipe::Pointer) = 0;
-     virtual void noteBodyConsumerAborted(BodyPipe::Pointer) = 0;
- 
--    bool handleReadData();
-     bool handleRequestBodyData();
- 
-     /// Forward future client requests using the given server connection.
-@@ -318,7 +297,6 @@ class ConnStateData : public BodyProducer, public HttpControlMsgSink, public Reg
-     virtual void clientPinnedConnectionClosed(const CommCloseCbParams &io);
- 
-     // comm callbacks
--    void clientReadRequest(const CommIoCbParams &io);
-     void clientReadFtpData(const CommIoCbParams &io);
-     void connStateClosed(const CommCloseCbParams &io);
-     void requestTimeout(const CommTimeoutCbParams &params);
-@@ -454,7 +432,9 @@ class ConnStateData : public BodyProducer, public HttpControlMsgSink, public Reg
-     BodyPipe::Pointer bodyPipe; ///< set when we are reading request body
- 
+@@ -38,12 +38,6 @@ class Scheme : public Auth::Scheme
  private:
--    int connFinishedWithConn(int size);
-+    /* ::Server API */
-+    virtual bool connFinishedWithConn(int size);
-+
-     void clientAfterReadingRequests();
-     bool concurrentRequestQueueFilled() const;
+     static Auth::Scheme::Pointer _instance;
  
-@@ -495,9 +475,6 @@ class ConnStateData : public BodyProducer, public HttpControlMsgSink, public Reg
-     /// the reason why we no longer read the request or nil
-     const char *stoppedReceiving_;
- 
--    AsyncCall::Pointer reader; ///< set when we are reading
--
--    bool receivedFirstByte_; ///< true if at least one byte received on this connection
-     SBuf connectionTag_; ///< clt_conn_tag=Tag annotation for client connection
+-    /**
+-     * Remove all cached user credentials from circulation.
+-     * Intended for use during shutdown procedure.
+-     * After calling this all newly received credentials must be re-authenticated.
+-     */
+-    static void PurgeCredentialsCache(void);
  };
  
-@@ -640,7 +640,7 @@ Ftp::Server::parseOneRequest()
-     SBuf cmd;
-     SBuf params;
+ } // namespace Digest
+@@ -7,6 +7,7 @@
+  */
  
--    Parser::Tokenizer tok(in.buf);
-+    Parser::Tokenizer tok(inBuf);
+ #include "squid.h"
++#include "auth/CredentialsCache.h"
+ #include "auth/digest/Config.h"
+ #include "auth/digest/User.h"
+ #include "Debug.h"
+@@ -72,3 +73,16 @@ Auth::Digest::User::currentNonce()
+     return nonce;
+ }
  
-     (void)tok.skipAll(LeadingSpace); // leading OWS and empty commands
-     const bool parsed = tok.prefix(cmd, CommandChars); // required command
-@@ -667,14 +667,14 @@ Ftp::Server::parseOneRequest()
-     // technically, we may skip multiple NLs below, but that is OK
-     if (!parsed || !tok.skipAll(CharacterSet::LF)) { // did not find terminating LF yet
-         // we need more data, but can we buffer more?
--        if (in.buf.length() >= Config.maxRequestHeaderSize) {
-+        if (inBuf.length() >= Config.maxRequestHeaderSize) {
-             changeState(fssError, "huge req");
-             quitAfterError(NULL);
-             return earlyError(EarlyErrorKind::HugeRequest);
-         } else {
-             flags.readMore = true;
-             debugs(33, 5, "Waiting for more, up to " <<
--                   (Config.maxRequestHeaderSize - in.buf.length()));
-+                   (Config.maxRequestHeaderSize - inBuf.length()));
-             return NULL;
-         }
-     }
-@@ -1272,7 +1272,7 @@ Ftp::Server::wroteReply(const CommIoCbParams &io)
-     case STREAM_COMPLETE:
-         flags.readMore = true;
-         changeState(fssConnected, "Ftp::Server::wroteReply");
--        if (in.bodyParser)
-+        if (bodyParser)
-             finishDechunkingRequest(false);
-         context->keepaliveNextRequest();
-         return;
-@@ -121,7 +121,7 @@ Http::One::Server::buildHttpRequest(ClientSocketContext *context)
-         }
-         // setLogUri should called before repContext->setReplyToError
-         setLogUri(http, http->uri, true);
--        const char * requestErrorBytes = in.buf.c_str();
-+        const char * requestErrorBytes = inBuf.c_str();
-         if (!clientTunnelOnError(this, context, request.getRaw(), parser_->method(), errPage, parser_->parseStatusCode, requestErrorBytes)) {
-             // HttpRequest object not build yet, there is no reason to call
-             // clientProcessRequestFinished method
-@@ -135,7 +135,7 @@ Http::One::Server::buildHttpRequest(ClientSocketContext *context)
-         // setLogUri should called before repContext->setReplyToError
-         setLogUri(http, http->uri, true);
- 
--        const char * requestErrorBytes = in.buf.c_str();
-+        const char * requestErrorBytes = inBuf.c_str();
-         if (!clientTunnelOnError(this, context, request.getRaw(), parser_->method(), ERR_INVALID_URL, Http::scBadRequest, requestErrorBytes)) {
-             // HttpRequest object not build yet, there is no reason to call
-             // clientProcessRequestFinished method
-@@ -11,8 +11,10 @@ include $(top_srcdir)/src/TestHeaders.am
- noinst_LTLIBRARIES = libservers.la
- 
- libservers_la_SOURCES = \
-+	forward.h \
- 	FtpServer.cc \
- 	FtpServer.h \
- 	Http1Server.cc \
- 	Http1Server.h \
--	forward.h
-+	Server.cc \
-+	Server.h
-@@ -0,0 +1,195 @@
-+/*
-+ * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
-+ *
-+ * Squid software is distributed under GPLv2+ license and includes
-+ * contributions from numerous individuals and organizations.
-+ * Please see the COPYING and CONTRIBUTORS files for details.
-+ */
-+
-+#include "squid.h"
-+#include "anyp/PortCfg.h"
-+#include "comm.h"
-+#include "comm/Read.h"
-+#include "Debug.h"
-+#include "fd.h"
-+#include "fde.h"
-+#include "MasterXaction.h"
-+#include "servers/Server.h"
-+#include "SquidConfig.h"
-+#include "StatCounters.h"
-+#include "tools.h"
-+
-+Server::Server(const MasterXaction::Pointer &xact) :
-+    AsyncJob("::Server"), // kids overwrite
-+    clientConnection(xact->tcpClient),
-+    transferProtocol(xact->squidPort->transport),
-+    port(xact->squidPort),
-+    receivedFirstByte_(false)
-+{}
-+
-+bool
-+Server::doneAll() const
++CbcPointer<Auth::CredentialsCache>
++Auth::Digest::User::Cache()
 +{
-+    // servers are not done while the connection is open
-+    return !Comm::IsConnOpen(clientConnection) &&
-+           BodyProducer::doneAll();
++    static CbcPointer<Auth::CredentialsCache> p(new Auth::CredentialsCache("digest","GC Digest user credentials"));
++    return p;
 +}
 +
 +void
-+Server::start()
++Auth::Digest::User::addToNameCache()
 +{
-+    // TODO: shuffle activity from ConnStateData
++    Cache()->insert(userKey(), this);
++}
++
+@@ -9,7 +9,9 @@
+ #ifndef _SQUID_AUTH_DIGEST_USER_H
+ #define _SQUID_AUTH_DIGEST_USER_H
+ 
++#include "auth/digest/Config.h"
+ #include "auth/User.h"
++#include "rfc2617.h"
+ 
+ namespace Auth
+ {
+@@ -23,10 +25,13 @@ class User : public Auth::User
+ 
+ public:
+     User(Auth::Config *, const char *requestRealm);
+-    ~User();
++    virtual ~User();
+     int authenticated() const;
++    virtual int32_t ttl() const override;
+ 
+-    virtual int32_t ttl() const;
++    /* Auth::User API */
++    static CbcPointer<Auth::CredentialsCache> Cache();
++    virtual void addToNameCache() override;
+ 
+     HASH HA1;
+     int HA1created;
+@@ -8,6 +8,7 @@
+ 
+ #include "squid.h"
+ #include "auth/Config.h"
++#include "auth/CredentialsCache.h"
+ #include "auth/negotiate/User.h"
+ #include "Debug.h"
+ 
+@@ -27,3 +28,16 @@ Auth::Negotiate::User::ttl() const
+     return -1; // Negotiate cannot be cached.
+ }
+ 
++CbcPointer<Auth::CredentialsCache>
++Auth::Negotiate::User::Cache()
++{
++    static CbcPointer<Auth::CredentialsCache> p(new Auth::CredentialsCache("negotiate", "GC Negotiate user credentials"));
++    return p;
 +}
 +
 +void
-+Server::swanSong()
++Auth::Negotiate::User::addToNameCache()
 +{
-+    if (Comm::IsConnOpen(clientConnection))
-+        clientConnection->close();
-+
-+    BodyProducer::swanSong();
++    Cache()->insert(userKey(), this);
 +}
 +
-+void
-+Server::stopReading()
-+{
-+    if (reading()) {
-+        Comm::ReadCancel(clientConnection->fd, reader);
-+        reader = NULL;
-+    }
-+}
+@@ -26,8 +26,12 @@ class User : public Auth::User
+ 
+ public:
+     User(Auth::Config *, const char *requestRealm);
+-    ~User();
+-    virtual int32_t ttl() const;
++    virtual ~User();
++    virtual int32_t ttl() const override;
 +
-+bool
-+Server::maybeMakeSpaceAvailable()
-+{
-+    if (inBuf.spaceSize() < 2) {
-+        const SBuf::size_type haveCapacity = inBuf.length() + inBuf.spaceSize();
-+        if (haveCapacity >= Config.maxRequestBufferSize) {
-+            debugs(33, 4, "request buffer full: client_request_buffer_max_size=" << Config.maxRequestBufferSize);
-+            return false;
-+        }
-+        if (haveCapacity == 0) {
-+            // haveCapacity is based on the SBuf visible window of the MemBlob buffer, which may fill up.
-+            // at which point bump the buffer back to default. This allocates a new MemBlob with any un-parsed bytes.
-+            inBuf.reserveCapacity(CLIENT_REQ_BUF_SZ);
++    /* Auth::User API */
++    static CbcPointer<Auth::CredentialsCache> Cache();
++    virtual void addToNameCache() override;
+ 
+     dlink_list proxy_auth_list;
+ };
+@@ -8,7 +8,9 @@
+ 
+ #include "squid.h"
+ #include "AccessLogEntry.h"
++#include "auth/CredentialsCache.h"
+ #include "auth/negotiate/Config.h"
++#include "auth/negotiate/User.h"
+ #include "auth/negotiate/UserRequest.h"
+ #include "auth/State.h"
+ #include "auth/User.h"
+@@ -331,24 +333,19 @@ Auth::Negotiate::UserRequest::HandleReply(void *data, const Helper::Reply &reply
+ 
+         /* connection is authenticated */
+         debugs(29, 4, HERE << "authenticated user " << auth_user_request->user()->username());
+-        /* see if this is an existing user */
+-        AuthUserHashPointer *usernamehash = static_cast<AuthUserHashPointer *>(hash_lookup(proxy_auth_username_cache, auth_user_request->user()->userKey()));
+-        Auth::User::Pointer local_auth_user = lm_request->user();
+-        while (usernamehash && (usernamehash->user()->auth_type != Auth::AUTH_NEGOTIATE ||
+-                                strcmp(usernamehash->user()->userKey(), auth_user_request->user()->userKey()) != 0))
+-            usernamehash = static_cast<AuthUserHashPointer *>(usernamehash->next);
+-        if (usernamehash) {
++        auto local_auth_user = lm_request->user();
++        auto cached_user = Auth::Negotiate::User::Cache()->lookup(auth_user_request->user()->userKey());
++        if (!cached_user) {
++            local_auth_user->addToNameCache();
 +        } else {
-+            const SBuf::size_type wantCapacity = min(static_cast<SBuf::size_type>(Config.maxRequestBufferSize), haveCapacity*2);
-+            inBuf.reserveCapacity(wantCapacity);
-+        }
-+        debugs(33, 2, "growing request buffer: available=" << inBuf.spaceSize() << " used=" << inBuf.length());
-+    }
-+    return (inBuf.spaceSize() >= 2);
-+}
-+
-+void
-+Server::readSomeData()
-+{
-+    if (reading())
-+        return;
-+
-+    debugs(33, 4, clientConnection << ": reading request...");
-+
-+    // we can only read if there is more than 1 byte of space free
-+    if (Config.maxRequestBufferSize - inBuf.length() < 2)
-+        return;
-+
-+    typedef CommCbMemFunT<Server, CommIoCbParams> Dialer;
-+    reader = JobCallback(33, 5, Dialer, this, Server::doClientRead);
-+    Comm::Read(clientConnection, reader);
-+}
-+
-+void
-+Server::doClientRead(const CommIoCbParams &io)
-+{
-+    debugs(33,5, io.conn);
-+    Must(reading());
-+    reader = NULL;
-+
-+    /* Bail out quickly on Comm::ERR_CLOSING - close handlers will tidy up */
-+    if (io.flag == Comm::ERR_CLOSING) {
-+        debugs(33,5, io.conn << " closing Bailout.");
-+        return;
-+    }
-+
-+    assert(Comm::IsConnOpen(clientConnection));
-+    assert(io.conn->fd == clientConnection->fd);
-+
-+    /*
-+     * Don't reset the timeout value here. The value should be
-+     * counting Config.Timeout.request and applies to the request
-+     * as a whole, not individual read() calls.
-+     * Plus, it breaks our lame *HalfClosed() detection
-+     */
-+
-+    maybeMakeSpaceAvailable();
-+    CommIoCbParams rd(this); // will be expanded with ReadNow results
-+    rd.conn = io.conn;
-+    switch (Comm::ReadNow(rd, inBuf)) {
-+    case Comm::INPROGRESS:
-+
-+        if (inBuf.isEmpty())
-+            debugs(33, 2, io.conn << ": no data to process, " << xstrerr(rd.xerrno));
-+        readSomeData();
-+        return;
-+
-+    case Comm::OK:
-+        statCounter.client_http.kbytes_in += rd.size;
-+        if (!receivedFirstByte_)
-+            receivedFirstByte();
-+        // may comm_close or setReplyToError
-+        if (!handleReadData())
-+            return;
-+
-+        /* Continue to process previously read data */
-+        break;
-+
-+    case Comm::ENDFILE: // close detected by 0-byte read
-+        debugs(33, 5, io.conn << " closed?");
-+
-+        if (connFinishedWithConn(rd.size)) {
-+            clientConnection->close();
-+            return;
-+        }
-+
-+        /* It might be half-closed, we can't tell */
-+        fd_table[io.conn->fd].flags.socket_eof = true;
-+        commMarkHalfClosed(io.conn->fd);
-+        fd_note(io.conn->fd, "half-closed");
-+
-+        /* There is one more close check at the end, to detect aborted
-+         * (partial) requests. At this point we can't tell if the request
-+         * is partial.
-+         */
-+
-+        /* Continue to process previously read data */
-+        break;
-+
-+    // case Comm::COMM_ERROR:
-+    default: // no other flags should ever occur
-+        debugs(33, 2, io.conn << ": got flag " << rd.flag << "; " << xstrerr(rd.xerrno));
-+        notifyAllContexts(rd.xerrno);
-+        io.conn->close();
-+        return;
-+    }
-+
-+    afterClientRead();
-+}
-+
-+void
-+Server::clientWriteDone(const CommIoCbParams &io)
-+{
-+    debugs(33,5, io.conn);
-+    Must(writer != NULL);
-+    writer = NULL;
-+
-+    /* Bail out quickly on Comm::ERR_CLOSING - close handlers will tidy up */
-+    if (io.flag == Comm::ERR_CLOSING) {
-+        debugs(33,5, io.conn << " closing Bailout.");
-+        return;
-+    }
-+
-+    assert(Comm::IsConnOpen(clientConnection));
-+    assert(io.conn->fd == clientConnection->fd);
-+
-+    writeSomeData(); // maybe schedules another write
-+}
-@@ -0,0 +1,107 @@
-+/*
-+ * Copyright (C) 1996-2015 The Squid Software Foundation and contributors
-+ *
-+ * Squid software is distributed under GPLv2+ license and includes
-+ * contributions from numerous individuals and organizations.
-+ * Please see the COPYING and CONTRIBUTORS files for details.
-+ */
-+
-+/* DEBUG: section 33    Client-side Routines */
-+
-+#ifndef SQUID_SERVERS_SERVER_H
-+#define SQUID_SERVERS_SERVER_H
-+
-+#include "anyp/forward.h"
-+#include "anyp/ProtocolVersion.h"
-+#include "base/AsyncJob.h"
-+#include "BodyPipe.h"
-+#include "comm/forward.h"
-+#include "CommCalls.h"
-+#include "SBuf.h"
-+
-+/**
-+ * Common base for all Server classes used
-+ * to manage connections from clients.
-+ */
-+class Server : virtual public AsyncJob, public BodyProducer
-+{
-+public:
-+    Server(const MasterXaction::Pointer &xact);
-+    virtual ~Server() {}
-+
-+    /* AsyncJob API */
-+    virtual void start();
-+    virtual bool doneAll() const;
-+    virtual void swanSong();
-+
-+    /// tell all active contexts on a connection about an error
-+    virtual void notifyAllContexts(const int xerrno) = 0;
-+
-+    /// ??
-+    virtual bool connFinishedWithConn(int size) = 0;
-+
-+    /// processing to be done after a Comm::Read()
-+    virtual void afterClientRead() = 0;
-+
-+    /// maybe grow the inBuf and schedule Comm::Read()
-+    void readSomeData();
-+
-+    /**
-+     * called when new request data has been read from the socket
-+     *
-+     * \retval false called comm_close or setReplyToError (the caller should bail)
-+     * \retval true  we did not call comm_close or setReplyToError
-+     */
-+    virtual bool handleReadData() = 0;
-+
-+    /// whether Comm::Read() is scheduled
-+    bool reading() const {return reader != NULL;}
-+
-+    /// cancels Comm::Read() if it is scheduled
-+    void stopReading();
-+
-+    /// Update flags and timeout after the first byte received
-+    virtual void receivedFirstByte() = 0;
-+
-+    /// maybe schedule another Comm::Write() and perform any
-+    /// processing to be done after previous Comm::Write() completes
-+    virtual void writeSomeData() {}
-+
-+    /// whether Comm::Write() is scheduled
-+    bool writing() const {return writer != NULL;}
-+
-+// XXX: should be 'protected:' for child access only,
-+//      but all sorts of code likes to play directly
-+//      with the I/O buffers and socket.
-+public:
-+
-+    /// grows the available read buffer space (if possible)
-+    bool maybeMakeSpaceAvailable();
-+
-+    // Client TCP connection details from comm layer.
-+    Comm::ConnectionPointer clientConnection;
-+
-+    /**
-+     * The transfer protocol currently being spoken on this connection.
-+     * HTTP/1.x CONNECT, HTTP/1.1 Upgrade and HTTP/2 SETTINGS offer the
-+     * ability to change protocols on the fly.
-+     */
-+    AnyP::ProtocolVersion transferProtocol;
-+
-+    /// Squid listening port details where this connection arrived.
-+    AnyP::PortCfgPointer port;
-+
-+    /// read I/O buffer for the client connection
-+    SBuf inBuf;
-+
-+    bool receivedFirstByte_; ///< true if at least one byte received on this connection
-+
-+protected:
-+    void doClientRead(const CommIoCbParams &io);
-+    void clientWriteDone(const CommIoCbParams &io);
-+
-+    AsyncCall::Pointer reader; ///< set when we are reading
-+    AsyncCall::Pointer writer; ///< set when we are writing
-+};
-+
-+#endif /* SQUID_SERVERS_SERVER_H */
-@@ -1857,7 +1857,7 @@ statClientRequests(StoreEntry * s)
-                               fd_table[fd].bytes_read, fd_table[fd].bytes_written);
-             storeAppendPrintf(s, "\tFD desc: %s\n", fd_table[fd].desc);
-             storeAppendPrintf(s, "\tin: buf %p, used %ld, free %ld\n",
--                              conn->in.buf.c_str(), (long int) conn->in.buf.length(), (long int) conn->in.buf.spaceSize());
-+                              conn->inBuf.rawContent(), (long int) conn->inBuf.length(), (long int) conn->inBuf.spaceSize());
-             storeAppendPrintf(s, "\tremote: %s\n",
-                               conn->clientConnection->remote.toUrl(buf,MAX_IPSTRLEN));
-             storeAppendPrintf(s, "\tlocal: %s\n",
-@@ -36,7 +36,6 @@ void ClientSocketContext::registerWithConn() STUB
- void ClientSocketContext::noteIoError(const int xerrno) STUB
- void ClientSocketContext::writeControlMsg(HttpControlMsg &msg) STUB
+             /* we can't seamlessly recheck the username due to the
+              * challenge-response nature of the protocol.
+              * Just free the temporary auth_user after merging as
+              * much of it new state into the existing one as possible */
+-            usernamehash->user()->absorb(local_auth_user);
++            cached_user->absorb(local_auth_user);
+             /* from here on we are working with the original cached credentials. */
+-            local_auth_user = usernamehash->user();
++            local_auth_user = cached_user;
+             auth_user_request->user(local_auth_user);
+-        } else {
+-            /* store user in hash's */
+-            local_auth_user->addToNameCache();
+         }
+         /* set these to now because this is either a new login from an
+          * existing user or a new user */
+@@ -8,6 +8,7 @@
  
--void ConnStateData::readSomeData() STUB
- bool ConnStateData::areAllContextsForThisConnection() const STUB_RETVAL(false)
- void ConnStateData::freeAllContexts() STUB
- void ConnStateData::notifyAllContexts(const int xerrno) STUB
-@@ -51,8 +50,6 @@ int64_t ConnStateData::mayNeedToReadMoreBody() const STUB_RETVAL(0)
- void ConnStateData::setAuth(const Auth::UserRequest::Pointer &aur, const char *cause) STUB
- #endif
- bool ConnStateData::transparent() const STUB_RETVAL(false)
--bool ConnStateData::reading() const STUB_RETVAL(false)
--void ConnStateData::stopReading() STUB
- void ConnStateData::stopReceiving(const char *error) STUB
- void ConnStateData::stopSending(const char *error) STUB
- void ConnStateData::expectNoForwarding() STUB
-@@ -64,7 +61,6 @@ void ConnStateData::pinConnection(const Comm::ConnectionPointer &pinServerConn,
- void ConnStateData::unpinConnection(const bool andClose) STUB
- const Comm::ConnectionPointer ConnStateData::validatePinnedConnection(HttpRequest *request, const CachePeer *peer) STUB_RETVAL(NULL)
- void ConnStateData::clientPinnedConnectionClosed(const CommCloseCbParams &io) STUB
--void ConnStateData::clientReadRequest(const CommIoCbParams &io) STUB
- void ConnStateData::connStateClosed(const CommCloseCbParams &io) STUB
- void ConnStateData::requestTimeout(const CommTimeoutCbParams &params) STUB
- void ConnStateData::swanSong() STUB
-@@ -80,8 +76,6 @@ void ConnStateData::buildSslCertGenerationParams(Ssl::CertificateProperties &cer
- bool ConnStateData::serveDelayedError(ClientSocketContext *context) STUB_RETVAL(false)
- #endif
+ #include "squid.h"
+ #include "auth/Config.h"
++#include "auth/CredentialsCache.h"
+ #include "auth/ntlm/User.h"
+ #include "Debug.h"
  
--bool ConnStateData::In::maybeMakeSpaceAvailable() STUB_RETVAL(false)
+@@ -27,3 +28,16 @@ Auth::Ntlm::User::ttl() const
+     return -1; // NTLM credentials cannot be cached.
+ }
+ 
++CbcPointer<Auth::CredentialsCache>
++Auth::Ntlm::User::Cache()
++{
++    static CbcPointer<Auth::CredentialsCache> p(new Auth::CredentialsCache("ntlm", "GC NTLM user credentials"));
++    return p;
++}
++
++void
++Auth::Ntlm::User::addToNameCache()
++{
++    Cache()->insert(userKey(), this);
++}
++
+@@ -26,9 +26,12 @@ class User : public Auth::User
+ 
+ public:
+     User(Auth::Config *, const char *requestRealm);
+-    ~User();
++    virtual ~User();
++    virtual int32_t ttl() const override;
+ 
+-    virtual int32_t ttl() const;
++    /* Auth::User API */
++    static CbcPointer<Auth::CredentialsCache> Cache();
++    virtual void addToNameCache() override;
+ 
+     dlink_list proxy_auth_list;
+ };
+@@ -8,7 +8,9 @@
+ 
+ #include "squid.h"
+ #include "AccessLogEntry.h"
++#include "auth/CredentialsCache.h"
+ #include "auth/ntlm/Config.h"
++#include "auth/ntlm/User.h"
+ #include "auth/ntlm/UserRequest.h"
+ #include "auth/State.h"
+ #include "cbdata.h"
+@@ -326,23 +328,19 @@ Auth::Ntlm::UserRequest::HandleReply(void *data, const Helper::Reply &reply)
+         /* connection is authenticated */
+         debugs(29, 4, HERE << "authenticated user " << auth_user_request->user()->username());
+         /* see if this is an existing user */
+-        AuthUserHashPointer *usernamehash = static_cast<AuthUserHashPointer *>(hash_lookup(proxy_auth_username_cache, auth_user_request->user()->userKey()));
+-        Auth::User::Pointer local_auth_user = lm_request->user();
+-        while (usernamehash && (usernamehash->user()->auth_type != Auth::AUTH_NTLM ||
+-                                strcmp(usernamehash->user()->userKey(), auth_user_request->user()->userKey()) != 0))
+-            usernamehash = static_cast<AuthUserHashPointer *>(usernamehash->next);
+-        if (usernamehash) {
++        auto local_auth_user = lm_request->user();
++        auto cached_user = Auth::Ntlm::User::Cache()->lookup(auth_user_request->user()->userKey());
++        if (!cached_user) {
++            local_auth_user->addToNameCache();
++        } else {
+             /* we can't seamlessly recheck the username due to the
+              * challenge-response nature of the protocol.
+              * Just free the temporary auth_user after merging as
+              * much of it new state into the existing one as possible */
+-            usernamehash->user()->absorb(local_auth_user);
++            cached_user->absorb(local_auth_user);
+             /* from here on we are working with the original cached credentials. */
+-            local_auth_user = usernamehash->user();
++            local_auth_user = cached_user;
+             auth_user_request->user(local_auth_user);
+-        } else {
+-            /* store user in hash's */
+-            local_auth_user->addToNameCache();
+         }
+         /* set these to now because this is either a new login from an
+          * existing user or a new user */
+@@ -88,7 +88,6 @@ extern int store_swap_low;  /* 0 */
+ extern int store_swap_high; /* 0 */
+ extern size_t store_pages_max;  /* 0 */
+ extern int64_t store_maxobjsize;    /* 0 */
+-extern hash_table *proxy_auth_username_cache;   /* NULL */
+ extern int incoming_sockets_accepted;
+ #if _SQUID_WINDOWS_
+ extern unsigned int WIN32_Socks_initialized;    /* 0 */
+@@ -1216,7 +1216,7 @@ statRegisterWithCacheManager(void)
+ #if USE_AUTH
+     Mgr::RegisterAction("username_cache",
+                         "Active Cached Usernames",
+-                        Auth::User::UsernameCacheStats, 0, 1);
++                        Auth::User::CredentialsCacheStats, 0, 1);
+ #endif
+ #if DEBUG_OPENFD
+     Mgr::RegisterAction("openfd_objects", "Objects with Swapout files open",
+@@ -25,9 +25,6 @@ void authenticateInit(Auth::ConfigVector *) STUB
+ void authenticateRotate(void) STUB
+ void authenticateReset(void) STUB
+ 
+-AuthUserHashPointer::AuthUserHashPointer(Auth::User::Pointer anAuth_user) STUB
+-Auth::User::Pointer AuthUserHashPointer::user() const STUB_RETVAL(NULL)
 -
- void setLogUri(ClientHttpRequest * http, char const *uri, bool cleanUrl) STUB
- const char *findTrailingHTTPVersion(const char *uriAndHTTPVersion, const char *end) STUB_RETVAL(NULL)
- int varyEvaluateMatch(StoreEntry * entry, HttpRequest * req) STUB_RETVAL(0)
-@@ -837,11 +837,11 @@ tunnelStartShoveling(TunnelStateData *tunnelState)
-             tunnelState->copy(tunnelState->server.len, tunnelState->server, tunnelState->client, TunnelStateData::WriteClientDone);
-         }
+ #include "auth/Scheme.h"
+ #include <vector>
+ std::vector<Auth::Scheme::Pointer> *Auth::Scheme::_Schemes = NULL;
+@@ -42,14 +39,10 @@ Auth::CredentialState Auth::User::credentials() const STUB_RETVAL(credentials_st
+ void Auth::User::credentials(CredentialState) STUB
+ void Auth::User::absorb(Auth::User::Pointer) STUB
+ Auth::User::~User() STUB_NOP
+-void Auth::User::cacheInit(void) STUB
+-void Auth::User::CachedACLsReset() STUB
+-void Auth::User::cacheCleanup(void *) STUB
+ void Auth::User::clearIp() STUB
+ void Auth::User::removeIp(Ip::Address) STUB
+ void Auth::User::addIp(Ip::Address) STUB
+-void Auth::User::addToNameCache() STUB
+-void Auth::User::UsernameCacheStats(StoreEntry *) STUB
++void Auth::User::CredentialsCacheStats(StoreEntry *) STUB
  
--        if (tunnelState->http.valid() && tunnelState->http->getConn() && !tunnelState->http->getConn()->in.buf.isEmpty()) {
--            struct ConnStateData::In *in = &tunnelState->http->getConn()->in;
--            debugs(26, DBG_DATA, "Tunnel client PUSH Payload: \n" << in->buf << "\n----------");
--            tunnelState->preReadClientData.append(in->buf);
--            in->buf.consume(); // ConnStateData buffer accounting after the shuffle.
-+        if (tunnelState->http.valid() && tunnelState->http->getConn() && !tunnelState->http->getConn()->inBuf.isEmpty()) {
-+            SBuf * const in = &tunnelState->http->getConn()->inBuf;
-+            debugs(26, DBG_DATA, "Tunnel client PUSH Payload: \n" << *in << "\n----------");
-+            tunnelState->preReadClientData.append(*in);
-+            in->consume(); // ConnStateData buffer accounting after the shuffle.
-         }
-         tunnelState->copyClientBytes();
-     }
+ #include "auth/UserRequest.h"
+ char const * Auth::UserRequest::username() const STUB_RETVAL("stub_username")

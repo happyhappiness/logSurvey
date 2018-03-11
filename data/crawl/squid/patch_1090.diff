@@ -1,0 +1,2474 @@
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: asn.cc,v 1.101 2005/05/08 09:15:39 serassio Exp $
++ * $Id: asn.cc,v 1.102 2006/01/03 17:22:30 wessels Exp $
+  *
+  * DEBUG: section 53    AS Number handling
+  * AUTHOR: Duane Wessels, Kostas Anagnostakis
+@@ -44,6 +44,7 @@
+ #include "ACLDestinationASN.h"
+ #include "ACLDestinationIP.h"
+ #include "HttpReply.h"
++#include "forward.h"
+ 
+ #define WHOIS_PORT 43
+ #define	AS_REQBUF_SZ	4096
+@@ -240,7 +241,7 @@ asnCacheStart(int as)
+     if ((e = storeGetPublic(asres, METHOD_GET)) == NULL) {
+         e = storeCreateEntry(asres, asres, request_flags(), METHOD_GET);
+         asState->sc = storeClientListAdd(e, asState);
+-        fwdStart(-1, e, asState->request);
++        FwdState::fwdStart(-1, e, asState->request);
+     } else {
+         storeLockObject(e);
+         asState->sc = storeClientListAdd(e, asState);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: cbdata.cc,v 1.67 2005/12/09 16:03:23 wessels Exp $
++ * $Id: cbdata.cc,v 1.68 2006/01/03 17:22:30 wessels Exp $
+  *
+  * DEBUG: section 45    Callback Data Registry
+  * ORIGINAL AUTHOR: Duane Wessels
+@@ -239,7 +239,6 @@ cbdataInit(void)
+      * most of these should be moved out to their respective module.
+      */
+     CREATE_CBDATA(ErrorState);
+-    CREATE_CBDATA(FwdState);
+     CREATE_CBDATA(generic_cbdata);
+     CREATE_CBDATA(helper);
+     CREATE_CBDATA(helper_server);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: client_side_reply.cc,v 1.91 2005/11/21 23:21:21 wessels Exp $
++ * $Id: client_side_reply.cc,v 1.92 2006/01/03 17:22:30 wessels Exp $
+  *
+  * DEBUG: section 88    Client-side Reply Routines
+  * AUTHOR: Robert Collins (Originally Duane Wessels in client_side.c)
+@@ -39,6 +39,7 @@
+ #include "Store.h"
+ #include "HttpReply.h"
+ #include "HttpRequest.h"
++#include "forward.h"
+ 
+ #include "clientStream.h"
+ #include "AuthUserRequest.h"
+@@ -265,7 +266,9 @@ clientReplyContext::processExpired()
+                  (long int) entry->lastmod);
+     http->storeEntry(entry);
+     assert(http->out.offset == 0);
+-    fwdStart(http->getConn().getRaw() != NULL ? http->getConn()->fd : -1, http->storeEntry(), http->request);
++    FwdState::fwdStart(http->getConn().getRaw() != NULL ? http->getConn()->fd : -1,
++                       http->storeEntry(),
++                       http->request);
+     /* Register with storage manager to receive updates when data comes in. */
+ 
+     if (EBIT_TEST(entry->flags, ENTRY_ABORTED))
+@@ -834,7 +837,9 @@ clientReplyContext::processMiss()
+         if (http->flags.internal)
+             r->protocol = PROTO_INTERNAL;
+ 
+-        fwdStart(http->getConn().getRaw() != NULL ? http->getConn()->fd : -1, http->storeEntry(), r);
++        FwdState::fwdStart(http->getConn().getRaw() != NULL ? http->getConn()->fd : -1,
++                           http->storeEntry(),
++                           r);
+     }
+ }
+ 
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: forward.cc,v 1.132 2005/12/08 20:08:46 wessels Exp $
++ * $Id: forward.cc,v 1.133 2006/01/03 17:22:31 wessels Exp $
+  *
+  * DEBUG: section 17    Request Forwarding
+  * AUTHOR: Duane Wessels
+@@ -35,6 +35,7 @@
+ 
+ 
+ #include "squid.h"
++#include "forward.h"
+ #include "Store.h"
+ #include "HttpRequest.h"
+ #include "fde.h"
+@@ -44,21 +45,17 @@
+ #include "HttpReply.h"
+ #include "pconn.h"
+ 
+-static PSC fwdStartComplete;
+-static void fwdDispatch(FwdState *);
+-static void fwdConnectStart(void *);	/* should be same as EVH */
+-static void fwdStateFree(FwdState * fwdState);
+-static PF fwdConnectTimeout;
+-static PF fwdServerClosed;
+-static PF fwdPeerClosed;
+-static CNCB fwdConnectDone;
+-static int fwdCheckRetry(FwdState * fwdState);
+-static int fwdReforward(FwdState *);
+-static void fwdStartFail(FwdState *);
+-static void fwdLogReplyStatus(int tries, http_status status);
++static PSC fwdStartCompleteWrapper;
++static PF fwdServerClosedWrapper;
++#if USE_SSL
++static PF fwdNegotiateSSLWrapper;
++#endif
++static PF fwdConnectTimeoutWrapper;
++static EVH fwdConnectStartWrapper;
++static CNCB fwdConnectDoneWrapper;
++
+ static OBJH fwdStats;
+-static STABH fwdAbort;
+-static peer *fwdStateServerPeer(FwdState *);
++static void fwdServerFree(FwdServer * fs);
+ 
+ #define MAX_FWD_STATS_IDX 9
+ static int FwdReplyCodes[MAX_FWD_STATS_IDX + 1][HTTP_INVALID_HEADER + 1];
+@@ -69,129 +66,327 @@ static Logfile *logfile = NULL;
+ #endif
+ 
+ static PconnPool *fwdPconnPool = new PconnPool("server-side");
++CBDATA_CLASS_INIT(FwdState);
+ 
+-static peer *
+-fwdStateServerPeer(FwdState * fwdState)
+-{
+-    if (NULL == fwdState)
+-        return NULL;
+-
+-    if (NULL == fwdState->servers)
+-        return NULL;
+-
+-    return fwdState->servers->_peer;
+-}
++/**** PUBLIC INTERFACE ********************************************************/
+ 
+-static void
+-fwdServerFree(FwdServer * fs)
++FwdState::FwdState(int fd, StoreEntry * e, HttpRequest * r)
+ {
+-    cbdataReferenceDone(fs->_peer);
+-    memFree(fs, MEM_FWD_SERVER);
++    entry = e;
++    client_fd = fd;
++    server_fd = -1;
++    request = requestLink(r);
++    start_t = squid_curtime;
++    storeLockObject(e);
++    EBIT_SET(e->flags, ENTRY_FWD_HDR_WAIT);
++    self = this;	// refcounted
+ }
+ 
+-static void
+-fwdStateFree(FwdState * fwdState)
++FwdState::~FwdState()
+ {
+-    StoreEntry *e = fwdState->entry;
+-    int sfd;
+-    peer *p;
+-    debug(17, 3) ("fwdStateFree: %p\n", fwdState);
+-    assert(e->mem_obj);
++    debugs(17, 3, HERE << "FwdState destructor starting");
+ #if URL_CHECKSUM_DEBUG
+ 
+-    e->mem_obj->checkUrlChecksum();
++    entry->mem_obj->checkUrlChecksum();
+ #endif
+ #if WIP_FWD_LOG
+ 
+-    fwdLog(fwdState);
++    log();
+ #endif
+ 
+-    if (e->store_status == STORE_PENDING) {
+-        if (e->isEmpty()) {
+-            assert(fwdState->err);
+-            errorAppendEntry(e, fwdState->err);
+-            fwdState->err = NULL;
++    if (entry->store_status == STORE_PENDING) {
++        if (entry->isEmpty()) {
++            assert(err);
++            errorAppendEntry(entry, err);
++            err = NULL;
+         } else {
+-            EBIT_CLR(e->flags, ENTRY_FWD_HDR_WAIT);
+-            e->complete();
+-            storeReleaseRequest(e);
++            EBIT_CLR(entry->flags, ENTRY_FWD_HDR_WAIT);
++            entry->complete();
++            storeReleaseRequest(entry);
+         }
+     }
+ 
+-    if (storePendingNClients(e) > 0)
+-        assert(!EBIT_TEST(e->flags, ENTRY_FWD_HDR_WAIT));
++    if (storePendingNClients(entry) > 0)
++        assert(!EBIT_TEST(entry->flags, ENTRY_FWD_HDR_WAIT));
+ 
+-    p = fwdStateServerPeer(fwdState);
++    serversFree(&servers);
+ 
+-    fwdServersFree(&fwdState->servers);
++    requestUnlink(request);
+ 
+-    requestUnlink(fwdState->request);
++    request = NULL;
+ 
+-    fwdState->request = NULL;
++    if (err)
++        errorStateFree(err);
+ 
+-    if (fwdState->err)
+-        errorStateFree(fwdState->err);
++    storeUnlockObject(entry);
+ 
+-    storeUnregisterAbort(e);
++    entry = NULL;
+ 
+-    storeUnlockObject(e);
++    if (server_fd > -1) {
++        comm_remove_close_handler(server_fd, fwdServerClosedWrapper, this);
++        server_fd = -1;
++        debug(17, 3) ("fwdStateFree: closing FD %d\n", server_fd);
++        comm_close(server_fd);
++    }
+ 
+-    fwdState->entry = NULL;
++    debugs(17, 3, HERE << "FwdState destructor done");
++}
+ 
+-    sfd = fwdState->server_fd;
++/*
++ * This is the entry point for client-side to start forwarding
++ * a transaction.  It is a static method that may or may not
++ * allocate a FwdState.
++ */
++void
++FwdState::fwdStart(int client_fd, StoreEntry *entry, HttpRequest *request)
++{
++    /*
++     * client_addr == no_addr indicates this is an "internal" request
++     * from peer_digest.c, asn.c, netdb.c, etc and should always
++     * be allowed.  yuck, I know.
++     */
+ 
+-    if (sfd > -1) {
+-        comm_remove_close_handler(sfd, fwdServerClosed, fwdState);
+-        fwdState->server_fd = -1;
+-        debug(17, 3) ("fwdStateFree: closing FD %d\n", sfd);
+-        comm_close(sfd);
++    if (request->client_addr.s_addr != no_addr.s_addr && request->protocol != PROTO_INTERNAL && request->protocol != PROTO_CACHEOBJ) {
++        /*
++         * Check if this host is allowed to fetch MISSES from us (miss_access)
++         */
++        ACLChecklist ch;
++        ch.src_addr = request->client_addr;
++        ch.my_addr = request->my_addr;
++        ch.my_port = request->my_port;
++        ch.request = requestLink(request);
++        ch.accessList = cbdataReference(Config.accessList.miss);
++        /* cbdataReferenceDone() happens in either fastCheck() or ~ACLCheckList */
++        int answer = ch.fastCheck();
++
++        if (answer == 0) {
++            err_type page_id;
++            page_id = aclGetDenyInfoPage(&Config.denyInfoList, AclMatchedName);
++
++            if (page_id == ERR_NONE)
++                page_id = ERR_FORWARDING_DENIED;
++
++            ErrorState *anErr = errorCon(page_id, HTTP_FORBIDDEN);
++
++            anErr->request = requestLink(request);
++
++            anErr->src_addr = request->client_addr;
++
++            errorAppendEntry(entry, anErr);	// frees anErr
++
++            return;
++        }
++    }
++
++    debug(17, 3) ("FwdState::start() '%s'\n", storeUrl(entry));
++    entry->mem_obj->request = requestLink(request);
++#if URL_CHECKSUM_DEBUG
++
++    entry->mem_obj->checkUrlChecksum();
++#endif
++
++    if (shutting_down) {
++        /* more yuck */
++        ErrorState *anErr = errorCon(ERR_SHUTTING_DOWN, HTTP_SERVICE_UNAVAILABLE);
++        anErr->request = requestLink(request);
++        errorAppendEntry(entry, anErr);	// frees anErr
++        return;
+     }
+ 
+-    cbdataFree(fwdState);
++    switch (request->protocol) {
++
++    case PROTO_INTERNAL:
++        internalStart(request, entry);
++        return;
++
++    case PROTO_CACHEOBJ:
++        cachemgrStart(client_fd, request, entry);
++        return;
++
++    case PROTO_URN:
++        urnStart(request, entry);
++        return;
++
++    default:
++        FwdState *fwd = new FwdState(client_fd, entry, request);
++        peerSelect(request, entry, fwdStartCompleteWrapper, fwd);
++        return;
++    }
++
++    /* NOTREACHED */
+ }
+ 
+-static int
+-fwdCheckRetry(FwdState * fwdState)
++void
++FwdState::fail(ErrorState * errorState)
++{
++    debug(17, 3) ("fwdFail: %s \"%s\"\n\t%s\n",
++                  err_type_str[errorState->type],
++                  httpStatusString(errorState->httpStatus),
++                  storeUrl(entry));
++
++    if (err)
++        errorStateFree(err);
++
++    err = errorState;
++
++    if (!errorState->request)
++        errorState->request = requestLink(request);
++}
++
++/*
++ * Frees fwdState without closing FD or generating an abort
++ */
++void
++FwdState::unregister(int fd)
++{
++    debug(17, 3) ("fwdUnregister: %s\n", storeUrl(entry));
++    assert(fd == server_fd);
++    assert(fd > -1);
++    comm_remove_close_handler(fd, fwdServerClosedWrapper, this);
++    server_fd = -1;
++}
++
++/*
++ * server-side modules call fwdComplete() when they are done
++ * downloading an object.  Then, we either 1) re-forward the
++ * request somewhere else if needed, or 2) call storeComplete()
++ * to finish it off
++ */
++void
++FwdState::complete()
++{
++    StoreEntry *e = entry;
++    assert(entry->store_status == STORE_PENDING);
++    debug(17, 3) ("fwdComplete: %s\n\tstatus %d\n", storeUrl(e),
++                  entry->getReply()->sline.status);
++#if URL_CHECKSUM_DEBUG
++
++    entry->mem_obj->checkUrlChecksum();
++#endif
++
++    logReplyStatus(n_tries, entry->getReply()->sline.status);
++
++    if (reforward()) {
++        debug(17, 3) ("fwdComplete: re-forwarding %d %s\n",
++                      entry->getReply()->sline.status,
++                      storeUrl(e));
++
++        if (server_fd > -1)
++            unregister(server_fd);
++
++        storeEntryReset(e);
++
++        startComplete(servers);
++    } else {
++        debug(17, 3) ("fwdComplete: not re-forwarding status %d\n",
++                      entry->getReply()->sline.status);
++        EBIT_CLR(entry->flags, ENTRY_FWD_HDR_WAIT);
++        entry->complete();
++    }
++}
++
++
++/**** CALLBACK WRAPPERS ************************************************************/
++
++static void
++fwdStartCompleteWrapper(FwdServer * servers, void *data)
++{
++    FwdState *fwd = (FwdState *) data;
++    fwd->startComplete(servers);
++}
++
++static void
++fwdServerClosedWrapper(int fd, void *data)
++{
++    FwdState *fwd = (FwdState *) data;
++    fwd->serverClosed(fd);
++}
++
++static void
++fwdConnectStartWrapper(void *data)
++{
++    FwdState *fwd = (FwdState *) data;
++    fwd->connectStart();
++}
++
++#if USE_SSL
++static void
++fwdNegotiateSSLWrapper(int fd, void *data)
++{
++    FwdState *fwd = (FwdState *) data;
++    fwd->negotiateSSL(fd);
++}
++
++#endif
++
++static void
++fwdConnectDoneWrapper(int server_fd, comm_err_t status, int xerrno, void *data)
++{
++    FwdState *fwd = (FwdState *) data;
++    fwd->connectDone(server_fd, status, xerrno);
++}
++
++static void
++fwdConnectTimeoutWrapper(int fd, void *data)
++{
++    FwdState *fwd = (FwdState *) data;
++    fwd->connectTimeout(fd);
++}
++
++/*
++ * Accounts for closed persistent connections
++ */
++static void
++fwdPeerClosed(int fd, void *data)
++{
++    peer *p = (peer *)data;
++    p->stats.conn_open--;
++}
++
++/**** PRIVATE *****************************************************************/
++
++bool
++FwdState::checkRetry()
+ {
+     if (shutting_down)
+-        return 0;
++        return false;
+ 
+-    if (fwdState->entry->store_status != STORE_PENDING)
+-        return 0;
++    if (entry->store_status != STORE_PENDING)
++        return false;
+ 
+-    if (!fwdState->entry->isEmpty())
+-        return 0;
++    if (!entry->isEmpty())
++        return false;
+ 
+-    if (fwdState->n_tries > 10)
+-        return 0;
++    if (n_tries > 10)
++        return false;
+ 
+-    if (fwdState->origin_tries > 2)
+-        return 0;
++    if (origin_tries > 2)
++        return false;
+ 
+-    if (squid_curtime - fwdState->start > Config.Timeout.forward)
+-        return 0;
++    if (squid_curtime - start_t > Config.Timeout.forward)
++        return false;
+ 
+-    if (fwdState->flags.dont_retry)
+-        return 0;
++    if (flags.dont_retry)
++        return false;
+ 
+-    if (fwdState->request->flags.body_sent)
+-        return 0;
++    if (request->flags.body_sent)
++        return false;
+ 
+-    return 1;
++    return true;
+ }
+ 
+-static int
+-fwdCheckRetriable(FwdState * fwdState)
++bool
++FwdState::checkRetriable()
+ {
+     /* If there is a request body then Squid can only try once
+      * even if the method is indempotent
+      */
+ 
+-    if (fwdState->request->body_connection.getRaw() != NULL)
+-        return 0;
++    if (request->body_connection.getRaw() != NULL)
++        return false;
+ 
+     /* RFC2616 9.1 Safe and Idempotent Methods */
+-    switch (fwdState->request->method) {
++    switch (request->method) {
+         /* 9.1.1 Safe Methods */
+ 
+     case METHOD_GET:
+@@ -209,33 +404,32 @@ fwdCheckRetriable(FwdState * fwdState)
+         break;
+ 
+     default:
+-        return 0;
++        return false;
+     }
+ 
+-    return 1;
++    return true;
+ }
+ 
+-static void
+-fwdServerClosed(int fd, void *data)
++void
++FwdState::serverClosed(int fd)
+ {
+-    FwdState *fwdState = (FwdState *)data;
+-    debug(17, 2) ("fwdServerClosed: FD %d %s\n", fd, storeUrl(fwdState->entry));
+-    assert(fwdState->server_fd == fd);
+-    fwdState->server_fd = -1;
++    debug(17, 2) ("fwdServerClosed: FD %d %s\n", fd, storeUrl(entry));
++    assert(server_fd == fd);
++    server_fd = -1;
+ 
+-    if (fwdCheckRetry(fwdState)) {
+-        int originserver = (fwdState->servers->_peer == NULL);
++    if (checkRetry()) {
++        int originserver = (servers->_peer == NULL);
+         debug(17, 3) ("fwdServerClosed: re-forwarding (%d tries, %d secs)\n",
+-                      fwdState->n_tries,
+-                      (int) (squid_curtime - fwdState->start));
++                      n_tries,
++                      (int) (squid_curtime - start_t));
+ 
+-        if (fwdState->servers->next) {
++        if (servers->next) {
+             /* use next, or cycle if origin server isn't last */
+-            FwdServer *fs = fwdState->servers;
++            FwdServer *fs = servers;
+             FwdServer **T, *T2 = NULL;
+-            fwdState->servers = fs->next;
++            servers = fs->next;
+ 
+-            for (T = &fwdState->servers; *T; T2 = *T, T = &(*T)->next)
++            for (T = &servers; *T; T2 = *T, T = &(*T)->next)
+ 
+                 ;
+             if (T2 && T2->_peer) {
+@@ -244,71 +438,68 @@ fwdServerClosed(int fd, void *data)
+                 fs->next = NULL;
+             } else {
+                 /* Use next. The last "direct" entry is retried multiple times */
+-                fwdState->servers = fs->next;
++                servers = fs->next;
+                 fwdServerFree(fs);
+                 originserver = 0;
+             }
+         }
+ 
+         /* use eventAdd to break potential call sequence loops and to slow things down a little */
+-        eventAdd("fwdConnectStart", fwdConnectStart, fwdState, originserver ? 0.05 : 0.005, 0);
++        eventAdd("fwdConnectStart", fwdConnectStartWrapper, this, originserver ? 0.05 : 0.005, 0);
+ 
+         return;
+     }
+ 
+-    if (!fwdState->err && shutting_down) {
+-        fwdState->err =errorCon(ERR_SHUTTING_DOWN, HTTP_SERVICE_UNAVAILABLE);
+-        fwdState->err->request = requestLink(fwdState->request);
++    if (!err && shutting_down) {
++        ErrorState *anErr = errorCon(ERR_SHUTTING_DOWN, HTTP_SERVICE_UNAVAILABLE);
++        anErr->request = requestLink(request);
+     }
+ 
+-    fwdStateFree(fwdState);
++    self = NULL;	// refcounted
+ }
+ 
+ #if USE_SSL
+-static void
+-fwdNegotiateSSL(int fd, void *data)
++void
++FwdState::negotiateSSL(int fd)
+ {
+-    FwdState *fwdState = (FwdState *)data;
+-    FwdServer *fs = fwdState->servers;
++    FwdServer *fs = servers;
+     SSL *ssl = fd_table[fd].ssl;
+     int ret;
+-    ErrorState *err;
+-    HttpRequest *request = fwdState->request;
+ 
+     if ((ret = SSL_connect(ssl)) <= 0) {
+         int ssl_error = SSL_get_error(ssl, ret);
+ 
+         switch (ssl_error) {
+ 
+         case SSL_ERROR_WANT_READ:
+-            commSetSelect(fd, COMM_SELECT_READ, fwdNegotiateSSL, fwdState, 0);
++            commSetSelect(fd, COMM_SELECT_READ, fwdNegotiateSSLWrapper, this, 0);
+             return;
+ 
+         case SSL_ERROR_WANT_WRITE:
+-            commSetSelect(fd, COMM_SELECT_WRITE, fwdNegotiateSSL, fwdState, 0);
++            commSetSelect(fd, COMM_SELECT_WRITE, fwdNegotiateSSLWrapper, this, 0);
+             return;
+ 
+         default:
+             debug(81, 1) ("fwdNegotiateSSL: Error negotiating SSL connection on FD %d: %s (%d/%d/%d)\n", fd, ERR_error_string(ERR_get_error(), NULL), ssl_error, ret, errno);
+-            err = errorCon(ERR_CONNECT_FAIL, HTTP_SERVICE_UNAVAILABLE);
++            ErrorState *anErr = errorCon(ERR_CONNECT_FAIL, HTTP_SERVICE_UNAVAILABLE);
+ #ifdef EPROTO
+ 
+-            err->xerrno = EPROTO;
++            anErr->xerrno = EPROTO;
+ #else
+ 
+-            err->xerrno = EACCES;
++            anErr->xerrno = EACCES;
+ #endif
+ 
+             if (fs->_peer) {
+-                err->host = xstrdup(fs->_peer->host);
+-                err->port = fs->_peer->http_port;
++                anErr->host = xstrdup(fs->_peer->host);
++                anErr->port = fs->_peer->http_port;
+             } else {
+-                err->host = xstrdup(request->host);
+-                err->port = request->port;
++                anErr->host = xstrdup(request->host);
++                anErr->port = request->port;
+             }
+ 
+-            err->request = requestLink(request);
+-            fwdFail(fwdState, err);
++            anErr->request = requestLink(request);
++            fail(anErr);
+ 
+             if (fs->_peer) {
+                 peerConnectFailed(fs->_peer);
+@@ -327,14 +518,14 @@ fwdNegotiateSSL(int fd, void *data)
+         fs->_peer->sslSession = SSL_get1_session(ssl);
+     }
+ 
+-    fwdDispatch(fwdState);
++    dispatch();
+ }
+ 
+-static void
+-fwdInitiateSSL(FwdState * fwdState)
++void
++FwdState::initiateSSL()
+ {
+-    FwdServer *fs = fwdState->servers;
+-    int fd = fwdState->server_fd;
++    FwdServer *fs = servers;
++    int fd = server_fd;
+     SSL *ssl;
+     SSL_CTX *sslContext = NULL;
+     peer *peer = fs->_peer;
+@@ -349,14 +540,13 @@ fwdInitiateSSL(FwdState * fwdState)
+     assert(sslContext);
+ 
+     if ((ssl = SSL_new(sslContext)) == NULL) {
+-        ErrorState *err;
+         debug(83, 1) ("fwdInitiateSSL: Error allocating handle: %s\n",
+                       ERR_error_string(ERR_get_error(), NULL));
+-        err = errorCon(ERR_SOCKET_FAILURE, HTTP_INTERNAL_SERVER_ERROR);
+-        err->xerrno = errno;
+-        err->request = requestLink(fwdState->request);
+-        fwdFail(fwdState, err);
+-        fwdStateFree(fwdState);
++        ErrorState *anErr = errorCon(ERR_SOCKET_FAILURE, HTTP_INTERNAL_SERVER_ERROR);
++        anErr->xerrno = errno;
++        anErr->request = requestLink(request);
++        fail(anErr);
++        self = NULL;		// refcounted
+         return;
+     }
+ 
+@@ -380,25 +570,22 @@ fwdInitiateSSL(FwdState * fwdState)
+             SSL_set_session(ssl, peer->sslSession);
+ 
+     } else {
+-        SSL_set_ex_data(ssl, ssl_ex_index_server, fwdState->request->host);
++        SSL_set_ex_data(ssl, ssl_ex_index_server, request->host);
+     }
+ 
+     fd_table[fd].ssl = ssl;
+     fd_table[fd].read_method = &ssl_read_method;
+     fd_table[fd].write_method = &ssl_write_method;
+-    fwdNegotiateSSL(fd, fwdState);
++    negotiateSSL(fd);
+ }
+ 
+ #endif
+ 
+-static void
+-fwdConnectDone(int server_fd, comm_err_t status, int xerrno, void *data)
++void
++FwdState::connectDone(int aServerFD, comm_err_t status, int xerrno)
+ {
+-    FwdState *fwdState = (FwdState *)data;
+-    FwdServer *fs = fwdState->servers;
+-    ErrorState *err;
+-    HttpRequest *request = fwdState->request;
+-    assert(fwdState->server_fd == server_fd);
++    FwdServer *fs = servers;
++    assert(server_fd == aServerFD);
+ 
+     if (status == COMM_ERR_DNS) {
+         /*
+@@ -408,39 +595,39 @@ fwdConnectDone(int server_fd, comm_err_t status, int xerrno, void *data)
+          */
+ 
+         if (NULL == fs->_peer)
+-            fwdState->flags.dont_retry = 1;
++            flags.dont_retry = 1;
+ 
+         debug(17, 4) ("fwdConnectDone: Unknown host: %s\n",
+                       request->host);
+ 
+-        err = errorCon(ERR_DNS_FAIL, HTTP_SERVICE_UNAVAILABLE);
++        ErrorState *anErr = errorCon(ERR_DNS_FAIL, HTTP_SERVICE_UNAVAILABLE);
+ 
+-        err->dnsserver_msg = xstrdup(dns_error_message);
++        anErr->dnsserver_msg = xstrdup(dns_error_message);
+ 
+-        fwdFail(fwdState, err);
++        fail(anErr);
+ 
+         comm_close(server_fd);
+     } else if (status != COMM_OK) {
+         assert(fs);
+-        err = errorCon(ERR_CONNECT_FAIL, HTTP_SERVICE_UNAVAILABLE);
+-        err->xerrno = xerrno;
++        ErrorState *anErr = errorCon(ERR_CONNECT_FAIL, HTTP_SERVICE_UNAVAILABLE);
++        anErr->xerrno = xerrno;
+ 
+         if (fs->_peer) {
+-            err->host = xstrdup(fs->_peer->host);
+-            err->port = fs->_peer->http_port;
++            anErr->host = xstrdup(fs->_peer->host);
++            anErr->port = fs->_peer->http_port;
+         } else {
+-            err->host = xstrdup(request->host);
+-            err->port = request->port;
++            anErr->host = xstrdup(request->host);
++            anErr->port = request->port;
+         }
+ 
+-        fwdFail(fwdState, err);
++        fail(anErr);
+ 
+         if (fs->_peer)
+             peerConnectFailed(fs->_peer);
+ 
+         comm_close(server_fd);
+     } else {
+-        debug(17, 3) ("fwdConnectDone: FD %d: '%s'\n", server_fd, storeUrl(fwdState->entry));
++        debug(17, 3) ("fwdConnectDone: FD %d: '%s'\n", server_fd, storeUrl(entry));
+ 
+         if (fs->_peer)
+             peerConnectSucceded(fs->_peer);
+@@ -449,119 +636,53 @@ fwdConnectDone(int server_fd, comm_err_t status, int xerrno, void *data)
+ 
+         if ((fs->_peer && fs->_peer->use_ssl) ||
+                 (!fs->_peer && request->protocol == PROTO_HTTPS)) {
+-            fwdInitiateSSL(fwdState);
++            initiateSSL();
+             return;
+         }
+ 
+ #endif
+-        fwdDispatch(fwdState);
++        dispatch();
+     }
+ }
+ 
+-static void
+-fwdConnectTimeout(int fd, void *data)
++void
++FwdState::connectTimeout(int fd)
+ {
+-    FwdState *fwdState = (FwdState *)data;
+-    StoreEntry *entry = fwdState->entry;
+-    ErrorState *err;
+     debug(17, 2) ("fwdConnectTimeout: FD %d: '%s'\n", fd, storeUrl(entry));
+-    assert(fd == fwdState->server_fd);
++    assert(fd == server_fd);
+ 
+     if (entry->isEmpty()) {
+-        err = errorCon(ERR_CONNECT_FAIL, HTTP_GATEWAY_TIMEOUT);
+-        err->xerrno = ETIMEDOUT;
+-        fwdFail(fwdState, err);
++        ErrorState *anErr = errorCon(ERR_CONNECT_FAIL, HTTP_GATEWAY_TIMEOUT);
++        anErr->xerrno = ETIMEDOUT;
++        fail(anErr);
+         /*
+          * This marks the peer DOWN ... 
+          */
+ 
+-        if (fwdState->servers)
+-            if (fwdState->servers->_peer)
+-                peerConnectFailed(fwdState->servers->_peer);
++        if (servers)
++            if (servers->_peer)
++                peerConnectFailed(servers->_peer);
+     }
+ 
+     comm_close(fd);
+ }
+ 
+-static struct IN_ADDR
+-            aclMapAddr(acl_address * head, ACLChecklist * ch)
+-{
+-    acl_address *l;
+-
+-    struct IN_ADDR addr;
+-
+-    for (l = head; l; l = l->next)
+-    {
+-        if (ch->matchAclListFast(l->aclList))
+-            return l->addr;
+-    }
+-
+-    addr.s_addr = INADDR_ANY;
+-    return addr;
+-}
+-
+-static int
+-aclMapTOS(acl_tos * head, ACLChecklist * ch)
+-{
+-    acl_tos *l;
+-
+-    for (l = head; l; l = l->next) {
+-        if (ch->matchAclListFast(l->aclList))
+-            return l->tos;
+-    }
+-
+-    return 0;
+-}
+-
+-struct IN_ADDR
+-            getOutgoingAddr(HttpRequest * request)
+-{
+-    ACLChecklist ch;
+-
+-    if (request)
+-    {
+-        ch.src_addr = request->client_addr;
+-        ch.my_addr = request->my_addr;
+-        ch.my_port = request->my_port;
+-        ch.request = requestLink(request);
+-    }
+-
+-    return aclMapAddr(Config.accessList.outgoing_address, &ch);
+-}
+-
+-unsigned long
+-getOutgoingTOS(HttpRequest * request)
+-{
+-    ACLChecklist ch;
+-
+-    if (request) {
+-        ch.src_addr = request->client_addr;
+-        ch.my_addr = request->my_addr;
+-        ch.my_port = request->my_port;
+-        ch.request = requestLink(request);
+-    }
+-
+-    return aclMapTOS(Config.accessList.outgoing_tos, &ch);
+-}
+-
+-static void
+-fwdConnectStart(void *data)
++void
++FwdState::connectStart()
+ {
+-    FwdState *fwdState = (FwdState *)data;
+-    const char *url = storeUrl(fwdState->entry);
++    const char *url = storeUrl(entry);
+     int fd = -1;
+-    ErrorState *err;
+-    FwdServer *fs = fwdState->servers;
++    FwdServer *fs = servers;
+     const char *host;
+     unsigned short port;
+     const char *domain = NULL;
+     int ctimeout;
+-    int ftimeout = Config.Timeout.forward - (squid_curtime - fwdState->start);
++    int ftimeout = Config.Timeout.forward - (squid_curtime - start_t);
+ 
+     struct IN_ADDR outgoing;
+     unsigned short tos;
+     assert(fs);
+-    assert(fwdState->server_fd == -1);
++    assert(server_fd == -1);
+     debug(17, 3) ("fwdConnectStart: %s\n", url);
+ 
+     if (fs->_peer) {
+@@ -571,10 +692,10 @@ fwdConnectStart(void *data)
+                    : Config.Timeout.peer_connect;
+ 
+         if (fs->_peer->options.originserver)
+-            domain = fwdState->request->host;
++            domain = request->host;
+     } else {
+-        host = fwdState->request->host;
+-        port = fwdState->request->port;
++        host = request->host;
++        port = request->port;
+         ctimeout = Config.Timeout.connect;
+     }
+ 
+@@ -585,17 +706,17 @@ fwdConnectStart(void *data)
+         ctimeout = ftimeout;
+ 
+     if ((fd = fwdPconnPool->pop(host, port, domain)) >= 0) {
+-        if (fwdCheckRetriable(fwdState)) {
++        if (checkRetriable()) {
+             debug(17, 3) ("fwdConnectStart: reusing pconn FD %d\n", fd);
+-            fwdState->server_fd = fd;
+-            fwdState->n_tries++;
++            server_fd = fd;
++            n_tries++;
+ 
+             if (!fs->_peer)
+-                fwdState->origin_tries++;
++                origin_tries++;
+ 
+-            comm_add_close_handler(fd, fwdServerClosed, fwdState);
++            comm_add_close_handler(fd, fwdServerClosedWrapper, this);
+ 
+-            fwdDispatch(fwdState);
++            dispatch();
+ 
+             return;
+         } else {
+@@ -608,13 +729,13 @@ fwdConnectStart(void *data)
+     }
+ 
+ #if URL_CHECKSUM_DEBUG
+-    fwdState->entry->mem_obj->checkUrlChecksum();
++    entry->mem_obj->checkUrlChecksum();
+ 
+ #endif
+ 
+-    outgoing = getOutgoingAddr(fwdState->request);
++    outgoing = getOutgoingAddr(request);
+ 
+-    tos = getOutgoingTOS(fwdState->request);
++    tos = getOutgoingTOS(request);
+ 
+     debug(17, 3) ("fwdConnectStart: got addr %s, tos %d\n",
+                   inet_ntoa(outgoing), tos);
+@@ -629,18 +750,18 @@ fwdConnectStart(void *data)
+ 
+     if (fd < 0) {
+         debug(50, 4) ("fwdConnectStart: %s\n", xstrerror());
+-        err = errorCon(ERR_SOCKET_FAILURE, HTTP_INTERNAL_SERVER_ERROR);
+-        err->xerrno = errno;
+-        fwdFail(fwdState, err);
+-        fwdStateFree(fwdState);
++        ErrorState *anErr = errorCon(ERR_SOCKET_FAILURE, HTTP_INTERNAL_SERVER_ERROR);
++        anErr->xerrno = errno;
++        fail(anErr);
++        self = NULL;	// refcounted
+         return;
+     }
+ 
+-    fwdState->server_fd = fd;
+-    fwdState->n_tries++;
++    server_fd = fd;
++    n_tries++;
+ 
+     if (!fs->_peer)
+-        fwdState->origin_tries++;
++        origin_tries++;
+ 
+     /*
+      * stats.conn_open is used to account for the number of
+@@ -654,52 +775,43 @@ fwdConnectStart(void *data)
+         comm_add_close_handler(fd, fwdPeerClosed, fs->_peer);
+     }
+ 
+-    comm_add_close_handler(fd, fwdServerClosed, fwdState);
++    comm_add_close_handler(fd, fwdServerClosedWrapper, this);
+ 
+-    commSetTimeout(fd,
+-                   ctimeout,
+-                   fwdConnectTimeout,
+-                   fwdState);
++    commSetTimeout(fd, ctimeout, fwdConnectTimeoutWrapper, this);
+ 
+-    commConnectStart(fd, host, port, fwdConnectDone, fwdState);
++    commConnectStart(fd, host, port, fwdConnectDoneWrapper, this);
+ }
+ 
+-static void
+-fwdStartComplete(FwdServer * servers, void *data)
++void
++FwdState::startComplete(FwdServer * theServers)
+ {
+-    FwdState *fwdState = (FwdState *)data;
+-    debug(17, 3) ("fwdStartComplete: %s\n", storeUrl(fwdState->entry));
++    debug(17, 3) ("fwdStartComplete: %s\n", storeUrl(entry));
+ 
+-    if (servers != NULL) {
+-        fwdState->servers = servers;
+-        fwdConnectStart(fwdState);
++    if (theServers != NULL) {
++        servers = theServers;
++        connectStart();
+     } else {
+-        fwdStartFail(fwdState);
++        startFail();
+     }
+ }
+ 
+-static void
+-fwdStartFail(FwdState * fwdState)
++void
++FwdState::startFail()
+ {
+-    ErrorState *err;
+-    debug(17, 3) ("fwdStartFail: %s\n", storeUrl(fwdState->entry));
+-    err = errorCon(ERR_CANNOT_FORWARD, HTTP_SERVICE_UNAVAILABLE);
+-    err->xerrno = errno;
+-    fwdFail(fwdState, err);
+-    fwdStateFree(fwdState);
++    debug(17, 3) ("fwdStartFail: %s\n", storeUrl(entry));
++    ErrorState *anErr = errorCon(ERR_CANNOT_FORWARD, HTTP_SERVICE_UNAVAILABLE);
++    anErr->xerrno = errno;
++    fail(anErr);
++    self = NULL;	// refcounted
+ }
+ 
+-static void
+-fwdDispatch(FwdState * fwdState)
++void
++FwdState::dispatch()
+ {
+     peer *p = NULL;
+-    HttpRequest *request = fwdState->request;
+-    StoreEntry *entry = fwdState->entry;
+-    ErrorState *err;
+-    FwdServer *fs = fwdState->servers;
+-    int server_fd = fwdState->server_fd;
++    FwdServer *fs = servers;
+     debug(17, 3) ("fwdDispatch: FD %d: Fetching '%s %s'\n",
+-                  fwdState->client_fd,
++                  client_fd,
+                   RequestMethodStr[request->method],
+                   storeUrl(entry));
+     /*
+@@ -710,13 +822,13 @@ fwdDispatch(FwdState * fwdState)
+     assert(server_fd > -1);
+ 
+     if (fs->_peer)
+-        hierarchyNote(&fwdState->request->hier, fs->code, fs->_peer->host);
++        hierarchyNote(&request->hier, fs->code, fs->_peer->host);
+     else if (Config.onoff.log_ip_on_direct)
+-        hierarchyNote(&fwdState->request->hier, fs->code, fd_table[server_fd].ipaddr);
++        hierarchyNote(&request->hier, fs->code, fd_table[server_fd].ipaddr);
+     else
+-        hierarchyNote(&fwdState->request->hier, fs->code, request->host);
++        hierarchyNote(&request->hier, fs->code, request->host);
+ 
+-    fd_note(server_fd, storeUrl(fwdState->entry));
++    fd_note(server_fd, storeUrl(entry));
+ 
+     fd_table[server_fd].noteUse(fwdPconnPool);
+ 
+@@ -729,37 +841,37 @@ fwdDispatch(FwdState * fwdState)
+ 
+     netdbPingSite(request->host);
+ 
+-    if (fwdState->servers && (p = fwdState->servers->_peer)) {
++    if (servers && (p = servers->_peer)) {
+         p->stats.fetches++;
+-        fwdState->request->peer_login = p->login;
+-        fwdState->request->peer_domain = p->domain;
+-        httpStart(fwdState);
++        request->peer_login = p->login;
++        request->peer_domain = p->domain;
++        httpStart(this);
+     } else {
+-        fwdState->request->peer_login = NULL;
+-        fwdState->request->peer_domain = NULL;
++        request->peer_login = NULL;
++        request->peer_domain = NULL;
+ 
+         switch (request->protocol) {
+ #if USE_SSL
+ 
+         case PROTO_HTTPS:
+-            httpStart(fwdState);
++            httpStart(this);
+             break;
+ #endif
+ 
+         case PROTO_HTTP:
+-            httpStart(fwdState);
++            httpStart(this);
+             break;
+ 
+         case PROTO_GOPHER:
+-            gopherStart(fwdState);
++            gopherStart(this);
+             break;
+ 
+         case PROTO_FTP:
+-            ftpStart(fwdState);
++            ftpStart(this);
+             break;
+ 
+         case PROTO_WAIS:
+-            waisStart(fwdState);
++            waisStart(this);
+             break;
+ 
+         case PROTO_CACHEOBJ:
+@@ -771,14 +883,14 @@ fwdDispatch(FwdState * fwdState)
+             break;
+ 
+         case PROTO_WHOIS:
+-            whoisStart(fwdState);
++            whoisStart(this);
+             break;
+ 
+         default:
+             debug(17, 1) ("fwdDispatch: Cannot retrieve '%s'\n",
+                           storeUrl(entry));
+-            err = errorCon(ERR_UNSUP_REQ, HTTP_BAD_REQUEST);
+-            fwdFail(fwdState, err);
++            ErrorState *anErr = errorCon(ERR_UNSUP_REQ, HTTP_BAD_REQUEST);
++            fail(anErr);
+             /*
+              * Force a persistent connection to be closed because
+              * some Netscape browsers have a bug that sends CONNECT
+@@ -789,18 +901,24 @@ fwdDispatch(FwdState * fwdState)
+              * Set the dont_retry flag becuase this is not a
+              * transient (network) error; its a bug.
+              */
+-            fwdState->flags.dont_retry = 1;
+-            comm_close(fwdState->server_fd);
++            flags.dont_retry = 1;
++            comm_close(server_fd);
+             break;
+         }
+     }
++
++    /*
++     * remove our self-refcount now that we've handed off the request
++     * to a server-side module
++     */
++    self = NULL;
+ }
+ 
+-static int
+-fwdReforward(FwdState * fwdState)
++int
++FwdState::reforward()
+ {
+-    StoreEntry *e = fwdState->entry;
+-    FwdServer *fs = fwdState->servers;
++    StoreEntry *e = entry;
++    FwdServer *fs = servers;
+     http_status s;
+     assert(e->store_status == STORE_PENDING);
+     assert(e->mem_obj);
+@@ -816,245 +934,101 @@ fwdReforward(FwdState * fwdState)
+         return 0;
+     }
+ 
+-    if (fwdState->n_tries > 9)
++    if (n_tries > 9)
+         return 0;
+ 
+-    if (fwdState->origin_tries > 1)
++    if (origin_tries > 1)
+         return 0;
+ 
+-    if (fwdState->request->flags.body_sent)
++    if (request->flags.body_sent)
+         return 0;
+ 
+     assert(fs);
+ 
+-    fwdState->servers = fs->next;
++    servers = fs->next;
+ 
+     fwdServerFree(fs);
+ 
+-    if (fwdState->servers == NULL) {
++    if (servers == NULL) {
+         debug(17, 3) ("fwdReforward: No forward-servers left\n");
+         return 0;
+     }
+ 
+     s = e->getReply()->sline.status;
+     debug(17, 3) ("fwdReforward: status %d\n", (int) s);
+-    return fwdReforwardableStatus(s);
++    return reforwardableStatus(s);
+ }
+ 
+-/* PUBLIC FUNCTIONS */
+-
+-void
+-fwdServersFree(FwdServer ** FSVR)
++static void
++fwdStats(StoreEntry * s)
+ {
+-    FwdServer *fs;
++    int i;
++    int j;
++    storeAppendPrintf(s, "Status");
+ 
+-    while ((fs = *FSVR)) {
+-        *FSVR = fs->next;
+-        fwdServerFree(fs);
++    for (j = 0; j <= MAX_FWD_STATS_IDX; j++) {
++        storeAppendPrintf(s, "\ttry#%d", j + 1);
+     }
+-}
+ 
+-void
+-fwdStart(int fd, StoreEntry * e, HttpRequest * r)
+-{
+-    FwdState *fwdState;
+-    int answer;
+-    ErrorState *err;
+-    /*
+-     * client_addr == no_addr indicates this is an "internal" request
+-     * from peer_digest.c, asn.c, netdb.c, etc and should always
+-     * be allowed.  yuck, I know.
+-     */
+-
+-    if (r->client_addr.s_addr != no_addr.s_addr && r->protocol != PROTO_INTERNAL && r->protocol != PROTO_CACHEOBJ) {
+-        /*
+-         * Check if this host is allowed to fetch MISSES from us (miss_access)
+-         */
+-        ACLChecklist ch;
+-        ch.src_addr = r->client_addr;
+-        ch.my_addr = r->my_addr;
+-        ch.my_port = r->my_port;
+-        ch.request = requestLink(r);
+-        ch.accessList = cbdataReference(Config.accessList.miss);
+-        /* cbdataReferenceDone() happens in either fastCheck() or ~ACLCheckList */
+-        answer = ch.fastCheck();
+-
+-        if (answer == 0) {
+-            err_type page_id;
+-            page_id = aclGetDenyInfoPage(&Config.denyInfoList, AclMatchedName);
+-
+-            if (page_id == ERR_NONE)
+-                page_id = ERR_FORWARDING_DENIED;
+-
+-            err = errorCon(page_id, HTTP_FORBIDDEN);
+-
+-            err->request = requestLink(r);
++    storeAppendPrintf(s, "\n");
+ 
+-            err->src_addr = r->client_addr;
++    for (i = 0; i <= (int) HTTP_INVALID_HEADER; i++) {
++        if (FwdReplyCodes[0][i] == 0)
++            continue;
+ 
+-            errorAppendEntry(e, err);
++        storeAppendPrintf(s, "%3d", i);
+ 
+-            return;
++        for (j = 0; j <= MAX_FWD_STATS_IDX; j++) {
++            storeAppendPrintf(s, "\t%d", FwdReplyCodes[j][i]);
+         }
+-    }
+ 
+-    debug(17, 3) ("fwdStart: '%s'\n", storeUrl(e));
+-    e->mem_obj->request = requestLink(r);
+-#if URL_CHECKSUM_DEBUG
+-
+-    e->mem_obj->checkUrlChecksum();
+-#endif
+-
+-    if (shutting_down) {
+-        /* more yuck */
+-        err = errorCon(ERR_SHUTTING_DOWN, HTTP_SERVICE_UNAVAILABLE);
+-        err->request = requestLink(r);
+-        errorAppendEntry(e, err);
+-        return;
+-    }
+-
+-    switch (r->protocol) {
+-        /*
+-         * Note, don't create fwdState for these requests
+-         */
+-
+-    case PROTO_INTERNAL:
+-        internalStart(r, e);
+-        return;
+-
+-    case PROTO_CACHEOBJ:
+-        cachemgrStart(fd, r, e);
+-        return;
+-
+-    case PROTO_URN:
+-        urnStart(r, e);
+-        return;
+-
+-    default:
+-        break;
++        storeAppendPrintf(s, "\n");
+     }
+-
+-    fwdState = cbdataAlloc(FwdState);
+-    fwdState->entry = e;
+-    fwdState->client_fd = fd;
+-    fwdState->server_fd = -1;
+-    fwdState->request = requestLink(r);
+-    fwdState->start = squid_curtime;
+-    storeLockObject(e);
+-    EBIT_SET(e->flags, ENTRY_FWD_HDR_WAIT);
+-    storeRegisterAbort(e, fwdAbort, fwdState);
+-    peerSelect(r, e, fwdStartComplete, fwdState);
+-}
+-
+-void
+-fwdFail(FwdState * fwdState, ErrorState * errorState)
+-{
+-    debug(17, 3) ("fwdFail: %s \"%s\"\n\t%s\n",
+-                  err_type_str[errorState->type],
+-                  httpStatusString(errorState->httpStatus),
+-                  storeUrl(fwdState->entry));
+-
+-    if (fwdState->err)
+-        errorStateFree(fwdState->err);
+-
+-    fwdState->err = errorState;
+-
+-    if (!errorState->request)
+-        errorState->request = requestLink(fwdState->request);
+-}
+-
+-/*
+- * Called when someone else calls StoreAbort() on this entry
+- */
+-static void
+-fwdAbort(void *data)
+-{
+-    FwdState *fwdState = (FwdState *)data;
+-    debug(17, 2) ("fwdAbort: %s\n", storeUrl(fwdState->entry));
+-    fwdStateFree(fwdState);
+ }
+ 
+-/*
+- * Accounts for closed persistent connections
+- */
+-static void
+-fwdPeerClosed(int fd, void *data)
+-{
+-    peer *p = (peer *)data;
+-    p->stats.conn_open--;
+-}
+ 
+-/*
+- * Frees fwdState without closing FD or generating an abort
+- */
+-void
+-fwdUnregister(int fd, FwdState * fwdState)
+-{
+-    debug(17, 3) ("fwdUnregister: %s\n", storeUrl(fwdState->entry));
+-    assert(fd == fwdState->server_fd);
+-    assert(fd > -1);
+-    comm_remove_close_handler(fd, fwdServerClosed, fwdState);
+-    fwdState->server_fd = -1;
+-}
++/**** STATIC MEMBER FUNCTIONS *************************************************/
+ 
+-/*
+- * server-side modules call fwdComplete() when they are done
+- * downloading an object.  Then, we either 1) re-forward the
+- * request somewhere else if needed, or 2) call storeComplete()
+- * to finish it off
+- */
+-void
+-fwdComplete(FwdState * fwdState)
++bool
++FwdState::reforwardableStatus(http_status s)
+ {
+-    StoreEntry *e = fwdState->entry;
+-    assert(e->store_status == STORE_PENDING);
+-    debug(17, 3) ("fwdComplete: %s\n\tstatus %d\n", storeUrl(e),
+-                  e->getReply()->sline.status);
+-#if URL_CHECKSUM_DEBUG
++    switch (s) {
+ 
+-    e->mem_obj->checkUrlChecksum();
+-#endif
++    case HTTP_BAD_GATEWAY:
+ 
+-    fwdLogReplyStatus(fwdState->n_tries, e->getReply()->sline.status);
++    case HTTP_GATEWAY_TIMEOUT:
++        return true;
+ 
+-    if (fwdReforward(fwdState)) {
+-        debug(17, 3) ("fwdComplete: re-forwarding %d %s\n",
+-                      e->getReply()->sline.status,
+-                      storeUrl(e));
++    case HTTP_FORBIDDEN:
+ 
+-        if (fwdState->server_fd > -1)
+-            fwdUnregister(fwdState->server_fd, fwdState);
++    case HTTP_INTERNAL_SERVER_ERROR:
+ 
+-        storeEntryReset(e);
++    case HTTP_NOT_IMPLEMENTED:
+ 
+-        fwdStartComplete(fwdState->servers, fwdState);
+-    } else {
+-        debug(17, 3) ("fwdComplete: not re-forwarding status %d\n",
+-                      e->getReply()->sline.status);
+-        EBIT_CLR(e->flags, ENTRY_FWD_HDR_WAIT);
+-        e->complete();
+-        /*
+-         * If fwdState isn't associated with a server FD, it
+-         * won't get freed unless we do it here.
+-         */
++    case HTTP_SERVICE_UNAVAILABLE:
++        return Config.retry.onerror;
+ 
+-        if (fwdState->server_fd < 0)
+-            fwdStateFree(fwdState);
++    default:
++        return false;
+     }
++
++    /* NOTREACHED */
+ }
+ 
+ void
+-fwdPconnPush(int fd, const char *host, int port, const char *domain)
++FwdState::pconnPush(int fd, const char *host, int port, const char *domain)
+ {
+     fwdPconnPool->push(fd, host, port, domain);
+ }
+ 
+ void
+-fwdInit(void)
++FwdState::initModule()
+ {
+     cachemgrRegister("forward",
+                      "Request Forwarding Statistics",
+                      fwdStats, 0, 1);
++    memDataInit(MEM_FWD_SERVER, "FwdServer", sizeof(FwdServer), 0);
++
+ #if WIP_FWD_LOG
+ 
+     if (logfile)
+@@ -1067,8 +1041,8 @@ fwdInit(void)
+ #endif
+ }
+ 
+-static void
+-fwdLogReplyStatus(int tries, http_status status)
++void
++FwdState::logReplyStatus(int tries, http_status status)
+ {
+     if (status > HTTP_INVALID_HEADER)
+         return;
+@@ -1083,59 +1057,90 @@ fwdLogReplyStatus(int tries, http_status status)
+     FwdReplyCodes[tries][status]++;
+ }
+ 
+-static void
+-fwdStats(StoreEntry * s)
++void
++FwdState::serversFree(FwdServer ** FSVR)
+ {
+-    int i;
+-    int j;
+-    storeAppendPrintf(s, "Status");
++    FwdServer *fs;
+ 
+-    for (j = 0; j <= MAX_FWD_STATS_IDX; j++) {
+-        storeAppendPrintf(s, "\ttry#%d", j + 1);
++    while ((fs = *FSVR)) {
++        *FSVR = fs->next;
++        fwdServerFree(fs);
+     }
++}
+ 
+-    storeAppendPrintf(s, "\n");
++/**** PRIVATE NON-MEMBER FUNCTIONS ********************************************/
+ 
+-    for (i = 0; i <= (int) HTTP_INVALID_HEADER; i++) {
+-        if (FwdReplyCodes[0][i] == 0)
+-            continue;
++static void
++fwdServerFree(FwdServer * fs)
++{
++    cbdataReferenceDone(fs->_peer);
++    memFree(fs, MEM_FWD_SERVER);
++}
+ 
+-        storeAppendPrintf(s, "%3d", i);
++static struct IN_ADDR
++            aclMapAddr(acl_address * head, ACLChecklist * ch)
++{
++    acl_address *l;
+ 
+-        for (j = 0; j <= MAX_FWD_STATS_IDX; j++) {
+-            storeAppendPrintf(s, "\t%d", FwdReplyCodes[j][i]);
+-        }
++    struct IN_ADDR addr;
+ 
+-        storeAppendPrintf(s, "\n");
++    for (l = head; l; l = l->next)
++    {
++        if (ch->matchAclListFast(l->aclList))
++            return l->addr;
+     }
++
++    addr.s_addr = INADDR_ANY;
++    return addr;
+ }
+ 
+-int
+-fwdReforwardableStatus(http_status s)
++static int
++aclMapTOS(acl_tos * head, ACLChecklist * ch)
+ {
+-    switch (s) {
++    acl_tos *l;
+ 
+-    case HTTP_BAD_GATEWAY:
++    for (l = head; l; l = l->next) {
++        if (ch->matchAclListFast(l->aclList))
++            return l->tos;
++    }
+ 
+-    case HTTP_GATEWAY_TIMEOUT:
+-        return 1;
++    return 0;
++}
+ 
+-    case HTTP_FORBIDDEN:
++struct IN_ADDR
++            getOutgoingAddr(HttpRequest * request)
++{
++    ACLChecklist ch;
+ 
+-    case HTTP_INTERNAL_SERVER_ERROR:
++    if (request)
++    {
++        ch.src_addr = request->client_addr;
++        ch.my_addr = request->my_addr;
++        ch.my_port = request->my_port;
++        ch.request = requestLink(request);
++    }
+ 
+-    case HTTP_NOT_IMPLEMENTED:
++    return aclMapAddr(Config.accessList.outgoing_address, &ch);
++}
+ 
+-    case HTTP_SERVICE_UNAVAILABLE:
+-        return Config.retry.onerror;
++unsigned long
++getOutgoingTOS(HttpRequest * request)
++{
++    ACLChecklist ch;
+ 
+-    default:
+-        return 0;
++    if (request) {
++        ch.src_addr = request->client_addr;
++        ch.my_addr = request->my_addr;
++        ch.my_port = request->my_port;
++        ch.request = requestLink(request);
+     }
+ 
+-    /* NOTREACHED */
++    return aclMapTOS(Config.accessList.outgoing_tos, &ch);
+ }
+ 
++
++/**** WIP_FWD_LOG *************************************************************/
++
+ #if WIP_FWD_LOG
+ void
+ fwdUninit(void)
+@@ -1156,23 +1161,23 @@ fwdLogRotate(void)
+ }
+ 
+ static void
+-fwdLog(FwdState * fwdState)
++FwdState::log()
+ {
+     if (NULL == logfile)
+         return;
+ 
+     logfilePrintf(logfile, "%9d.%03d %03d %s %s\n",
+                   (int) current_time.tv_sec,
+                   (int) current_time.tv_usec / 1000,
+-                  fwdState->last_status,
+-                  RequestMethodStr[fwdState->request->method],
+-                  fwdState->request->canonical);
++                  last_status,
++                  RequestMethodStr[request->method],
++                  request->canonical);
+ }
+ 
+ void
+-fwdStatus(FwdState * fwdState, http_status s)
++FwdState::status(http_status s)
+ {
+-    fwdState->last_status = s;
++    last_status = s;
+ }
+ 
+ #endif
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: ftp.cc,v 1.373 2005/11/05 00:08:32 wessels Exp $
++ * $Id: ftp.cc,v 1.374 2006/01/03 17:22:31 wessels Exp $
+  *
+  * DEBUG: section 9     File Transfer Protocol (FTP)
+  * AUTHOR: Harvest Derived
+@@ -47,6 +47,7 @@
+ #include "MemObject.h"
+ #endif
+ #include "ConnectionDetail.h"
++#include "forward.h"
+ 
+ static const char *const crlf = "\r\n";
+ static char cbuf[1024];
+@@ -193,7 +194,7 @@ class FtpStateData
+     data;
+ 
+     struct _ftp_flags flags;
+-    FwdState *fwd;
++    FwdState::Pointer fwd;
+ 
+ private:
+     CBDATA_CLASS(FtpStateData);
+@@ -421,6 +422,8 @@ FtpStateData::~FtpStateData()
+     safe_free(ftpState->filepath);
+ 
+     safe_free(ftpState->data.host);
++
++    fwd = NULL;	// refcounted
+ }
+ 
+ static void
+@@ -460,8 +463,8 @@ ftpTimeout(int fd, void *data)
+ 
+     if (SENT_PASV == ftpState->state && fd == ftpState->data.fd) {
+         /* stupid ftp.netscape.com */
+-        ftpState->fwd->flags.dont_retry = 0;
+-        ftpState->fwd->flags.ftp_pasv_failed = 1;
++        ftpState->fwd->dontRetry(false);
++        ftpState->fwd->ftpPasvFailed(true);
+         debug(9, 1) ("ftpTimeout: timeout in SENT_PASV state\n");
+     }
+ 
+@@ -1231,9 +1234,9 @@ ftpDataRead(int fd, char *buf, size_t len, comm_err_t errflag, int xerrno, void
+ 
+             comm_read(fd, ftpState->data.buf + ftpState->data.offset, read_sz, ftpDataRead, data);
+         } else {
+-            if (!ftpState->flags.http_header_sent && !ftpState->fwd->flags.ftp_pasv_failed && ftpState->flags.pasv_supported) {
+-                ftpState->fwd->flags.dont_retry = 0;	/* this is a retryable error */
+-                ftpState->fwd->flags.ftp_pasv_failed = 1;
++            if (!ftpState->flags.http_header_sent && !ftpState->fwd->ftpPasvFailed() && ftpState->flags.pasv_supported) {
++                ftpState->fwd->dontRetry(false);	/* this is a retryable error */
++                ftpState->fwd->ftpPasvFailed(true);
+             }
+ 
+             ftpFailed(ftpState, ERR_READ_ERROR, 0);
+@@ -1408,7 +1411,7 @@ ftpStart(FwdState * fwd)
+     ftpState->size = -1;
+     ftpState->mdtm = -1;
+ 
+-    if (Config.Ftp.passive && !fwd->flags.ftp_pasv_failed)
++    if (Config.Ftp.passive && !fwd->ftpPasvFailed())
+         ftpState->flags.pasv_supported = 1;
+ 
+     ftpState->flags.rest_supported = 1;
+@@ -1440,7 +1443,7 @@ ftpStart(FwdState * fwd)
+ 
+         reply->swapOut(entry);
+ 
+-        fwdComplete(ftpState->fwd);
++        ftpState->fwd->complete();
+ 
+         comm_close(fd);
+ 
+@@ -1770,7 +1773,7 @@ ftpReadWelcome(FtpStateData * ftpState)
+         ftpState->login_att++;
+ 
+     /* Dont retry if the FTP server accepted the connection */
+-    ftpState->fwd->flags.dont_retry = 1;
++    ftpState->fwd->dontRetry(true);
+ 
+     if (code == 220) {
+         if (ftpState->ctrl.message) {
+@@ -2148,7 +2151,7 @@ ftpSendPasv(FtpStateData * ftpState)
+          */
+ 
+         if (!EBIT_TEST(ftpState->entry->flags, ENTRY_ABORTED))
+-            fwdComplete(ftpState->fwd);
++            ftpState->fwd->complete();
+ 
+         ftpSendQuit(ftpState);
+ 
+@@ -2298,8 +2301,8 @@ ftpPasvCallback(int fd, comm_err_t status, int xerrno, void *data)
+ 
+     if (status != COMM_OK) {
+         debug(9, 2) ("ftpPasvCallback: failed to connect. Retrying without PASV.\n");
+-        ftpState->fwd->flags.dont_retry = 0;	/* this is a retryable error */
+-        ftpState->fwd->flags.ftp_pasv_failed = 1;
++        ftpState->fwd->dontRetry(false);	/* this is a retryable error */
++        ftpState->fwd->ftpPasvFailed(true);
+         ftpFailed(ftpState, ERR_NONE, 0);
+         /* ftpFailed closes ctrl.fd and frees ftpState */
+         return;
+@@ -2731,9 +2734,9 @@ ftpReadTransferDone(FtpStateData * ftpState)
+         if (ftpState->flags.html_header_sent)
+             ftpListingFinish(ftpState);
+ 
+-        fwdUnregister(ftpState->ctrl.fd, ftpState->fwd);
++        ftpState->fwd->unregister(ftpState->ctrl.fd);
+ 
+-        fwdComplete(ftpState->fwd);
++        ftpState->fwd->complete();
+ 
+         ftpSendQuit(ftpState);
+     } else {			/* != 226 */
+@@ -3005,7 +3008,7 @@ ftpFailedErrorMessage(FtpStateData * ftpState, err_type error, int xerrno)
+     if (reply)
+         err->ftp.reply = xstrdup(reply);
+ 
+-    fwdFail(ftpState->fwd, err);
++    ftpState->fwd->fail(err);
+ }
+ 
+ static void
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: gopher.cc,v 1.191 2005/09/17 05:50:08 wessels Exp $
++ * $Id: gopher.cc,v 1.192 2006/01/03 17:22:31 wessels Exp $
+  *
+  * DEBUG: section 10    Gopher
+  * AUTHOR: Harvest Derived
+@@ -42,6 +42,7 @@
+ #include "MemObject.h"
+ #endif
+ #include "MemBuf.h"
++#include "forward.h"
+ 
+ /* gopher type code from rfc. Anawat. */
+ #define GOPHER_FILE         '0'
+@@ -94,7 +95,7 @@ typedef struct gopher_ds
+     char *buf;			/* pts to a 4k page */
+     int fd;
+     HttpRequest *req;
+-    FwdState *fwdState;
++    FwdState::Pointer fwd;
+     char replybuf[BUFSIZ];
+ }
+ 
+@@ -132,6 +133,8 @@ gopherStateFree(int fdnotused, void *data)
+         requestUnlink(gopherState->req);
+     }
+ 
++    gopherState->fwd = NULL;	// refcounted
++
+     memFree(gopherState->buf, MEM_4K_BUF);
+     gopherState->buf = NULL;
+     cbdataFree(gopherState);
+@@ -707,8 +710,7 @@ gopherTimeout(int fd, void *data)
+     StoreEntry *entry = gopherState->entry;
+     debug(10, 4) ("gopherTimeout: FD %d: '%s'\n", fd, storeUrl(entry));
+ 
+-    fwdFail(gopherState->fwdState,
+-            errorCon(ERR_READ_TIMEOUT, HTTP_GATEWAY_TIMEOUT));
++    gopherState->fwd->fail(errorCon(ERR_READ_TIMEOUT, HTTP_GATEWAY_TIMEOUT));
+ 
+     comm_close(fd);
+ }
+@@ -780,12 +782,12 @@ gopherReadReply(int fd, char *buf, size_t len, comm_err_t flag, int xerrno, void
+             ErrorState *err;
+             err = errorCon(ERR_READ_ERROR, HTTP_INTERNAL_SERVER_ERROR);
+             err->xerrno = errno;
+-            fwdFail(gopherState->fwdState, err);
++            gopherState->fwd->fail(err);
+             comm_close(fd);
+             do_next_read = 0;
+         }
+     } else if (len == 0 && entry->isEmpty()) {
+-        fwdFail(gopherState->fwdState, errorCon(ERR_ZERO_SIZE_OBJECT, HTTP_SERVICE_UNAVAILABLE));
++        gopherState->fwd->fail(errorCon(ERR_ZERO_SIZE_OBJECT, HTTP_SERVICE_UNAVAILABLE));
+         comm_close(fd);
+         do_next_read = 0;
+     } else if (len == 0) {
+@@ -799,7 +801,7 @@ gopherReadReply(int fd, char *buf, size_t len, comm_err_t flag, int xerrno, void
+ 
+         storeBufferFlush(entry);
+ 
+-        fwdComplete(gopherState->fwdState);
++        gopherState->fwd->complete();
+ 
+         comm_close(fd);
+ 
+@@ -843,7 +845,7 @@ gopherSendComplete(int fd, char *buf, size_t size, comm_err_t errflag, int xerrn
+         err->host = xstrdup(gopherState->req->host);
+         err->port = gopherState->req->port;
+         err->url = xstrdup(storeUrl(entry));
+-        fwdFail(gopherState->fwdState, err);
++        gopherState->fwd->fail(err);
+         comm_close(fd);
+ 
+         if (buf)
+@@ -934,22 +936,22 @@ gopherSendRequest(int fd, void *data)
+ CBDATA_TYPE(GopherStateData);
+ 
+ void
+-gopherStart(FwdState * fwdState)
++gopherStart(FwdState * fwd)
+ {
+-    int fd = fwdState->server_fd;
+-    StoreEntry *entry = fwdState->entry;
++    int fd = fwd->server_fd;
++    StoreEntry *entry = fwd->entry;
+     GopherStateData *gopherState;
+     CBDATA_INIT_TYPE(GopherStateData);
+     gopherState = cbdataAlloc(GopherStateData);
+     gopherState->buf = (char *)memAllocate(MEM_4K_BUF);
+     storeLockObject(entry);
+     gopherState->entry = entry;
+-    gopherState->fwdState = fwdState;
++    gopherState->fwd = fwd;
+     debug(10, 3) ("gopherStart: %s\n", storeUrl(entry));
+     statCounter.server.all.requests++;
+     statCounter.server.other.requests++;
+     /* Parse url. */
+-    gopher_request_parse(fwdState->request,
++    gopher_request_parse(fwd->request,
+                          &gopherState->type_id, gopherState->request);
+     comm_add_close_handler(fd, gopherStateFree, gopherState);
+ 
+@@ -970,13 +972,13 @@ gopherStart(FwdState * fwdState)
+         }
+ 
+         gopherToHTML(gopherState, (char *) NULL, 0);
+-        fwdComplete(fwdState);
++        fwd->complete();
+         comm_close(fd);
+         return;
+     }
+ 
+     gopherState->fd = fd;
+-    gopherState->fwdState = fwdState;
++    gopherState->fwd = fwd;
+     gopherSendRequest(fd, gopherState);
+     commSetTimeout(fd, Config.Timeout.read, gopherTimeout, gopherState);
+ }
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: http.cc,v 1.474 2005/12/28 21:43:13 wessels Exp $
++ * $Id: http.cc,v 1.475 2006/01/03 17:22:31 wessels Exp $
+  *
+  * DEBUG: section 11    Hypertext Transfer Protocol (HTTP)
+  * AUTHOR: Harvest Derived
+@@ -110,6 +110,8 @@ HttpStateData::~HttpStateData()
+ 
+     orig_request = NULL;
+ 
++    fwd = NULL;	// refcounted
++
+     if (reply)
+         delete reply;
+ 
+@@ -153,8 +155,7 @@ httpTimeout(int fd, void *data)
+     debug(11, 4) ("httpTimeout: FD %d: '%s'\n", fd, storeUrl(entry));
+ 
+     if (entry->store_status == STORE_PENDING) {
+-        fwdFail(httpState->fwd,
+-                errorCon(ERR_READ_TIMEOUT, HTTP_GATEWAY_TIMEOUT));
++        httpState->fwd->fail(errorCon(ERR_READ_TIMEOUT, HTTP_GATEWAY_TIMEOUT));
+     }
+ 
+     comm_close(fd);
+@@ -827,7 +828,7 @@ HttpStateData::haveParsedReplyHeaders()
+      * If its not a reply that we will re-forward, then
+      * allow the client to get it.
+      */
+-    if (!fwdReforwardableStatus(getReply()->sline.status))
++    if (!fwd->reforwardableStatus(getReply()->sline.status))
+         EBIT_CLR(entry->flags, ENTRY_FWD_HDR_WAIT);
+ 
+     switch (cacheableReply()) {
+@@ -1048,12 +1049,12 @@ HttpStateData::readReply (size_t len, comm_err_t flag, int xerrno)
+             ErrorState *err;
+             err = errorCon(ERR_READ_ERROR, HTTP_BAD_GATEWAY);
+             err->xerrno = errno;
+-            fwdFail(fwd, err);
++            fwd->fail(err);
+             flags.do_next_read = 0;
+             comm_close(fd);
+         }
+     } else if (flag == COMM_OK && len == 0 && !flags.headers_parsed) {
+-        fwdFail(fwd, errorCon(ERR_ZERO_SIZE_OBJECT, HTTP_BAD_GATEWAY));
++        fwd->fail(errorCon(ERR_ZERO_SIZE_OBJECT, HTTP_BAD_GATEWAY));
+         eof = 1;
+         flags.do_next_read = 0;
+         comm_close(fd);
+@@ -1070,13 +1071,13 @@ HttpStateData::readReply (size_t len, comm_err_t flag, int xerrno)
+              */
+             processReplyHeader();
+         else if (getReply()->sline.status == HTTP_INVALID_HEADER && HttpVersion(0,9) != getReply()->sline.version) {
+-            fwdFail(fwd, errorCon(ERR_INVALID_RESP, HTTP_BAD_GATEWAY));
++            fwd->fail(errorCon(ERR_INVALID_RESP, HTTP_BAD_GATEWAY));
+             flags.do_next_read = 0;
+         } else {
+             if (entry->mem_obj->getReply()->sline.status == HTTP_HEADER_TOO_LARGE) {
+                 storeEntryReset(entry);
+-                fwdFail(fwd, errorCon(ERR_TOO_BIG, HTTP_BAD_GATEWAY));
+-                fwd->flags.dont_retry = 1;
++                fwd->fail( errorCon(ERR_TOO_BIG, HTTP_BAD_GATEWAY));
++                fwd->dontRetry(true);
+                 flags.do_next_read = 0;
+                 comm_close(fd);
+             } else {
+@@ -1093,7 +1094,7 @@ HttpStateData::readReply (size_t len, comm_err_t flag, int xerrno)
+ 
+                 if (s == HTTP_INVALID_HEADER && httpver != HttpVersion(0,9)) {
+                     storeEntryReset(entry);
+-                    fwdFail(fwd, errorCon(ERR_INVALID_RESP, HTTP_BAD_GATEWAY));
++                    fwd->fail( errorCon(ERR_INVALID_RESP, HTTP_BAD_GATEWAY));
+                     comm_close(fd);
+                     return;
+                 }
+@@ -1191,15 +1192,15 @@ HttpStateData::processReplyBody()
+             flags.do_next_read = 0;
+ 
+             comm_remove_close_handler(fd, httpStateFree, this);
+-            fwdUnregister(fd, fwd);
++            fwd->unregister(fd);
+ 
+             if (_peer) {
+                 if (_peer->options.originserver)
+-                    fwdPconnPush(fd, _peer->name, orig_request->port, orig_request->host);
++                    fwd->pconnPush(fd, _peer->name, orig_request->port, orig_request->host);
+                 else
+-                    fwdPconnPush(fd, _peer->name, _peer->http_port, NULL);
++                    fwd->pconnPush(fd, _peer->name, _peer->http_port, NULL);
+             } else {
+-                fwdPconnPush(fd, request->host, request->port, NULL);
++                fwd->pconnPush(fd, request->host, request->port, NULL);
+             }
+ 
+             fd = -1;
+@@ -1287,7 +1288,7 @@ HttpStateData::SendComplete(int fd, char *bufnotused, size_t size, comm_err_t er
+         ErrorState *err;
+         err = errorCon(ERR_WRITE_ERROR, HTTP_BAD_GATEWAY);
+         err->xerrno = errno;
+-        fwdFail(httpState->fwd, err);
++        httpState->fwd->fail(err);
+         comm_close(fd);
+         return;
+     }
+@@ -1316,7 +1317,7 @@ void
+ HttpStateData::transactionComplete()
+ {
+     if (fd >= 0) {
+-        fwdUnregister(fd, fwd);
++        fwd->unregister(fd);
+         comm_remove_close_handler(fd, httpStateFree, this);
+         comm_close(fd);
+         fd = -1;
+@@ -1330,7 +1331,7 @@ HttpStateData::transactionComplete()
+ 
+ #endif
+ 
+-    fwdComplete(fwd);
++    fwd->complete();
+ 
+     httpStateFree(-1, this);
+ }
+@@ -1807,22 +1808,20 @@ httpSendRequest(HttpStateData * httpState)
+ }
+ 
+ void
+-httpStart(FwdState * fwd)
++httpStart(FwdState *fwd)
+ {
+-    int fd = fwd->server_fd;
+-    HttpStateData *httpState;
+     HttpRequest *proxy_req;
+     HttpRequest *orig_req = fwd->request;
+     debug(11, 3) ("httpStart: \"%s %s\"\n",
+                   RequestMethodStr[orig_req->method],
+                   storeUrl(fwd->entry));
+-    httpState = new HttpStateData;
++    HttpStateData *httpState = new HttpStateData;
+     httpState->ignoreCacheControl = false;
+     httpState->surrogateNoStore = false;
+     storeLockObject(fwd->entry);
+     httpState->fwd = fwd;
+     httpState->entry = fwd->entry;
+-    httpState->fd = fd;
++    httpState->fd = fwd->server_fd;
+     httpState->readBuf = new MemBuf;
+     httpState->readBuf->init(4096, SQUID_TCP_SO_RCVBUF);
+ 
+@@ -1876,7 +1875,7 @@ httpStart(FwdState * fwd)
+     /*
+      * register the handler to free HTTP state data when the FD closes
+      */
+-    comm_add_close_handler(fd, httpStateFree, httpState);
++    comm_add_close_handler(httpState->fd, httpStateFree, httpState);
+ 
+     statCounter.server.all.requests++;
+ 
+@@ -1969,7 +1968,7 @@ httpSendRequestEntity(int fd, char *bufnotused, size_t size, comm_err_t errflag,
+         ErrorState *err;
+         err = errorCon(ERR_WRITE_ERROR, HTTP_BAD_GATEWAY);
+         err->xerrno = errno;
+-        fwdFail(httpState->fwd, err);
++        httpState->fwd->fail(err);
+         comm_close(fd);
+         return;
+     }
+@@ -2114,7 +2113,7 @@ HttpStateData::doneAdapting()
+         debug(11,5)("\toops, entry is not Accepting!\n");
+         icap->ownerAbort();
+     } else {
+-        fwdComplete(fwd);
++        fwd->complete();
+     }
+ 
+     /*
+@@ -2146,14 +2145,14 @@ HttpStateData::abortAdapting()
+         err = errorCon(ERR_ICAP_FAILURE, HTTP_INTERNAL_SERVER_ERROR);
+         err->request = requestLink((HttpRequest *) request);
+         err->xerrno = errno;
+-        fwdFail(fwd, err);
+-        fwd->flags.dont_retry = 1;
++        fwd->fail( err);
++        fwd->dontRetry(true);
+         flags.do_next_read = 0;
+ 
+         if (fd >= 0) {
+             comm_close(fd);
+         } else {
+-            fwdComplete(fwd);
++            fwd->complete();
+             httpStateFree(-1, this);	// deletes this
+         }
+ 
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: http.h,v 1.15 2005/11/21 23:29:08 wessels Exp $
++ * $Id: http.h,v 1.16 2006/01/03 17:22:31 wessels Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -36,6 +36,7 @@
+ 
+ #include "StoreIOBuffer.h"
+ #include "comm.h"
++#include "forward.h"
+ 
+ #if ICAP_CLIENT
+ #include "ICAP/ICAPServiceRep.h"
+@@ -75,7 +76,7 @@ class HttpStateData
+     HttpRequest *orig_request;
+     int fd;
+     http_state_flags flags;
+-    FwdState *fwd;
++    FwdState::Pointer fwd;
+     char *request_body_buf;
+     off_t currentOffset;
+     size_t read_sz;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: main.cc,v 1.415 2005/12/06 23:03:34 wessels Exp $
++ * $Id: main.cc,v 1.416 2006/01/03 17:22:31 wessels Exp $
+  *
+  * DEBUG: section 1     Startup and Main Loop
+  * AUTHOR: Harvest Derived
+@@ -47,6 +47,7 @@
+ #include "DiskIO/DiskIOModule.h"
+ #include "comm.h"
+ #include "SwapDir.h"
++#include "forward.h"
+ 
+ #if USE_WIN32_SERVICE
+ 
+@@ -793,7 +794,7 @@ mainInitialize(void)
+         DelayPools::Init();
+ #endif
+ 
+-        fwdInit();
++        FwdState::initModule();
+     }
+ 
+ #if USE_WCCP
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: mem.cc,v 1.88 2005/12/12 18:28:12 wessels Exp $
++ * $Id: mem.cc,v 1.89 2006/01/03 17:22:31 wessels Exp $
+  *
+  * DEBUG: section 13    High Level Memory Pool Management
+  * AUTHOR: Harvest Derived
+@@ -385,7 +385,6 @@ Mem::Init(void)
+     memDataInit(MEM_DLINK_NODE, "dlink_node", sizeof(dlink_node), 10);
+     memDataInit(MEM_DREAD_CTRL, "dread_ctrl", sizeof(dread_ctrl), 0);
+     memDataInit(MEM_DWRITE_Q, "dwrite_q", sizeof(dwrite_q), 0);
+-    memDataInit(MEM_FWD_SERVER, "FwdServer", sizeof(FwdServer), 0);
+     memDataInit(MEM_HTTP_HDR_CC, "HttpHdrCc", sizeof(HttpHdrCc), 0);
+     memDataInit(MEM_HTTP_HDR_SC, "HttpHdrSc", sizeof(HttpHdrSc), 0);
+     memDataInit(MEM_HTTP_HDR_SCTARGET, "HttpHdrScTarget", sizeof(HttpHdrScTarget), 0);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: peer_select.cc,v 1.136 2005/03/18 15:12:36 hno Exp $
++ * $Id: peer_select.cc,v 1.137 2006/01/03 17:22:31 wessels Exp $
+  *
+  * DEBUG: section 44    Peer Selection Algorithm
+  * AUTHOR: Duane Wessels
+@@ -40,6 +40,7 @@
+ #include "HttpRequest.h"
+ #include "ACLChecklist.h"
+ #include "htcp.h"
++#include "forward.h"
+ 
+ const char *hier_strings[] =
+     {
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: protos.h,v 1.516 2005/12/26 11:35:22 serassio Exp $
++ * $Id: protos.h,v 1.517 2006/01/03 17:22:31 wessels Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -272,6 +272,7 @@ SQUIDCEXTERN void fqdncache_restart(void);
+ SQUIDCEXTERN EVH fqdncache_purgelru;
+ SQUIDCEXTERN void fqdncacheAddEntryFromHosts(char *addr, wordlist * hostnames);
+ 
++class FwdState;
+ SQUIDCEXTERN void ftpStart(FwdState *);
+ SQUIDCEXTERN char *ftpUrlWith2f(const HttpRequest *);
+ 
+@@ -590,21 +591,6 @@ SQUIDCEXTERN void peerDigestNeeded(PeerDigest * pd);
+ SQUIDCEXTERN void peerDigestNotePeerGone(PeerDigest * pd);
+ SQUIDCEXTERN void peerDigestStatsReport(const PeerDigest * pd, StoreEntry * e);
+ 
+-/* forward.c */
+-SQUIDCEXTERN void fwdStart(int, StoreEntry *, HttpRequest *);
+-SQUIDCEXTERN void fwdFail(FwdState *, ErrorState *);
+-SQUIDCEXTERN void fwdUnregister(int fd, FwdState *);
+-SQUIDCEXTERN void fwdComplete(FwdState * fwdState);
+-SQUIDCEXTERN void fwdInit(void);
+-SQUIDCEXTERN int fwdReforwardableStatus(http_status s);
+-SQUIDCEXTERN void fwdServersFree(FwdServer ** FSVR);
+-SQUIDCEXTERN void fwdPconnPush(int, const char *, int, const char *);
+-#if WIP_FWD_LOG
+-SQUIDCEXTERN void fwdUninit(void);
+-SQUIDCEXTERN void fwdLogRotate(void);
+-SQUIDCEXTERN void fwdStatus(FwdState *, http_status);
+-#endif
+-
+ SQUIDCEXTERN struct IN_ADDR getOutgoingAddr(HttpRequest * request);
+ unsigned long getOutgoingTOS(HttpRequest * request);
+ 
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: structs.h,v 1.532 2005/11/21 23:29:08 wessels Exp $
++ * $Id: structs.h,v 1.533 2006/01/03 17:22:31 wessels Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -1889,42 +1889,6 @@ struct _CacheDigest
+     int del_count;		/* number of deletions performed so far */
+ };
+ 
+-struct _FwdServer
+-{
+-    peer *_peer;		/* NULL --> origin server */
+-    hier_code code;
+-    FwdServer *next;
+-};
+-
+-struct _FwdState
+-{
+-    int client_fd;
+-    StoreEntry *entry;
+-    HttpRequest *request;
+-    FwdServer *servers;
+-    int server_fd;
+-    ErrorState *err;
+-    time_t start;
+-    int n_tries;
+-    int origin_tries;
+-#if WIP_FWD_LOG
+-
+-    http_status last_status;
+-#endif
+-
+-    struct
+-    {
+-
+-unsigned int dont_retry:
+-        1;
+-
+-unsigned int ftp_pasv_failed:
+-        1;
+-    }
+-
+-    flags;
+-};
+-
+ class helper_request;
+ 
+ struct _helper
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: tunnel.cc,v 1.156 2005/12/08 20:08:47 wessels Exp $
++ * $Id: tunnel.cc,v 1.157 2006/01/03 17:22:31 wessels Exp $
+  *
+  * DEBUG: section 26    Secure Sockets Layer Proxy
+  * AUTHOR: Duane Wessels
+@@ -44,6 +44,7 @@
+ #endif
+ #include "client_side.h"
+ #include "MemBuf.h"
++#include "forward.h"
+ 
+ class SslStateData
+ {
+@@ -155,7 +156,7 @@ sslStateFree(SslStateData * sslState)
+     assert(sslState != NULL);
+     assert(sslState->noConnections());
+     safe_free(sslState->url);
+-    fwdServersFree(&sslState->servers);
++    FwdState::serversFree(&sslState->servers);
+     sslState->host = NULL;
+     requestUnlink(sslState->request);
+     sslState->request = NULL;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: typedefs.h,v 1.177 2005/01/03 16:08:26 robertc Exp $
++ * $Id: typedefs.h,v 1.178 2006/01/03 17:22:31 wessels Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -221,10 +221,6 @@ typedef struct _CacheDigest CacheDigest;
+ 
+ typedef struct _Version Version;
+ 
+-typedef struct _FwdState FwdState;
+-
+-typedef struct _FwdServer FwdServer;
+-
+ typedef struct _helper helper;
+ 
+ typedef struct _helper_stateful statefulhelper;
+@@ -287,6 +283,8 @@ typedef void FQDNH(const char *, void *);
+ typedef void IDCB(const char *ident, void *data);
+ typedef void IPH(const ipcache_addrs *, void *);
+ typedef void IRCB(peer *, peer_t, protocol_t, void *, void *data);
++
++class FwdServer;
+ typedef void PSC(FwdServer *, void *);
+ typedef void RH(void *data, char *);
+ typedef void UH(void *data, wordlist *);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: urn.cc,v 1.92 2005/11/07 22:00:38 wessels Exp $
++ * $Id: urn.cc,v 1.93 2006/01/03 17:22:31 wessels Exp $
+  *
+  * DEBUG: section 52    URN Parsing
+  * AUTHOR: Kostas Anagnostakis
+@@ -39,6 +39,7 @@
+ #include "HttpReply.h"
+ #include "HttpRequest.h"
+ #include "MemBuf.h"
++#include "forward.h"
+ 
+ #define	URN_REQBUF_SZ	4096
+ 
+@@ -260,7 +261,7 @@ UrnState::created(StoreEntry *newEntry)
+     if (urlres_e->isNull()) {
+         urlres_e = storeCreateEntry(urlres, urlres, request_flags(), METHOD_GET);
+         sc = storeClientListAdd(urlres_e, this);
+-        fwdStart(-1, urlres_e, urlres_r);
++        FwdState::fwdStart(-1, urlres_e, urlres_r);
+     } else {
+         storeLockObject(urlres_e);
+         sc = storeClientListAdd(urlres_e, this);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: wais.cc,v 1.154 2005/09/17 05:50:08 wessels Exp $
++ * $Id: wais.cc,v 1.155 2006/01/03 17:22:31 wessels Exp $
+  *
+  * DEBUG: section 24    WAIS Relay
+  * AUTHOR: Harvest Derived
+@@ -42,6 +42,7 @@
+ #endif
+ #include "comm.h"
+ #include "MemBuf.h"
++#include "forward.h"
+ 
+ class WaisStateData
+ {
+@@ -53,7 +54,7 @@ class WaisStateData
+     const HttpHeader *request_hdr;
+     char url[MAX_URL];
+     HttpRequest *request;
+-    FwdState *fwd;
++    FwdState::Pointer fwd;
+     char buf[BUFSIZ];
+     bool dataWritten;
+ };
+@@ -76,6 +77,8 @@ waisStateFree(int fdnotused, void *data)
+ 
+     requestUnlink(waisState->request);
+ 
++    waisState->fwd = NULL;	// refcounted
++
+     cbdataFree(waisState);
+ }
+ 
+@@ -88,8 +91,7 @@ waisTimeout(int fd, void *data)
+     debug(24, 4) ("waisTimeout: FD %d: '%s'\n", fd, storeUrl(entry));
+ 
+     if (entry->store_status == STORE_PENDING) {
+-        fwdFail(waisState->fwd,
+-                errorCon(ERR_READ_TIMEOUT, HTTP_GATEWAY_TIMEOUT));
++        waisState->fwd->fail(errorCon(ERR_READ_TIMEOUT, HTTP_GATEWAY_TIMEOUT));
+     }
+ 
+     comm_close(fd);
+@@ -162,16 +164,16 @@ waisReadReply(int fd, char *buf, size_t len, comm_err_t flag, int xerrno, void *
+             ErrorState *err;
+             err = errorCon(ERR_READ_ERROR, HTTP_INTERNAL_SERVER_ERROR);
+             err->xerrno = errno;
+-            fwdFail(waisState->fwd, err);
++            waisState->fwd->fail(err);
+             comm_close(fd);
+         }
+     } else if (flag == COMM_OK && len == 0 && !waisState->dataWritten) {
+-        fwdFail(waisState->fwd, errorCon(ERR_ZERO_SIZE_OBJECT, HTTP_SERVICE_UNAVAILABLE));
++        waisState->fwd->fail(errorCon(ERR_ZERO_SIZE_OBJECT, HTTP_SERVICE_UNAVAILABLE));
+         comm_close(fd);
+     } else if (flag == COMM_OK && len == 0) {
+         /* Connection closed; retrieval done. */
+         entry->expires = squid_curtime;
+-        fwdComplete(waisState->fwd);
++        waisState->fwd->complete();
+         comm_close(fd);
+     } else {
+         waisState->dataWritten = 1;
+@@ -203,7 +205,7 @@ waisSendComplete(int fd, char *bufnotused, size_t size, comm_err_t errflag, void
+         ErrorState *err;
+         err = errorCon(ERR_WRITE_ERROR, HTTP_SERVICE_UNAVAILABLE);
+         err->xerrno = errno;
+-        fwdFail(waisState->fwd, err);
++        waisState->fwd->fail(err);
+         comm_close(fd);
+     } else {
+         /* Schedule read reply. */
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: whois.cc,v 1.31 2005/11/05 00:08:33 wessels Exp $
++ * $Id: whois.cc,v 1.32 2006/01/03 17:22:31 wessels Exp $
+  *
+  * DEBUG: section 75    WHOIS protocol
+  * AUTHOR: Duane Wessels, Kostas Anagnostakis
+@@ -39,18 +39,20 @@
+ #include "HttpRequest.h"
+ #include "comm.h"
+ #include "HttpRequest.h"
++#include "forward.h"
+ 
+ #define WHOIS_PORT 43
+ 
+ class WhoisState
+ {
+ 
+ public:
++    ~WhoisState();
+     void readReply (int fd, char *buf, size_t len, comm_err_t flag, int xerrno);
+     void setReplyToOK(StoreEntry *entry);
+     StoreEntry *entry;
+     HttpRequest *request;
+-    FwdState *fwd;
++    FwdState::Pointer fwd;
+     char buf[BUFSIZ];
+     bool dataWritten;
+ };
+@@ -63,6 +65,11 @@ static IOCB whoisReadReply;
+ 
+ CBDATA_TYPE(WhoisState);
+ 
++WhoisState::~WhoisState()
++{
++    fwd = NULL;	// refcounted
++}
++
+ static void
+ whoisWriteComplete(int fd, char *buf, size_t size, comm_err_t flag, int xerrno, void *data)
+ {
+@@ -160,7 +167,7 @@ WhoisState::readReply (int fd, char *buf, size_t len, comm_err_t flag, int xerrn
+             ErrorState *err;
+             err = errorCon(ERR_READ_ERROR, HTTP_INTERNAL_SERVER_ERROR);
+             err->xerrno = errno;
+-            fwdFail(fwd, err);
++            fwd->fail(err);
+             comm_close(fd);
+             do_next_read = 0;
+         }
+@@ -171,7 +178,7 @@ WhoisState::readReply (int fd, char *buf, size_t len, comm_err_t flag, int xerrn
+         if (!EBIT_TEST(entry->flags, RELEASE_REQUEST))
+             storeSetPublicKey(entry);
+ 
+-        fwdComplete(fwd);
++        fwd->complete();
+ 
+         debug(75, 3) ("whoisReadReply: Done: %s\n", storeUrl(entry));
+ 

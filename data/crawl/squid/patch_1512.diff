@@ -1,0 +1,2668 @@
+@@ -1,7 +1,7 @@
+ #
+ #  Makefile for the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.160 1998/08/17 23:27:15 wessels Exp $
++#  $Id: Makefile.in,v 1.161 1998/10/10 14:57:36 wessels Exp $
+ #
+ #  Uncomment and customize the following to suit your needs:
+ #
+@@ -107,6 +107,7 @@ OBJS	 	= \
+ 		ftp.o \
+ 		globals.o \
+ 		gopher.o \
++		helper.o \
+ 		@HTCP_OBJS@ \
+ 		http.o \
+ 		http-anon.o \
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: authenticate.cc,v 1.4 1998/09/14 21:58:45 wessels Exp $
++ * $Id: authenticate.cc,v 1.5 1998/10/10 14:57:36 wessels Exp $
+  *
+  * DEBUG: section 29    Authenticator
+  * AUTHOR: Duane Wessels
+@@ -41,420 +41,90 @@ typedef struct {
+     RH *handler;
+ } authenticateStateData;
+ 
+-typedef struct _authenticator {
+-    int index;
+-    helper_flags flags;
+-    int fd;
+-    char *inbuf;
+-    unsigned int size;
+-    unsigned int offset;
+-    struct timeval dispatch_time;
+-    authenticateStateData *authenticateState;
+-} authenticator_t;
+-
+-static struct {
+-    int requests;
+-    int replies;
+-    int errors;
+-    int avg_svc_time;
+-    int queue_size;
+-    int use_hist[DefaultAuthenticateChildrenMax];
+-    int rewrites[DefaultAuthenticateChildrenMax];
+-} AuthenticateStats;
+-
+-
+-struct authenticateQueueData {
+-    struct authenticateQueueData *next;
+-    authenticateStateData *authenticateState;
+-};
+-
+-static authenticator_t *GetFirstAvailable(void);
+-static PF authenticateHandleRead;
+-static authenticateStateData *Dequeue(void);
+-static void Enqueue(authenticateStateData *);
+-static void authenticateDispatch(authenticator_t *, authenticateStateData *);
++static HLPCB authenticateHandleReply;
+ static void authenticateStateFree(authenticateStateData * r);
+-
+-static authenticator_t **authenticate_child_table = NULL;
+-static int NAuthenticators = 0;
+-static int NAuthenticatorsOpen = 0;
+-static struct authenticateQueueData *authenticateQueueHead = NULL;
+-static struct authenticateQueueData **authenticateQueueTailP = &authenticateQueueHead;
++static helper *authenticators = NULL;
+ 
+ static void
+-authenticateHandleRead(int fd, void *data)
++authenticateHandleReply(void *data, char *reply)
+ {
+-    authenticator_t *authenticator = data;
+-    int len;
+-    authenticateStateData *r = authenticator->authenticateState;
++    authenticateStateData *r = data;
++    int valid;
+     char *t = NULL;
+-    int n;
+-
+-    Counter.syscalls.sock.reads++;
+-    len = read(fd,
+-	authenticator->inbuf + authenticator->offset,
+-	authenticator->size - authenticator->offset);
+-    fd_bytes(fd, len, FD_READ);
+-    debug(29, 5) ("authenticateHandleRead: %d bytes from Authenticator #%d.\n",
+-	len, authenticator->index + 1);
+-    if (len <= 0) {
+-	if (len < 0)
+-	    debug(50, 1) ("authenticateHandleRead: FD %d read: %s\n", fd, xstrerror());
+-	debug(29, authenticator->flags.closing ? 5 : 1)
+-	    ("FD %d: Connection from Authenticator #%d is closed, disabling\n",
+-	    fd, authenticator->index + 1);
+-	authenticator->flags.alive = 0;
+-	authenticator->flags.busy = 0;
+-	authenticator->flags.closing = 0;
+-	authenticator->flags.shutdown = 0;
+-	memFree(MEM_8K_BUF, authenticator->inbuf);
+-	authenticator->inbuf = NULL;
+-	comm_close(fd);
+-	if (--NAuthenticatorsOpen == 0 && !shutting_down)
+-	    fatal_dump("All authenticators have exited!");
+-	return;
+-    }
+-    if (len != 1)
+-	AuthenticateStats.rewrites[authenticator->index]++;
+-    authenticator->offset += len;
+-    authenticator->inbuf[authenticator->offset] = '\0';
+-    /* reschedule */
+-    commSetSelect(authenticator->fd,
+-	COMM_SELECT_READ,
+-	authenticateHandleRead,
+-	authenticator, 0);
+-    if ((t = strchr(authenticator->inbuf, '\n'))) {
+-	/* end of record found */
++    debug(29, 5) ("authenticateHandleReply: {%s}\n", reply);
++    if ((t = strchr(reply, ' ')))
+ 	*t = '\0';
+-	if ((t = strchr(authenticator->inbuf, ' ')))
+-	    *t = '\0';		/* terminate at space */
+-	if (r == NULL) {
+-	    /* A naughty authenticator has spoken without being spoken to */
+-	    /* B.R.Foster@massey.ac.nz, SQUID/1.1.3 */
+-	    debug(29, 0) ("authenticateHandleRead: unexpected reply: '%s'\n",
+-		authenticator->inbuf);
+-	    authenticator->offset = 0;
+-	} else {
+-	    debug(29, 5) ("authenticateHandleRead: reply: '%s'\n",
+-		authenticator->inbuf);
+-	    /* careful here.  r->data might point to something which
+-	     * has recently been freed.  If so, we require that r->handler
+-	     * be NULL */
+-	    if (r->handler) {
+-		r->handler(r->data,
+-		    t == authenticator->inbuf ? NULL : authenticator->inbuf);
+-	    }
+-	    authenticateStateFree(r);
+-	    authenticator->authenticateState = NULL;
+-	    authenticator->flags.busy = 0;
+-	    authenticator->offset = 0;
+-	    n = ++AuthenticateStats.replies;
+-	    AuthenticateStats.avg_svc_time =
+-		intAverage(AuthenticateStats.avg_svc_time,
+-		tvSubMsec(authenticator->dispatch_time, current_time),
+-		n, AUTHENTICATE_AV_FACTOR);
+-	}
+-    }
+-    while ((authenticator = GetFirstAvailable()) && (r = Dequeue()))
+-	authenticateDispatch(authenticator, r);
+-}
+-
+-static void
+-Enqueue(authenticateStateData * r)
+-{
+-    struct authenticateQueueData *new = xcalloc(1, sizeof(struct authenticateQueueData));
+-    new->authenticateState = r;
+-    *authenticateQueueTailP = new;
+-    authenticateQueueTailP = &new->next;
+-    AuthenticateStats.queue_size++;
+-}
+-
+-static authenticateStateData *
+-Dequeue(void)
+-{
+-    struct authenticateQueueData *old = NULL;
+-    authenticateStateData *r = NULL;
+-    if (authenticateQueueHead) {
+-	r = authenticateQueueHead->authenticateState;
+-	old = authenticateQueueHead;
+-	authenticateQueueHead = authenticateQueueHead->next;
+-	if (authenticateQueueHead == NULL)
+-	    authenticateQueueTailP = &authenticateQueueHead;
+-	safe_free(old);
+-	AuthenticateStats.queue_size--;
+-    }
+-    return r;
+-}
+-
+-static authenticator_t *
+-GetFirstAvailable(void)
+-{
+-    int k;
+-    authenticator_t *authenticate = NULL;
+-    for (k = 0; k < NAuthenticators; k++) {
+-	authenticate = *(authenticate_child_table + k);
+-	if (authenticate->flags.busy)
+-	    continue;
+-	if (!authenticate->flags.alive)
+-	    continue;
+-	return authenticate;
+-    }
+-    return NULL;
++    if (*reply == '\0')
++	reply = NULL;
++    valid = cbdataValid(r->data);
++    cbdataUnlock(r->data);
++    if (valid)
++	r->handler(r->data, reply);
++    authenticateStateFree(r);
+ }
+ 
+ static void
+ authenticateStateFree(authenticateStateData * r)
+ {
+-    safe_free(r);
++    cbdataFree(r);
+ }
+ 
+-
+ static void
+-authenticateDispatch(authenticator_t * authenticate, authenticateStateData * r)
++authenticateStats(StoreEntry * sentry)
+ {
+-    char *buf = NULL;
+-    int len;
+-    if (r->handler == NULL) {
+-	debug(29, 1) ("authenticateDispatch: skipping '%s' because no handler\n",
+-	    r->auth_user->user);
+-	authenticateStateFree(r);
+-	return;
+-    }
+-    authenticate->flags.busy = 1;
+-    authenticate->authenticateState = r;
+-    authenticate->dispatch_time = current_time;
+-    buf = memAllocate(MEM_8K_BUF);
+-    snprintf(buf, 8192, "%s %s\n",
+-	r->auth_user->user,
+-	r->auth_user->passwd);
+-    len = strlen(buf);
+-    comm_write(authenticate->fd,
+-	buf,
+-	len,
+-	NULL,			/* Handler */
+-	NULL,			/* Handler-data */
+-	memFree8K);
+-    debug(29, 5) ("authenticateDispatch: Request sent to Authenticator #%d, %d bytes\n",
+-	authenticate->index + 1, len);
+-    AuthenticateStats.use_hist[authenticate->index]++;
+-    AuthenticateStats.requests++;
++    storeAppendPrintf(sentry, "Authenticator Statistics:\n");
++    helperStats(sentry, authenticators);
+ }
+ 
+-
+ /**** PUBLIC FUNCTIONS ****/
+ 
+ 
+ void
+ authenticateStart(acl_proxy_auth_user * auth_user, RH * handler, void *data)
+ {
+     authenticateStateData *r = NULL;
+-    authenticator_t *authenticator = NULL;
+-    if (!auth_user)
+-	fatal_dump("authenticateStart: NULL auth_user");
+-    if (!handler)
+-	fatal_dump("authenticateStart: NULL handler");
++    char buf[8192];
++    assert(auth_user);
++    assert(handler);
+     debug(29, 5) ("authenticateStart: '%s:%s'\n", auth_user->user,
+ 	auth_user->passwd);
+     if (Config.Program.authenticate == NULL) {
+ 	handler(data, NULL);
+ 	return;
+     }
+     r = xcalloc(1, sizeof(authenticateStateData));
++    cbdataAdd(r, MEM_NONE);
+     r->handler = handler;
+     r->data = data;
+     r->auth_user = auth_user;
+-    if ((authenticator = GetFirstAvailable()))
+-	authenticateDispatch(authenticator, r);
+-    else
+-	Enqueue(r);
++    snprintf(buf, 8192, "%s %s\n", r->auth_user->user, r->auth_user->passwd);
++    helperSubmit(authenticators, buf, authenticateHandleReply, r);
+ }
+ 
+ void
+-authenticateFreeMemory(void)
++authenticateInit(void)
+ {
+-    int k;
+-    /* free old structures if present */
+-    if (authenticate_child_table) {
+-	for (k = 0; k < NAuthenticators; k++) {
+-	    if (authenticate_child_table[k]->inbuf)
+-		memFree(MEM_8K_BUF, authenticate_child_table[k]->inbuf);
+-	    safe_free(authenticate_child_table[k]);
+-	}
+-	safe_free(authenticate_child_table);
+-    }
+-}
+-
+-void
+-authenticateOpenServers(void)
+-{
+-    char *prg;
+-    wordlist *auth_opts;
+-    char *short_prg;
+-    char *short_prg2;
+-    int k;
+-    int authenticatesocket;
+-    LOCAL_ARRAY(char, fd_note_buf, FD_DESC_SZ);
+-    static int first_time = 0;
+-    char *s;
+-    char *args[32];
+-    int i, x;
+-
+-    authenticateFreeMemory();
+-    if (Config.Program.authenticate == NULL)
++    static int init = 0;
++    safe_free(authenticators);
++    if (!Config.Program.authenticate)
+ 	return;
+-    prg = Config.Program.authenticate->key;
+-    NAuthenticators = NAuthenticatorsOpen = Config.authenticateChildren;
+-    authenticate_child_table = xcalloc(NAuthenticators, sizeof(authenticator_t *));
+-    debug(29, 1) ("authenticateOpenServers: Starting %d '%s' processes\n",
+-	NAuthenticators, prg);
+-    if ((s = strrchr(prg, '/')))
+-	short_prg = xstrdup(s + 1);
+-    else
+-	short_prg = xstrdup(prg);
+-    short_prg2 = xmalloc(strlen(s) + 3);
+-    snprintf(short_prg2, strlen(s) + 3, "(%s)", short_prg);
+-    for (k = 0; k < NAuthenticators; k++) {
+-	authenticate_child_table[k] = xcalloc(1, sizeof(authenticator_t));
+-	args[0] = short_prg2;
+-	i = 1;
+-	auth_opts = Config.Program.authenticate->next;
+-	while ((auth_opts != NULL) && (i < 31)) {
+-	    args[i++] = auth_opts->key;
+-	    auth_opts = auth_opts->next;
+-	}
+-	if (auth_opts != NULL) {
+-	    debug(29, 0) ("WARNING: too many authenticate_options\n");
+-	}
+-	args[i] = NULL;
+-	x = ipcCreate(IPC_TCP_SOCKET,
+-	    prg,
+-	    args,
+-	    "authenticator",
+-	    &authenticatesocket,
+-	    &authenticatesocket);
+-	if (x < 0) {
+-	    debug(29, 1) ("WARNING: Cannot run '%s' process.\n", prg);
+-	    authenticate_child_table[k]->flags.alive = 0;
+-	} else {
+-	    authenticate_child_table[k]->flags.alive = 1;
+-	    authenticate_child_table[k]->index = k;
+-	    authenticate_child_table[k]->fd = authenticatesocket;
+-	    authenticate_child_table[k]->inbuf = memAllocate(MEM_8K_BUF);
+-	    authenticate_child_table[k]->size = 8192;
+-	    authenticate_child_table[k]->offset = 0;
+-	    snprintf(fd_note_buf, FD_DESC_SZ, "%s #%d",
+-		short_prg,
+-		authenticate_child_table[k]->index + 1);
+-	    fd_note(authenticate_child_table[k]->fd, fd_note_buf);
+-	    commSetNonBlocking(authenticate_child_table[k]->fd);
+-	    /* set handler for incoming result */
+-	    commSetSelect(authenticate_child_table[k]->fd,
+-		COMM_SELECT_READ,
+-		authenticateHandleRead,
+-		authenticate_child_table[k], 0);
+-	    debug(29, 3) ("authenticateOpenServers: 'authenticate_server' %d started\n",
+-		k);
+-	}
+-    }
+-    if (first_time == 0) {
+-	first_time++;
+-	memset(&AuthenticateStats, '\0', sizeof(AuthenticateStats));
++    authenticators = xcalloc(1, sizeof(*authenticators));
++    authenticators->id_name = "authenticator";
++    authenticators->cmdline = Config.Program.authenticate;
++    authenticators->n_to_start = Config.authenticateChildren;
++    authenticators->ipc_type = IPC_TCP_SOCKET;
++    helperOpenServers(authenticators);
++    if (!init) {
+ 	cachemgrRegister("authenticator",
+-	    "Authenticator Stats",
++	    "User Authenticator Stats",
+ 	    authenticateStats, 0, 1);
+     }
+-    safe_free(short_prg);
+-    safe_free(short_prg2);
+-}
+-
+-void
+-authenticateShutdownServers(void *unused)
+-{
+-    authenticator_t *authenticate = NULL;
+-    authenticateStateData *r = NULL;
+-    int k;
+-    int na = 0;
+-    if (Config.Program.authenticate == NULL)
+-	return;
+-    if (authenticateQueueHead) {
+-	while ((authenticate = GetFirstAvailable()) && (r = Dequeue()))
+-	    authenticateDispatch(authenticate, r);
+-	return;
+-    }
+-    for (k = 0; k < NAuthenticators; k++) {
+-	authenticate = *(authenticate_child_table + k);
+-	if (!authenticate->flags.alive)
+-	    continue;
+-	if (authenticate->flags.closing)
+-	    continue;
+-	if (authenticate->flags.busy) {
+-	    na++;
+-	    continue;
+-	}
+-	debug(29, 3) ("authenticateShutdownServers: closing authenticator #%d, FD %d\n",
+-	    authenticate->index + 1, authenticate->fd);
+-	comm_close(authenticate->fd);
+-	authenticate->flags.closing = 1;
+-	authenticate->flags.busy = 1;
+-    }
+-    if (na)
+-	eventAdd("authenticateShutdownServers", authenticateShutdownServers, NULL, 1.0, 1);
+-}
+-
+-int
+-authenticateUnregister(const char *url, void *data)
+-{
+-    authenticator_t *authenticate = NULL;
+-    authenticateStateData *r = NULL;
+-    struct authenticateQueueData *rq = NULL;
+-    int k;
+-    int n = 0;
+-    if (Config.Program.authenticate == NULL)
+-	return 0;
+-    debug(29, 3) ("authenticateUnregister: '%s'\n", url);
+-    for (k = 0; k < NAuthenticators; k++) {
+-	authenticate = *(authenticate_child_table + k);
+-	if ((r = authenticate->authenticateState) == NULL)
+-	    continue;
+-	if (r->data != data)
+-	    continue;
+-	debug(29, 3) ("authenticateUnregister: Found match\n");
+-	r->handler = NULL;
+-	n++;
+-    }
+-    for (rq = authenticateQueueHead; rq; rq = rq->next) {
+-	if ((r = rq->authenticateState) == NULL)
+-	    continue;
+-	if (r->data != data)
+-	    continue;
+-	debug(29, 3) ("authenticateUnregister: Found match.\n");
+-	r->handler = NULL;
+-	n++;
+-    }
+-    debug(29, 3) ("authenticateUnregister: Unregistered %d handlers\n", n);
+-    return n;
++    init++;
+ }
+ 
+ void
+-authenticateStats(StoreEntry * sentry)
++authenticateShutdown(void)
+ {
+-    int k;
+-    storeAppendPrintf(sentry, "Authenticator Statistics:\n");
+-    storeAppendPrintf(sentry, "requests: %d\n",
+-	AuthenticateStats.requests);
+-    storeAppendPrintf(sentry, "replies: %d\n",
+-	AuthenticateStats.replies);
+-    storeAppendPrintf(sentry, "queue length: %d\n",
+-	AuthenticateStats.queue_size);
+-    storeAppendPrintf(sentry, "avg service time: %d msec\n",
+-	AuthenticateStats.avg_svc_time);
+-    storeAppendPrintf(sentry, "number of authenticators: %d\n",
+-	NAuthenticators);
+-    storeAppendPrintf(sentry, "use histogram:\n");
+-    for (k = 0; k < NAuthenticators; k++) {
+-	storeAppendPrintf(sentry, "    authenticator #%d: %d (%d requests)\n",
+-	    k + 1,
+-	    AuthenticateStats.use_hist[k],
+-	    AuthenticateStats.rewrites[k]);
+-    }
++    if (authenticators)
++	helperShutdown(authenticators);
+ }
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: cache_cf.cc,v 1.305 1998/09/14 21:58:46 wessels Exp $
++ * $Id: cache_cf.cc,v 1.306 1998/10/10 14:57:37 wessels Exp $
+  *
+  * DEBUG: section 3     Configuration File Parsing
+  * AUTHOR: Harvest Derived
+@@ -57,7 +57,6 @@ static const char *const B_GBYTES_STR = "GB";
+ static const char *const list_sep = ", \t\n\r";
+ 
+ static void self_destruct(void);
+-static void wordlistAdd(wordlist **, const char *);
+ 
+ static void configDoConfigure(void);
+ static void parse_refreshpattern(refresh_t **);
+@@ -97,7 +96,7 @@ wordlistDestroy(wordlist ** list)
+     *list = NULL;
+ }
+ 
+-static void
++void
+ wordlistAdd(wordlist ** list, const char *key)
+ {
+     wordlist *p = NULL;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: dns.cc,v 1.66 1998/09/29 16:33:44 wessels Exp $
++ * $Id: dns.cc,v 1.67 1998/10/10 14:57:38 wessels Exp $
+  *
+  * DEBUG: section 34    Dnsserver interface
+  * AUTHOR: Harvest Derived
+@@ -35,286 +35,86 @@
+ 
+ #include "squid.h"
+ 
+-struct dnsQueueData {
+-    struct dnsQueueData *next;
+-    void *data;
+-};
+-
+-static PF dnsShutdownRead;
+-static PF dnsFDClosed;
+-static dnsserver_t **dns_child_table = NULL;
+-static int NDnsServersRunning = 0;
++static helper *dnsservers = NULL;
+ 
+ static void
+-dnsFDClosed(int fd, void *data)
+-{
+-    dnsserver_t *dns = data;
+-    NDnsServersRunning--;
+-    if (shutting_down || reconfiguring)
+-	return;
+-    debug(34, 0) ("WARNING: DNSSERVER #%d (FD %d) exited\n",
+-	dns->id, fd);
+-    if (NDnsServersRunning < Config.dnsChildren / 2)
+-	fatal("Too few DNSSERVER processes are running");
+-}
+-
+-dnsserver_t *
+-dnsGetFirstAvailable(void)
+-{
+-    int k;
+-    dnsserver_t *dns = NULL;
+-    for (k = 0; k < NDnsServersAlloc; k++) {
+-	dns = *(dns_child_table + k);
+-	if (dns->flags.busy)
+-	    continue;
+-	if (dns->flags.closing)
+-	    continue;
+-	if (!dns->flags.alive)
+-	    continue;
+-	return dns;
+-    }
+-    return NULL;
+-}
+-
+-
+-void
+-dnsFreeMemory(void)
++dnsStats(StoreEntry * sentry)
+ {
+-    int k;
+-    /* free old structures if present */
+-    if (dns_child_table) {
+-	for (k = 0; k < NDnsServersAlloc; k++)
+-	    cbdataFree(dns_child_table[k]);
+-	safe_free(dns_child_table);
+-    }
++    storeAppendPrintf(sentry, "Dnsserver Statistics:\n");
++    helperStats(sentry, dnsservers);
+ }
+ 
+ void
+-dnsOpenServers(void)
++dnsInit(void)
+ {
+-    int N = Config.dnsChildren;
+-    char *prg = Config.Program.dnsserver;
+-    int k;
+-    int x;
+-    int rfd;
+-    int wfd;
+-    LOCAL_ARRAY(char, fd_note_buf, FD_DESC_SZ);
+-    char *s;
+-    char *args[64];
+-    int nargs = 0;
++    static int init = 0;
+     wordlist *w;
+-
+-    dnsFreeMemory();
+-    dns_child_table = xcalloc(N, sizeof(dnsserver_t *));
+-    NDnsServersAlloc = 0;
+-    NDnsServersRunning = 0;
+-    args[nargs++] = "(dnsserver)";
++    safe_free(dnsservers);
++    if (!Config.Program.dnsserver)
++	return;
++    dnsservers = xcalloc(1, sizeof(*dnsservers));
++    dnsservers->id_name = "dnsor";
++    dnsservers->n_to_start = Config.dnsChildren;
++    dnsservers->ipc_type = IPC_TCP_SOCKET;
++    wordlistAdd(&dnsservers->cmdline, Config.Program.dnsserver);
+     if (Config.onoff.res_defnames)
+-	args[nargs++] = "-D";
+-    if (Config.dns_nameservers != NULL) {
+-	args[nargs++] = "-s";
+-	for (w = Config.dns_nameservers; w != NULL; w = w->next) {
+-	    if (nargs > 60)
+-		break;
+-	    args[nargs++] = w->key;
+-	}
++	wordlistAdd(&dnsservers->cmdline, "-D");
++    if (Config.dns_nameservers) {
++	wordlistAdd(&dnsservers->cmdline, "-s");
++	for (w = Config.dns_nameservers; w != NULL; w = w->next)
++	    wordlistAdd(&dnsservers->cmdline, w->key);
+     }
+-    args[nargs++] = NULL;
+-    for (k = 0; k < N; k++) {
+-	dns_child_table[k] = xcalloc(1, sizeof(dnsserver_t));
+-	cbdataAdd(dns_child_table[k], MEM_NONE);
+-	x = ipcCreate(IPC_TCP_SOCKET,
+-	    prg,
+-	    args,
+-	    "dnsserver",
+-	    &rfd,
+-	    &wfd);
+-	if (x < 0) {
+-	    debug(34, 1) ("dnsOpenServers: WARNING: Failed to start 'dnsserver' #%d.\n", k + 1);
+-	    dns_child_table[k]->flags.alive = 0;
+-	    dns_child_table[k]->id = k + 1;
+-	    dns_child_table[k]->inpipe = -1;
+-	    dns_child_table[k]->outpipe = -1;
+-	} else {
+-	    debug(34, 4) ("dnsOpenServers: FD %d connected to %s #%d.\n",
+-		wfd, prg, k + 1);
+-	    dns_child_table[k]->flags.alive = 1;
+-	    dns_child_table[k]->id = k + 1;
+-	    dns_child_table[k]->inpipe = rfd;
+-	    dns_child_table[k]->outpipe = wfd;
+-	    dns_child_table[k]->answer = squid_curtime;
+-	    dns_child_table[k]->dispatch_time = current_time;
+-	    dns_child_table[k]->size = DNS_INBUF_SZ - 1;
+-	    dns_child_table[k]->offset = 0;
+-	    if ((s = strrchr(prg, '/')))
+-		s++;
+-	    else
+-		s = prg;
+-	    snprintf(fd_note_buf, FD_DESC_SZ, "%s #%d", s, dns_child_table[k]->id);
+-	    fd_note(dns_child_table[k]->inpipe, fd_note_buf);
+-	    commSetNonBlocking(dns_child_table[k]->inpipe);
+-	    comm_add_close_handler(dns_child_table[k]->inpipe, dnsFDClosed,
+-		dns_child_table[k]);
+-	    debug(34, 3) ("dnsOpenServers: DNSSERVER #%d started\n", k + 1);
+-	    NDnsServersAlloc++;
+-	    NDnsServersRunning++;
+-	}
++    helperOpenServers(dnsservers);
++    if (!init) {
++	cachemgrRegister("dns",
++	    "Dnsserver Statistics",
++	    dnsStats, 0, 1);
+     }
+-    if (NDnsServersAlloc == 0 && Config.dnsChildren > 0)
+-	fatal("Failed to start any dnsservers");
+-    if (NDnsServersRunning < Config.dnsChildren / 2)
+-	fatal("Too few DNSSERVER processes are running");
+-    cachemgrRegister("dns", "dnsserver child process information",
+-	dnsStats, 0, 1);
+-    debug(34, 1) ("Started %d 'dnsserver' processes\n", NDnsServersAlloc);
++    init++;
+ }
+ 
+-
+ void
+-dnsStats(StoreEntry * sentry)
++dnsShutdown(void)
+ {
+-    int k;
+-    dnsserver_t *dns = NULL;
+-    storeAppendPrintf(sentry, "DNSServer Statistics:\n");
+-    storeAppendPrintf(sentry, "dnsserver requests: %d\n",
+-	DnsStats.requests);
+-    storeAppendPrintf(sentry, "dnsserver replies: %d\n",
+-	DnsStats.replies);
+-    storeAppendPrintf(sentry, "number of dnsservers: %d\n",
+-	NDnsServersAlloc);
+-    storeAppendPrintf(sentry, "\n");
+-    storeAppendPrintf(sentry, "%7s\t%7s\t%11s\t%s\t%7s\t%7s\n",
+-	"#",
+-	"FD",
+-	"# Requests",
+-	"Flags",
+-	"Time",
+-	"Offset");
+-    for (k = 0; k < NDnsServersAlloc; k++) {
+-	dns = *(dns_child_table + k);
+-	storeAppendPrintf(sentry, "%7d\t%7d\t%11d\t%c%c%c%c\t%7.3f\t%7d\n",
+-	    k + 1,
+-	    dns->inpipe,
+-	    DnsStats.hist[k],
+-	    dns->flags.alive ? 'A' : ' ',
+-	    dns->flags.busy ? 'B' : ' ',
+-	    dns->flags.closing ? 'C' : ' ',
+-	    dns->flags.shutdown ? 'S' : ' ',
+-	    0.001 * tvSubMsec(dns->dispatch_time, current_time),
+-	    (int) dns->offset);
+-    }
+-    storeAppendPrintf(sentry, "\nFlags key:\n\n");
+-    storeAppendPrintf(sentry, "   A = ALIVE\n");
+-    storeAppendPrintf(sentry, "   B = BUSY\n");
+-    storeAppendPrintf(sentry, "   C = CLOSING\n");
+-}
+-
+-void
+-dnsShutdownServers(void *notused)
+-{
+-    dnsserver_t *dns = NULL;
+-    int k;
+-    int na = 0;
+-    debug(34, 3) ("dnsShutdownServers:\n");
+-    for (k = 0; k < NDnsServersAlloc; k++) {
+-	dns = *(dns_child_table + k);
+-	if (!dns->flags.alive) {
+-	    debug(34, 3) ("dnsShutdownServers: #%d is NOT ALIVE.\n", dns->id);
+-	    continue;
+-	}
+-	if (dns->flags.busy) {
+-	    debug(34, 3) ("dnsShutdownServers: #%d is BUSY.\n", dns->id);
+-	    dns->flags.shutdown = 1;
+-	    na++;
+-	    continue;
+-	}
+-	if (dns->flags.closing) {
+-	    debug(34, 3) ("dnsShutdownServers: #%d is CLOSING.\n", dns->id);
+-	    continue;
+-	}
+-	dnsShutdownServer(dns);
+-    }
+-    /*
+-     * Here we pass in 'dns_child_table[0]' as callback data so that
+-     * if the dns_child_table[] array gets freed, the event will
+-     * never execute.
+-     */
+-    if (na)
+-	eventAdd("dnsShutdownServers",
+-	    dnsShutdownServers,
+-	    dns_child_table[0],
+-	    1.0,
+-	    1);
++    if (!dnsservers)
++	return;
++    helperShutdown(dnsservers);
++    wordlistDestroy(&dnsservers->cmdline);
+ }
+ 
+ void
+-dnsShutdownServer(dnsserver_t * dns)
+-{
+-    static char *shutdown_cmd = "$shutdown\n";
+-    debug(34, 3) ("dnsShutdownServer: sending '$shutdown' to dnsserver #%d\n",
+-	dns->id);
+-    debug(34, 3) ("dnsShutdownServer: --> FD %d\n", dns->outpipe);
+-    cbdataLock(dns);
+-    comm_write(dns->outpipe,
+-	xstrdup(shutdown_cmd),
+-	strlen(shutdown_cmd),
+-	NULL,			/* Handler */
+-	NULL,			/* Handler-data */
+-	xfree);
+-    commSetSelect(dns->inpipe,
+-	COMM_SELECT_READ,
+-	dnsShutdownRead,
+-	dns,
+-	0);
+-    dns->flags.closing = 1;
+-}
+-
+-static void
+-dnsShutdownRead(int fd, void *data)
++dnsSubmit(const char *lookup, HLPCB * callback, void *data)
+ {
+-    dnsserver_t *dns = data;
+-    debug(14, dns->flags.closing ? 5 : 1)
+-	("FD %d: Connection from DNSSERVER #%d is closed, disabling\n",
+-	fd,
+-	dns->id);
+-    dns->flags.alive = 0;
+-    dns->flags.busy = 0;
+-    dns->flags.closing = 0;
+-    dns->flags.shutdown = 0;
+-    commSetSelect(fd, COMM_SELECT_WRITE, NULL, NULL, 0);
+-    cbdataUnlock(dns);
+-    comm_close(fd);
++    char buf[256];
++    snprintf(buf, 256, "%s\n", lookup);
++    helperSubmit(dnsservers, buf, callback, data);
+ }
+ 
+ #ifdef SQUID_SNMP
+ /*
+  * The function to return the DNS via SNMP
+  */
+-
+ variable_list *
+ snmp_netDnsFn(variable_list * Var, snint * ErrP)
+ {
+     variable_list *Answer;
+-
+     debug(49, 5) ("snmp_netDnsFn: Processing request:\n", Var->name[LEN_SQ_NET +
+ 	    1]);
+     snmpDebugOid(5, Var->name, Var->name_length);
+-
+     Answer = snmp_var_new(Var->name, Var->name_length);
+     *ErrP = SNMP_ERR_NOERROR;
+     Answer->val_len = sizeof(snint);
+     Answer->val.integer = xmalloc(Answer->val_len);
+     Answer->type = SMI_COUNTER32;
+-
+     switch (Var->name[LEN_SQ_NET + 1]) {
+     case DNS_REQ:
+-	*(Answer->val.integer) = DnsStats.requests;
++	*(Answer->val.integer) = dnsservers->stats.requests;
+ 	break;
+     case DNS_REP:
+-	*(Answer->val.integer) = DnsStats.replies;
++	*(Answer->val.integer) = dnsservers->stats.replies;
+ 	break;
+     case DNS_SERVERS:
+-	*(Answer->val.integer) = NDnsServersAlloc;
++	*(Answer->val.integer) = dnsservers->n_running;
+ 	break;
+     default:
+ 	*ErrP = SNMP_ERR_NOSUCHNAME;
+@@ -323,5 +123,4 @@ snmp_netDnsFn(variable_list * Var, snint * ErrP)
+     }
+     return Answer;
+ }
+-
+ #endif /*SQUID_SNMP */
+@@ -1,7 +1,7 @@
+ 
+ 
+ /*
+- * $Id: fqdncache.cc,v 1.120 1998/09/29 16:33:45 wessels Exp $
++ * $Id: fqdncache.cc,v 1.121 1998/10/10 14:57:39 wessels Exp $
+  *
+  * DEBUG: section 35    FQDN Cache
+  * AUTHOR: Harvest Derived
+@@ -39,11 +39,6 @@
+ #define FQDN_LOW_WATER       90
+ #define FQDN_HIGH_WATER      95
+ 
+-struct fqdncacheQueueData {
+-    struct fqdncacheQueueData *next;
+-    fqdncache_entry *f;
+-};
+-
+ static struct {
+     int requests;
+     int replies;
+@@ -57,29 +52,22 @@ static struct {
+ 
+ static dlink_list lru_list;
+ 
+-static void fqdncache_dnsHandleRead(int, void *);
+-static fqdncache_entry *fqdncacheParse(const char *buf, dnsserver_t *);
++static HLPCB fqdncacheHandleReply;
++static fqdncache_entry *fqdncacheParse(const char *buf);
+ static void fqdncache_release(fqdncache_entry *);
+ static fqdncache_entry *fqdncache_create(const char *name);
+ static void fqdncache_call_pending(fqdncache_entry *);
+ static void fqdncacheAddHostent(fqdncache_entry *, const struct hostent *);
+-static int fqdncacheHasPending(const fqdncache_entry *);
+ static fqdncache_entry *fqdncache_get(const char *);
+ static FQDNH dummy_handler;
+ static int fqdncacheExpiredEntry(const fqdncache_entry *);
+ static void fqdncacheAddPending(fqdncache_entry *, FQDNH *, void *);
+-static void fqdncacheEnqueue(fqdncache_entry *);
+-static void *fqdncacheDequeue(void);
+-static void fqdncache_dnsDispatch(dnsserver_t *, fqdncache_entry *);
+ static void fqdncacheChangeKey(fqdncache_entry * i);
+ static void fqdncacheLockEntry(fqdncache_entry * f);
+ static void fqdncacheUnlockEntry(fqdncache_entry * f);
+ static FREE fqdncacheFreeEntry;
+ 
+ static hash_table *fqdn_table = NULL;
+-static struct fqdncacheQueueData *fqdncacheQueueHead = NULL;
+-static struct fqdncacheQueueData **fqdncacheQueueTailP = &fqdncacheQueueHead;
+-static int queue_length = 0;
+ 
+ static char fqdncache_status_char[] =
+ {
+@@ -92,48 +80,6 @@ static char fqdncache_status_char[] =
+ static long fqdncache_low = 180;
+ static long fqdncache_high = 200;
+ 
+-static void
+-fqdncacheEnqueue(fqdncache_entry * f)
+-{
+-    static time_t last_warning = 0;
+-    struct fqdncacheQueueData *new = xcalloc(1, sizeof(struct fqdncacheQueueData));
+-    new->f = f;
+-    *fqdncacheQueueTailP = new;
+-    fqdncacheQueueTailP = &new->next;
+-    queue_length++;
+-    if (queue_length < NDnsServersAlloc)
+-	return;
+-    if (squid_curtime - last_warning < 600)
+-	return;
+-    last_warning = squid_curtime;
+-    debug(35, 0) ("fqdncacheEnqueue: WARNING: All dnsservers are busy.\n");
+-    debug(35, 0) ("fqdncacheEnqueue: WARNING: %d DNS lookups queued\n", queue_length);
+-    if (queue_length > NDnsServersAlloc * 2)
+-	fatal("Too many queued DNS lookups");
+-    if (Config.dnsChildren >= DefaultDnsChildrenMax)
+-	return;
+-    debug(35, 1) ("fqdncacheEnqueue: Consider increasing 'dns_children' in your config file.\n");
+-}
+-
+-static void *
+-fqdncacheDequeue(void)
+-{
+-    struct fqdncacheQueueData *old = NULL;
+-    fqdncache_entry *f = NULL;
+-    if (fqdncacheQueueHead) {
+-	f = fqdncacheQueueHead->f;
+-	old = fqdncacheQueueHead;
+-	fqdncacheQueueHead = fqdncacheQueueHead->next;
+-	if (fqdncacheQueueHead == NULL)
+-	    fqdncacheQueueTailP = &fqdncacheQueueHead;
+-	safe_free(old);
+-	queue_length--;
+-    }
+-    if (f && f->status != FQDN_PENDING)
+-	debug_trap("fqdncacheDequeue: status != FQDN_PENDING");
+-    return f;
+-}
+-
+ /* removes the given fqdncache entry */
+ static void
+ fqdncache_release(fqdncache_entry * f)
+@@ -161,7 +107,6 @@ fqdncache_get(const char *name)
+ {
+     hash_link *e;
+     static fqdncache_entry *f;
+-
+     f = NULL;
+     if (fqdn_table) {
+ 	if ((e = hash_lookup(fqdn_table, name)) != NULL)
+@@ -209,7 +154,6 @@ fqdncache_purgelru(void *notused)
+     debug(35, 3) ("fqdncache_purgelru: removed %d entries\n", removed);
+ }
+ 
+-
+ /* create blank fqdncache_entry */
+ static fqdncache_entry *
+ fqdncache_create(const char *name)
+@@ -258,9 +202,7 @@ fqdncache_call_pending(fqdncache_entry * f)
+ {
+     fqdn_pending *p = NULL;
+     int nhandler = 0;
+-
+     f->lastref = squid_curtime;
+-
+     fqdncacheLockEntry(f);
+     while (f->pending_head != NULL) {
+ 	p = f->pending_head;
+@@ -280,7 +222,7 @@ fqdncache_call_pending(fqdncache_entry * f)
+ 
+ 
+ static fqdncache_entry *
+-fqdncacheParse(const char *inbuf, dnsserver_t * dnsData)
++fqdncacheParse(const char *inbuf)
+ {
+     LOCAL_ARRAY(char, buf, DNS_INBUF_SZ);
+     char *token;
+@@ -327,93 +269,31 @@ fqdncacheParse(const char *inbuf, dnsserver_t * dnsData)
+ }
+ 
+ static void
+-fqdncacheNudgeQueue(void)
+-{
+-    dnsserver_t *dnsData;
+-    fqdncache_entry *f = NULL;
+-    while ((dnsData = dnsGetFirstAvailable()) && (f = fqdncacheDequeue()))
+-	fqdncache_dnsDispatch(dnsData, f);
+-}
+-
+-static void
+-fqdncache_dnsHandleRead(int fd, void *data)
++fqdncacheHandleReply(void *data, char *reply)
+ {
+-    dnsserver_t *dnsData = data;
+-    int len;
+     int n;
+-    fqdncache_entry *f = NULL;
++    generic_cbdata *c = data;
++    fqdncache_entry *f = c->data;
+     fqdncache_entry *x = NULL;
+-
+-    Counter.syscalls.sock.reads++;
+-    len = read(fd,
+-	dnsData->ip_inbuf + dnsData->offset,
+-	dnsData->size - dnsData->offset);
+-    fd_bytes(fd, len, FD_READ);
+-    debug(35, 5) ("fqdncache_dnsHandleRead: Result from DNS ID %d (%d bytes)\n",
+-	dnsData->id, len);
+-    if (len <= 0) {
+-	if (len < 0 && ignoreErrno(errno)) {
+-	    commSetSelect(fd,
+-		COMM_SELECT_READ,
+-		fqdncache_dnsHandleRead,
+-		dnsData, 0);
+-	    return;
+-	}
+-	debug(35, dnsData->flags.closing ? 5 : 1)
+-	    ("FD %d: Connection from DNSSERVER #%d is closed, disabling\n",
+-	    fd, dnsData->id);
+-	dnsData->flags.alive = 0;
+-	dnsData->flags.busy = 0;
+-	dnsData->flags.closing = 0;
+-	dnsData->flags.shutdown = 0;
+-	commSetSelect(fd,
+-	    COMM_SELECT_WRITE,
+-	    NULL,
+-	    NULL,
+-	    0);
+-	comm_close(fd);
+-	return;
+-    }
+     n = ++FqdncacheStats.replies;
+-    dnsData->offset += len;
+-    dnsData->ip_inbuf[dnsData->offset] = '\0';
+-    f = dnsData->data;
+     assert(f->status == FQDN_DISPATCHED);
+-    if (strchr(dnsData->ip_inbuf, '\n')) {
+-	/* end of record found */
+-	DnsStats.replies++;
+-	statHistCount(&Counter.dns.svc_time,
+-	    tvSubMsec(dnsData->dispatch_time, current_time));
+-	if ((x = fqdncacheParse(dnsData->ip_inbuf, dnsData)) == NULL) {
+-	    debug(35, 0) ("fqdncache_dnsHandleRead: fqdncacheParse failed?!\n");
+-	} else {
+-	    dnsData->offset = 0;
+-	    dnsData->ip_inbuf[0] = '\0';
+-	    f->name_count = x->name_count;
+-	    for (n = 0; n < (int) f->name_count; n++)
+-		f->names[n] = x->names[n];
+-	    f->error_message = x->error_message;
+-	    f->status = x->status;
+-	    f->expires = x->expires;
+-	    fqdncache_call_pending(f);
+-	}
+-	fqdncacheUnlockEntry(f);	/* unlock from FQDN_DISPATCHED */
++    assert(f->locks);
++    cbdataFree(c);
++    c = NULL;
++    statHistCount(&Counter.dns.svc_time,
++	tvSubMsec(f->request_time, current_time));
++    if ((x = fqdncacheParse(reply)) == NULL) {
++	debug(35, 0) ("fqdncache_dnsHandleRead: fqdncacheParse failed?!\n");
+     } else {
+-	debug(35, 5) ("fqdncache_dnsHandleRead: Incomplete reply\n");
+-	commSetSelect(fd,
+-	    COMM_SELECT_READ,
+-	    fqdncache_dnsHandleRead,
+-	    dnsData,
+-	    0);
+-    }
+-    if (dnsData->offset == 0) {
+-	dnsData->data = NULL;
+-	dnsData->flags.busy = 0;
+-	if (dnsData->flags.shutdown)
+-	    dnsShutdownServer(dnsData);
+-	cbdataUnlock(dnsData);
++	f->name_count = x->name_count;
++	for (n = 0; n < (int) f->name_count; n++)
++	    f->names[n] = x->names[n];
++	f->error_message = x->error_message;
++	f->status = x->status;
++	f->expires = x->expires;
++	fqdncache_call_pending(f);
+     }
+-    fqdncacheNudgeQueue();
++    fqdncacheUnlockEntry(f);	/* unlock from FQDN_DISPATCHED */
+ }
+ 
+ static void
+@@ -426,22 +306,17 @@ fqdncacheAddPending(fqdncache_entry * f, FQDNH * handler, void *handlerData)
+     pending->handlerData = handlerData;
+     for (I = &(f->pending_head); *I; I = &((*I)->next));
+     *I = pending;
+-    if (f->status == FQDN_PENDING)
+-	fqdncacheNudgeQueue();
+ }
+ 
+ void
+ fqdncache_nbgethostbyaddr(struct in_addr addr, FQDNH * handler, void *handlerData)
+ {
+     fqdncache_entry *f = NULL;
+-    dnsserver_t *dnsData = NULL;
+     char *name = inet_ntoa(addr);
+-
++    generic_cbdata *c;
+     assert(handler);
+-
+     debug(35, 4) ("fqdncache_nbgethostbyaddr: Name '%s'.\n", name);
+     FqdncacheStats.requests++;
+-
+     if (name == NULL || name[0] == '\0') {
+ 	debug(35, 4) ("fqdncache_nbgethostbyaddr: Invalid name!\n");
+ 	handler(NULL, handlerData);
+@@ -459,6 +334,7 @@ fqdncache_nbgethostbyaddr(struct in_addr addr, FQDNH * handler, void *handlerDat
+ 	FqdncacheStats.misses++;
+ 	f = fqdncacheAddNew(name, NULL, FQDN_PENDING);
+ 	fqdncacheAddPending(f, handler, handlerData);
++	f->request_time = current_time;
+     } else if (f->status == FQDN_CACHED || f->status == FQDN_NEGATIVE_CACHED) {
+ 	/* HIT */
+ 	debug(35, 4) ("fqdncache_nbgethostbyaddr: HIT for '%s'\n", name);
+@@ -485,59 +361,15 @@ fqdncache_nbgethostbyaddr(struct in_addr addr, FQDNH * handler, void *handlerDat
+ 	    (int) f->status);
+ 	assert(0);
+     }
+-
+-    /* for HIT, PENDING, DISPATCHED we've returned.  For MISS we continue */
+-
+-    if ((dnsData = dnsGetFirstAvailable())) {
+-	fqdncache_dnsDispatch(dnsData, f);
+-    } else if (NDnsServersAlloc > 0) {
+-	fqdncacheEnqueue(f);
+-    } else {
+-	/* abort if we get here */
+-	assert(NDnsServersAlloc);
+-    }
+-}
+-
+-static void
+-fqdncache_dnsDispatch(dnsserver_t * dns, fqdncache_entry * f)
+-{
+-    char *buf = NULL;
+-    assert(dns->flags.alive);
+-    if (!fqdncacheHasPending(f)) {
+-	debug(35, 0) ("fqdncache_dnsDispatch: skipping '%s' because no handler.\n",
+-	    f->name);
+-	f->status = FQDN_NEGATIVE_CACHED;
+-	fqdncache_release(f);
+-	return;
+-    }
+-    if (f->status != FQDN_PENDING)
+-	debug_trap("fqdncache_dnsDispatch: status != FQDN_PENDING");
+-    buf = xcalloc(1, 256);
+-    snprintf(buf, 256, "%s\n", f->name);
+-    dns->flags.busy = 1;
+-    dns->data = f;
++    /* for HIT, PENDING, DISPATCHED we've returned.  For MISS we submit */
++    c = xcalloc(1, sizeof(*c));
++    c->data = f;
++    cbdataAdd(c, MEM_NONE);
+     f->status = FQDN_DISPATCHED;
+-    comm_write(dns->outpipe,
+-	buf,
+-	strlen(buf),
+-	NULL,			/* Handler */
+-	NULL,			/* Handler-data */
+-	xfree);
+-    cbdataLock(dns);
+-    commSetSelect(dns->outpipe,
+-	COMM_SELECT_READ,
+-	fqdncache_dnsHandleRead,
+-	dns,
+-	0);
+-    debug(35, 5) ("fqdncache_dnsDispatch: Request sent to DNS server #%d.\n",
+-	dns->id);
+-    dns->dispatch_time = current_time;
+-    DnsStats.requests++;
+-    DnsStats.hist[dns->id - 1]++;
+     fqdncacheLockEntry(f);	/* lock while FQDN_DISPATCHED */
++    dnsSubmit(f->name, fqdncacheHandleReply, c);
+ }
+ 
+-
+ /* initialize the fqdncache */
+ void
+ fqdncache_init(void)
+@@ -644,7 +476,6 @@ fqdnStats(StoreEntry * sentry)
+ 	FqdncacheStats.misses);
+     storeAppendPrintf(sentry, "Blocking calls to gethostbyaddr(): %d\n",
+ 	FqdncacheStats.ghba_calls);
+-    storeAppendPrintf(sentry, "pending queue length: %d\n", queue_length);
+     storeAppendPrintf(sentry, "FQDN Cache Contents:\n\n");
+ 
+     hash_first(fqdn_table);
+@@ -670,18 +501,6 @@ dummy_handler(const char *bufnotused, void *datanotused)
+     return;
+ }
+ 
+-static int
+-fqdncacheHasPending(const fqdncache_entry * f)
+-{
+-    const fqdn_pending *p = NULL;
+-    if (f->status != FQDN_PENDING)
+-	return 0;
+-    for (p = f->pending_head; p; p = p->next)
+-	if (p->handler)
+-	    return 1;
+-    return 0;
+-}
+-
+ void
+ fqdncacheReleaseInvalid(const char *name)
+ {
+@@ -780,7 +599,6 @@ fqdncache_restart(void)
+ {
+     fqdncache_entry *this;
+     assert(fqdn_table);
+-    while (fqdncacheDequeue());
+     hash_first(fqdn_table);
+     while ((this = (fqdncache_entry *) hash_next(fqdn_table))) {
+ 	if (this->status == FQDN_CACHED)
+@@ -838,10 +656,12 @@ snmp_netFqdnFn(variable_list * Var, snint * ErrP)
+     case FQDN_GHBN:
+ 	*(Answer->val.integer) = FqdncacheStats.ghba_calls;
+ 	break;
++#if DELETE_ME
+     case FQDN_LENG:
+ 	*(Answer->val.integer) = queue_length;
+ 	Answer->type = SMI_GAUGE32;
+ 	break;
++#endif
+     default:
+ 	*ErrP = SNMP_ERR_NOSUCHNAME;
+ 	snmp_var_free(Answer);
+@@ -0,0 +1,348 @@
++#include "squid.h"
++
++#define HELPER_MAX_ARGS 64
++
++static PF helperHandleRead;
++static PF helperStateFree;
++static void Enqueue(helper * hlp, helper_request *);
++static helper_request *Dequeue(helper * hlp);
++static helper_server *GetFirstAvailable(helper * hlp);
++static void helperDispatch(helper_server * srv, helper_request * r);
++static void helperKickQueue(helper * hlp);
++static void helperRequestFree(helper_request * r);
++
++
++void
++helperOpenServers(helper * hlp)
++{
++    char *s;
++    char *progname;
++    char *shortname;
++    char *procname;
++    char *args[HELPER_MAX_ARGS];
++    char fd_note_buf[FD_DESC_SZ];
++    helper_server *srv;
++    int nargs = 0;
++    int k;
++    int x;
++    int rfd;
++    int wfd;
++    wordlist *w;
++    if (hlp->cmdline == NULL)
++	return;
++    progname = hlp->cmdline->key;
++    assert(hlp->servers.head == NULL);
++    assert(hlp->servers.tail == NULL);
++    if ((s = strrchr(progname, '/')))
++	shortname = xstrdup(s + 1);
++    else
++	shortname = xstrdup(progname);
++    debug(29, 1) ("helperOpenServers: Starting %d '%s' processes\n",
++	hlp->n_to_start, shortname);
++    procname = xmalloc(strlen(shortname) + 3);
++    snprintf(procname, strlen(shortname) + 3, "(%s)", shortname);
++    args[nargs++] = procname;
++    for (w = hlp->cmdline->next; w && nargs < HELPER_MAX_ARGS; w = w->next)
++	args[nargs++] = w->key;
++    args[nargs++] = NULL;
++    assert(nargs <= HELPER_MAX_ARGS);
++    for (k = 0; k < hlp->n_to_start; k++) {
++	rfd = wfd = -1;
++	x = ipcCreate(hlp->ipc_type,
++	    progname,
++	    args,
++	    shortname,
++	    &rfd,
++	    &wfd);
++	if (x < 0) {
++	    debug(29, 1) ("WARNING: Cannot run '%s' process.\n", progname);
++	    continue;
++	}
++	hlp->n_running++;
++	srv = xcalloc(1, sizeof(*srv));
++	cbdataAdd(srv, MEM_NONE);
++	srv->flags.alive = 1;
++	srv->index = k;
++	srv->rfd = rfd;
++	srv->wfd = wfd;
++	srv->buf = memAllocate(MEM_8K_BUF);
++	srv->buf_sz = 8192;
++	srv->offset = 0;
++	srv->parent = hlp;
++	dlinkAddTail(srv, &srv->link, &hlp->servers);
++	if (rfd == wfd) {
++	    snprintf(fd_note_buf, FD_DESC_SZ, "%s #%d", shortname, k + 1);
++	    fd_note(rfd, fd_note_buf);
++	} else {
++	    snprintf(fd_note_buf, FD_DESC_SZ, "reading %s #%d", shortname, k + 1);
++	    fd_note(rfd, fd_note_buf);
++	    snprintf(fd_note_buf, FD_DESC_SZ, "writing %s #%d", shortname, k + 1);
++	    fd_note(wfd, fd_note_buf);
++	}
++	commSetNonBlocking(rfd);
++	if (wfd != rfd)
++	    commSetNonBlocking(wfd);
++	comm_add_close_handler(rfd, helperStateFree, srv);
++    }
++    safe_free(shortname);
++    safe_free(procname);
++}
++
++void
++helperSubmit(helper * hlp, const char *buf, HLPCB * callback, void *data)
++{
++    helper_request *r = xcalloc(1, sizeof(*r));
++    helper_server *srv;
++    r->callback = callback;
++    r->data = data;
++    r->buf = xstrdup(buf);
++    cbdataLock(r->data);
++    if ((srv = GetFirstAvailable(hlp)))
++	helperDispatch(srv, r);
++    else
++	Enqueue(hlp, r);
++}
++
++void
++helperStats(StoreEntry * sentry, helper * hlp)
++{
++    helper_server *srv;
++    dlink_node *link;
++    storeAppendPrintf(sentry, "number running: %d of %d\n",
++	hlp->n_running, hlp->n_to_start);
++    storeAppendPrintf(sentry, "requests sent: %d\n",
++	hlp->stats.requests);
++    storeAppendPrintf(sentry, "replies received: %d\n",
++	hlp->stats.replies);
++    storeAppendPrintf(sentry, "queue length: %d\n",
++	hlp->stats.queue_size);
++    storeAppendPrintf(sentry, "avg service time: %d msec\n",
++	hlp->stats.avg_svc_time);
++    storeAppendPrintf(sentry, "\n");
++    storeAppendPrintf(sentry, "%7s\t%7s\t%11s\t%s\t%7s\t%7s\n",
++	"#",
++	"FD",
++	"# Requests",
++	"Flags",
++	"Time",
++	"Offset");
++    for (link = hlp->servers.head; link; link = link->next) {
++	srv = link->data;
++	storeAppendPrintf(sentry, "%7d\t%7d\t%11d\t%c%c%c%c\t%7.3f\t%7d\n",
++	    srv->index + 1,
++	    srv->rfd,
++	    srv->stats.uses,
++	    srv->flags.alive ? 'A' : ' ',
++	    srv->flags.busy ? 'B' : ' ',
++	    srv->flags.closing ? 'C' : ' ',
++	    srv->flags.shutdown ? 'S' : ' ',
++	    0.001 * tvSubMsec(srv->dispatch_time, current_time),
++	    (int) srv->offset);
++    }
++    storeAppendPrintf(sentry, "\nFlags key:\n\n");
++    storeAppendPrintf(sentry, "   A = ALIVE\n");
++    storeAppendPrintf(sentry, "   B = BUSY\n");
++    storeAppendPrintf(sentry, "   C = CLOSING\n");
++    storeAppendPrintf(sentry, "   S = SHUTDOWN\n");
++}
++
++void
++helperShutdown(helper * hlp)
++{
++    dlink_node *link;
++    helper_server *srv;
++    for (link = hlp->servers.head; link; link = link->next) {
++	srv = link->data;
++	if (!srv->flags.alive) {
++	    debug(34, 3) ("helperShutdown: %s #%d is NOT ALIVE.\n",
++		hlp->id_name, srv->index + 1);
++	    continue;
++	}
++	if (srv->flags.busy) {
++	    debug(34, 3) ("helperShutdown: %s #%d is BUSY.\n",
++		hlp->id_name, srv->index + 1);
++	    srv->flags.shutdown = 1;
++	    continue;
++	}
++	if (srv->flags.closing) {
++	    debug(34, 3) ("helperShutdown: %s #%d is CLOSING.\n",
++		hlp->id_name, srv->index + 1);
++	    continue;
++	}
++	comm_close(srv->wfd);
++	srv->flags.closing = 1;
++    }
++}
++
++/* ====================================================================== */
++/* LOCAL FUNCTIONS */
++/* ====================================================================== */
++
++static void
++helperStateFree(int fd, void *data)
++{
++    helper_server *srv = data;
++    helper *hlp = srv->parent;
++    assert(srv->rfd == fd);
++    if (srv->buf) {
++	memFree(MEM_8K_BUF, srv->buf);
++	srv->buf = NULL;
++    }
++    if (srv->wfd != srv->rfd)
++	comm_close(srv->wfd);
++    dlinkDelete(&srv->link, &hlp->servers);
++    cbdataFree(srv);
++    hlp->n_running--;
++    assert(hlp->n_running >= 0);
++    if (shutting_down || reconfiguring)
++	return;
++    debug(34, 0) ("WARNING: %s #%d (FD %d) exited\n",
++	hlp->id_name, srv->index + 1, fd);
++    if (hlp->n_running < hlp->n_to_start / 2)
++	fatalf("Too few %s processes are running", hlp->id_name);
++}
++
++static void
++helperHandleRead(int fd, void *data)
++{
++    int len;
++    char *t = NULL;
++    helper_server *srv = data;
++    helper_request *r;
++    helper *hlp = srv->parent;
++    assert(fd == srv->rfd);
++    assert(cbdataValid(data));
++    Counter.syscalls.sock.reads++;
++    len = read(fd, srv->buf + srv->offset, srv->buf_sz - srv->offset);
++    fd_bytes(fd, len, FD_READ);
++    debug(29, 5) ("helperHandleRead: %d bytes from %s #%d.\n",
++	len, hlp->id_name, srv->index + 1);
++    if (len <= 0) {
++	if (len < 0)
++	    debug(50, 1) ("helperHandleRead: FD %d read: %s\n", fd, xstrerror());
++	comm_close(fd);
++	return;
++    }
++    srv->offset += len;
++    srv->buf[srv->offset] = '\0';
++    r = srv->request;
++    if (r == NULL) {
++	/* someone spoke without being spoken to */
++	debug(29, 1) ("helperHandleRead: unexpected read from %s #%d, %d bytes\n",
++	    hlp->id_name, srv->index + 1, len);
++	srv->offset = 0;
++    } else if ((t = strchr(srv->buf, '\n'))) {
++	/* end of reply found */
++	debug(29, 3) ("helperHandleRead: end of reply found\n");
++	*t = '\0';
++	if (cbdataValid(r->data))
++	    r->callback(r->data, srv->buf);
++	srv->flags.busy = 0;
++	srv->offset = 0;
++	helperRequestFree(r);
++	hlp->stats.replies++;
++	hlp->stats.avg_svc_time =
++	    intAverage(hlp->stats.avg_svc_time,
++	    tvSubMsec(srv->dispatch_time, current_time),
++	    hlp->stats.replies, REDIRECT_AV_FACTOR);
++	if (srv->flags.shutdown)
++	    comm_close(srv->wfd);
++    } else {
++	commSetSelect(srv->rfd, COMM_SELECT_READ, helperHandleRead, srv, 0);
++    }
++    helperKickQueue(hlp);
++}
++
++static void
++Enqueue(helper * hlp, helper_request * r)
++{
++    dlink_node *link = xcalloc(1, sizeof(*link));
++    dlinkAddTail(r, link, &hlp->queue);
++    hlp->stats.queue_size++;
++    if (hlp->stats.queue_size < hlp->n_running)
++	return;
++    if (squid_curtime - hlp->last_queue_warn < 600)
++	return;
++    hlp->last_queue_warn = squid_curtime;
++    debug(14, 0) ("WARNING: All %s processes are busy.\n", hlp->id_name);
++    debug(14, 0) ("WARNING: %d pending requests queued\n", hlp->stats.queue_size);
++    if (hlp->stats.queue_size > hlp->n_running * 2)
++	fatalf("Too many queued %s requests", hlp->id_name);
++    debug(14, 1) ("Consider increasing the number of %s processes in your config file.\n", hlp->id_name);
++}
++
++static helper_request *
++Dequeue(helper * hlp)
++{
++    dlink_node *link;
++    helper_request *r = NULL;
++    if ((link = hlp->queue.head)) {
++	r = link->data;
++	dlinkDelete(link, &hlp->queue);
++	safe_free(link);
++	hlp->stats.queue_size--;
++    }
++    return r;
++}
++
++static helper_server *
++GetFirstAvailable(helper * hlp)
++{
++    dlink_node *n;
++    helper_server *srv = NULL;
++    for (n = hlp->servers.head; n != NULL; n = n->next) {
++	srv = n->data;
++	if (srv->flags.busy)
++	    continue;
++	if (!srv->flags.alive)
++	    continue;
++	return srv;
++    }
++    return NULL;
++}
++
++static void
++helperDispatch(helper_server * srv, helper_request * r)
++{
++    helper *hlp = srv->parent;
++    if (!cbdataValid(r->data)) {
++	debug(29, 1) ("helperDispatch: invalid callback data\n");
++	helperRequestFree(r);
++	return;
++    }
++    assert(!srv->flags.busy);
++    srv->flags.busy = 1;
++    srv->request = r;
++    srv->dispatch_time = current_time;
++    comm_write(srv->wfd,
++	r->buf,
++	strlen(r->buf),
++	NULL,			/* Handler */
++	NULL,			/* Handler-data */
++	NULL);			/* free */
++    commSetSelect(srv->rfd,
++	COMM_SELECT_READ,
++	helperHandleRead,
++	srv, 0);
++    debug(29, 5) ("helperDispatch: Request sent to %s #%d, %d bytes\n",
++	hlp->id_name, srv->index + 1, strlen(r->buf));
++    srv->stats.uses++;
++    hlp->stats.requests++;
++}
++
++static void
++helperKickQueue(helper * hlp)
++{
++    helper_request *r;
++    helper_server *srv;
++    while ((srv = GetFirstAvailable(hlp)) && (r = Dequeue(hlp)))
++	helperDispatch(srv, r);
++}
++
++static void
++helperRequestFree(helper_request * r)
++{
++    cbdataUnlock(r->data);
++    xfree(r->buf);
++    xfree(r);
++}
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: ipcache.cc,v 1.203 1998/09/29 16:33:47 wessels Exp $
++ * $Id: ipcache.cc,v 1.204 1998/10/10 14:57:40 wessels Exp $
+  *
+  * DEBUG: section 14    IP Cache
+  * AUTHOR: Harvest Derived
+@@ -35,11 +35,6 @@
+ 
+ #include "squid.h"
+ 
+-struct ipcacheQueueData {
+-    struct ipcacheQueueData *next;
+-    ipcache_entry *i;
+-};
+-
+ static struct {
+     int requests;
+     int replies;
+@@ -54,34 +49,26 @@ static struct {
+ 
+ static dlink_list lru_list;
+ 
++static FREE ipcacheFreeEntry;
++static HLPCB ipcacheHandleReply;
++static IPH dummy_handler;
++static int ipcacheExpiredEntry(ipcache_entry *);
+ static int ipcache_testname(void);
+-static PF ipcache_dnsHandleRead;
+-static ipcache_entry *ipcacheParse(const char *buf, dnsserver_t *);
+-static void ipcache_release(ipcache_entry *);
+-static ipcache_entry *ipcache_create(const char *name);
+-static void ipcache_call_pending(ipcache_entry *);
+ static ipcache_entry *ipcacheAddNew(const char *, const struct hostent *, ipcache_status_t);
+-static void ipcacheAddHostent(ipcache_entry *, const struct hostent *);
+-static int ipcacheHasPending(ipcache_entry *);
++static ipcache_entry *ipcacheParse(const char *buf);
++static ipcache_entry *ipcache_create(const char *name);
+ static ipcache_entry *ipcache_get(const char *);
+-static IPH dummy_handler;
+-static int ipcacheExpiredEntry(ipcache_entry *);
++static void ipcacheAddHostent(ipcache_entry *, const struct hostent *);
+ static void ipcacheAddPending(ipcache_entry *, IPH *, void *);
+-static void ipcacheEnqueue(ipcache_entry *);
+-static void *ipcacheDequeue(void);
+-static void ipcache_dnsDispatch(dnsserver_t *, ipcache_entry *);
++static void ipcacheChangeKey(ipcache_entry * i);
++static void ipcacheLockEntry(ipcache_entry *);
+ static void ipcacheStatPrint(ipcache_entry *, StoreEntry *);
+ static void ipcacheUnlockEntry(ipcache_entry *);
+-static void ipcacheLockEntry(ipcache_entry *);
+-static void ipcacheNudgeQueue(void);
+-static void ipcacheChangeKey(ipcache_entry * i);
+-static FREE ipcacheFreeEntry;
++static void ipcache_call_pending(ipcache_entry *);
++static void ipcache_release(ipcache_entry *);
+ 
+ static ipcache_addrs static_addrs;
+ static hash_table *ip_table = NULL;
+-static struct ipcacheQueueData *ipcacheQueueHead = NULL;
+-static struct ipcacheQueueData **ipcacheQueueTailP = &ipcacheQueueHead;
+-static int queue_length = 0;
+ 
+ static char ipcache_status_char[] =
+ {
+@@ -98,48 +85,6 @@ static long ipcache_high = 200;
+ extern int _dns_ttl_;
+ #endif
+ 
+-static void
+-ipcacheEnqueue(ipcache_entry * i)
+-{
+-    static time_t last_warning = 0;
+-    struct ipcacheQueueData *new = xcalloc(1, sizeof(struct ipcacheQueueData));
+-    new->i = i;
+-    *ipcacheQueueTailP = new;
+-    ipcacheQueueTailP = &new->next;
+-    queue_length++;
+-    if (queue_length < NDnsServersAlloc)
+-	return;
+-    if (squid_curtime - last_warning < 600)
+-	return;
+-    last_warning = squid_curtime;
+-    debug(14, 0) ("ipcacheEnqueue: WARNING: All dnsservers are busy.\n");
+-    debug(14, 0) ("ipcacheEnqueue: WARNING: %d DNS lookups queued\n", queue_length);
+-    if (queue_length > NDnsServersAlloc * 2)
+-	fatal("Too many queued DNS lookups");
+-    if (Config.dnsChildren >= DefaultDnsChildrenMax)
+-	return;
+-    debug(14, 1) ("ipcacheEnqueue: Consider increasing 'dns_children' in your config file.\n");
+-}
+-
+-static void *
+-ipcacheDequeue(void)
+-{
+-    struct ipcacheQueueData *old = NULL;
+-    ipcache_entry *i = NULL;
+-    if (ipcacheQueueHead) {
+-	i = ipcacheQueueHead->i;
+-	old = ipcacheQueueHead;
+-	ipcacheQueueHead = ipcacheQueueHead->next;
+-	if (ipcacheQueueHead == NULL)
+-	    ipcacheQueueTailP = &ipcacheQueueHead;
+-	safe_free(old);
+-	queue_length--;
+-    }
+-    if (i != NULL)
+-	assert(i->status == IP_PENDING);
+-    return i;
+-}
+-
+ static int
+ ipcache_testname(void)
+ {
+@@ -309,9 +254,8 @@ ipcache_call_pending(ipcache_entry * i)
+     ipcacheUnlockEntry(i);
+ }
+ 
+-
+ static ipcache_entry *
+-ipcacheParse(const char *inbuf, dnsserver_t * dnsData)
++ipcacheParse(const char *inbuf)
+ {
+     LOCAL_ARRAY(char, buf, DNS_INBUF_SZ);
+     char *token;
+@@ -376,89 +320,28 @@ ipcacheParse(const char *inbuf, dnsserver_t * dnsData)
+ }
+ 
+ static void
+-ipcacheNudgeQueue(void)
+-{
+-    dnsserver_t *dnsData;
+-    ipcache_entry *i = NULL;
+-    while ((dnsData = dnsGetFirstAvailable()) && (i = ipcacheDequeue()))
+-	ipcache_dnsDispatch(dnsData, i);
+-}
+-
+-static void
+-ipcache_dnsHandleRead(int fd, void *data)
++ipcacheHandleReply(void *data, char *reply)
+ {
+-    dnsserver_t *dnsData = data;
+-    int len;
+     int n;
+-    ipcache_entry *i = NULL;
++    generic_cbdata *c = data;
++    ipcache_entry *i = c->data;
+     ipcache_entry *x = NULL;
+-
+-    Counter.syscalls.sock.reads++;
+-    len = read(fd,
+-	dnsData->ip_inbuf + dnsData->offset,
+-	dnsData->size - dnsData->offset);
+-    fd_bytes(fd, len, FD_READ);
+-    debug(14, 5) ("ipcache_dnsHandleRead: Result from DNS ID %d (%d bytes)\n",
+-	dnsData->id, len);
+-    if (len <= 0) {
+-	if (len < 0 && ignoreErrno(errno)) {
+-	    commSetSelect(fd,
+-		COMM_SELECT_READ,
+-		ipcache_dnsHandleRead,
+-		dnsData,
+-		0);
+-	    return;
+-	}
+-	debug(14, dnsData->flags.closing ? 5 : 1)
+-	    ("FD %d: Connection from DNSSERVER #%d is closed, disabling\n",
+-	    fd, dnsData->id);
+-	dnsData->flags.alive = 0;
+-	dnsData->flags.busy = 0;
+-	dnsData->flags.closing = 0;
+-	dnsData->flags.shutdown = 0;
+-	commSetSelect(fd, COMM_SELECT_WRITE, NULL, NULL, 0);
+-	comm_close(fd);
+-	return;
+-    }
+-    n = ++IpcacheStats.replies;
+-    dnsData->offset += len;
+-    dnsData->ip_inbuf[dnsData->offset] = '\0';
+-    i = dnsData->data;
+-    assert(i != NULL);
+     assert(i->status == IP_DISPATCHED);
+-    if (strchr(dnsData->ip_inbuf, '\n')) {
+-	/* end of record found */
+-	DnsStats.replies++;
+-	statHistCount(&Counter.dns.svc_time,
+-	    tvSubMsec(i->request_time, current_time));
+-	if ((x = ipcacheParse(dnsData->ip_inbuf, dnsData)) == NULL) {
+-	    debug(14, 0) ("ipcache_dnsHandleRead: ipcacheParse failed?!\n");
+-	} else {
+-	    dnsData->offset = 0;
+-	    dnsData->ip_inbuf[0] = '\0';
+-	    i->status = x->status;
+-	    i->addrs = x->addrs;
+-	    i->error_message = x->error_message;
+-	    i->expires = x->expires;
+-	    ipcache_call_pending(i);
+-	}
+-	ipcacheUnlockEntry(i);	/* unlock from IP_DISPATCHED */
++    assert(i->locks);
++    cbdataFree(c);
++    c = NULL;
++    n = ++IpcacheStats.replies;
++    statHistCount(&Counter.dns.svc_time, tvSubMsec(i->request_time, current_time));
++    if ((x = ipcacheParse(reply)) == NULL) {
++	debug(14, 0) ("ipcache_dnsHandleRead: ipcacheParse failed?!\n");
+     } else {
+-	debug(14, 5) ("ipcache_dnsHandleRead: Incomplete reply\n");
+-	commSetSelect(fd,
+-	    COMM_SELECT_READ,
+-	    ipcache_dnsHandleRead,
+-	    dnsData,
+-	    0);
+-    }
+-    if (dnsData->offset == 0) {
+-	dnsData->data = NULL;
+-	dnsData->flags.busy = 0;
+-	if (dnsData->flags.shutdown)
+-	    dnsShutdownServer(dnsData);
+-	cbdataUnlock(dnsData);
++	i->status = x->status;
++	i->addrs = x->addrs;
++	i->error_message = x->error_message;
++	i->expires = x->expires;
++	ipcache_call_pending(i);
+     }
+-    ipcacheNudgeQueue();
++    ipcacheUnlockEntry(i);	/* unlock from IP_DISPATCHED */
+ }
+ 
+ static void
+@@ -472,20 +355,17 @@ ipcacheAddPending(ipcache_entry * i, IPH * handler, void *handlerData)
+     cbdataLock(handlerData);
+     for (I = &(i->pending_head); *I; I = &((*I)->next));
+     *I = pending;
+-    if (i->status == IP_PENDING)
+-	ipcacheNudgeQueue();
+ }
+ 
+ void
+ ipcache_nbgethostbyname(const char *name, IPH * handler, void *handlerData)
+ {
+     ipcache_entry *i = NULL;
+-    dnsserver_t *dnsData = NULL;
+     const ipcache_addrs *addrs = NULL;
++    generic_cbdata *c;
+     assert(handler != NULL);
+     debug(14, 4) ("ipcache_nbgethostbyname: Name '%s'.\n", name);
+     IpcacheStats.requests++;
+-
+     if (name == NULL || name[0] == '\0') {
+ 	debug(14, 4) ("ipcache_nbgethostbyname: Invalid name!\n");
+ 	handler(NULL, handlerData);
+@@ -531,67 +411,23 @@ ipcache_nbgethostbyname(const char *name, IPH * handler, void *handlerData)
+     } else {
+ 	fatal_dump("ipcache_nbgethostbyname: BAD ipcache_entry status");
+     }
+-
+-    /* for HIT, PENDING, DISPATCHED we've returned.  For MISS we continue */
+-
+-    if ((dnsData = dnsGetFirstAvailable())) {
+-	ipcache_dnsDispatch(dnsData, i);
+-    } else if (NDnsServersAlloc) {
+-	ipcacheEnqueue(i);
+-    } else {
+-	/* generate abort if we get here */
+-	assert(NDnsServersAlloc);
+-    }
+-}
+-
+-static void
+-ipcache_dnsDispatch(dnsserver_t * dns, ipcache_entry * i)
+-{
+-    char *buf = NULL;
+-    assert(dns->flags.alive);
+-    if (!ipcacheHasPending(i)) {
+-	debug(14, 3) ("Skipping lookup of '%s' because client(s) disappeared.\n",
+-	    i->name);
+-	i->status = IP_NEGATIVE_CACHED;
+-	ipcache_release(i);
+-	return;
+-    }
+-    assert(i->status == IP_PENDING);
+-    buf = xcalloc(1, 256);
+-    snprintf(buf, 256, "%s\n", i->name);
+-    dns->flags.busy = 1;
+-    dns->data = i;
++    /* for HIT, PENDING, DISPATCHED we've returned.  For MISS we submit */
++    c = xcalloc(1, sizeof(*c));
++    c->data = i;
++    cbdataAdd(c, MEM_NONE);
+     i->status = IP_DISPATCHED;
+-    cbdataLock(dns);
+-    comm_write(dns->outpipe,
+-	buf,
+-	strlen(buf),
+-	NULL,			/* Handler */
+-	NULL,			/* Handler-data */
+-	xfree);
+-    commSetSelect(dns->outpipe,
+-	COMM_SELECT_READ,
+-	ipcache_dnsHandleRead,
+-	dns, 0);
+-    debug(14, 5) ("ipcache_dnsDispatch: Request sent to DNS server #%d.\n",
+-	dns->id);
+-    dns->dispatch_time = current_time;
+-    DnsStats.requests++;
+-    DnsStats.hist[dns->id - 1]++;
+-    ipcacheLockEntry(i);	/* lock while IP_DISPATCHED */
++    ipcacheLockEntry(i);
++    dnsSubmit(i->name, ipcacheHandleReply, c);
+ }
+ 
+-
+ /* initialize the ipcache */
+ void
+ ipcache_init(void)
+ {
+     int n;
+     debug(14, 3) ("Initializing IP Cache...\n");
+-
+     memset(&IpcacheStats, '\0', sizeof(IpcacheStats));
+     memset(&lru_list, '\0', sizeof(lru_list));
+-
+     /* test naming lookup */
+     if (!opt_dns_tests) {
+ 	debug(14, 4) ("ipcache_init: Skipping DNS name lookup tests.\n");
+@@ -600,11 +436,9 @@ ipcache_init(void)
+     } else {
+ 	debug(14, 1) ("Successful DNS name lookup tests...\n");
+     }
+-
+     memset(&static_addrs, '\0', sizeof(ipcache_addrs));
+     static_addrs.in_addrs = xcalloc(1, sizeof(struct in_addr));
+     static_addrs.bad_mask = xcalloc(1, sizeof(unsigned char));
+-
+     ipcache_high = (long) (((float) Config.ipcache.size *
+ 	    (float) Config.ipcache.high) / (float) 100);
+     ipcache_low = (long) (((float) Config.ipcache.size *
+@@ -643,7 +477,6 @@ ipcache_gethostbyname(const char *name, int flags)
+ {
+     ipcache_entry *i = NULL;
+     ipcache_addrs *addrs;
+-
+     if (!name)
+ 	fatal_dump("ipcache_gethostbyname: NULL name");
+     debug(14, 3) ("ipcache_gethostbyname: '%s', flags=%x\n", name, flags);
+@@ -717,7 +550,6 @@ stat_ipcache_get(StoreEntry * sentry)
+ 	IpcacheStats.ghbn_calls);
+     storeAppendPrintf(sentry, "Attempts to release locked entries: %d\n",
+ 	IpcacheStats.release_locked);
+-    storeAppendPrintf(sentry, "pending queue length: %d\n", queue_length);
+     storeAppendPrintf(sentry, "\n\n");
+     storeAppendPrintf(sentry, "IP Cache Contents:\n\n");
+     storeAppendPrintf(sentry, " %-29.29s %5s %6s %6s %1s\n",
+@@ -736,18 +568,6 @@ dummy_handler(const ipcache_addrs * addrsnotused, void *datanotused)
+     return;
+ }
+ 
+-static int
+-ipcacheHasPending(ipcache_entry * i)
+-{
+-    ip_pending *p = NULL;
+-    if (i->status != IP_PENDING)
+-	return 0;
+-    for (p = i->pending_head; p; p = p->next)
+-	if (p->handler)
+-	    return 1;
+-    return 0;
+-}
+-
+ void
+ ipcacheReleaseInvalid(const char *name)
+ {
+@@ -943,7 +763,6 @@ ipcache_restart(void)
+ {
+     ipcache_entry *this;
+     assert(ip_table != NULL);
+-    while (ipcacheDequeue());
+     hash_first(ip_table);
+     while ((this = (ipcache_entry *) hash_next(ip_table))) {
+ 	if (this->status == IP_CACHED)
+@@ -1004,10 +823,12 @@ snmp_netIpFn(variable_list * Var, snint * ErrP)
+     case IP_LOC:
+ 	*(Answer->val.integer) = IpcacheStats.release_locked;
+ 	break;
++#if DELETE_ME
+     case IP_LENG:
+ 	*(Answer->val.integer) = queue_length;
+ 	Answer->type = SMI_GAUGE32;
+ 	break;
++#endif
+     default:
+ 	*ErrP = SNMP_ERR_NOSUCHNAME;
+ 	snmp_var_free(Answer);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: main.cc,v 1.272 1998/09/15 19:37:51 wessels Exp $
++ * $Id: main.cc,v 1.273 1998/10/10 14:57:41 wessels Exp $
+  *
+  * DEBUG: section 1     Startup and Main Loop
+  * AUTHOR: Harvest Derived
+@@ -314,19 +314,19 @@ mainReconfigure(void)
+ #ifdef SQUID_SNMP
+     snmpConnectionClose();
+ #endif
+-    dnsShutdownServers(NULL);
+-    redirectShutdownServers(NULL);
+-    authenticateShutdownServers(NULL);
++    dnsShutdown();
++    redirectShutdown();
++    authenticateShutdown();
+     storeDirCloseSwapLogs();
+     errorFree();
+     parseConfigFile(ConfigFile);
+     _db_init(Config.Log.log, Config.debugOptions);
+     ipcache_restart();		/* clear stuck entries */
+     fqdncache_restart();	/* sigh, fqdncache too */
+     errorInitialize();		/* reload error pages */
+-    dnsOpenServers();
+-    redirectOpenServers();
+-    authenticateOpenServers();
++    dnsInit();
++    redirectInit();
++    authenticateInit();
+     serverConnectionsOpen();
+     if (theOutIcpConnection >= 0) {
+ 	if (!Config2.Accel.on || Config.onoff.accel_with_proxy)
+@@ -404,9 +404,9 @@ mainInitialize(void)
+ 	disk_init();		/* disk_init must go before ipcache_init() */
+     ipcache_init();
+     fqdncache_init();
+-    dnsOpenServers();
+-    redirectOpenServers();
+-    authenticateOpenServers();
++    dnsInit();
++    redirectInit();
++    authenticateInit();
+     useragentOpenLog();
+     httpHeaderInitModule();	/* must go before any header processing (e.g. the one in errorInitialize) */
+     httpAnonInitModule();	/* must go before accepting requests */
+@@ -575,9 +575,9 @@ main(int argc, char **argv)
+ 	    do_shutdown = 0;
+ 	    shutting_down = 1;
+ 	    serverConnectionsClose();
+-	    eventAdd("dnsShutdownServers", dnsShutdownServers, NULL, 0.0, 1);
+-	    eventAdd("redirectShutdownServers", redirectShutdownServers, NULL, 0.0, 1);
+-	    eventAdd("authenticateShutdownServers", authenticateShutdownServers, NULL, 0.0, 1);
++	    dnsShutdown();
++	    redirectShutdown();
++	    authenticateShutdown();
+ 	    eventAdd("SquidShutdown", SquidShutdown, NULL, (double) (wait + 1), 1);
+ 	}
+ 	eventRun();
+@@ -704,7 +704,6 @@ SquidShutdown(void *unused)
+     snmpConnectionClose();
+ #endif
+     releaseServerSockets();
+-    redirectShutdownServers(NULL);
+     commCloseAllSockets();
+     unlinkdClose();
+     storeDirWriteCleanLogs(0);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: protos.h,v 1.275 1998/10/01 22:28:29 wessels Exp $
++ * $Id: protos.h,v 1.276 1998/10/10 14:57:42 wessels Exp $
+  *
+  *
+  * SQUID Internet Object Cache  http://squid.nlanr.net/Squid/
+@@ -89,6 +89,7 @@ extern void aioCheckCallbacks(void);
+ extern int parseConfigFile(const char *file_name);
+ extern void intlistDestroy(intlist **);
+ extern int intlistFind(intlist * list, int i);
++extern void wordlistAdd(wordlist **, const char *);
+ extern void wordlistDestroy(wordlist **);
+ extern void configFreeMemory(void);
+ extern void wordlistCat(const wordlist *, MemBuf * mb);
+@@ -202,12 +203,9 @@ extern int file_read(int, char *, int, off_t, DRCB *, void *);
+ extern void disk_init(void);
+ extern int diskWriteIsComplete(int);
+ 
+-extern void dnsShutdownServers(void *);
+-extern void dnsShutdownServer(dnsserver_t * dns);
+-extern void dnsOpenServers(void);
+-extern dnsserver_t *dnsGetFirstAvailable(void);
+-extern void dnsStats(StoreEntry *);
+-extern void dnsFreeMemory(void);
++extern void dnsShutdown(void);
++extern void dnsInit(void);
++extern void dnsSubmit(const char *lookup, HLPCB * callback, void *data);
+ 
+ extern void eventAdd(const char *name, EVH * func, void *arg, double when, int);
+ extern void eventAddIsh(const char *name, EVH * func, void *arg, double delta_ish, int);
+@@ -635,16 +633,12 @@ extern void fwdUnregister(int fd, FwdState *);
+ extern void urnStart(request_t *, StoreEntry *);
+ 
+ extern void redirectStart(clientHttpRequest *, RH *, void *);
+-extern void redirectOpenServers(void);
+-extern void redirectShutdownServers(void *);
+-extern void redirectStats(StoreEntry *);
++extern void redirectInit(void);
++extern void redirectShutdown(void);
+ 
+ extern void authenticateStart(acl_proxy_auth_user *, RH *, void *);
+-extern void authenticateOpenServers(void);
+-extern void authenticateShutdownServers(void *);
+-extern void authenticateStats(StoreEntry *);
+-extern int authenticateUnregister(const char *url, void *);
+-extern void authenticateFreeMemory(void);
++extern void authenticateInit(void);
++extern void authenticateShutdown(void);
+ 
+ extern void refreshAddToList(const char *, int, time_t, int, time_t);
+ extern int refreshCheck(const StoreEntry *, request_t *, time_t delta);
+@@ -1080,6 +1074,11 @@ extern void delaySetStoreClient(StoreEntry * e, void *data, delay_id delay_id);
+ extern int delayBytesWanted(delay_id d, int min, int max);
+ #endif
+ 
++extern void helperOpenServers(helper * hlp);
++extern void helperSubmit(helper * hlp, const char *buf, HLPCB * callback, void *data);
++extern void helperStats(StoreEntry * sentry, helper * hlp);
++extern void helperShutdown(helper * hlp);
++
+ /*
+  * prototypes for system functions missing from system includes
+  */
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: redirect.cc,v 1.70 1998/09/15 06:49:58 wessels Exp $
++ * $Id: redirect.cc,v 1.71 1998/10/10 14:57:42 wessels Exp $
+  *
+  * DEBUG: section 29    Redirector
+  * AUTHOR: Duane Wessels
+@@ -44,236 +44,62 @@ typedef struct {
+     RH *handler;
+ } redirectStateData;
+ 
+-typedef struct _redirector {
+-    int index;
+-    helper_flags flags;
+-    int fd;
+-    char *inbuf;
+-    unsigned int size;
+-    unsigned int offset;
+-    struct timeval dispatch_time;
+-    redirectStateData *redirectState;
+-    dlink_node link;
+-} redirector_t;
+-
+-static struct {
+-    int requests;
+-    int replies;
+-    int errors;
+-    int avg_svc_time;
+-    int queue_size;
+-    int use_hist[DefaultRedirectChildrenMax];
+-    int rewrites[DefaultRedirectChildrenMax];
+-} RedirectStats;
+-
+-struct redirectQueueData {
+-    struct redirectQueueData *next;
+-    redirectStateData *redirectState;
+-};
+-
+-static redirector_t *GetFirstAvailable(void);
+-static PF redirectHandleRead;
+-static redirectStateData *Dequeue(void);
+-static void Enqueue(redirectStateData *);
+-static void redirectDispatch(redirector_t *, redirectStateData *);
++static HLPCB redirectHandleReply;
+ static void redirectStateFree(redirectStateData * r);
+-static PF redirectorStateFree;
+-
+-static dlink_list redirectors;
+-static int NRedirectors = 0;
+-static int NRedirectorsOpen = 0;
+-static struct redirectQueueData *redirectQueueHead = NULL;
+-static struct redirectQueueData **redirectQueueTailP = &redirectQueueHead;
++static helper *redirectors = NULL;
++static OBJH redirectStats;
+ 
+ static void
+-redirectHandleRead(int fd, void *data)
++redirectHandleReply(void *data, char *reply)
+ {
+-    redirector_t *redirector = data;
+-    int len;
+-    redirectStateData *r = redirector->redirectState;
+-    char *t = NULL;
+-    int n;
++    redirectStateData *r = data;
+     int valid;
++    char *t;
+     assert(cbdataValid(data));
+-    Counter.syscalls.sock.reads++;
+-    len = read(fd,
+-	redirector->inbuf + redirector->offset,
+-	redirector->size - redirector->offset);
+-    fd_bytes(fd, len, FD_READ);
+-    debug(29, 5) ("redirectHandleRead: %d bytes from Redirector #%d.\n",
+-	len, redirector->index + 1);
+-    if (len <= 0) {
+-	if (len < 0)
+-	    debug(50, 1) ("redirectHandleRead: FD %d read: %s\n", fd, xstrerror());
+-	debug(29, redirector->flags.closing ? 5 : 1)
+-	    ("FD %d: Connection from Redirector #%d is closed, disabling\n",
+-	    fd, redirector->index + 1);
+-	redirector->flags.alive = 0;
+-	redirector->flags.busy = 0;
+-	redirector->flags.closing = 0;
+-	redirector->flags.shutdown = 0;
+-	memFree(MEM_8K_BUF, redirector->inbuf);
+-	redirector->inbuf = NULL;
+-	comm_close(fd);
+-	return;
+-    }
+-    if (len != 1)
+-	RedirectStats.rewrites[redirector->index]++;
+-    redirector->offset += len;
+-    redirector->inbuf[redirector->offset] = '\0';
+-    if ((t = strchr(redirector->inbuf, '\n'))) {
+-	/* end of record found */
+-	*t = '\0';
+-	if ((t = strchr(redirector->inbuf, ' ')))
+-	    *t = '\0';		/* terminate at space */
+-	if (r == NULL) {
+-	    /* A naughty redirector has spoken without being spoken to */
+-	    /* B.R.Foster@massey.ac.nz, SQUID/1.1.3 */
+-	    debug(29, 0) ("redirectHandleRead: unexpected reply: '%s'\n",
+-		redirector->inbuf);
+-	    redirector->offset = 0;
+-	} else {
+-	    debug(29, 5) ("redirectHandleRead: reply: '%s'\n",
+-		redirector->inbuf);
+-	    valid = cbdataValid(r->data);
+-	    cbdataUnlock(r->data);
+-	    if (valid)
+-		r->handler(r->data,
+-		    t == redirector->inbuf ? NULL : redirector->inbuf);
+-	    redirectStateFree(r);
+-	    redirector->redirectState = NULL;
+-	    redirector->flags.busy = 0;
+-	    redirector->offset = 0;
+-	    n = ++RedirectStats.replies;
+-	    RedirectStats.avg_svc_time =
+-		intAverage(RedirectStats.avg_svc_time,
+-		tvSubMsec(redirector->dispatch_time, current_time),
+-		n, REDIRECT_AV_FACTOR);
+-	    if (redirector->flags.shutdown)
+-		comm_close(redirector->fd);
+-	}
+-    } else {
+-	commSetSelect(redirector->fd,
+-	    COMM_SELECT_READ,
+-	    redirectHandleRead,
+-	    redirector, 0);
+-    }
+-    while ((redirector = GetFirstAvailable()) && (r = Dequeue()))
+-	redirectDispatch(redirector, r);
+-}
+-
+-static void
+-Enqueue(redirectStateData * r)
+-{
+-    struct redirectQueueData *new = xcalloc(1, sizeof(struct redirectQueueData));
+-    new->redirectState = r;
+-    *redirectQueueTailP = new;
+-    redirectQueueTailP = &new->next;
+-    RedirectStats.queue_size++;
+-}
+-
+-static redirectStateData *
+-Dequeue(void)
+-{
+-    struct redirectQueueData *old = NULL;
+-    redirectStateData *r = NULL;
+-    if (redirectQueueHead) {
+-	r = redirectQueueHead->redirectState;
+-	old = redirectQueueHead;
+-	redirectQueueHead = redirectQueueHead->next;
+-	if (redirectQueueHead == NULL)
+-	    redirectQueueTailP = &redirectQueueHead;
+-	safe_free(old);
+-	RedirectStats.queue_size--;
+-    }
+-    return r;
+-}
+-
+-static redirector_t *
+-GetFirstAvailable(void)
+-{
+-    dlink_node *n;
+-    redirector_t *r = NULL;
+-    for (n = redirectors.head; n != NULL; n = n->next) {
+-	r = n->data;
+-	if (r->flags.busy)
+-	    continue;
+-	if (!r->flags.alive)
+-	    continue;
+-	return r;
+-    }
+-    return NULL;
++    debug(29, 5) ("redirectHandleRead: {%s}\n", reply);
++    if ((t = strchr(reply, ' ')))
++	t = '\0';
++    if (*reply == '\0')
++	reply = NULL;
++    valid = cbdataValid(r->data);
++    cbdataUnlock(r->data);
++    if (valid)
++	r->handler(r->data, reply);
++    redirectStateFree(r);
+ }
+ 
+ static void
+ redirectStateFree(redirectStateData * r)
+ {
+     safe_free(r->orig_url);
+-    safe_free(r);
++    cbdataFree(r);
+ }
+ 
+-
+ static void
+-redirectDispatch(redirector_t * redirect, redirectStateData * r)
++redirectStats(StoreEntry * sentry)
+ {
+-    char *buf = NULL;
+-    const char *fqdn = NULL;
+-    int len;
+-    if (r->handler == NULL) {
+-	debug(29, 1) ("redirectDispatch: skipping '%s' because no handler\n",
+-	    r->orig_url);
+-	redirectStateFree(r);
+-	return;
+-    }
+-    redirect->flags.busy = 1;
+-    redirect->redirectState = r;
+-    redirect->dispatch_time = current_time;
+-    if ((fqdn = fqdncache_gethostbyaddr(r->client_addr, 0)) == NULL)
+-	fqdn = dash_str;
+-    buf = memAllocate(MEM_8K_BUF);
+-    snprintf(buf, 8192, "%s %s/%s %s %s\n",
+-	r->orig_url,
+-	inet_ntoa(r->client_addr),
+-	fqdn,
+-	r->client_ident,
+-	r->method_s);
+-    len = strlen(buf);
+-    comm_write(redirect->fd,
+-	buf,
+-	len,
+-	NULL,			/* Handler */
+-	NULL,			/* Handler-data */
+-	memFree8K);
+-    commSetSelect(redirect->fd,
+-	COMM_SELECT_READ,
+-	redirectHandleRead,
+-	redirect, 0);
+-    debug(29, 5) ("redirectDispatch: Request sent to Redirector #%d, %d bytes\n",
+-	redirect->index + 1, len);
+-    RedirectStats.use_hist[redirect->index]++;
+-    RedirectStats.requests++;
++    storeAppendPrintf(sentry, "Redirector Statistics:\n");
++    helperStats(sentry, redirectors);
+ }
+ 
+-
+ /**** PUBLIC FUNCTIONS ****/
+ 
+-
+ void
+ redirectStart(clientHttpRequest * http, RH * handler, void *data)
+ {
+     ConnStateData *conn = http->conn;
+     redirectStateData *r = NULL;
+-    redirector_t *redirector = NULL;
+-    if (!http)
+-	fatal_dump("redirectStart: NULL clientHttpRequest");
+-    if (!handler)
+-	fatal_dump("redirectStart: NULL handler");
++    const char *fqdn;
++    char buf[8192];
++    assert(http);
++    assert(handler);
+     debug(29, 5) ("redirectStart: '%s'\n", http->uri);
+     if (Config.Program.redirect == NULL) {
+ 	handler(data, NULL);
+ 	return;
+     }
+     r = xcalloc(1, sizeof(redirectStateData));
++    cbdataAdd(r, MEM_NONE);
+     r->orig_url = xstrdup(http->uri);
+     r->client_addr = conn->log_addr;
+     if (conn->ident.ident == NULL || *conn->ident.ident == '\0') {
+@@ -285,153 +111,43 @@ redirectStart(clientHttpRequest * http, RH * handler, void *data)
+     r->handler = handler;
+     r->data = data;
+     cbdataLock(r->data);
+-    if ((redirector = GetFirstAvailable()))
+-	redirectDispatch(redirector, r);
+-    else
+-	Enqueue(r);
+-}
+-
+-static void
+-redirectorStateFree(int fd, void *data)
+-{
+-    redirector_t *r = data;
+-    assert(r->fd == fd);
+-    if (r->inbuf) {
+-	memFree(MEM_8K_BUF, r->inbuf);
+-	r->inbuf = NULL;
+-    }
+-    dlinkDelete(&r->link, &redirectors);
+-    cbdataFree(r);
+-    NRedirectorsOpen--;
+-    if (NRedirectorsOpen == 0 && !shutting_down)
+-	fatal_dump("All redirectors have exited!");
++    if ((fqdn = fqdncache_gethostbyaddr(r->client_addr, 0)) == NULL)
++	fqdn = dash_str;
++    snprintf(buf, 8192, "%s %s/%s %s %s\n",
++	r->orig_url,
++	inet_ntoa(r->client_addr),
++	fqdn,
++	r->client_ident,
++	r->method_s);
++    helperSubmit(redirectors, buf, redirectHandleReply, r);
+ }
+ 
+ void
+-redirectOpenServers(void)
++redirectInit(void)
+ {
+-    char *prg = Config.Program.redirect;
+-    char *short_prg;
+-    char *short_prg2;
+-    redirector_t *redirector;
+-    int k;
+-    int redirectsocket;
+-    LOCAL_ARRAY(char, fd_note_buf, FD_DESC_SZ);
+-    static int first_time = 0;
+-    char *s;
+-    char *args[2];
+-    int x;
+-
+-    if (first_time == 0) {
+-	memset(&redirectors, '\0', sizeof(redirectors));
+-    }
+-    assert(redirectors.head == NULL);
+-    assert(redirectors.tail == NULL);
+-    if (Config.Program.redirect == NULL)
++    static int init = 0;
++    safe_free(redirectors);
++    if (!Config.Program.redirect)
+ 	return;
+-    NRedirectors = Config.redirectChildren;
+-    debug(29, 1) ("redirectOpenServers: Starting %d '%s' processes\n",
+-	NRedirectors, prg);
+-    if ((s = strrchr(prg, '/')))
+-	short_prg = xstrdup(s + 1);
+-    else
+-	short_prg = xstrdup(prg);
+-    short_prg2 = xmalloc(strlen(s) + 3);
+-    snprintf(short_prg2, strlen(s) + 3, "(%s)", short_prg);
+-    for (k = 0; k < NRedirectors; k++) {
+-	args[0] = short_prg2;
+-	args[1] = NULL;
+-	x = ipcCreate(IPC_TCP_SOCKET,
+-	    prg,
+-	    args,
+-	    "redirector",
+-	    &redirectsocket,
+-	    &redirectsocket);
+-	if (x < 0) {
+-	    debug(29, 1) ("WARNING: Cannot run '%s' process.\n", prg);
+-	    continue;
+-	}
+-	NRedirectorsOpen++;
+-	redirector = xcalloc(1, sizeof(redirector_t));
+-	cbdataAdd(redirector, MEM_NONE);
+-	redirector->flags.alive = 1;
+-	redirector->index = k;
+-	redirector->fd = redirectsocket;
+-	redirector->inbuf = memAllocate(MEM_8K_BUF);
+-	redirector->size = 8192;
+-	redirector->offset = 0;
+-	snprintf(fd_note_buf, FD_DESC_SZ, "%s #%d",
+-	    short_prg,
+-	    redirector->index + 1);
+-	fd_note(redirector->fd, fd_note_buf);
+-	commSetNonBlocking(redirector->fd);
+-	comm_add_close_handler(redirector->fd, redirectorStateFree, redirector);
+-	debug(29, 3) ("redirectOpenServers: 'redirect_server' %d started\n",
+-	    k);
+-	dlinkAddTail(redirector, &redirector->link, &redirectors);
+-    }
+-    if (first_time == 0) {
+-	first_time++;
+-	memset(&RedirectStats, '\0', sizeof(RedirectStats));
++    redirectors = xcalloc(1, sizeof(*redirectors));
++    redirectors->id_name = "redirector";
++    wordlistAdd(&redirectors->cmdline, Config.Program.redirect);
++    redirectors->n_to_start = Config.redirectChildren;
++    redirectors->ipc_type = IPC_TCP_SOCKET;
++    helperOpenServers(redirectors);
++    if (!init) {
+ 	cachemgrRegister("redirector",
+ 	    "URL Redirector Stats",
+ 	    redirectStats, 0, 1);
+     }
+-    safe_free(short_prg);
+-    safe_free(short_prg2);
+-}
+-
+-static void
+-redirectShutdown(redirector_t * r)
+-{
+-    if (!r->flags.alive)
+-	return;
+-    if (r->flags.closing)
+-	return;
+-    debug(29, 3) ("redirectShutdown: closing redirector #%d, FD %d\n",
+-	r->index + 1, r->fd);
+-    r->flags.shutdown = 1;
+-    r->flags.busy = 1;
+-    /*
+-     * orphan the redirector, it will have to be freed when its done with
+-     * the current request
+-     */
+-    dlinkDelete(&r->link, &redirectors);
++    init++;
+ }
+ 
+ void
+-redirectShutdownServers(void *unused)
++redirectShutdown(void)
+ {
+-    dlink_node *n;
+-    redirector_t *redirect = NULL;
+-    if (Config.Program.redirect == NULL)
++    if (!redirectors)
+ 	return;
+-    for (n = redirectors.head; n != NULL; n = n->next) {
+-	redirect = n->data;
+-	redirectShutdown(redirect);
+-    }
+-}
+-
+-void
+-redirectStats(StoreEntry * sentry)
+-{
+-    int k;
+-    storeAppendPrintf(sentry, "Redirector Statistics:\n");
+-    storeAppendPrintf(sentry, "requests: %d\n",
+-	RedirectStats.requests);
+-    storeAppendPrintf(sentry, "replies: %d\n",
+-	RedirectStats.replies);
+-    storeAppendPrintf(sentry, "queue length: %d\n",
+-	RedirectStats.queue_size);
+-    storeAppendPrintf(sentry, "avg service time: %d msec\n",
+-	RedirectStats.avg_svc_time);
+-    storeAppendPrintf(sentry, "number of redirectors: %d\n",
+-	NRedirectors);
+-    storeAppendPrintf(sentry, "use histogram:\n");
+-    for (k = 0; k < NRedirectors; k++) {
+-	storeAppendPrintf(sentry, "    redirector #%d: %d (%d rewrites)\n",
+-	    k + 1,
+-	    RedirectStats.use_hist[k],
+-	    RedirectStats.rewrites[k]);
+-    }
++    helperShutdown(redirectors);
++    wordlistDestroy(&redirectors->cmdline);
+ }
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: structs.h,v 1.238 1998/10/08 02:40:09 wessels Exp $
++ * $Id: structs.h,v 1.239 1998/10/10 14:57:43 wessels Exp $
+  *
+  *
+  * SQUID Internet Object Cache  http://squid.nlanr.net/Squid/
+@@ -904,6 +904,7 @@ struct _fqdncache_entry {
+     char *names[FQDN_MAX_NAMES + 1];
+     fqdn_pending *pending_head;
+     char *error_message;
++    struct timeval request_time;
+     dlink_node lru;
+     unsigned char locks;
+     fqdncache_status_t status:3;
+@@ -1604,3 +1605,53 @@ struct _htcpReplyData {
+ };
+ 
+ #endif
++
++
++struct _helper_request {
++    char *buf;
++    HLPCB *callback;
++    void *data;
++};
++
++struct _helper {
++    wordlist *cmdline;
++    dlink_list servers;
++    dlink_list queue;
++    char *id_name;
++    int n_to_start;
++    int n_running;
++    int ipc_type;
++    time_t last_queue_warn;
++    struct {
++	int requests;
++	int replies;
++	int queue_size;
++	int avg_svc_time;
++    } stats;
++};
++
++struct _helper_server {
++    int index;
++    int rfd;
++    int wfd;
++    char *buf;
++    size_t buf_sz;
++    off_t offset;
++    struct timeval dispatch_time;
++    struct timeval answer_time;
++    dlink_node link;
++    helper *parent;
++    helper_request *request;
++    helper_flags flags;
++    struct {
++	int uses;
++    } stats;
++};
++
++/*
++ * use this when you need to pass callback data to a blocking
++ * operation, but you don't want to add that pointer to cbdata
++ */
++struct _generic_cbdata {
++    void *data;
++};
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: typedefs.h,v 1.78 1998/09/19 17:06:18 wessels Exp $
++ * $Id: typedefs.h,v 1.79 1998/10/10 14:57:44 wessels Exp $
+  *
+  *
+  * SQUID Internet Object Cache  http://squid.nlanr.net/Squid/
+@@ -157,6 +157,10 @@ typedef struct _CacheDigest CacheDigest;
+ typedef struct _Version Version;
+ typedef struct _FwdState FwdState;
+ typedef struct _FwdServer FwdServer;
++typedef struct _helper helper;
++typedef struct _helper_server helper_server;
++typedef struct _helper_request helper_request;
++typedef struct _generic_cbdata generic_cbdata;
+ 
+ #if SQUID_SNMP
+ typedef struct _snmp_request_t snmp_request_t;
+@@ -193,6 +197,8 @@ typedef void ERCB(int fd, void *, size_t);
+ typedef void OBJH(StoreEntry *);
+ typedef void SIGHDLR(int sig);
+ typedef void STVLDCB(void *, int, int);
++typedef void HLPCB(void *, char *buf);
++typedef void HLPCMDOPTS(int *argc, char **argv);
+ 
+ typedef double (*hbase_f) (double);
+ typedef void StatHistBinDumper(StoreEntry *, int idx, double val, double size, int count);

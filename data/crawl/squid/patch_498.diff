@@ -1,38 +1,868 @@
-@@ -57,16 +57,24 @@ rotate(const char *path, int rotate_count)
-         snprintf(from, MAXPATHLEN, "%s.%d", path, i - 1);
-         snprintf(to, MAXPATHLEN, "%s.%d", path, i);
- #if _SQUID_OS2_ || _SQUID_WINDOWS_
--        remove(to);
-+        if (remove(to) < 0) {
-+            fprintf(stderr, "WARNING: remove '%s' failure: %s\n", to, xstrerror());
-+        }
- #endif
--        rename(from, to);
-+        if (rename(path, to) < 0 && errno != ENOENT) {
-+            fprintf(stderr, "WARNING: rename '%s' to '%s' failure: %s\n", path, to, xstrerror());
-+        }
-     }
-     if (rotate_count > 0) {
-         snprintf(to, MAXPATHLEN, "%s.%d", path, 0);
- #if _SQUID_OS2_ || _SQUID_WINDOWS_
--        remove(to);
-+        if (remove(to) < 0) {
-+            fprintf(stderr, "WARNING: remove '%s' failure: %s\n", to, xstrerror());
-+        }
- #endif
--        rename(path, to);
-+        if (rename(path, to) < 0 && errno != ENOENT) {
-+            fprintf(stderr, "WARNING: rename %s to %s failure: %s\n", path, to, xstrerror());
-+        }
-     }
+@@ -1,9 +1,8 @@
+ 
+ /*
+- * $Id$
+  *
+  * DEBUG: section 65    HTTP Cache Control Header
+- * AUTHOR: Alex Rousskov
++ * AUTHOR: Alex Rousskov, Francesco Chemolli
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+  * ----------------------------------------------------------
+@@ -36,28 +35,42 @@
+ #include "squid.h"
+ #include "Store.h"
+ #include "HttpHeader.h"
+-
+-/* this table is used for parsing cache control header */
+-static const HttpHeaderFieldAttrs CcAttrs[CC_ENUM_END] = {
+-    {"public", (http_hdr_type)CC_PUBLIC},
+-
+-    {"private", (http_hdr_type)CC_PRIVATE},
+-    {"no-cache", (http_hdr_type)CC_NO_CACHE},
+-    {"no-store", (http_hdr_type)CC_NO_STORE},
+-    {"no-transform", (http_hdr_type)CC_NO_TRANSFORM},
+-    {"must-revalidate", (http_hdr_type)CC_MUST_REVALIDATE},
+-    {"proxy-revalidate", (http_hdr_type)CC_PROXY_REVALIDATE},
+-    {"only-if-cached", (http_hdr_type)CC_ONLY_IF_CACHED},
+-    {"max-age", (http_hdr_type)CC_MAX_AGE},
+-    {"s-maxage", (http_hdr_type)CC_S_MAXAGE},
+-    {"max-stale", (http_hdr_type)CC_MAX_STALE},
+-    {"stale-if-error", (http_hdr_type)CC_STALE_IF_ERROR},
+-    {"min-fresh", (http_hdr_type)CC_MIN_FRESH},
+-    {"Other,", (http_hdr_type)CC_OTHER}	/* ',' will protect from matches */
++#include "HttpHdrCc.h"
++
++#if HAVE_MAP
++#include <map>
++#endif
++
++/* this table is used for parsing cache control header and statistics */
++typedef struct {
++    const char *name;
++    http_hdr_cc_type id;
++    HttpHeaderFieldStat stat;
++} HttpHeaderCcFields;
++
++/* order must match that of enum http_hdr_cc_type. The constraint is verified at initialization time */
++static HttpHeaderCcFields CcAttrs[CC_ENUM_END] = {
++        {"public", CC_PUBLIC},
++        {"private", CC_PRIVATE},
++        {"no-cache", CC_NO_CACHE},
++        {"no-store", CC_NO_STORE},
++        {"no-transform", CC_NO_TRANSFORM},
++        {"must-revalidate", CC_MUST_REVALIDATE},
++        {"proxy-revalidate", CC_PROXY_REVALIDATE},
++        {"max-age", CC_MAX_AGE},
++        {"s-maxage", CC_S_MAXAGE},
++        {"max-stale", CC_MAX_STALE},
++        {"min-fresh", CC_MIN_FRESH},
++        {"only-if-cached", CC_ONLY_IF_CACHED},
++        {"stale-if-error", CC_STALE_IF_ERROR},
++        {"Other,", CC_OTHER} /* ',' will protect from matches */
+ };
+ 
+-HttpHeaderFieldInfo *CcFieldsInfo = NULL;
++/// Map an header name to its type, to expedite parsing
++typedef std::map<String,http_hdr_cc_type> HdrCcNameToIdMap_t;
++static HdrCcNameToIdMap_t HdrCcNameToIdMap;
+ 
++// iterate over a table of http_header_cc_type structs
+ http_hdr_cc_type &operator++ (http_hdr_cc_type &aHeader)
+ {
+     int tmp = (int)aHeader;
+@@ -66,64 +79,53 @@ http_hdr_cc_type &operator++ (http_hdr_cc_type &aHeader)
  }
  
-@@ -119,7 +127,7 @@ main(int argc, char *argv[])
-                      * out of device space - recover by rotating and hoping that rotation count drops a big one.
-                      */
-                     if (err == EFBIG || err == ENOSPC) {
--                        fprintf(stderr, "WARNING: %s writing %s. Attempting to recover via a log rotation.\n",strerror(err),argv[1]);
-+                        fprintf(stderr, "WARNING: %s writing %s. Attempting to recover via a log rotation.\n",xstrerr(err),argv[1]);
-                         fclose(fp);
-                         rotate(argv[1], rotate_count);
-                         fp = fopen(argv[1], "a");
+ 
+-/* local prototypes */
+-static int httpHdrCcParseInit(HttpHdrCc * cc, const String * str);
+-
+-
+ /* module initialization */
+ 
+ void
+ httpHdrCcInitModule(void)
+ {
+-    CcFieldsInfo = httpHeaderBuildFieldsInfo(CcAttrs, CC_ENUM_END);
++    int32_t i;
++    /* build lookup and accounting structures */
++    for (i=0;i<CC_ENUM_END;i++) {
++        assert(i==CcAttrs[i].id); /* verify assumption: the id is the key into the array */
++        HdrCcNameToIdMap[CcAttrs[i].name]=CcAttrs[i].id;
++    }
+ }
+ 
+ void
+ httpHdrCcCleanModule(void)
+ {
+-    httpHeaderDestroyFieldsInfo(CcFieldsInfo, CC_ENUM_END);
+-    CcFieldsInfo = NULL;
+-}
+-
+-/* implementation */
+-
+-HttpHdrCc *
+-httpHdrCcCreate(void)
+-{
+-    HttpHdrCc *cc = (HttpHdrCc *)memAllocate(MEM_HTTP_HDR_CC);
+-    cc->max_age = cc->s_maxage = cc->max_stale = cc->min_fresh = -1;
+-    return cc;
++    // HdrCcNameToIdMap is self-cleaning
+ }
+ 
+-/* creates an cc object from a 0-terminating string */
+-HttpHdrCc *
+-httpHdrCcParseCreate(const String * str)
++void
++HttpHdrCc::clear()
+ {
+-    HttpHdrCc *cc = httpHdrCcCreate();
+-
+-    if (!httpHdrCcParseInit(cc, str)) {
+-        httpHdrCcDestroy(cc);
+-        cc = NULL;
+-    }
+-
+-    return cc;
++    mask=0;
++    max_age=-1;
++    mask=0;
++    max_age=-1;
++    s_maxage=-1;
++    max_stale=-1;
++    stale_if_error=0;
++    min_fresh=-1;
++    other.clean();
+ }
+ 
+-/* parses a 0-terminating string and inits cc */
+-static int
+-httpHdrCcParseInit(HttpHdrCc * cc, const String * str)
++bool
++HttpHdrCc::parseInit(const String & str)
+ {
+     const char *item;
+     const char *p;		/* '=' parameter */
+     const char *pos = NULL;
+     http_hdr_cc_type type;
+     int ilen;
+     int nlen;
+-    assert(cc && str);
+ 
+     /* iterate through comma separated list */
+ 
+-    while (strListGetItem(str, ',', &item, &ilen, &pos)) {
++    while (strListGetItem(&str, ',', &item, &ilen, &pos)) {
++        String tmpstr;
+         /* isolate directive name */
+ 
+         if ((p = (const char *)memchr(item, '=', ilen)) && (p - item < ilen))
+@@ -132,81 +134,81 @@ httpHdrCcParseInit(HttpHdrCc * cc, const String * str)
+             nlen = ilen;
+ 
+         /* find type */
+-        type = (http_hdr_cc_type ) httpHeaderIdByName(item, nlen,
+-                CcFieldsInfo, CC_ENUM_END);
+-
+-        if (type < 0) {
+-            debugs(65, 2, "hdr cc: unknown cache-directive: near '" << item << "' in '" << str << "'");
+-            type = CC_OTHER;
+-        }
++        tmpstr.limitInit(item,nlen);
++        HdrCcNameToIdMap_t::iterator i;
++        i=HdrCcNameToIdMap.find(tmpstr);
++        if (i==HdrCcNameToIdMap.end())
++            type=CC_OTHER;
++        else
++            type=i->second;
+ 
+         // ignore known duplicate directives
+-        if (EBIT_TEST(cc->mask, type)) {
++        if (EBIT_TEST(mask, type)) {
+             if (type != CC_OTHER) {
+                 debugs(65, 2, "hdr cc: ignoring duplicate cache-directive: near '" << item << "' in '" << str << "'");
+-                CcFieldsInfo[type].stat.repCount++;
++                CcAttrs[type].stat.repCount++;
+                 continue;
+             }
+         } else {
+-            EBIT_SET(cc->mask, type);
++            EBIT_SET(mask, type);
+         }
+ 
+         /* post-processing special cases */
+         switch (type) {
+ 
+         case CC_MAX_AGE:
+ 
+-            if (!p || !httpHeaderParseInt(p, &cc->max_age)) {
++            if (!p || !httpHeaderParseInt(p, &max_age)) {
+                 debugs(65, 2, "cc: invalid max-age specs near '" << item << "'");
+-                cc->max_age = -1;
+-                EBIT_CLR(cc->mask, type);
++                max_age = -1;
++                EBIT_CLR(mask, type);
+             }
+ 
+             break;
+ 
+         case CC_S_MAXAGE:
+ 
+-            if (!p || !httpHeaderParseInt(p, &cc->s_maxage)) {
++            if (!p || !httpHeaderParseInt(p, &s_maxage)) {
+                 debugs(65, 2, "cc: invalid s-maxage specs near '" << item << "'");
+-                cc->s_maxage = -1;
+-                EBIT_CLR(cc->mask, type);
++                s_maxage = -1;
++                EBIT_CLR(mask, type);
+             }
+ 
+             break;
+ 
+         case CC_MAX_STALE:
+ 
+-            if (!p || !httpHeaderParseInt(p, &cc->max_stale)) {
++            if (!p || !httpHeaderParseInt(p, &max_stale)) {
+                 debugs(65, 2, "cc: max-stale directive is valid without value");
+-                cc->max_stale = -1;
++                max_stale = -1;
+             }
+ 
+             break;
+ 
+         case CC_MIN_FRESH:
+ 
+-            if (!p || !httpHeaderParseInt(p, &cc->min_fresh)) {
++            if (!p || !httpHeaderParseInt(p, &min_fresh)) {
+                 debugs(65, 2, "cc: invalid min-fresh specs near '" << item << "'");
+-                cc->min_fresh = -1;
+-                EBIT_CLR(cc->mask, type);
++                min_fresh = -1;
++                EBIT_CLR(mask, type);
+             }
+ 
+             break;
+ 
+         case CC_STALE_IF_ERROR:
+-            if (!p || !httpHeaderParseInt(p, &cc->stale_if_error)) {
++            if (!p || !httpHeaderParseInt(p, &stale_if_error)) {
+                 debugs(65, 2, "cc: invalid stale-if-error specs near '" << item << "'");
+-                cc->stale_if_error = -1;
+-                EBIT_CLR(cc->mask, type);
++                stale_if_error = -1;
++                EBIT_CLR(mask, type);
+             }
+             break;
+ 
+         case CC_OTHER:
+ 
+-            if (cc->other.size())
+-                cc->other.append(", ");
++            if (other.size())
++                other.append(", ");
+ 
+-            cc->other.append(item, ilen);
++            other.append(item, ilen);
+ 
+             break;
+ 
+@@ -216,18 +218,7 @@ httpHdrCcParseInit(HttpHdrCc * cc, const String * str)
+         }
+     }
+ 
+-    return cc->mask != 0;
+-}
+-
+-void
+-httpHdrCcDestroy(HttpHdrCc * cc)
+-{
+-    assert(cc);
+-
+-    if (cc->other.defined())
+-        cc->other.clean();
+-
+-    memFree(cc, MEM_HTTP_HDR_CC);
++    return (mask != 0);
+ }
+ 
+ void
+@@ -241,8 +232,7 @@ httpHdrCcPackInto(const HttpHdrCc * cc, Packer * p)
+         if (EBIT_TEST(cc->mask, flag) && flag != CC_OTHER) {
+ 
+             /* print option name */
+-            packerPrintf(p, (pcount ? ", " SQUIDSTRINGPH : SQUIDSTRINGPH),
+-                         SQUIDSTRINGPRINT(CcFieldsInfo[flag].name));
++            packerPrintf(p, (pcount ? ", %s": "%s") , CcAttrs[flag].name);
+ 
+             /* handle options with values */
+ 
+@@ -267,30 +257,26 @@ httpHdrCcPackInto(const HttpHdrCc * cc, Packer * p)
+                      SQUIDSTRINGPRINT(cc->other));
+ }
+ 
+-/* negative max_age will clean old max_Age setting */
+ void
+-httpHdrCcSetMaxAge(HttpHdrCc * cc, int max_age)
++HttpHdrCc::setMaxAge(int max_age_)
+ {
+-    assert(cc);
+-    cc->max_age = max_age;
++    max_age = max_age_;
+ 
+-    if (max_age >= 0)
+-        EBIT_SET(cc->mask, CC_MAX_AGE);
++    if (max_age_ >= 0)
++        EBIT_SET(mask, CC_MAX_AGE);
+     else
+-        EBIT_CLR(cc->mask, CC_MAX_AGE);
++        EBIT_CLR(mask, CC_MAX_AGE);
+ }
+ 
+-/* negative s_maxage will clean old s-maxage setting */
+ void
+-httpHdrCcSetSMaxAge(HttpHdrCc * cc, int s_maxage)
++HttpHdrCc::setSMaxAge(int s_maxage_)
+ {
+-    assert(cc);
+-    cc->s_maxage = s_maxage;
++    s_maxage = s_maxage_;
+ 
+-    if (s_maxage >= 0)
+-        EBIT_SET(cc->mask, CC_S_MAXAGE);
++    if (s_maxage_ >= 0)
++        EBIT_SET(mask, CC_S_MAXAGE);
+     else
+-        EBIT_CLR(cc->mask, CC_S_MAXAGE);
++        EBIT_CLR(mask, CC_S_MAXAGE);
+ }
+ 
+ void
+@@ -310,7 +296,7 @@ httpHdrCcStatDumper(StoreEntry * sentry, int idx, double val, double size, int c
+     extern const HttpHeaderStat *dump_stat;	/* argh! */
+     const int id = (int) val;
+     const int valid_id = id >= 0 && id < CC_ENUM_END;
+-    const char *name = valid_id ? CcFieldsInfo[id].name.termedBuf() : "INVALID";
++    const char *name = valid_id ? CcAttrs[id].name : "INVALID";
+ 
+     if (count || valid_id)
+         storeAppendPrintf(sentry, "%2d\t %-20s\t %5d\t %6.2f\n",
+@@ -1,5 +1,5 @@
+ /*
+- * HttpHeaderCacheControl.h
++ * HttpHdrCc.h
+  *
+  *  Created on: Sep 2, 2011
+  *      Author: Francesco Chemolli
+@@ -38,7 +38,10 @@
+ #include "MemPool.h"
+ #include "SquidString.h"
+ 
+-/* http cache control header field */
++/** Http Cache-control header representation
++ *
++ * Store, parse and output the Cache-control HTTP header.
++ */
+ class HttpHdrCc
+ {
+ 
+@@ -56,7 +59,16 @@ class HttpHdrCc
+             mask(0), max_age(max_age_), s_maxage(s_maxage_),
+             max_stale(max_stale_), stale_if_error(0),
+             min_fresh(min_fresh_) {}
+-    /// (re)initialize by parsing the supplied Cache-control header string
++
++    /** reset the structure to a clear state.
++     *
++     */
++    void clear();
++    /**parses the supplied string filling in HttpHdrCc's fields.
++     *
++     * \note: internal structures are not cleaned-up beforehand.
++     *        caller must explicitly clear() beforehand if he wants that
++     */
+     bool parseInit(const String &s);
+     /** set the max_age value
+      *
+@@ -37,7 +37,7 @@
+ #include "HttpHeaderRange.h"
+ /* HttpHeader holds a HttpHeaderMask */
+ #include "HttpHeaderMask.h"
+-#include "HttpHeaderCacheControl.h"
++#include "HttpHdrCc.h"
+ 
+ 
+ /* class forward declarations */
+@@ -1,291 +0,0 @@
+-
+-/*
+- *
+- * DEBUG: section 65    HTTP Cache Control Header
+- * AUTHOR: Alex Rousskov, Francesco Chemolli
+- *
+- * SQUID Web Proxy Cache          http://www.squid-cache.org/
+- * ----------------------------------------------------------
+- *
+- *  Squid is the result of efforts by numerous individuals from
+- *  the Internet community; see the CONTRIBUTORS file for full
+- *  details.   Many organizations have provided support for Squid's
+- *  development; see the SPONSORS file for full details.  Squid is
+- *  Copyrighted (C) 2001 by the Regents of the University of
+- *  California; see the COPYRIGHT file for full details.  Squid
+- *  incorporates software developed and/or copyrighted by other
+- *  sources; see the CREDITS file for full details.
+- *
+- *  This program is free software; you can redistribute it and/or modify
+- *  it under the terms of the GNU General Public License as published by
+- *  the Free Software Foundation; either version 2 of the License, or
+- *  (at your option) any later version.
+- *
+- *  This program is distributed in the hope that it will be useful,
+- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- *  GNU General Public License for more details.
+- *
+- *  You should have received a copy of the GNU General Public License
+- *  along with this program; if not, write to the Free Software
+- *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
+- *
+- */
+-
+-#include "squid.h"
+-#include "Store.h"
+-#include "HttpHeader.h"
+-#include "HttpHeaderCacheControl.h"
+-
+-#if HAVE_MAP
+-#include <map>
+-#endif
+-
+-/* this table is used for parsing cache control header and statistics */
+-typedef struct {
+-    const char *name;
+-    http_hdr_cc_type id;
+-    HttpHeaderFieldStat stat;
+-} HttpHeaderCcFields;
+-
+-/* order must match that of enum http_hdr_cc_type. The constraint is verified at initialization time */
+-static HttpHeaderCcFields CcAttrs[CC_ENUM_END] = {
+-        {"public", CC_PUBLIC},
+-        {"private", CC_PRIVATE},
+-        {"no-cache", CC_NO_CACHE},
+-        {"no-store", CC_NO_STORE},
+-        {"no-transform", CC_NO_TRANSFORM},
+-        {"must-revalidate", CC_MUST_REVALIDATE},
+-        {"proxy-revalidate", CC_PROXY_REVALIDATE},
+-        {"max-age", CC_MAX_AGE},
+-        {"s-maxage", CC_S_MAXAGE},
+-        {"max-stale", CC_MAX_STALE},
+-        {"min-fresh", CC_MIN_FRESH},
+-        {"only-if-cached", CC_ONLY_IF_CACHED},
+-        {"stale-if-error", CC_STALE_IF_ERROR},
+-        {"Other,", CC_OTHER} /* ',' will protect from matches */
+-};
+-
+-/// Map an header name to its type, to expedite parsing
+-typedef std::map<String,http_hdr_cc_type> HdrCcNameToIdMap_t;
+-static HdrCcNameToIdMap_t HdrCcNameToIdMap;
+-
+-// iterate over a table of http_header_cc_type structs
+-http_hdr_cc_type &operator++ (http_hdr_cc_type &aHeader)
+-{
+-    int tmp = (int)aHeader;
+-    aHeader = (http_hdr_cc_type)(++tmp);
+-    return aHeader;
+-}
+-
+-
+-/* module initialization */
+-
+-void
+-httpHdrCcInitModule(void)
+-{
+-    int32_t i;
+-    /* build lookup and accounting structures */
+-    for (i=0;i<CC_ENUM_END;i++) {
+-        assert(i==CcAttrs[i].id); /* verify assumption: the id is the key into the array */
+-        HdrCcNameToIdMap[CcAttrs[i].name]=CcAttrs[i].id;
+-    }
+-}
+-
+-void
+-httpHdrCcCleanModule(void)
+-{
+-    // HdrCcNameToIdMap is self-cleaning
+-}
+-
+-/* parses a 0-terminating string and inits cc */
+-bool
+-HttpHdrCc::parseInit(const String & str)
+-{
+-    const char *item;
+-    const char *p;		/* '=' parameter */
+-    const char *pos = NULL;
+-    http_hdr_cc_type type;
+-    int ilen;
+-    int nlen;
+-
+-    /* iterate through comma separated list */
+-
+-    while (strListGetItem(&str, ',', &item, &ilen, &pos)) {
+-        String tmpstr;
+-        /* isolate directive name */
+-
+-        if ((p = (const char *)memchr(item, '=', ilen)) && (p - item < ilen))
+-            nlen = p++ - item;
+-        else
+-            nlen = ilen;
+-
+-        /* find type */
+-        tmpstr.limitInit(item,nlen);
+-        HdrCcNameToIdMap_t::iterator i;
+-        i=HdrCcNameToIdMap.find(tmpstr);
+-        if (i==HdrCcNameToIdMap.end())
+-            type=CC_OTHER;
+-        else
+-            type=i->second;
+-
+-        // ignore known duplicate directives
+-        if (EBIT_TEST(mask, type)) {
+-            if (type != CC_OTHER) {
+-                debugs(65, 2, "hdr cc: ignoring duplicate cache-directive: near '" << item << "' in '" << str << "'");
+-                CcAttrs[type].stat.repCount++;
+-                continue;
+-            }
+-        } else {
+-            EBIT_SET(mask, type);
+-        }
+-
+-        /* post-processing special cases */
+-        switch (type) {
+-
+-        case CC_MAX_AGE:
+-
+-            if (!p || !httpHeaderParseInt(p, &max_age)) {
+-                debugs(65, 2, "cc: invalid max-age specs near '" << item << "'");
+-                max_age = -1;
+-                EBIT_CLR(mask, type);
+-            }
+-
+-            break;
+-
+-        case CC_S_MAXAGE:
+-
+-            if (!p || !httpHeaderParseInt(p, &s_maxage)) {
+-                debugs(65, 2, "cc: invalid s-maxage specs near '" << item << "'");
+-                s_maxage = -1;
+-                EBIT_CLR(mask, type);
+-            }
+-
+-            break;
+-
+-        case CC_MAX_STALE:
+-
+-            if (!p || !httpHeaderParseInt(p, &max_stale)) {
+-                debugs(65, 2, "cc: max-stale directive is valid without value");
+-                max_stale = -1;
+-            }
+-
+-            break;
+-
+-        case CC_MIN_FRESH:
+-
+-            if (!p || !httpHeaderParseInt(p, &min_fresh)) {
+-                debugs(65, 2, "cc: invalid min-fresh specs near '" << item << "'");
+-                min_fresh = -1;
+-                EBIT_CLR(mask, type);
+-            }
+-
+-            break;
+-
+-        case CC_STALE_IF_ERROR:
+-            if (!p || !httpHeaderParseInt(p, &stale_if_error)) {
+-                debugs(65, 2, "cc: invalid stale-if-error specs near '" << item << "'");
+-                stale_if_error = -1;
+-                EBIT_CLR(mask, type);
+-            }
+-            break;
+-
+-        case CC_OTHER:
+-
+-            if (other.size())
+-                other.append(", ");
+-
+-            other.append(item, ilen);
+-
+-            break;
+-
+-        default:
+-            /* note that we ignore most of '=' specs (RFCVIOLATION) */
+-            break;
+-        }
+-    }
+-
+-    return (mask != 0);
+-}
+-
+-void
+-httpHdrCcPackInto(const HttpHdrCc * cc, Packer * p)
+-{
+-    http_hdr_cc_type flag;
+-    int pcount = 0;
+-    assert(cc && p);
+-
+-    for (flag = CC_PUBLIC; flag < CC_ENUM_END; ++flag) {
+-        if (EBIT_TEST(cc->mask, flag) && flag != CC_OTHER) {
+-
+-            /* print option name */
+-            packerPrintf(p, (pcount ? ", %s": "%s") , CcAttrs[flag].name);
+-
+-            /* handle options with values */
+-
+-            if (flag == CC_MAX_AGE)
+-                packerPrintf(p, "=%d", (int) cc->max_age);
+-
+-            if (flag == CC_S_MAXAGE)
+-                packerPrintf(p, "=%d", (int) cc->s_maxage);
+-
+-            if (flag == CC_MAX_STALE && cc->max_stale >= 0)
+-                packerPrintf(p, "=%d", (int) cc->max_stale);
+-
+-            if (flag == CC_MIN_FRESH)
+-                packerPrintf(p, "=%d", (int) cc->min_fresh);
+-
+-            pcount++;
+-        }
+-    }
+-
+-    if (cc->other.size() != 0)
+-        packerPrintf(p, (pcount ? ", " SQUIDSTRINGPH : SQUIDSTRINGPH),
+-                     SQUIDSTRINGPRINT(cc->other));
+-}
+-
+-void
+-HttpHdrCc::setMaxAge(int max_age_)
+-{
+-    max_age = max_age_;
+-
+-    if (max_age_ >= 0)
+-        EBIT_SET(mask, CC_MAX_AGE);
+-    else
+-        EBIT_CLR(mask, CC_MAX_AGE);
+-}
+-
+-void
+-HttpHdrCc::setSMaxAge(int s_maxage_)
+-{
+-    s_maxage = s_maxage_;
+-
+-    if (s_maxage_ >= 0)
+-        EBIT_SET(mask, CC_S_MAXAGE);
+-    else
+-        EBIT_CLR(mask, CC_S_MAXAGE);
+-}
+-
+-void
+-httpHdrCcUpdateStats(const HttpHdrCc * cc, StatHist * hist)
+-{
+-    http_hdr_cc_type c;
+-    assert(cc);
+-
+-    for (c = CC_PUBLIC; c < CC_ENUM_END; ++c)
+-        if (EBIT_TEST(cc->mask, c))
+-            statHistCount(hist, c);
+-}
+-
+-void
+-httpHdrCcStatDumper(StoreEntry * sentry, int idx, double val, double size, int count)
+-{
+-    extern const HttpHeaderStat *dump_stat;	/* argh! */
+-    const int id = (int) val;
+-    const int valid_id = id >= 0 && id < CC_ENUM_END;
+-    const char *name = valid_id ? CcAttrs[id].name : "INVALID";
+-
+-    if (count || valid_id)
+-        storeAppendPrintf(sentry, "%2d\t %-20s\t %5d\t %6.2f\n",
+-                          id, name, count, xdiv(count, dump_stat->ccParsedCount));
+-}
+@@ -341,8 +341,8 @@ squid_SOURCES = \
+ 	HttpStatusCode.h \
+ 	HttpStatusLine.cc \
+ 	HttpStatusLine.h \
+-	HttpHeaderCacheControl.h \
+-	HttpHeaderCacheControl.cc \
++	HttpHdrCc.h \
++	HttpHdrCc.cc \
+ 	HttpHdrRange.cc \
+ 	HttpHdrSc.cc \
+ 	HttpHdrSc.h \
+@@ -1016,8 +1016,8 @@ tests_testHttpReply_SOURCES=\
+ 	cbdata.h \
+ 	ETag.cc \
+ 	HttpBody.cc \
+-	HttpHeaderCacheControl.h \
+-	HttpHeaderCacheControl.cc \
++	HttpHdrCc.h \
++	HttpHdrCc.cc \
+ 	HttpHdrContRange.cc \
+ 	HttpHdrContRange.h \
+ 	HttpHdrRange.cc \
+@@ -1074,7 +1074,7 @@ tests_testHttpReply_LDADD=\
+ tests_testHttpReply_DEPENDENCIES= $(SQUID_CPPUNIT_LA)
+ 
+ ## Tests for the ACLMaxUserIP class
+-## acl needs wordlist. wordlist needs MemBug
++## acl needs wordlist. wordlist needs MemBuf
+ ## MemBuf needs mem, MemBuf needs event,
+ ## event needs cbdata.
+ ## ACLMaxUserUP needs $(AUTH_LIBS)
+@@ -1084,7 +1084,7 @@ tests_testHttpReply_DEPENDENCIES= $(SQUID_CPPUNIT_LA)
+ ##	HttpHeader.cc \
+ ##	HttpHeaderTools.cc \
+ ##	HttpHdrContRange.cc \
+-##	HttpHeaderCacheControl.cc \
++##	HttpHdrCc.cc \
+ ##	HttpHdrRange.cc \
+ ##	HttpHdrSc.cc \
+ ##	HttpHdrScTarget.cc \
+@@ -1110,8 +1110,8 @@ tests_testACLMaxUserIP_SOURCES= \
+ 	HttpHeaderTools.cc \
+ 	HttpHdrContRange.cc \
+ 	HttpHdrRange.cc \
+-	HttpHeaderCacheControl.h \
+-	HttpHeaderCacheControl.cc \
++	HttpHdrCc.h \
++	HttpHdrCc.cc \
+ 	HttpHdrSc.cc \
+ 	HttpHdrScTarget.cc \
+ 	HttpMsg.cc \
+@@ -1271,8 +1271,8 @@ tests_testCacheManager_SOURCES = \
+ 	HttpBody.cc \
+ 	HttpHeader.cc \
+ 	HttpHeaderTools.cc \
+-	HttpHeaderCacheControl.h \
+-	HttpHeaderCacheControl.cc \
++	HttpHdrCc.h \
++	HttpHdrCc.cc \
+ 	HttpHdrContRange.cc \
+ 	HttpHdrRange.cc \
+ 	HttpHdrSc.cc \
+@@ -1403,8 +1403,8 @@ tests_testDiskIO_SOURCES = \
+ 	fd.cc \
+ 	filemap.cc \
+ 	HttpBody.cc \
+-	HttpHeaderCacheControl.h \
+-	HttpHeaderCacheControl.cc \
++	HttpHdrCc.h \
++	HttpHdrCc.cc \
+ 	HttpHdrContRange.cc \
+ 	HttpHdrSc.cc \
+ 	HttpHdrScTarget.cc \
+@@ -1576,8 +1576,8 @@ tests_testEvent_SOURCES = \
+ 	HttpBody.cc \
+ 	HttpHeader.cc \
+ 	HttpHeaderTools.cc \
+-	HttpHeaderCacheControl.h \
+-	HttpHeaderCacheControl.cc \
++	HttpHdrCc.h \
++	HttpHdrCc.cc \
+ 	HttpHdrContRange.cc \
+ 	HttpHdrRange.cc \
+ 	HttpHdrSc.cc \
+@@ -1755,8 +1755,8 @@ tests_testEventLoop_SOURCES = \
+ 	HttpBody.cc \
+ 	HttpHeader.cc \
+ 	HttpHeaderTools.cc \
+-	HttpHeaderCacheControl.h \
+-	HttpHeaderCacheControl.cc \
++	HttpHdrCc.h \
++	HttpHdrCc.cc \
+ 	HttpHdrContRange.cc \
+ 	HttpHdrRange.cc \
+ 	HttpHdrSc.cc \
+@@ -1930,8 +1930,8 @@ tests_test_http_range_SOURCES = \
+ 	$(HTCPSOURCE) \
+ 	http.cc \
+ 	HttpBody.cc \
+-	HttpHeaderCacheControl.h \
+-	HttpHeaderCacheControl.cc \
++	HttpHdrCc.h \
++	HttpHdrCc.cc \
+ 	HttpHdrContRange.cc \
+ 	HttpHdrRange.cc \
+ 	HttpHdrSc.cc \
+@@ -2148,8 +2148,8 @@ tests_testHttpRequest_SOURCES = \
+ 	HttpBody.cc \
+ 	HttpHeader.cc \
+ 	HttpHeaderTools.cc \
+-	HttpHeaderCacheControl.h \
+-	HttpHeaderCacheControl.cc \
++	HttpHdrCc.h \
++	HttpHdrCc.cc \
+ 	HttpHdrContRange.cc \
+ 	HttpHdrRange.cc \
+ 	HttpHdrSc.cc \
+@@ -2279,8 +2279,8 @@ tests_testStore_SOURCES= \
+ 	event.cc \
+ 	EventLoop.cc \
+ 	filemap.cc \
+-	HttpHeaderCacheControl.h \
+-	HttpHeaderCacheControl.cc \
++	HttpHdrCc.h \
++	HttpHdrCc.cc \
+ 	HttpHdrContRange.cc \
+ 	HttpHdrRange.cc \
+ 	HttpHdrSc.cc \
+@@ -2514,8 +2514,8 @@ tests_testUfs_SOURCES = \
+ 	MemBuf.cc \
+ 	HttpHdrContRange.cc \
+ 	Packer.cc \
+-	HttpHeaderCacheControl.h \
+-	HttpHeaderCacheControl.cc \
++	HttpHdrCc.h \
++	HttpHdrCc.cc \
+ 	HttpHdrSc.cc \
+ 	HttpHdrScTarget.cc \
+ 	url.cc \
+@@ -2645,8 +2645,8 @@ tests_testCoss_SOURCES = \
+ 	MemBuf.cc \
+ 	HttpHdrContRange.cc \
+ 	Packer.cc \
+-	HttpHeaderCacheControl.h \
+-	HttpHeaderCacheControl.cc \
++	HttpHdrCc.h \
++	HttpHdrCc.cc \
+ 	HttpHdrSc.cc \
+ 	HttpHdrScTarget.cc \
+ 	url.cc \
+@@ -2770,8 +2770,8 @@ tests_testNull_SOURCES = \
+ 	MemBuf.cc \
+ 	HttpHdrContRange.cc \
+ 	Packer.cc \
+-	HttpHeaderCacheControl.h \
+-	HttpHeaderCacheControl.cc \
++	HttpHdrCc.h \
++	HttpHdrCc.cc \
+ 	HttpHdrSc.cc \
+ 	HttpHdrScTarget.cc \
+ 	url.cc \
+@@ -2873,8 +2873,8 @@ tests_testURL_SOURCES = \
+ 	$(HTCPSOURCE) \
+ 	http.cc \
+ 	HttpBody.cc \
+-	HttpHeaderCacheControl.h \
+-	HttpHeaderCacheControl.cc \
++	HttpHdrCc.h \
++	HttpHdrCc.cc \
+ 	HttpHdrContRange.cc \
+ 	HttpHdrRange.cc \
+ 	HttpHdrSc.cc \
+@@ -67,7 +67,7 @@
+ #include "compat/inet_pton.h"
+ #include "fde.h"
+ #include "format/Tokens.h"
+-#include "HttpHeaderCacheControl.h"
++#include "HttpHdrCc.h"
+ #include "HttpReply.h"
+ #include "HttpRequest.h"
+ #include "ip/QosConfig.h"

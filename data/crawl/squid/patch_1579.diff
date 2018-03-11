@@ -1,0 +1,1412 @@
+@@ -14,6 +14,9 @@
+ 	- Added while loop in icpHandleUdp().
+ 	- Fixed some small memory leaks.
+ 	- Fixed single-bit-int flag checks (Henrik Nordstrom).
++	- Replaced "complex" (offset accounting) calls to snprintf with MemBuf
++	- Do not send only-if-cached cc directive with requests 
++          for peer's digests.
+ 
+ Changes to squid-1.2.beta21 (May 22, 1998):
+ 
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: HttpHeaderTools.cc,v 1.15 1998/05/28 05:12:42 wessels Exp $
++ * $Id: HttpHeaderTools.cc,v 1.16 1998/05/30 19:42:58 rousskov Exp $
+  *
+  * DEBUG: section 66    HTTP Header Tools
+  * AUTHOR: Alex Rousskov
+@@ -135,18 +135,11 @@ httpHeaderPutStrf(va_alist)
+ static void
+ httpHeaderPutStrvf(HttpHeader * hdr, http_hdr_type id, const char *fmt, va_list vargs)
+ {
+-#if OLD_CODE
+-    LOCAL_ARRAY(char, buf, 4096);
+-    buf[0] = '\0';
+-    vsnprintf(buf, 4096, fmt, vargs);
+-    httpHeaderPutStr(hdr, id, buf);
+-#else
+     MemBuf mb;
+     memBufDefInit(&mb);
+     memBufVPrintf(&mb, fmt, vargs);
+     httpHeaderPutStr(hdr, id, mb.buf);
+     memBufClean(&mb);
+-#endif
+ }
+ 
+ 
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: MemBuf.cc,v 1.11 1998/05/28 17:32:41 rousskov Exp $
++ * $Id: MemBuf.cc,v 1.12 1998/05/30 19:42:59 rousskov Exp $
+  *
+  * DEBUG: section 59    auto-growing Memory Buffer with printf
+  * AUTHOR: Alex Rousskov
+@@ -147,6 +147,25 @@ memBufClean(MemBuf * mb)
+     mb->size = mb->capacity = 0;
+ }
+ 
++/* cleans the buffer without changing its capacity 
++ * if called with a Null buffer, calls memBufDefInit() */
++void
++memBufReset(MemBuf * mb)
++{
++    assert(mb);
++
++    if (!mb->buf && !mb->max_capacity && !mb->capacity && !mb->size) { 
++	/* Null */
++	memBufDefInit(mb);
++    } else {
++	assert(mb->buf);
++	assert(mb->freefunc); /* not frozen */
++	/* reset */
++	memset(mb->buf, 0, mb->capacity);
++	mb->size = 0;
++    }
++}
++
+ /* calls memcpy, appends exactly size bytes, extends buffer if needed */
+ void
+ memBufAppend(MemBuf * mb, const char *buf, mb_size_t sz)
+@@ -197,7 +216,6 @@ memBufVPrintf(MemBuf * mb, const char *fmt, va_list vargs)
+     assert(mb && fmt);
+     assert(mb->buf);
+     assert(mb->freefunc);	/* not frozen */
+-    /* @?@ we do not init buf with '\0', do we have to for vsnprintf?? @?@ */
+     /* assert in Grow should quit first, but we do not want to have a scary infinite loop */
+     while (mb->capacity <= mb->max_capacity) {
+ 	mb_size_t free_space = mb->capacity - mb->size;
+@@ -206,17 +224,19 @@ memBufVPrintf(MemBuf * mb, const char *fmt, va_list vargs)
+ 	/* check for possible overflow */
+ 	/* snprintf on Linuz returns -1 on overflows */
+ 	/* snprintf on FreeBSD returns at least free_space on overflows */
+-	if (sz < 0 || sz + 32 >= free_space)	/* magic constant 32, ARGH! @?@ */
++	if (sz < 0 || sz >= free_space)
+ 	    memBufGrow(mb, mb->capacity + 1);
+ 	else
+ 	    break;
+     }
+-    /* snprintf on FreeBSD and linux do not count terminating '\0' as "character stored" */
+-    if (!sz || mb->buf[mb->size+sz-1])
+-	assert(!mb->buf[mb->size+sz]);
+-    else
+-	sz--;	/* we cut 0-terminator as store does */
+     mb->size += sz;
++    /* on Linux and FreeBSD, '\0' is not counted in return value */
++    /* on XXX it might be counted */
++    /* check that '\0' is appended and not counted */
++    if (!mb->size || mb->buf[mb->size-1])
++	assert(!mb->buf[mb->size]);
++    else
++	mb->size--;
+ }
+ 
+ /*
+@@ -244,6 +264,8 @@ static void
+ memBufGrow(MemBuf * mb, mb_size_t min_cap)
+ {
+     mb_size_t new_cap;
++    MemBuf old_mb;
++
+     assert(mb);
+     assert(mb->capacity < min_cap);
+ 
+@@ -259,18 +281,48 @@ memBufGrow(MemBuf * mb, mb_size_t min_cap)
+     if (new_cap > mb->max_capacity)
+ 	new_cap = mb->max_capacity;
+ 
+-    assert(new_cap <= mb->max_capacity);	/* no overflow */
++    assert(new_cap <= mb->max_capacity);/* no overflow */
+     assert(new_cap > mb->capacity);	/* progress */
+ 
+-    /* finally [re]allocate memory */
+-    if (!mb->buf) {
+-	mb->buf = xmalloc(new_cap);
+-	mb->freefunc = &xfree;
++    old_mb = *mb;
++
++    /* allocate new memory */
++    switch (new_cap) {
++    case 2048:
++	mb->buf = memAllocate(MEM_2K_BUF);
++	mb->freefunc = &memFree2K;
++	break;
++    case 4096:
++	mb->buf = memAllocate(MEM_4K_BUF);
++	mb->freefunc = &memFree4K;
++	break;
++    case 8192:
++	mb->buf = memAllocate(MEM_8K_BUF);
++	mb->freefunc = &memFree8K;
++	break;
++    default:
++	/* recycle if old buffer was not "pool"ed */
++	if (old_mb.freefunc == &xfree) {
++	    mb->buf = xrealloc(old_mb.buf, new_cap);
++	    old_mb.buf = NULL;
++	    old_mb.freefunc = NULL;
++	    /* init tail, just in case */
++	    memset(mb->buf + mb->size, 0, new_cap - mb->size);
++	} else {
++	    mb->buf = xcalloc(1, new_cap);
++	    mb->freefunc = &xfree;
++	}
++    }
++
++    /* copy and free old buffer if needed */
++    if (old_mb.buf && old_mb.freefunc) {
++	memcpy(mb->buf, old_mb.buf, old_mb.size);
++	(*old_mb.freefunc)(old_mb.buf);
+     } else {
+-	assert(mb->freefunc == &xfree);		/* for now */
+-	mb->buf = xrealloc(mb->buf, new_cap);
++	assert(!old_mb.buf && !old_mb.freefunc);
+     }
+-    memset(mb->buf + mb->size, 0, new_cap - mb->size);	/* just in case */
++
++    /* done */
+     mb->capacity = new_cap;
+ }
+ 
+@@ -1,7 +1,7 @@
+ 
+ 
+ /*
+- * $Id: access_log.cc,v 1.31 1998/05/27 22:51:47 rousskov Exp $
++ * $Id: access_log.cc,v 1.32 1998/05/30 19:43:00 rousskov Exp $
+  *
+  * DEBUG: section 46    Access Log
+  * AUTHOR: Duane Wessels
+@@ -35,8 +35,8 @@
+ 
+ static void accessLogOpen(const char *fname);
+ static char *log_quote(const char *header);
+-static int accessLogSquid(AccessLogEntry * al);
+-static int accessLogCommon(AccessLogEntry * al);
++static void accessLogSquid(AccessLogEntry * al, MemBuf *mb);
++static void accessLogCommon(AccessLogEntry * al, MemBuf *mb);
+ 
+ const char *log_tags[] =
+ {
+@@ -83,7 +83,6 @@ static int LogfileStatus = LOG_DISABLE;
+ static int LogfileFD = -1;
+ static char LogfileName[SQUID_MAXPATHLEN];
+ #define LOG_BUF_SZ (MAX_URL<<2)
+-static char log_buf[LOG_BUF_SZ];
+ 
+ static const char c2x[] =
+ "000102030405060708090a0b0c0d0e0f"
+@@ -154,16 +153,15 @@ log_quote(const char *header)
+     return buf;
+ }
+ 
+-static int
+-accessLogSquid(AccessLogEntry * al)
++static void
++accessLogSquid(AccessLogEntry * al, MemBuf *mb)
+ {
+     const char *client = NULL;
+     if (Config.onoff.log_fqdn)
+ 	client = fqdncache_gethostbyaddr(al->cache.caddr, 0);
+     if (client == NULL)
+ 	client = inet_ntoa(al->cache.caddr);
+-    return snprintf(log_buf, LOG_BUF_SZ,
+-	"%9d.%03d %6d %s %s/%03d %d %s %s %s %s%s/%s %s\n",
++    memBufPrintf(mb, "%9d.%03d %6d %s %s/%03d %d %s %s %s %s%s/%s %s",
+ 	(int) current_time.tv_sec,
+ 	(int) current_time.tv_usec / 1000,
+ 	al->cache.msec,
+@@ -180,16 +178,15 @@ accessLogSquid(AccessLogEntry * al)
+ 	al->http.content_type);
+ }
+ 
+-static int
+-accessLogCommon(AccessLogEntry * al)
++static void
++accessLogCommon(AccessLogEntry * al, MemBuf *mb)
+ {
+     const char *client = NULL;
+     if (Config.onoff.log_fqdn)
+ 	client = fqdncache_gethostbyaddr(al->cache.caddr, 0);
+     if (client == NULL)
+ 	client = inet_ntoa(al->cache.caddr);
+-    return snprintf(log_buf, LOG_BUF_SZ,
+-	"%s %s - [%s] \"%s %s\" %d %d %s:%s\n",
++    memBufPrintf(mb, "%s %s - [%s] \"%s %s\" %d %d %s:%s",
+ 	client,
+ 	al->cache.ident,
+ 	mkhttpdlogtime(&squid_curtime),
+@@ -217,9 +214,10 @@ accessLogOpen(const char *fname)
+ void
+ accessLogLog(AccessLogEntry * al)
+ {
+-    int l;
++    MemBuf mb;
+     char *t;
+     char *xbuf = NULL;
++
+     if (LogfileStatus != LOG_ENABLE)
+ 	return;
+     if (al->url == NULL)
+@@ -244,28 +242,23 @@ accessLogLog(AccessLogEntry * al)
+ 	al->private.method_str = RequestMethodStr[al->http.method];
+     if (al->hier.host[0] == '\0')
+ 	xstrncpy(al->hier.host, dash_str, SQUIDHOSTNAMELEN);
++
++    memBufDefInit(&mb);
++
+     if (Config.onoff.common_log)
+-	l = accessLogCommon(al);
++	accessLogCommon(al, &mb);
+     else
+-	l = accessLogSquid(al);
++	accessLogSquid(al, &mb);
+     if (Config.onoff.log_mime_hdrs) {
+ 	char *ereq = log_quote(al->headers.request);
+ 	char *erep = log_quote(al->headers.reply);
+-	if (LOG_BUF_SZ - l > 0) {
+-	    l--;
+-	    l += snprintf(log_buf + l, LOG_BUF_SZ - l, " [%s] [%s]\n",
+-		ereq, erep);
+-	}
++	memBufPrintf(&mb, " [%s] [%s]\n", ereq, erep);
+ 	safe_free(ereq);
+ 	safe_free(erep);
++    } else {
++	memBufPrintf(&mb, "\n");
+     }
+-    file_write(LogfileFD,
+-	-1,
+-	xstrdup(log_buf),
+-	l,
+-	NULL,
+-	NULL,
+-	xfree);
++    file_write_mbuf(LogfileFD, -1, mb, NULL, NULL);
+     safe_free(xbuf);
+ }
+ 
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: acl.cc,v 1.165 1998/05/28 20:47:52 wessels Exp $
++ * $Id: acl.cc,v 1.166 1998/05/30 19:43:00 rousskov Exp $
+  *
+  * DEBUG: section 28    Access Control
+  * AUTHOR: Duane Wessels
+@@ -1936,22 +1936,23 @@ aclDumpIpList(acl_ip_data * ip)
+ #else
+     wordlist *W = NULL;
+     wordlist **T = &W;
+-    wordlist *w;
+-    char buf[128];
+-    off_t o;
++    MemBuf mb;
++
++    memBufDefInit(&mb);
+     while (ip != NULL) {
+-	o = 0;
+-	o += snprintf(buf + o, 128 - o, "%s", inet_ntoa(ip->addr1));
++	wordlist *w = xcalloc(1, sizeof(wordlist));
++	memBufReset(&mb);
++	memBufPrintf(&mb, "%s", inet_ntoa(ip->addr1));
+ 	if (ip->addr2.s_addr != any_addr.s_addr)
+-	    o += snprintf(buf + o, 128 - o, "-%s", inet_ntoa(ip->addr2));
++	    memBufPrintf(&mb, "-%s", inet_ntoa(ip->addr2));
+ 	if (ip->mask.s_addr != no_addr.s_addr)
+-	    o += snprintf(buf + o, 128 - o, "/%s", inet_ntoa(ip->mask));
+-	w = xcalloc(1, sizeof(wordlist));
+-	w->key = xstrdup(buf);
++	    memBufPrintf(&mb, "/%s", inet_ntoa(ip->mask));
++	w->key = xstrdup(mb.buf);
+ 	*T = w;
+ 	T = &w->next;
+ 	ip = ip->next;
+     }
++    memBufClean(&mb);
+     return W;
+ #endif
+ }
+@@ -1971,10 +1972,10 @@ aclDumpTimeSpecList(acl_time_data * t)
+ {
+     wordlist *W = NULL;
+     wordlist **T = &W;
+-    wordlist *w;
+     char buf[128];
+     while (t != NULL) {
+-	snprintf(buf, 128, "%c%c%c%c%c%c%c %02d:%02d-%02d:%02d",
++	wordlist *w = xcalloc(1, sizeof(wordlist));
++	snprintf(buf, sizeof(buf), "%c%c%c%c%c%c%c %02d:%02d-%02d:%02d",
+ 	    t->weekbits & ACL_SUNDAY ? 'S' : '-',
+ 	    t->weekbits & ACL_MONDAY ? 'M' : '-',
+ 	    t->weekbits & ACL_TUESDAY ? 'T' : '-',
+@@ -1986,7 +1987,6 @@ aclDumpTimeSpecList(acl_time_data * t)
+ 	    t->start % 60,
+ 	    t->stop / 60,
+ 	    t->stop % 60);
+-	w = xcalloc(1, sizeof(wordlist));
+ 	w->key = xstrdup(buf);
+ 	*T = w;
+ 	T = &w->next;
+@@ -2016,11 +2016,10 @@ aclDumpIntlistList(intlist * data)
+ {
+     wordlist *W = NULL;
+     wordlist **T = &W;
+-    wordlist *w;
+     char buf[32];
+     while (data != NULL) {
+-	snprintf(buf, 32, "%d", data->i);
+-	w = xcalloc(1, sizeof(wordlist));
++	wordlist *w = xcalloc(1, sizeof(wordlist));
++	snprintf(buf, sizeof(buf), "%d", data->i);
+ 	w->key = xstrdup(buf);
+ 	*T = w;
+ 	T = &w->next;
+@@ -2084,11 +2083,10 @@ aclDumpProxyAuthList(acl_proxy_auth * data)
+ {
+     wordlist *W = NULL;
+     wordlist **T = &W;
+-    wordlist *w;
+     char buf[MAXPATHLEN];
++    wordlist *w = xcalloc(1, sizeof(wordlist));
+     assert(data != NULL);
+-    snprintf(buf, MAXPATHLEN, "%s %d\n", data->filename, data->check_interval);
+-    w = xcalloc(1, sizeof(wordlist));
++    snprintf(buf, sizeof(buf), "%s %d\n", data->filename, data->check_interval);
+     w->key = xstrdup(buf);
+     *T = w;
+     T = &w->next;
+@@ -2388,13 +2386,12 @@ aclDumpArpList(acl_arp_data * data)
+ {
+     wordlist *W = NULL;
+     wordlist **T = &W;
+-    wordlist *w;
+     char buf[24];
+     while (data != NULL) {
+-	snprintf(buf, 24, "%02x:%02x:02x:02x:02x:02x",
++	wordlist *w = xcalloc(1, sizeof(wordlist));
++	xsnprintf(buf, sizeof(buf), "%02x:%02x:02x:02x:02x:02x",
+ 	    data->eth[0], data->eth[1], data->eth[2], data->eth[3],
+ 	    data->eth[4], data->eth[5]);
+-	w = xcalloc(1, sizeof(wordlist));
+ 	w->key = xstrdup(buf);
+ 	*T = w;
+ 	T = &w->next;
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: asn.cc,v 1.37 1998/05/27 22:51:48 rousskov Exp $
++ * $Id: asn.cc,v 1.38 1998/05/30 19:43:01 rousskov Exp $
+  *
+  * DEBUG: section 53    AS Number handling
+  * AUTHOR: Duane Wessels, Kostas Anagnostakis
+@@ -424,7 +424,7 @@ whoisConnectDone(int fd, int status, void *data)
+ 	comm_close(fd);
+ 	return;
+     }
+-    snprintf(buf, 128, "%s\r\n", strBuf(p->request->urlpath) + 1);
++    snprintf(buf, sizeof(buf), "%s\r\n", strBuf(p->request->urlpath) + 1);
+     debug(53, 3) ("whoisConnectDone: FD %d, '%s'\n", fd, strBuf(p->request->urlpath) + 1);
+     comm_write(fd, xstrdup(buf), strlen(buf), NULL, p, xfree);
+     commSetSelect(fd, COMM_SELECT_READ, whoisReadReply, p, 0);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: cache_cf.cc,v 1.282 1998/05/21 03:59:34 wessels Exp $
++ * $Id: cache_cf.cc,v 1.283 1998/05/30 19:43:02 rousskov Exp $
+  *
+  * DEBUG: section 3     Configuration File Parsing
+  * AUTHOR: Harvest Derived
+@@ -52,7 +52,6 @@ static const char *const B_GBYTES_STR = "GB";
+ 
+ static const char *const list_sep = ", \t\n\r";
+ 
+-static char fatal_str[BUFSIZ];
+ static void self_destruct(void);
+ static void wordlistAdd(wordlist **, const char *);
+ 
+@@ -78,9 +77,8 @@ static OBJH dump_config;
+ static void
+ self_destruct(void)
+ {
+-    snprintf(fatal_str, BUFSIZ, "Bungled %s line %d: %s",
++    fatalf("Bungled %s line %d: %s",
+ 	cfg_filename, config_lineno, config_input_line);
+-    fatal(fatal_str);
+ }
+ 
+ void
+@@ -117,19 +115,13 @@ wordlistAdd(wordlist ** list, const char *key)
+     }
+ }
+ 
+-char *
+-wordlistCat(const wordlist * w)
++void
++wordlistCat(const wordlist * w, MemBuf *mb)
+ {
+-    LOCAL_ARRAY(char, buf, 16384);
+-    int o = 0;
+-    buf[0] = '\0';
+     while (NULL != w) {
+-	if (o + strlen(w->key) > 16384)
+-	    break;
+-	o += snprintf(buf + o, 16384 - o, "%s\n", w->key);
++	memBufPrintf(mb, "%s\n", w->key);
+ 	w = w->next;
+     }
+-    return buf;
+ }
+ 
+ void
+@@ -175,11 +167,9 @@ parseConfigFile(const char *file_name)
+     char *tmp_line;
+     free_all();
+     default_all();
+-    if ((fp = fopen(file_name, "r")) == NULL) {
+-	snprintf(fatal_str, BUFSIZ, "Unable to open configuration file: %s: %s",
++    if ((fp = fopen(file_name, "r")) == NULL)
++	fatalf("Unable to open configuration file: %s: %s",
+ 	    file_name, xstrerror());
+-	fatal(fatal_str);
+-    }
+     cfg_filename = file_name;
+     if ((token = strrchr(cfg_filename, '/')))
+ 	cfg_filename = token + 1;
+@@ -287,10 +277,10 @@ configDoConfigure(void)
+ 	vhost_mode = 1;
+     if (Config.Port.http == NULL)
+ 	fatal("No http_port specified!");
+-    snprintf(ThisCache, SQUIDHOSTNAMELEN << 1, "%s:%d (Squid/%s)",
++    snprintf(ThisCache, sizeof(ThisCache), "%s:%d (%s)",
+ 	getMyHostname(),
+ 	(int) Config.Port.http->i,
+-	SQUID_VERSION);
++	full_appname_string);
+     if (!Config.udpMaxHitObjsz || Config.udpMaxHitObjsz > SQUID_UDP_SO_SNDBUF)
+ 	Config.udpMaxHitObjsz = SQUID_UDP_SO_SNDBUF;
+     if (Config.appendDomain)
+@@ -1346,10 +1336,7 @@ static void
+ requirePathnameExists(const char *name, const char *path)
+ {
+     struct stat sb;
+-    char buf[MAXPATHLEN];
+     assert(path != NULL);
+-    if (stat(path, &sb) < 0) {
+-	snprintf(buf, MAXPATHLEN, "%s: %s", path, xstrerror());
+-	fatal(buf);
+-    }
++    if (stat(path, &sb) < 0)
++	fatalf("%s: %s", path, xstrerror());
+ }
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: cachemgr.cc,v 1.78 1998/03/31 05:37:35 wessels Exp $
++ * $Id: cachemgr.cc,v 1.79 1998/05/30 19:43:03 rousskov Exp $
+  *
+  * DEBUG: section 0     CGI Cache Manager
+  * AUTHOR: Duane Wessels
+@@ -282,7 +282,7 @@ static char *
+ menu_url(cachemgr_request * req, const char *action)
+ {
+     static char url[1024];
+-    snprintf(url, 1024, "%s?host=%s&port=%d&user_name=%s&operation=%s&auth=%s",
++    snprintf(url, sizeof(url), "%s?host=%s&port=%d&user_name=%s&operation=%s&auth=%s",
+ 	script_name,
+ 	req->hostname,
+ 	req->port,
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: client_db.cc,v 1.33 1998/05/28 05:20:43 wessels Exp $
++ * $Id: client_db.cc,v 1.34 1998/05/30 19:43:04 rousskov Exp $
+  *
+  * DEBUG: section 0     Client Database
+  * AUTHOR: Duane Wessels
+@@ -200,13 +200,13 @@ int
+ meshCtblGetRowFn(oid * New, oid * Oid)
+ {
+     ClientInfo *c = NULL;
+-    static char key[15];
+ 
+     if (!Oid[0] && !Oid[1] && !Oid[2] && !Oid[3]) {
+ 	hash_first(client_table);
+ 	c = (ClientInfo *) hash_next(client_table);
+     } else {
+-	snprintf(key, 15, "%d.%d.%d.%d", Oid[0], Oid[1], Oid[2], Oid[3]);
++	char key[15];
++	snprintf(key, sizeof(key), "%d.%d.%d.%d", Oid[0], Oid[1], Oid[2], Oid[3]);
+ 	c = (ClientInfo *) hash_lookup(client_table, key);
+ 	if (NULL != c)
+ 	    c = c->next;
+@@ -230,7 +230,7 @@ snmp_meshCtblFn(variable_list * Var, snint * ErrP)
+     Answer = snmp_var_new(Var->name, Var->name_length);
+     *ErrP = SNMP_ERR_NOERROR;
+ 
+-    snprintf(key, 15, "%d.%d.%d.%d", Var->name[11], Var->name[12],
++    snprintf(key, sizeof(key), "%d.%d.%d.%d", Var->name[11], Var->name[12],
+ 	Var->name[13], Var->name[14]);
+     debug(49, 5) ("snmp_meshCtblFn: [%s] requested!\n", key);
+     c = (ClientInfo *) hash_lookup(client_table, key);
+@@ -1,7 +1,7 @@
+ 
+ 
+ /*
+- * $Id: comm.cc,v 1.266 1998/05/28 23:35:31 wessels Exp $
++ * $Id: comm.cc,v 1.267 1998/05/30 19:43:05 rousskov Exp $
+  *
+  * DEBUG: section 5     Socket Functions
+  * AUTHOR: Harvest Derived
+@@ -1383,7 +1383,7 @@ comm_write(int fd, char *buf, int size, CWCB * handler, void *handler_data, FREE
+     commSetSelect(fd, COMM_SELECT_WRITE, commHandleWrite, state, 0);
+ }
+ 
+-/* a wrapper around comm_write to allow for MemBuf to comm_written in a snap */
++/* a wrapper around comm_write to allow for MemBuf to be comm_written in a snap */
+ void
+ comm_write_mbuf(int fd, MemBuf mb, CWCB * handler, void *handler_data)
+ {
+@@ -222,6 +222,9 @@
+ /* handy to determine the #elements in a static array */
+ #define countof(arr) (sizeof(arr)/sizeof(*arr))
+ 
++/* to initialize static variables (see also MemBufNull) */
++#define MemBufNULL { NULL, 0, 0, 0, NULL }
++
+ /*
+  * Max number of ICP messages to receive per call to icpHandleUdp
+  */
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: disk.cc,v 1.116 1998/05/22 23:44:03 wessels Exp $
++ * $Id: disk.cc,v 1.117 1998/05/30 19:43:06 rousskov Exp $
+  *
+  * DEBUG: section 6     Disk I/O Routines
+  * AUTHOR: Harvest Derived
+@@ -466,7 +466,12 @@ file_write(int fd,
+     }
+ }
+ 
+-
++/* a wrapper around file_write to allow for MemBuf to be file_written in a snap */
++void
++file_write_mbuf(int fd, off_t off, MemBuf mb, DWCB * handler, void *handler_data)
++{
++    file_write(fd, off, mb.buf, mb.size, handler, handler_data, memBufFreeFunc(&mb));
++}
+ 
+ /* Read from FD */
+ static void
+@@ -516,6 +516,7 @@ typedef enum {
+     MEM_DONTFREE,
+     MEM_DISK_BUF,
+     MEM_STMEM_BUF,
++    MEM_2K_BUF,
+     MEM_4K_BUF,
+     MEM_8K_BUF,
+     MEM_ACL_IP_DATA,
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: errorpage.cc,v 1.134 1998/05/27 22:51:52 rousskov Exp $
++ * $Id: errorpage.cc,v 1.135 1998/05/30 19:43:07 rousskov Exp $
+  *
+  * DEBUG: section 4     Error Generation
+  * AUTHOR: Duane Wessels
+@@ -149,8 +149,7 @@ errorTryLoadText(const char *page_name, const char *dir)
+     struct stat sb;
+     char *text;
+ 
+-    snprintf(path, MAXPATHLEN, "%s/%s",
+-	dir, page_name);
++    snprintf(path, sizeof(path), "%s/%s", dir, page_name);
+     fd = file_open(path, O_RDONLY, NULL, NULL, NULL);
+     if (fd < 0 || fstat(fd, &sb) < 0) {
+ 	debug(4, 0) ("errorTryLoadText: '%s': %s\n", path, xstrerror());
+@@ -372,20 +371,22 @@ static const char *
+ errorConvert(char token, ErrorState * err)
+ {
+     request_t *r = err->request;
+-    static char buf[CVT_BUF_SZ];
+-    const char *p = buf;
++    static MemBuf mb = MemBufNULL;
++    const char *p = NULL; /* takes priority over mb if set */
++    
++    memBufReset(&mb);
+     switch (token) {
+     case 'B':
+ 	p = r ? ftpUrlWith2f(r) : "[no URL]";
+ 	break;
+     case 'e':
+-	snprintf(buf, CVT_BUF_SZ, "%d", err->xerrno);
++	memBufPrintf(&mb, "%d", err->xerrno);
+ 	break;
+     case 'E':
+ 	if (err->xerrno)
+-	    snprintf(buf, CVT_BUF_SZ, "(%d) %s", err->xerrno, strerror(err->xerrno));
++	    memBufPrintf(&mb, "(%d) %s", err->xerrno, strerror(err->xerrno));
+ 	else
+-	    snprintf(buf, CVT_BUF_SZ, "[No Error]");
++	    memBufPrintf(&mb, "[No Error]");
+ 	break;
+     case 'f':
+ 	/* FTP REQUEST LINE */
+@@ -403,26 +404,26 @@ errorConvert(char token, ErrorState * err)
+ 	break;
+     case 'g':
+ 	/* FTP SERVER MESSAGE */
+-	p = wordlistCat(err->ftp_server_msg);
++	wordlistCat(err->ftp_server_msg, &mb);
+ 	break;
+     case 'h':
+-	snprintf(buf, CVT_BUF_SZ, "%s", getMyHostname());
++	memBufPrintf(&mb, "%s", getMyHostname());
+ 	break;
+     case 'H':
+ 	p = r ? r->host : "[unknown host]";
+ 	break;
+     case 'i':
+-	snprintf(buf, CVT_BUF_SZ, "%s", inet_ntoa(err->src_addr));
++	memBufPrintf(&mb, "%s", inet_ntoa(err->src_addr));
+ 	break;
+     case 'I':
+ 	if (err->host) {
+-	    snprintf(buf, CVT_BUF_SZ, "%s", err->host);
++	    memBufPrintf(&mb, "%s", err->host);
+ 	} else
+ 	    p = "[unknown]";
+ 	break;
+     case 'L':
+ 	if (Config.errHtmlText) {
+-	    snprintf(buf, CVT_BUF_SZ, "%s", Config.errHtmlText);
++	    memBufPrintf(&mb, "%s", Config.errHtmlText);
+ 	} else
+ 	    p = "[not available]";
+ 	break;
+@@ -431,7 +432,7 @@ errorConvert(char token, ErrorState * err)
+ 	break;
+     case 'p':
+ 	if (r) {
+-	    snprintf(buf, CVT_BUF_SZ, "%d", (int) r->port);
++	    memBufPrintf(&mb, "%d", (int) r->port);
+ 	} else {
+ 	    p = "[unknown port]";
+ 	}
+@@ -441,18 +442,14 @@ errorConvert(char token, ErrorState * err)
+ 	break;
+     case 'R':
+ 	if (NULL != r) {
+-	    MemBuf mb;
+ 	    Packer p;
+-	    memBufDefInit(&mb);
+ 	    memBufPrintf(&mb, "%s %s HTTP/%3.1f\n",
+ 		RequestMethodStr[r->method],
+ 		strLen(r->urlpath) ? strBuf(r->urlpath) : "/",
+ 		(double) r->http_ver);
+ 	    packerToMemInit(&p, &mb);
+ 	    httpHeaderPackInto(&r->header, &p);
+ 	    packerClean(&p);
+-	    xstrncpy(buf, mb.buf, CVT_BUF_SZ);
+-	    memBufClean(&mb);
+ 	} else if (err->request_hdrs) {
+ 	    p = err->request_hdrs;
+ 	} else {
+@@ -466,30 +463,30 @@ errorConvert(char token, ErrorState * err)
+ 	/* signature may contain %-escapes, recursion */
+ 	if (err->page_id != ERR_SQUID_SIGNATURE) {
+ 	    const int saved_id = err->page_id;
+-	    MemBuf mb;
++	    MemBuf sign_mb;
+ 	    err->page_id = ERR_SQUID_SIGNATURE;
+-	    mb = errorBuildContent(err);
+-	    snprintf(buf, CVT_BUF_SZ, "%s", mb.buf);
+-	    memBufClean(&mb);
++	    sign_mb = errorBuildContent(err);
++	    memBufPrintf(&mb, "%s", sign_mb.buf);
++	    memBufClean(&sign_mb);
+ 	    err->page_id = saved_id;
+ 	} else {
+ 	    /* wow, somebody put %S into ERR_SIGNATURE, stop recursion */
+ 	    p = "[%S]";
+ 	}
+ 	break;
+     case 't':
+-	xstrncpy(buf, mkhttpdlogtime(&squid_curtime), 128);
++	memBufPrintf(&mb, "%s", mkhttpdlogtime(&squid_curtime));
+ 	break;
+     case 'T':
+-	snprintf(buf, CVT_BUF_SZ, "%s", mkrfc1123(squid_curtime));
++	memBufPrintf(&mb, "%s", mkrfc1123(squid_curtime));
+ 	break;
+     case 'U':
+ 	p = r ? urlCanonicalClean(r) : err->url ? err->url : "[no URL]";
+ 	break;
+     case 'w':
+-	if (Config.adminEmail) {
+-	    snprintf(buf, CVT_BUF_SZ, "%s", Config.adminEmail);
+-	} else
++	if (Config.adminEmail)
++	    memBufPrintf(&mb, "%s", Config.adminEmail);
++	else
+ 	    p = "[unknown]";
+ 	break;
+     case 'z':
+@@ -505,7 +502,9 @@ errorConvert(char token, ErrorState * err)
+ 	p = "%UNKNOWN%";
+ 	break;
+     }
+-    assert(p != NULL);
++    if (!p)
++	p = mb.buf; /* do not use mb after this assignment! */
++    assert(p);
+     debug(4, 3) ("errorConvert: %%%c --> '%s'\n", token, p);
+     return p;
+ }
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: globals.h,v 1.57 1998/05/22 23:14:20 wessels Exp $
++ * $Id: globals.h,v 1.58 1998/05/30 19:43:08 rousskov Exp $
+  */
+ 
+ extern FILE *debug_log;		/* NULL */
+@@ -97,6 +97,7 @@ extern int store_hash_buckets;	/* 0 */
+ extern hash_table *store_table;	/* NULL */
+ extern dlink_list store_list;
+ extern const String StringNull;	/* { 0, 0, NULL } */
++extern const MemBuf MemBufNull;	/* MemBufNULL */
+ extern int hot_obj_count;	/* 0 */
+ extern int _db_level;
+ extern const int CacheDigestHashFuncCount;	/* 4 */
+@@ -1,7 +1,7 @@
+ 
+ 
+ /*
+- * $Id: gopher.cc,v 1.125 1998/04/24 07:09:34 wessels Exp $
++ * $Id: gopher.cc,v 1.126 1998/05/30 19:43:09 rousskov Exp $
+  *
+  * DEBUG: section 10    Gopher
+  * AUTHOR: Harvest Derived
+@@ -161,7 +161,7 @@ typedef struct gopher_ds {
+ } GopherStateData;
+ 
+ static PF gopherStateFree;
+-static void gopher_mime_content(char *buf, const char *name, const char *def);
++static void gopher_mime_content(MemBuf *mb, const char *name, const char *def);
+ static void gopherMimeCreate(GopherStateData *);
+ static int gopher_url_parser(const char *url,
+     char *host,
+@@ -199,13 +199,13 @@ gopherStateFree(int fdnotused, void *data)
+ 
+ /* figure out content type from file extension */
+ static void
+-gopher_mime_content(char *buf, const char *name, const char *def_ctype)
++gopher_mime_content(MemBuf *mb, const char *name, const char *def_ctype)
+ {
+     char *ctype = mimeGetContentType(name);
+     char *cenc = mimeGetContentEncoding(name);
+     if (cenc)
+-	snprintf(buf + strlen(buf), MAX_MIME - strlen(buf), "Content-Encoding: %s\r\n", cenc);
+-    snprintf(buf + strlen(buf), MAX_MIME - strlen(buf), "Content-Type: %s\r\n",
++	memBufPrintf(mb, "Content-Encoding: %s\r\n", cenc);
++    memBufPrintf(mb, "Content-Type: %s\r\n",
+ 	ctype ? ctype : def_ctype);
+ }
+ 
+@@ -215,9 +215,11 @@ gopher_mime_content(char *buf, const char *name, const char *def_ctype)
+ static void
+ gopherMimeCreate(GopherStateData * gopherState)
+ {
+-    LOCAL_ARRAY(char, tempMIME, MAX_MIME);
++    MemBuf mb;
+ 
+-    snprintf(tempMIME, MAX_MIME,
++    memBufDefInit(&mb);
++
++    memBufPrintf(&mb, 
+ 	"HTTP/1.0 200 OK Gatewaying\r\n"
+ 	"Server: Squid/%s\r\n"
+ 	"Date: %s\r\n"
+@@ -231,34 +233,35 @@ gopherMimeCreate(GopherStateData * gopherState)
+     case GOPHER_HTML:
+     case GOPHER_WWW:
+     case GOPHER_CSO:
+-	strcat(tempMIME, "Content-Type: text/html\r\n");
++	memBufPrintf(&mb, "Content-Type: text/html\r\n");
+ 	break;
+     case GOPHER_GIF:
+     case GOPHER_IMAGE:
+     case GOPHER_PLUS_IMAGE:
+-	strcat(tempMIME, "Content-Type: image/gif\r\n");
++	memBufPrintf(&mb, "Content-Type: image/gif\r\n");
+ 	break;
+     case GOPHER_SOUND:
+     case GOPHER_PLUS_SOUND:
+-	strcat(tempMIME, "Content-Type: audio/basic\r\n");
++	memBufPrintf(&mb, "Content-Type: audio/basic\r\n");
+ 	break;
+     case GOPHER_PLUS_MOVIE:
+-	strcat(tempMIME, "Content-Type: video/mpeg\r\n");
++	memBufPrintf(&mb, "Content-Type: video/mpeg\r\n");
+ 	break;
+     case GOPHER_MACBINHEX:
+     case GOPHER_DOSBIN:
+     case GOPHER_UUENCODED:
+     case GOPHER_BIN:
+ 	/* Rightnow We have no idea what it is. */
+-	gopher_mime_content(tempMIME, gopherState->request, def_gopher_bin);
++	gopher_mime_content(&mb, gopherState->request, def_gopher_bin);
+ 	break;
+     case GOPHER_FILE:
+     default:
+-	gopher_mime_content(tempMIME, gopherState->request, def_gopher_text);
++	gopher_mime_content(&mb, gopherState->request, def_gopher_text);
+ 	break;
+     }
+-    strcat(tempMIME, "\r\n");
+-    storeAppend(gopherState->entry, tempMIME, strlen(tempMIME));
++    memBufPrintf(&mb, "\r\n");
++    storeAppend(gopherState->entry, mb.buf, mb.size);
++    memBufClean(&mb);
+ }
+ 
+ /* Parse a gopher url into components.  By Anawat. */
+@@ -330,15 +333,10 @@ gopherCachable(const char *url)
+ static void
+ gopherEndHTML(GopherStateData * gopherState)
+ {
+-    LOCAL_ARRAY(char, tmpbuf, TEMP_BUF_SIZE);
+-
+-    if (!gopherState->data_in) {
+-	snprintf(tmpbuf, TEMP_BUF_SIZE,
++    if (!gopherState->data_in)
++	storeAppendPrintf(gopherState->entry,
+ 	    "<HTML><HEAD><TITLE>Server Return Nothing.</TITLE>\n"
+ 	    "</HEAD><BODY><HR><H1>Server Return Nothing.</H1></BODY></HTML>\n");
+-	storeAppend(gopherState->entry, tmpbuf, strlen(tmpbuf));
+-	return;
+-    }
+ }
+ 
+ 
+@@ -369,29 +367,27 @@ gopherToHTML(GopherStateData * gopherState, char *inbuf, int len)
+     entry = gopherState->entry;
+ 
+     if (gopherState->conversion == HTML_INDEX_PAGE) {
+-	snprintf(outbuf, TEMP_BUF_SIZE << 4,
++	storeAppendPrintf(entry,
+ 	    "<HTML><HEAD><TITLE>Gopher Index %s</TITLE></HEAD>\n"
+ 	    "<BODY><H1>%s<BR>Gopher Search</H1>\n"
+ 	    "<p>This is a searchable Gopher index. Use the search\n"
+ 	    "function of your browser to enter search terms.\n"
+-	    "<ISINDEX></BODY></HTML>\n", storeUrl(entry), storeUrl(entry));
+-	storeAppend(entry, outbuf, strlen(outbuf));
++	    "<ISINDEX></BODY></HTML>\n",
++	    storeUrl(entry), storeUrl(entry));
+ 	/* now let start sending stuff to client */
+ 	storeBufferFlush(entry);
+ 	gopherState->data_in = 1;
+ 
+ 	return;
+     }
+     if (gopherState->conversion == HTML_CSO_PAGE) {
+-	snprintf(outbuf, TEMP_BUF_SIZE << 4,
++	storeAppendPrintf(entry,
+ 	    "<HTML><HEAD><TITLE>CSO Search of %s</TITLE></HEAD>\n"
+ 	    "<BODY><H1>%s<BR>CSO Search</H1>\n"
+ 	    "<P>A CSO database usually contains a phonebook or\n"
+ 	    "directory.  Use the search function of your browser to enter\n"
+ 	    "search terms.</P><ISINDEX></BODY></HTML>\n",
+ 	    storeUrl(entry), storeUrl(entry));
+-
+-	storeAppend(entry, outbuf, strlen(outbuf));
+ 	/* now let start sending stuff to client */
+ 	storeBufferFlush(entry);
+ 	gopherState->data_in = 1;
+@@ -275,7 +275,7 @@ htcpQuery(StoreEntry * e, request_t * req, peer * p)
+     ssize_t pktlen;
+     char vbuf[32];
+     htcpStuff stuff;
+-    snprintf(vbuf, 32, "%3.1f", req->http_ver);
++    snprintf(vbuf, sizeof(vbuf), "%3.1f", req->http_ver);
+     stuff.op = HTCP_TST;
+     stuff.rr = RR_REQUEST;
+     stuff.f1 = 1;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: http.cc,v 1.276 1998/05/27 22:51:53 rousskov Exp $
++ * $Id: http.cc,v 1.277 1998/05/30 19:43:11 rousskov Exp $
+  *
+  * DEBUG: section 11    Hypertext Transfer Protocol (HTTP)
+  * AUTHOR: Harvest Derived
+@@ -113,16 +113,6 @@
+ 
+ static const char *const crlf = "\r\n";
+ 
+-enum {
+-    CCC_NOCACHE,
+-    CCC_NOSTORE,
+-    CCC_MAXAGE,
+-    CCC_MAXSTALE,
+-    CCC_MINFRESH,
+-    CCC_ONLYIFCACHED,
+-    CCC_ENUM_END
+-};
+-
+ static CNCB httpConnectDone;
+ static CWCB httpSendComplete;
+ static CWCB httpSendRequestEntry;
+@@ -614,6 +604,7 @@ httpBuildRequestHeader(request_t * request,
+     LOCAL_ARRAY(char, bbuf, BBUF_SZ);
+     String strConnection = StringNull;
+     const HttpHeader *hdr_in = &orig_request->header;
++    HttpHdrRange *range = NULL;
+     const HttpHeaderEntry *e;
+     HttpHeaderPos pos = HttpHeaderInitPos;
+ 
+@@ -627,6 +618,14 @@ httpBuildRequestHeader(request_t * request,
+     if (entry && entry->lastmod > -1 && request->method == METHOD_GET)
+ 	httpHeaderPutTime(hdr_out, HDR_IF_MODIFIED_SINCE, entry->lastmod);
+ 
++#if FUTURE_CODE
++    /* decide if we want to filter out Range specs
++     * no reason to filter out if the reply will not be cachable
++     * or if we cannot parse the specs */
++    if (EBIT_TEST(orig_request->flags, REQ_CACHABLE))
++	range = httpHeaderGetRange(hdr_in);
++#endif
++
+     strConnection = httpHeaderGetList(hdr_in, HDR_CONNECTION);
+     while ((e = httpHeaderGetEntry(hdr_in, &pos))) {
+ 	debug(11, 5) ("httpBuildRequestHeader: %s: %s\n",
+@@ -658,6 +657,12 @@ httpBuildRequestHeader(request_t * request,
+ 		    httpHeaderPutInt(hdr_out, HDR_MAX_FORWARDS, hops - 1);
+ 	    }
+ 	    break;
++#if FUTURE_CODE
++	case HDR_RANGE:
++	    if (!range)
++		httpHeaderAddEntry(hdr_out, httpHeaderEntryClone(e));
++	    break;
++#endif
+ 	case HDR_PROXY_CONNECTION:
+ 	case HDR_CONNECTION:
+ 	case HDR_VIA:
+@@ -724,6 +729,8 @@ httpBuildRequestHeader(request_t * request,
+ 	}
+     }
+     stringClean(&strConnection);
++    if (range)
++	httpHdrRangeDestroy(range);
+ }
+ 
+ /* build request prefix and append it to a given MemBuf; 
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: ident.cc,v 1.40 1998/03/31 05:37:45 wessels Exp $
++ * $Id: ident.cc,v 1.41 1998/05/30 19:43:11 rousskov Exp $
+  *
+  * DEBUG: section 30    Ident (RFC 931)
+  * AUTHOR: Duane Wessels
+@@ -89,16 +89,17 @@ static void
+ identConnectDone(int fd, int status, void *data)
+ {
+     ConnStateData *connState = data;
+-    LOCAL_ARRAY(char, reqbuf, BUFSIZ);
++    MemBuf mb;
+     if (status != COMM_OK) {
+ 	comm_close(fd);
+ 	identCallback(connState);
+ 	return;
+     }
+-    snprintf(reqbuf, BUFSIZ, "%d, %d\r\n",
++    memBufDefInit(&mb);
++    memBufPrintf(&mb, "%d, %d\r\n",
+ 	ntohs(connState->peer.sin_port),
+ 	ntohs(connState->me.sin_port));
+-    comm_write(fd, xstrdup(reqbuf), strlen(reqbuf), NULL, connState, xfree);
++    comm_write_mbuf(fd, mb, NULL, connState);
+     commSetSelect(fd, COMM_SELECT_READ, identReadReply, connState, 0);
+     commSetTimeout(fd, Config.Timeout.read, identTimeout, connState);
+ }
+@@ -40,19 +40,23 @@ internalStaticCheck(const char *urlpath)
+ char *
+ internalRemoteUri(const char *host, u_short port, const char *dir, const char *name)
+ {
+-    LOCAL_ARRAY(char, buf, MAX_URL);
+-    int k = 0;
++    static MemBuf mb = MemBufNULL;
+     static char lc_host[SQUIDHOSTNAMELEN];
+     assert(host && port && name);
+-    xstrncpy(lc_host, host, SQUIDHOSTNAMELEN);
++    /* convert host name to lower case */
++    xstrncpy(lc_host, host, sizeof(lc_host));
+     Tolower(lc_host);
+-    k += snprintf(buf + k, MAX_URL - k, "http://%s", lc_host);
++    /* build uri in mb */
++    memBufReset(&mb);
++    memBufPrintf(&mb, "http://%s", lc_host);
++    /* append port if not default */
+     if (port != urlDefaultPort(PROTO_HTTP))
+-	k += snprintf(buf + k, MAX_URL - k, ":%d", port);
++	memBufPrintf(&mb, ":%d", port);
+     if (dir)
+-	k += snprintf(buf + k, MAX_URL - k, "%s", dir);
+-    k += snprintf(buf + k, MAX_URL - k, "%s", name);
+-    return buf;
++	memBufPrintf(&mb, "%s", dir);
++    memBufPrintf(&mb, "%s", name);
++    /* return a pointer to a local static buffer */
++    return mb.buf;
+ }
+ 
+ /*
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: ipcache.cc,v 1.188 1998/05/24 03:41:10 wessels Exp $
++ * $Id: ipcache.cc,v 1.189 1998/05/30 19:43:13 rousskov Exp $
+  *
+  * DEBUG: section 14    IP Cache
+  * AUTHOR: Harvest Derived
+@@ -989,8 +989,7 @@ ipcacheChangeKey(ipcache_entry * i)
+     }
+     assert(i == (ipcache_entry *) table_entry);
+     hash_remove_link(ip_table, table_entry);
+-    snprintf(new_key, 256, "%d/", ++index);
+-    strncat(new_key, i->name, 128);
++    snprintf(new_key, 256, "%d/%s", ++index, i->name);
+     debug(14, 1) ("ipcacheChangeKey: from '%s' to '%s'\n", i->name, new_key);
+     safe_free(i->name);
+     i->name = xstrdup(new_key);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: mem.cc,v 1.24 1998/05/22 23:44:15 wessels Exp $
++ * $Id: mem.cc,v 1.25 1998/05/30 19:43:14 rousskov Exp $
+  *
+  * DEBUG: section 13    High Level Memory Pool Management
+  * AUTHOR: Harvest Derived
+@@ -183,6 +183,7 @@ memInit(void)
+      * that are never used or used only once; perhaps we should simply use
+      * malloc() for those? @?@
+      */
++    memDataInit(MEM_2K_BUF, "2K Buffer", 2048, 10);
+     memDataInit(MEM_4K_BUF, "4K Buffer", 4096, 10);
+     memDataInit(MEM_8K_BUF, "8K Buffer", 8192, 10);
+     memDataInit(MEM_ACCESSLOGENTRY, "AccessLogEntry",
+@@ -303,6 +304,12 @@ memInUse(mem_type type)
+ 
+ /* ick */
+ 
++void
++memFree2K(void *p)
++{
++    memFree(MEM_2K_BUF, p);
++}
++
+ void
+ memFree4K(void *p)
+ {
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: mime.cc,v 1.66 1998/05/27 22:51:55 rousskov Exp $
++ * $Id: mime.cc,v 1.67 1998/05/30 19:43:15 rousskov Exp $
+  *
+  * DEBUG: section 25    MIME Parsing
+  * AUTHOR: Harvest Derived
+@@ -230,7 +230,7 @@ headersEnd(const char *mime, size_t l)
+  *  Returns the MIME header in the provided 'result' buffer, and
+  *  returns non-zero on error, or 0 on success.
+  */
+-int
++static int
+ mk_mime_hdr(char *result, const char *type, int size, time_t ttl, time_t lmt)
+ {
+     time_t expiretime;
+@@ -246,7 +246,7 @@ mk_mime_hdr(char *result, const char *type, int size, time_t ttl, time_t lmt)
+     expiretime = ttl ? t + ttl : 0;
+     date[0] = expires[0] = last_modified[0] = '\0';
+     content_length[0] = result[0] = '\0';
+-    snprintf(date, 100, "Date: %s\r\n", mkrfc1123(t));
++    xsnprintf(date, 100, "Date: %s\r\n", mkrfc1123(t));
+     if (ttl >= 0)
+ 	snprintf(expires, 100, "Expires: %s\r\n", mkrfc1123(expiretime));
+     if (lmt)
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: net_db.cc,v 1.113 1998/05/28 05:37:39 wessels Exp $
++ * $Id: net_db.cc,v 1.114 1998/05/30 19:43:15 rousskov Exp $
+  *
+  * DEBUG: section 37    Network Measurement Database
+  * AUTHOR: Duane Wessels
+@@ -861,14 +861,14 @@ netdbGetRowFn(oid * New, oid * Oid)
+ {
+     netdbEntry *c = NULL;
+     static struct in_addr maddr;
+-    static char key[15];
+ 
+ #if USE_ICMP
+     if (!Oid[0] && !Oid[1] && !Oid[2] && !Oid[3]) {
+ 	hash_first(addr_table);
+ 	c = (netdbEntry *) hash_next(addr_table);
+     } else {
+-	snprintf(key, 15, "%d.%d.%d.%d", Oid[0], Oid[1], Oid[2], Oid[3]);
++	static char key[15];
++	snprintf(key, sizeof(key), "%d.%d.%d.%d", Oid[0], Oid[1], Oid[2], Oid[3]);
+ 	c = (netdbEntry *) hash_lookup(addr_table, key);
+ 	if (NULL != c) {
+ 	    debug(49, 8) ("netdbGetRowFn: [%s] found\n", key);
+@@ -897,7 +897,7 @@ snmp_netdbFn(variable_list * Var, snint * ErrP)
+ #if USE_ICMP
+     struct in_addr addr;
+ #endif
+-    snprintf(key, 15, "%d.%d.%d.%d", Var->name[11], Var->name[12],
++    snprintf(key, sizeof(key), "%d.%d.%d.%d", Var->name[11], Var->name[12],
+ 	Var->name[13], Var->name[14]);
+ 
+     debug(49, 5) ("snmp_netdbFn: request with %d. (%s)!\n", Var->name[10], key);
+@@ -60,7 +60,7 @@ extern void intlistDestroy(intlist **);
+ extern int intlistFind(intlist * list, int i);
+ extern void wordlistDestroy(wordlist **);
+ extern void configFreeMemory(void);
+-extern char *wordlistCat(const wordlist *);
++extern void wordlistCat(const wordlist *, MemBuf *mb);
+ 
+ extern void cbdataInit(void);
+ #if CBDATA_DEBUG
+@@ -153,6 +153,7 @@ extern void _db_print();
+ extern int file_open(const char *path, int mode, FOCB *, void *callback_data, void *tag);
+ extern void file_close(int fd);
+ extern void file_write(int, off_t, void *, int len, DWCB *, void *, FREE *);
++extern void file_write_mbuf(int fd, off_t, MemBuf mb, DWCB * handler, void *handler_data);
+ extern int file_read(int, char *, int, off_t, DRCB *, void *);
+ extern void disk_init(void);
+ extern int diskWriteIsComplete(int);
+@@ -465,8 +466,10 @@ extern int ipcacheUnregister(const char *name, void *data);
+ extern void memBufInit(MemBuf * mb, mb_size_t szInit, mb_size_t szMax);
+ /* init with defaults */
+ extern void memBufDefInit(MemBuf * mb);
+-/* cleans the mb; last function to call if you do not give .buf away */
++/* cleans mb; last function to call if you do not give .buf away */
+ extern void memBufClean(MemBuf * mb);
++/* resets mb preserving (or initializing if needed) memory buffer */
++extern void memBufReset(MemBuf * mb);
+ /* calls memcpy, appends exactly size bytes, extends buffer if needed */
+ extern void memBufAppend(MemBuf * mb, const char *buf, mb_size_t size);
+ /* calls snprintf, extends buffer if needed */
+@@ -628,6 +631,7 @@ extern void *memAllocate(mem_type);
+ extern void *memAllocBuf(size_t net_size, size_t * gross_size);
+ extern void memFree(mem_type, void *);
+ extern void memFreeBuf(size_t size, void *);
++extern void memFree2K(void *);
+ extern void memFree4K(void *);
+ extern void memFree8K(void *);
+ extern void memFreeDISK(void *);
+@@ -836,6 +840,11 @@ extern const char *getMyHostname(void);
+ extern void safeunlink(const char *path, int quiet);
+ extern void death(int sig);
+ extern void fatal(const char *message);
++#ifdef __STDC__
++extern void fatalf(const char *fmt,...);
++#else
++extern void fatalf();
++#endif
+ extern void fatal_dump(const char *message);
+ extern void sigusr2_handle(int sig);
+ extern void sig_child(int sig);
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: snmp_core.cc,v 1.4 1998/04/27 19:16:11 wessels Exp $
++ * $Id: snmp_core.cc,v 1.5 1998/05/30 19:43:17 rousskov Exp $
+  *
+  * DEBUG: section 49    SNMP support
+  * AUTHOR: Kostas Anagnostakis
+@@ -640,8 +640,8 @@ snmpDebugOid(int lvl, oid * Name, snint Len)
+     int x;
+     objid[0] = '\0';
+     for (x = 0; x < Len; x++) {
+-	snprintf(mbuf, 16, ".%u", (unsigned char) Name[x]);
+-	strcat(objid, mbuf);
++	snprintf(mbuf, sizeof(mbuf), ".%u", (unsigned char) Name[x]);
++	strncat(objid, mbuf, sizeof(objid));
+     }
+     debug(49, lvl) ("   oid = %s\n", objid);
+ }
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: store_dir.cc,v 1.69 1998/05/22 23:14:22 wessels Exp $
++ * $Id: store_dir.cc,v 1.70 1998/05/30 19:43:18 rousskov Exp $
+  *
+  * DEBUG: section 47    Store Directory Routines
+  * AUTHOR: Duane Wessels
+@@ -131,18 +131,14 @@ storeCreateDirectory(const char *path, int should_exist)
+ 	if (S_ISDIR(st.st_mode)) {
+ 	    debug(20, should_exist ? 3 : 1) ("%s exists\n", path);
+ 	} else {
+-	    snprintf(tmp_error_buf, ERROR_BUF_SZ,
+-		"Swap directory %s is not a directory.", path);
+-	    fatal(tmp_error_buf);
++	    fatalf("Swap directory %s is not a directory.", path);
+ 	}
+     } else if (0 == mkdir(path, 0755)) {
+ 	debug(20, should_exist ? 1 : 3) ("%s created\n", path);
+ 	created = 1;
+     } else {
+-	snprintf(tmp_error_buf, ERROR_BUF_SZ,
+-	    "Failed to make swap directory %s: %s",
++	fatalf("Failed to make swap directory %s: %s",
+ 	    path, xstrerror());
+-	fatal(tmp_error_buf);
+     }
+     return created;
+ }
+@@ -5,14 +5,12 @@ static cache_key null_key[MD5_DIGEST_CHARS];
+ const char *
+ storeKeyText(const unsigned char *key)
+ {
+-    LOCAL_ARRAY(char, buf, 33);
++    static MemBuf mb = MemBufNULL;
+     int i;
+-    int o;
+-    for (i = 0; i < MD5_DIGEST_CHARS; i++) {
+-	o = i << 1;
+-	snprintf(buf + o, 33 - o, "%02X", *(key + i));
+-    }
+-    return buf;
++    memBufReset(&mb);
++    for (i = 0; i < MD5_DIGEST_CHARS; i++)
++	memBufPrintf(&mb, "%02X", *(key + i));
++    return mb.buf;
+ }
+ 
+ const unsigned char *
+@@ -68,7 +66,7 @@ storeKeyPrivate(const char *url, method_t method, int num)
+     assert(num > 0);
+     debug(20, 3) ("storeKeyPrivate: %s %s\n",
+ 	RequestMethodStr[method], url);
+-    n = snprintf(key_buf, MAX_URL + 100, "%d %s %s",
++    n = snprintf(key_buf, sizeof(key_buf), "%d %s %s",
+ 	num,
+ 	RequestMethodStr[method],
+ 	url);
+@@ -85,7 +83,7 @@ storeKeyPublic(const char *url, method_t method)
+     MD5_CTX M;
+     int n;
+     char key_buf[MAX_URL + 100];
+-    n = snprintf(key_buf, MAX_URL + 100, "%s %s",
++    n = snprintf(key_buf, sizeof(key_buf), "%s %s",
+ 	RequestMethodStr[method],
+ 	url);
+     MD5Init(&M);
+@@ -14,7 +14,7 @@ static int storelog_fd = -1;
+ void
+ storeLog(int tag, const StoreEntry * e)
+ {
+-    LOCAL_ARRAY(char, logmsg, MAX_URL << 1);
++    MemBuf mb;
+     MemObject *mem = e->mem_obj;
+     HttpReply *reply;
+     if (storelog_fd < 0)
+@@ -26,8 +26,9 @@ storeLog(int tag, const StoreEntry * e)
+ 	storeMemObjectDump(mem);
+ 	mem->log_url = xstrdup(mem->url);
+     }
++    memBufDefInit(&mb);
+     reply = mem->reply;
+-    snprintf(logmsg, MAX_URL << 1, "%9d.%03d %-7s %08X %4d %9d %9d %9d %s %d/%d %s %s\n",
++    memBufPrintf(&mb, "%9d.%03d %-7s %08X %4d %9d %9d %9d %s %d/%d %s %s\n",
+ 	(int) current_time.tv_sec,
+ 	(int) current_time.tv_usec / 1000,
+ 	storeLogTags[tag],
+@@ -41,13 +42,7 @@ storeLog(int tag, const StoreEntry * e)
+ 	(int) (mem->inmem_hi - mem->reply->hdr_sz),
+ 	RequestMethodStr[mem->method],
+ 	mem->log_url);
+-    file_write(storelog_fd,
+-	-1,
+-	xstrdup(logmsg),
+-	strlen(logmsg),
+-	NULL,
+-	NULL,
+-	xfree);
++    file_write_mbuf(storelog_fd, -1, mb, NULL, NULL);
+ }
+ 
+ void
+@@ -969,6 +969,7 @@ struct _iostats {
+ };
+ 
+ /* auto-growing memory-resident buffer with printf interface */
++/* note: when updating this struct, update MemBufNULL #define */
+ struct _MemBuf {
+     /* public, read-only */
+     char *buf;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: tools.cc,v 1.154 1998/05/15 15:16:39 wessels Exp $
++ * $Id: tools.cc,v 1.155 1998/05/30 19:43:20 rousskov Exp $
+  *
+  * DEBUG: section 21    Misc Functions
+  * AUTHOR: Harvest Derived
+@@ -117,6 +117,7 @@ and report the trace back to squid-bugs@nlanr.net.\n\
+ Thanks!\n"
+ 
+ static void fatal_common(const char *);
++static void fatalvf(const char *fmt, va_list args);
+ static void mail_warranty(void);
+ static void shutdownTimeoutHandler(int fd, void *data);
+ #if USE_ASYNC_IO
+@@ -417,6 +418,37 @@ fatal(const char *message)
+     exit(1);
+ }
+ 
++/* printf-style interface for fatal */
++#ifdef __STDC__
++void
++fatalf(const char *fmt,...)
++{
++    va_list args;
++    va_start(args, fmt);
++#else
++void
++fatalf(va_alist)
++     va_dcl
++{
++    va_list args;
++    const char *fmt = NULL;
++    va_start(args);
++    fmt = va_arg(args, char *);
++#endif
++    fatalvf(fmt, args);
++    va_end(args);
++}
++
++
++/* used by fatalf */
++static void
++fatalvf(const char *fmt, va_list args)
++{
++    static char fatal_str[BUFSIZ];
++    vsnprintf(fatal_str, sizeof(fatal_str), fmt, args);
++    fatal(fatal_str);
++}
++
+ /* fatal with dumping core */
+ void
+ fatal_dump(const char *message)
+@@ -674,7 +706,7 @@ setMaxFD(void)
+ 	if (rl.rlim_cur > rl.rlim_max)
+ 	    Squid_MaxFD = rl.rlim_cur = rl.rlim_max;
+ 	if (setrlimit(RLIMIT_OFILE, &rl) < 0) {
+-	    snprintf(tmp_error_buf, ERROR_BUF_SZ,
++	    xsnprintf(tmp_error_buf, ERROR_BUF_SZ,
+ 		"setrlimit: RLIMIT_OFILE: %s", xstrerror());
+ 	    fatal_dump(tmp_error_buf);
+ 	}

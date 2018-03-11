@@ -1,0 +1,328 @@
+@@ -53,8 +53,8 @@ ACLChecklist::authenticated()
+     } else if (request->flags.accelerated) {
+         /* WWW authorization on accelerated requests */
+         headertype = HDR_AUTHORIZATION;
+-    } else if (request->flags.transparent) {
+-        debugs(28, 1, "ACHChecklist::authenticated: authentication not applicable on transparently intercepted requests.");
++    } else if (request->flags.intercepted || request->flags.tproxy) {
++        debugs(28, DBG_IMPORTANT, HERE << " authentication not applicable on intercepted requests.");
+         return -1;
+     } else {
+         /* Proxy authorization on proxy requests */
+@@ -1,8 +1,6 @@
+-
+ /*
+  * $Id: ProtoPort.h,v 1.1 2008/02/11 22:24:39 rousskov Exp $
+  */
+-
+ #ifndef SQUID_PROTO_PORT_H
+ #define SQUID_PROTO_PORT_H
+ 
+@@ -21,21 +19,15 @@ struct http_port_list
+     char *name;                /* visible name */
+     char *defaultsite;         /* default web site */
+ 
+-    unsigned int transparent:1; /* transparent proxy */
+-
+-    unsigned int accel:1; /* HTTP accelerator */
+-
+-    unsigned int vhost:1; /* uses host header */
+-
+-    unsigned int sslBump:1; /* intercepts CONNECT requests */
++    unsigned int intercepted:1;  /* intercepting proxy */
++    unsigned int tproxy:1;       /* spoof client ip using TPROXY */
++    unsigned int accel:1;        /* HTTP accelerator */
++    unsigned int vhost:1;        /* uses host header */
++    unsigned int sslBump:1;      /* intercepts CONNECT requests */
+ 
+     int vport;                 /* virtual port support, -1 for dynamic, >0 static*/
+     int disable_pmtu_discovery;
+ 
+-#if LINUX_TPROXY2 || LINUX_TPROXY4
+-    unsigned int tproxy:1; /* spoof client ip using tproxy */
+-#endif
+-
+     struct {
+ 	unsigned int enabled;
+ 	unsigned int idle;
+@@ -2920,8 +2920,8 @@ parse_http_port_option(http_port_list * s, char *token)
+         else
+             self_destruct();
+ 
+-    } else if (strcmp(token, "transparent") == 0) {
+-        s->transparent = 1;
++    } else if (strcmp(token, "transparent") == 0 || strcmp(token, "intercept") == 0) {
++        s->intercepted = 1;
+         IPInterceptor.StartInterception();
+ #if USE_IPV6
+         /* INET6: until transparent REDIRECT works on IPv6 SOCKET, force wildcard to IPv4 */
+@@ -3063,8 +3063,8 @@ dump_generic_http_port(StoreEntry * e, const char *n, const http_port_list * s)
+     if (s->defaultsite)
+         storeAppendPrintf(e, " defaultsite=%s", s->defaultsite);
+ 
+-    if (s->transparent)
+-        storeAppendPrintf(e, " transparent");
++    if (s->intercepted)
++        storeAppendPrintf(e, " intercept");
+ 
+     if (s->vhost)
+         storeAppendPrintf(e, " vhost");
+@@ -1824,7 +1824,7 @@ prepareTransparentURL(ConnStateData * conn, ClientHttpRequest *http, char *url,
+     char *host;
+     char ntoabuf[MAX_IPSTRLEN];
+ 
+-    http->flags.transparent = 1;
++    http->flags.intercepted = 1;
+ 
+     if (*url != '/')
+         return; /* already in good shape */
+@@ -1995,8 +1995,8 @@ parseHttpRequest(ConnStateData *conn, HttpParser *hp, HttpRequestMethod * method
+         /* prepend our name & port */
+         http->uri = xstrdup(internalLocalUri(NULL, url));
+         http->flags.accel = 1;
+-    } else if (conn->port->transparent) {
+-	// Fallback on transparent if enabled, useful for "self" requests
++    } else if (conn->port->intercepted) {
++	// Fallback on transparent interception if enabled, useful for "self" requests
+         prepareTransparentURL(conn, http, url, req_hdr);
+     }
+ 
+@@ -2213,9 +2213,17 @@ clientProcessRequest(ConnStateData *conn, HttpParser *hp, ClientSocketContext *c
+     }
+ 
+     request->flags.accelerated = http->flags.accel;
+-    /* propagate the transparent and interception flags only if those modes are currently active. */
+-    request->flags.transparent = http->flags.transparent && IPInterceptor.InterceptActive();
+-    request->flags.tproxy = conn->port->tproxy && IPInterceptor.TransparentActive();
++
++    /** \par
++     * If transparent or interception mode is working clone the transparent and interception flags
++     * from the port settings to the request.
++     */
++    if(IPInterceptor.InterceptActive()) {
++        request->flags.intercepted = http->flags.intercepted;
++    }
++    if(IPInterceptor.TransparentActive()) {
++        request->flags.tproxy = conn->port->tproxy;
++    }
+ 
+     if (internalCheck(request->urlpath.buf())) {
+         if (internalHostnameIs(request->GetHost()) &&
+@@ -2715,6 +2723,7 @@ ConnStateData *
+ connStateCreate(const IPAddress &peer, const IPAddress &me, int fd, http_port_list *port)
+ {
+     ConnStateData *result = new ConnStateData;
++
+     result->peer = peer;
+     result->log_addr = peer;
+     result->log_addr.ApplyMask(Config.Addrs.client_netmask.GetCIDR());
+@@ -2723,12 +2732,7 @@ connStateCreate(const IPAddress &peer, const IPAddress &me, int fd, http_port_li
+     result->in.buf = (char *)memAllocBuf(CLIENT_REQ_BUF_SZ, &result->in.allocatedSize);
+     result->port = cbdataReference(port);
+ 
+-#if LINUX_TPROXY4
+-    if(port->transparent || port->tproxy)
+-#else
+-    if(port->transparent)
+-#endif
+-    {
++    if(port->intercepted || port->tproxy) {
+         IPAddress dst;
+ 
+         if (IPInterceptor.NatLookup(fd, me, peer, dst) == 0) {
+@@ -3111,13 +3115,9 @@ clientHttpConnectionsOpen(void)
+ 
+         enter_suid();
+ 
+-#if LINUX_TPROXY4
+         if(s->tproxy) {
+             fd = comm_openex(SOCK_STREAM, IPPROTO_TCP, s->s, (COMM_NONBLOCKING|COMM_TRANSPARENT), 0, "HTTP Socket");
+-        }
+-        else
+-#endif
+-        {
++        } else {
+             fd = comm_open(SOCK_STREAM, IPPROTO_TCP, s->s, COMM_NONBLOCKING, "HTTP Socket");
+         }
+ 
+@@ -3131,9 +3131,10 @@ clientHttpConnectionsOpen(void)
+         comm_accept(fd, httpAccept, s);
+ 
+         debugs(1, 1, "Accepting " <<
+-               (s->transparent ? "transparently proxied" :
+-                       s->sslBump ? "bumpy" :
+-                       s->accel ? "accelerated" : "") 
++               (s->intercepted ? " intercepted" : "") <<
++               (s->tproxy ? " spoofing" : "") <<
++               (s->sslBump ? " bumpy" : "") <<
++               (s->accel ? " accelerated" : "") 
+                << " HTTP connections at " << s->s
+                << ", FD " << fd << "." );
+ 
+@@ -117,7 +117,7 @@ class ClientHttpRequest
+     struct
+     {
+         unsigned int accel:1;
+-        unsigned int transparent:1;
++        unsigned int intercepted:1;
+         unsigned int internal:1;
+         unsigned int done_copying:1;
+         unsigned int purging:1;
+@@ -634,7 +634,7 @@ comm_set_v6only(int fd, int tos)
+ void
+ comm_set_transparent(int fd)
+ {
+-#if LINUX_TPROXY4
++#if defined(IP_TRANSPARENT)
+     int tos = 1;
+     if (setsockopt(fd, SOL_IP, IP_TRANSPARENT, (char *) &tos, sizeof(int)) < 0) {
+         debugs(50, DBG_IMPORTANT, "comm_open: setsockopt(IP_TRANSPARENT) on FD " << fd << ": " << xstrerror());
+@@ -754,12 +754,10 @@ comm_openex(int sock_type,
+             commSetReuseAddr(new_socket);
+     }
+ 
+-#if LINUX_TPROXY4
+     /* MUST be done before binding or face OS Error: "(99) Cannot assign requested address"... */
+     if((flags & COMM_TRANSPARENT)) {
+         comm_set_transparent(new_socket);
+     }
+-#endif
+ 
+     if (!addr.IsNoAddr())
+     {
+@@ -1351,13 +1349,11 @@ comm_old_accept(int fd, ConnectionDetail &details)
+ 
+     commSetNonBlocking(sock);
+ 
+-#if LINUX_TPROXY4
+-    /* AYJ: do we actually need to set this again on every accept? */
+     if(fd_table[fd].flags.transparent == 1) {
+-        comm_set_transparent(sock);
++        /* AYJ: do we actually need to set this again on every accept? */
++        //comm_set_transparent(sock);
+         F->flags.transparent = 1;
+     }
+-#endif
+ 
+     PROF_stop(comm_accept);
+     return sock;
+@@ -265,11 +265,13 @@ FwdState::fwdStart(int client_fd, StoreEntry *entry, HttpRequest *request)
+ 
+     default:
+         FwdState::Pointer fwd = new FwdState(client_fd, entry, request);
+-#if LINUX_TPROXY2 || LINUX_TPROXY4
++
+         /* If we need to transparently proxy the request
+          * then we need the client source protocol, address and port */
+-        fwd->src = request->client_addr;
+-#endif
++        if(request->flags.tproxy) {
++            fwd->src = request->client_addr;
++            // AYJ: do we need to pass on the transparent flag also?
++        }
+ 
+         fwd->start(fwd);
+         return;
+@@ -793,12 +795,9 @@ FwdState::connectStart()
+         ctimeout = Config.Timeout.connect;
+     }
+ 
+-#if LINUX_TPROXY2 || LINUX_TPROXY4
+     if (request->flags.tproxy)
+         client_addr = request->client_addr;
+ 
+-#endif
+-
+     if (ftimeout < 0)
+         ftimeout = 5;
+ 
+@@ -836,13 +835,9 @@ FwdState::connectStart()
+ 
+     debugs(17, 3, "fwdConnectStart: got outgoing addr " << outgoing << ", tos " << tos);
+ 
+-#if LINUX_TPROXY4
+     if (request->flags.tproxy) {
+         fd = comm_openex(SOCK_STREAM, IPPROTO_TCP, outgoing, (COMM_NONBLOCKING|COMM_TRANSPARENT), tos, url);
+-    }
+-    else
+-#endif
+-    {
++    } else {
+         fd = comm_openex(SOCK_STREAM, IPPROTO_TCP, outgoing, COMM_NONBLOCKING, tos, url);
+     }
+ 
+@@ -887,7 +882,7 @@ FwdState::connectStart()
+         if (request->flags.tproxy) {
+             // try to set the outgoing address using TPROXY v2
+             // if it fails we abort any further TPROXY actions on this connection
+-            if(IPInterceptor.SetTPROXY2OutgoingAddr(int fd, const IPAddress &src) == -1) {
++            if(IPInterceptor.SetTproxy2OutgoingAddr(int fd, const IPAddress &src) == -1) {
+                 request->flags.tproxy = 0;
+             }
+         }
+@@ -1227,10 +1222,8 @@ getOutgoingAddr(HttpRequest * request)
+ {
+     ACLChecklist ch;
+ 
+-#if LINUX_TPROXY4
+     if (request && request->flags.tproxy)
+         return request->client_addr;
+-#endif
+ 
+     if (request)
+     {
+@@ -99,10 +99,8 @@ class FwdState : public RefCountable
+         unsigned int ftp_pasv_failed:1;
+         unsigned int forward_completed:1;
+     } flags;
+-#if LINUX_NETFILTER || LINUX_TPROXY2 || LINUX_TPROXY4
+-    IPAddress src;
+-#endif
+ 
++    IPAddress src; /* Client address for this connection. Needed for transparent operations. */
+ };
+ 
+ #endif
+@@ -1230,13 +1230,9 @@ HttpStateData::processReplyBody()
+             closeHandler = NULL;
+             fwd->unregister(fd);
+ 
+-#if LINUX_TPROXY2 || LINUX_TPROXY4
+-
+             if (orig_request->flags.tproxy)
+                 client_addr = orig_request->client_addr;
+ 
+-#endif
+-
+             if (_peer) {
+                 if (_peer->options.originserver)
+                     fwd->pconnPush(fd, _peer->name, orig_request->port, orig_request->GetHost(), client_addr);
+@@ -1024,14 +1024,12 @@ struct _iostats
+ 
+ struct request_flags
+ {
+-    request_flags():range(0),nocache(0),ims(0),auth(0),cachable(0),hierarchical(0),loopdetect(0),proxy_keepalive(0),proxying(0),refresh(0),redirected(0),need_validation(0),accelerated(0),transparent(0),internal(0),internalclient(0),must_keepalive(0),destinationIPLookedUp_(0)
++    request_flags(): range(0),nocache(0),ims(0),auth(0),cachable(0),hierarchical(0),loopdetect(0),proxy_keepalive(0),proxying(0),refresh(0),redirected(0),need_validation(0),accelerated(0),intercepted(0),internal(0),internalclient(0),must_keepalive(0),destinationIPLookedUp_(0)
+     {
+ #if HTTP_VIOLATIONS
+         nocache_hack = 0;
+ #endif
+-#if LINUX_TPROXY2 || LINUX_TPROXY4
+ 	tproxy = 0;
+-#endif
+     }
+ 
+     unsigned int range:1;
+@@ -1050,10 +1048,8 @@ struct request_flags
+     unsigned int nocache_hack:1;	/* for changing/ignoring no-cache requests */
+ #endif
+     unsigned int accelerated:1;
+-    unsigned int transparent:1;
+-#if LINUX_TPROXY2 || LINUX_TPROXY4
+-    unsigned int tproxy:1; /* spoof client ip using tproxy */
+-#endif
++    unsigned int intercepted:1;  /**< transparently intercepted request */
++    unsigned int tproxy:1;  /**< spoof client ip using tproxy */
+     unsigned int internal:1;
+     unsigned int internalclient:1;
+     unsigned int must_keepalive:1;

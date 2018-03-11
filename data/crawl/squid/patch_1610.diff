@@ -1,0 +1,363 @@
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: client_side.cc,v 1.274 1998/04/10 01:27:29 wessels Exp $
++ * $Id: client_side.cc,v 1.275 1998/04/12 06:10:05 rousskov Exp $
+  *
+  * DEBUG: section 33    Client-side Routines
+  * AUTHOR: Duane Wessels
+@@ -44,7 +44,9 @@ static CWCB clientWriteComplete;
+ static PF clientReadRequest;
+ static PF connStateFree;
+ static PF requestTimeout;
++static void clientFinishIMS(clientHttpRequest *http);
+ static STCB clientGetHeadersForIMS;
++static STCB clientGetHeadersForSpecialIMS;
+ static int CheckQuickAbort2(const clientHttpRequest *);
+ static int clientCheckTransferDone(clientHttpRequest *);
+ static void CheckQuickAbort(clientHttpRequest *);
+@@ -1218,13 +1220,53 @@ clientWriteComplete(int fd, char *bufnotused, size_t size, int errflag, void *da
+     }
+ }
+ 
++/* called when clientGetHeadersFor*IMS completes */
++static void
++clientFinishIMS(clientHttpRequest *http)
++{
++    StoreEntry *entry = http->entry;
++    MemBuf mb;
++
++    http->log_type = LOG_TCP_IMS_HIT;
++    entry->refcount++;
++    /* All headers are available, double check if object is modified or not */
++    if (modifiedSince(entry, http->request)) {
++	debug(33, 4) ("clientFinishIMS: Modified '%s'\n",
++	    storeUrl(entry));
++	if (entry->store_status == STORE_ABORTED)
++	    debug(33, 0) ("clientFinishIMS: entry->swap_status == STORE_ABORTED\n");
++	storeClientCopy(entry,
++	    http->out.offset,
++	    http->out.offset,
++	    SM_PAGE_SIZE,
++	    memAllocate(MEM_4K_BUF),
++	    clientSendMoreData,
++	    http);
++	return;
++    }
++    debug(33, 4) ("clientFinishIMS: Not modified '%s'\n",
++	storeUrl(entry));
++    /*
++     * Create the Not-Modified reply from the existing entry,
++     * Then make a new entry to hold the reply to be written
++     * to the client.
++     */
++    mb = httpPacked304Reply(entry->mem_obj->reply);
++    storeUnregister(entry, http);
++    storeUnlockObject(entry);
++    http->entry = clientCreateStoreEntry(http, http->request->method, 0);
++    httpReplyParse(http->entry->mem_obj->reply, mb.buf);
++    storeAppend(http->entry, mb.buf, mb.size);
++    memBufClean(&mb);
++    storeComplete(http->entry);
++}
++
+ static void
+ clientGetHeadersForIMS(void *data, char *buf, ssize_t size)
+ {
+     clientHttpRequest *http = data;
+     StoreEntry *entry = http->entry;
+     MemObject *mem;
+-    MemBuf mb;
+     debug(33, 3) ("clientGetHeadersForIMS: %s, %d bytes\n",
+ 	http->uri, (int) size);
+     assert(size <= SM_PAGE_SIZE);
+@@ -1293,35 +1335,53 @@ clientGetHeadersForIMS(void *data, char *buf, ssize_t size)
+ 	return;
+     }
+ #endif
+-    http->log_type = LOG_TCP_IMS_HIT;
+-    entry->refcount++;
+-    if (modifiedSince(entry, http->request)) {
++    clientFinishIMS(http);
++}
++
++/*
++ * Client sent an IMS request for ENTRY_SPECIAL
++ *   - fetch the headers
++ *   - construct a 304 reply
++ *   - if something goes wrong call clientCacheHit()
++ *     to mimic our usual processing of special entries
++ *   - note that clientGetHeadersForIMS frees "buf" earlier than we do
++ */
++static void
++clientGetHeadersForSpecialIMS(void *data, char *buf, ssize_t size)
++{
++    clientHttpRequest *http = data;
++    StoreEntry *entry = http->entry;
++    debug(33, 3) ("clientGetHeadersForSpecialIMS: %s, %d bytes\n",
++	http->uri, (int) size);
++    assert(size <= SM_PAGE_SIZE);
++    if (size < 0 || entry->store_status == STORE_ABORTED) {
++	clientCacheHit(data, buf, size);
++	return;
++    }
++    if (entry->mem_obj->reply->sline.status == 0) {
++	if (entry->mem_status == IN_MEMORY) {
++	    clientCacheHit(data, buf, size);
++	    return;
++	}
++	if (size == SM_PAGE_SIZE && http->out.offset == 0) {
++	    clientCacheHit(data, buf, size);
++	    return;
++	}
++	debug(33, 3) ("clientGetHeadersForSpecialIMS: waiting for HTTP reply headers\n");
++	/* All headers are not yet available, wait for more data */
+ 	if (entry->store_status == STORE_ABORTED)
+-	    debug(33, 0) ("clientGetHeadersForIMS 2: entry->swap_status == STORE_ABORTED\n");
++	    debug(33, 0) ("clientGetHeadersForSpecialIMS: entry->swap_status == STORE_ABORTED\n");
+ 	storeClientCopy(entry,
+-	    http->out.offset,
++	    http->out.offset + size,
+ 	    http->out.offset,
+ 	    SM_PAGE_SIZE,
+-	    memAllocate(MEM_4K_BUF),
+-	    clientSendMoreData,
++	    buf,
++	    clientGetHeadersForSpecialIMS,
+ 	    http);
+ 	return;
+     }
+-    debug(33, 4) ("clientGetHeadersForIMS: Not modified '%s'\n",
+-	storeUrl(entry));
+-    /*
+-     * Create the Not-Modified reply from the existing entry,
+-     * Then make a new entry to hold the reply to be written
+-     * to the client.
+-     */
+-    mb = httpPacked304Reply(mem->reply);
+-    storeUnregister(entry, http);
+-    storeUnlockObject(entry);
+-    http->entry = clientCreateStoreEntry(http, http->request->method, 0);
+-    httpReplyParse(http->entry->mem_obj->reply, mb.buf);
+-    storeAppend(http->entry, mb.buf, mb.size);
+-    memBufClean(&mb);
+-    storeComplete(http->entry);
++    memFree(MEM_4K_BUF, buf);
++    clientFinishIMS(http);
+ }
+ 
+ /*
+@@ -1458,7 +1518,6 @@ clientProcessRequest(clientHttpRequest * http)
+     case LOG_TCP_HIT:
+     case LOG_TCP_NEGATIVE_HIT:
+     case LOG_TCP_MEM_HIT:
+-    case LOG_TCP_IMS_HIT:
+ 	entry->refcount++;	/* HIT CASE */
+ 	if (entry->store_status == STORE_ABORTED)
+ 	    debug(33, 0) ("clientProcessRequest: entry->swap_status == STORE_ABORTED\n");
+@@ -1470,6 +1529,7 @@ clientProcessRequest(clientHttpRequest * http)
+ 	    clientCacheHit,
+ 	    http);
+ 	return;
++    case LOG_TCP_IMS_HIT:
+     case LOG_TCP_IMS_MISS:
+ 	if (entry->store_status == STORE_ABORTED)
+ 	    debug(33, 0) ("clientProcessRequest 2: entry->swap_status == STORE_ABORTED\n");
+@@ -1478,7 +1538,8 @@ clientProcessRequest(clientHttpRequest * http)
+ 	    http->out.offset,
+ 	    SM_PAGE_SIZE,
+ 	    memAllocate(MEM_4K_BUF),
+-	    clientGetHeadersForIMS,
++	    (http->log_type == LOG_TCP_IMS_MISS) ? 
++		clientGetHeadersForIMS : clientGetHeadersForSpecialIMS,
+ 	    http);
+ 	break;
+     case LOG_TCP_REFRESH_MISS:
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: peer_digest.cc,v 1.12 1998/04/10 00:39:32 rousskov Exp $
++ * $Id: peer_digest.cc,v 1.13 1998/04/12 06:10:06 rousskov Exp $
+  *
+  * DEBUG: section 72    Peer Digest Routines
+  * AUTHOR: Alex Rousskov
+@@ -87,7 +87,8 @@ static void
+ peerDigestClean(peer *p)
+ {
+     if (!cbdataValid(p))
+-	debug(72, 2) ("peerDigest: note: peer '%s' was reset or deleted\n", p->host);
++	debug(72, 2) ("peerDigest: note: peer '%s' was reset or deleted\n", 
++	    p->host ? p->host : "<null>");
+     assert(!EBIT_TEST(p->digest.flags, PD_REQUESTED));
+     peerDigestDisable(p);
+     cbdataUnlock(p);
+@@ -136,13 +137,14 @@ peerDigestDelay(peer *p, int disable, time_t delay)
+ 	assert(delay || !disable);
+ 	debug(72, 2) ("peerDigestDelay: %s: peer %s for %d secs till %s\n",
+ 	    disable ? "disabling" : "delaying",
+-	    p->host, delay, mkrfc1123(squid_curtime + delay));
++	    p->host ? p->host : "<null>", 
++	    delay, mkrfc1123(squid_curtime + delay));
+ 	eventAdd("peerDigestValidate", (EVH*) peerDigestValidate,
+ 	    p, delay);
+     } else {
+ 	assert(disable);
+ 	debug(72, 2) ("peerDigestDisable: disabling peer %s for good\n",
+-	    p->host);
++	    p->host ? p->host : "<null>");
+ 	/* just in case, will not need it anymore */
+ 	EBIT_CLR(p->digest.flags, PD_USABLE);
+     }
+@@ -300,16 +302,17 @@ peerDigestFetchReply(void *data, char *buf, ssize_t size)
+ 	assert(reply);
+ 	httpReplyParse(reply, buf);
+ 	status = reply->sline.status;
+-	debug(72, 3) ("peerDigestFetchHeaders: status: %d, expires: %s\n",
+-	    status, mkrfc1123(reply->expires));
++	debug(72, 3) ("peerDigestFetchHeaders: %s status: %d, expires: %s\n",
++	    peer->host, status, mkrfc1123(reply->expires));
+ 	/* this "if" is based on clientHandleIMSReply() */
+ 	if (status == HTTP_NOT_MODIFIED) {
+ 	    request_t *r = NULL;
+ 	    /* our old entry is fine */
+ 	    assert(fetch->old_entry);
+ 	    if (!fetch->old_entry->mem_obj->request)
+ 		fetch->old_entry->mem_obj->request = r =
+-		    requestLink(fetch->old_entry->mem_obj->request);
++		    requestLink(fetch->entry->mem_obj->request);
++	    assert(fetch->old_entry->mem_obj->request);
+ 	    httpReplyUpdateOnNotModified(fetch->old_entry->mem_obj->reply, reply);
+ 	    storeTimestampsSet(fetch->old_entry);
+ 	    /* get rid of 304 reply */
+@@ -319,8 +322,10 @@ peerDigestFetchReply(void *data, char *buf, ssize_t size)
+ 	    storeUnlockObject(fetch->entry);
+ 	    fetch->entry = fetch->old_entry;
+ 	    fetch->old_entry = NULL;
+-	    requestUnlink(r);
+-	    fetch->entry->mem_obj->request = NULL;
++	    /* preserve request -- we need its size to update counters */
++	    /* requestUnlink(r); */
++	    /* fetch->entry->mem_obj->request = NULL; */
++	    assert(fetch->entry->mem_obj);
+ 	} else
+ 	if (status == HTTP_OK) {
+ 	    /* get rid of old entry if any */
+@@ -489,6 +494,7 @@ peerDigestFetchFinish(DigestFetchState *fetch, char *buf, const char *err_msg)
+     const time_t fetch_resp_time = squid_curtime - fetch->start_time;
+     const int b_read = (fetch->entry->store_status == STORE_PENDING) ? 
+ 	mem->inmem_hi : mem->object_sz;
++    assert(req);
+     if (!err_msg && !peer->digest.cd)
+ 	err_msg = "null digest (internal bug?)";
+     if (!err_msg && fetch->mask_offset != peer->digest.cd->mask_size)
+@@ -501,8 +507,9 @@ peerDigestFetchFinish(DigestFetchState *fetch, char *buf, const char *err_msg)
+ 	fetch->old_entry = NULL;
+     }
+     assert(fetch->entry);
+-    debug(72, 3) ("peerDigestFetchFinish: %s, read %d bytes\n",
+-	peer->host, b_read);
++    debug(72, 3) ("peerDigestFetchFinish: %s, read %d b, expires: %s lmt: %s\n",
++	peer->host, b_read, 
++	mkrfc1123(fetch->entry->expires), mkrfc1123(fetch->entry->lastmod));
+     if (err_msg) {
+ 	debug(72, 1) ("disabling corrupted (%s) digest from %s\n",
+ 	    err_msg, peer->host);
+@@ -519,8 +526,12 @@ peerDigestFetchFinish(DigestFetchState *fetch, char *buf, const char *err_msg)
+ 	/* release buggy entry */
+ 	storeReleaseRequest(fetch->entry);
+     } else {
+-	debug(72, 2) ("received valid digest from %s\n", peer->host);
+-        storeComplete(fetch->entry);
++	if (fetch->entry->store_status == STORE_OK) {
++	   debug(72, 2) ("re-used old digest from %s\n", peer->host);
++	} else {
++	   debug(72, 2) ("received valid digest from %s\n", peer->host);
++           storeComplete(fetch->entry);
++	}
+ 	EBIT_SET(peer->digest.flags, PD_USABLE);
+ 	EBIT_CLR(peer->digest.flags, PD_DISABLED);
+ 	peer->digest.last_dis_delay = 0;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: peer_select.cc,v 1.48 1998/04/09 11:41:28 rousskov Exp $
++ * $Id: peer_select.cc,v 1.49 1998/04/12 06:10:07 rousskov Exp $
+  *
+  * DEBUG: section 44    Peer Selection Algorithm
+  * AUTHOR: Duane Wessels
+@@ -314,7 +314,10 @@ peerSelectFoo(ps_state * psstate)
+ 	    request->hier.alg = PEER_SA_DIGEST;
+ 	    if (1 /* global_digested_peer_count */)
+ 		p = neighborsDigestSelect(request, entry);
+-  	    code = DIRECT; /* default @?@: CACHE_DIGEST_NONE */
++	    /* update counters */
++	    statHistCount(&Counter.cd.peer_choice_count, request->hier.n_choices);
++	    statHistCount(&Counter.cd.peer_ichoice_count, request->hier.n_ichoices);
++  	    code = DIRECT;
+ 	    switch (request->hier.cd_lookup) {
+ 	    case LOOKUP_HIT:
+ 		assert(p);
+@@ -562,6 +562,8 @@ double statHistDeltaMedian(const StatHist * A, const StatHist * B);
+ void statHistDump(const StatHist * H, StoreEntry * sentry, StatHistBinDumper bd);
+ void statHistLogInit(StatHist * H, int capacity, double min, double max);
+ void statHistEnumInit(StatHist * H, int last_enum);
++void statHistIntDumper(StoreEntry * sentry, int idx, double val, double size, int count);
++
+ 
+ /* MemMeter */
+ extern void memMeterSyncHWater(MemMeter * m);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: stat.cc,v 1.236 1998/04/10 00:49:39 rousskov Exp $
++ * $Id: stat.cc,v 1.237 1998/04/12 06:10:08 rousskov Exp $
+  *
+  * DEBUG: section 18    Cache Manager Statistics
+  * AUTHOR: Harvest Derived
+@@ -878,6 +878,8 @@ statCountersInitSpecial(StatCounters * C)
+     statHistLogInit(&C->icp.client_svc_time, 300, 0.0, 3600000.0 * 30.0);
+     statHistLogInit(&C->cd.server_svc_time, 300, 0.0, 3600000.0 * 30.0);
+     statHistLogInit(&C->icp.server_svc_time, 300, 0.0, 3600000.0 * 30.0);
++    statHistEnumInit(&C->cd.peer_choice_count, Config.npeers);
++    statHistEnumInit(&C->cd.peer_ichoice_count, Config.npeers);
+ #endif
+ }
+ 
+@@ -898,6 +900,8 @@ statCountersClean(StatCounters * C)
+     statHistClean(&C->icp.client_svc_time);
+     statHistClean(&C->cd.server_svc_time);
+     statHistClean(&C->icp.server_svc_time);
++    statHistClean(&C->cd.peer_choice_count);
++    statHistClean(&C->cd.peer_ichoice_count);
+ #endif
+ }
+ 
+@@ -924,6 +928,8 @@ statCountersCopy(StatCounters * dest, const StatCounters * orig)
+     statHistCopy(&dest->icp.client_svc_time, &orig->icp.client_svc_time);
+     statHistCopy(&dest->cd.server_svc_time, &orig->cd.server_svc_time);
+     statHistCopy(&dest->icp.server_svc_time, &orig->icp.server_svc_time);
++    statHistCopy(&dest->cd.peer_choice_count, &orig->cd.peer_choice_count);
++    statHistCopy(&dest->cd.peer_ichoice_count, &orig->cd.peer_ichoice_count);
+ #endif
+ }
+ 
+@@ -950,6 +956,10 @@ statCountersHistograms(StoreEntry *sentry)
+     statHistDump(&f->icp.client_svc_time, sentry, NULL);
+     storeAppendPrintf(sentry, "\ncd.client_svc_time histogram:\n");
+     statHistDump(&f->cd.client_svc_time, sentry, NULL);
++    storeAppendPrintf(sentry, "\ncd.peer_choice_count histogram:\n");
++    statHistDump(&f->cd.peer_choice_count, sentry, &statHistIntDumper);
++    storeAppendPrintf(sentry, "\ncd.peer_ichoice_count histogram:\n");
++    statHistDump(&f->cd.peer_ichoice_count, sentry, &statHistIntDumper);
+ #endif
+ #if TOO_MUCH_OUTPUT
+     storeAppendPrintf(sentry, "icp.query_svc_time histogram:\n");
+@@ -1222,6 +1222,8 @@ struct _StatCounters {
+         cd_guess_stats guess;
+ 	StatHist client_svc_time;
+ 	StatHist server_svc_time;
++	StatHist peer_choice_count;
++	StatHist peer_ichoice_count;
+     } cd;
+ #endif
+     int page_faults;

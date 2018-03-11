@@ -1,655 +1,305 @@
-@@ -5,40 +5,34 @@
-  */
+@@ -39,6 +39,7 @@
+ #include "log/ModStdio.h"
+ #include "log/ModSyslog.h"
+ #include "log/ModUdp.h"
++#include "log/ModTcp.h"
  
- #include "squid.h"
+ CBDATA_TYPE(Logfile);
+ 
+@@ -61,6 +62,9 @@ logfileOpen(const char *path, size_t bufsz, int fatal_flag)
+     } else if (strncmp(path, "daemon:", 7) == 0) {
+         patharg = path + 7;
+         ret = logfile_mod_daemon_open(lf, patharg, bufsz, fatal_flag);
++    } else if (strncmp(path, "tcp:", 4) == 0) {
++        patharg = path + 4;
++        ret = logfile_mod_tcp_open(lf, patharg, bufsz, fatal_flag);
+     } else if (strncmp(path, "udp:", 4) == 0) {
+         patharg = path + 4;
+         ret = logfile_mod_udp_open(lf, patharg, bufsz, fatal_flag);
+@@ -15,5 +15,7 @@ liblog_la_SOURCES = \
+ 	ModStdio.h \
+ 	ModSyslog.cc \
+ 	ModSyslog.h \
++	ModTcp.cc \
++	ModTcp.h \
+ 	ModUdp.cc \
+ 	ModUdp.h
+@@ -0,0 +1,233 @@
++/*
++ * DEBUG: section 50    Log file handling
++ * AUTHOR: Dhaval Varia
++ * Developed based on ModUdp.* by Adrian Chadd
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sources; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ */
 +
-+#include "Store.h"
- #include "fs/rock/RockDirMap.h"
- 
- static const char SharedMemoryName[] = "RockDirMap";
- 
--Rock::DirMap::DirMap(const int id, const int limit):
--    shm(SharedMemoryName, id)
-+Rock::DirMap::DirMap(const char *const path, const int limit):
-+    shm(SharedMemoryName(path))
- {
-     shm.create(limit);
-     assert(shm.mem());
-     shared = new (shm.mem()) Shared(limit);
- }
- 
--Rock::DirMap::DirMap(const int id):
--    shm(SharedMemoryName, id)
-+Rock::DirMap::DirMap(const char *const path):
-+    shm(SharedMemoryName(path))
- {
-     shm.open();
-     assert(shm.mem());
-     shared = reinterpret_cast<Shared *>(shm.mem());
- }
- 
- StoreEntryBasics *
--Rock::DirMap::add(const cache_key *const key)
--{
--    return add(key, slotIdx(key));
--}
--
--StoreEntryBasics *
--Rock::DirMap::add(const cache_key *const key, const sfileno fileno)
-+Rock::DirMap::openForWriting(const cache_key *const key, sfileno &fileno)
- {
--    if (fileno != slotIdx(key))
--        return 0;
--
--    free(fileno);
--    Slot &s = shared->slots[fileno];
-+    const int idx = slotIdx(key);
-+    free(idx);
-+    Slot &s = shared->slots[idx];
-     if (s.state.swap_if(Slot::Empty, Slot::Writing)) {
-         s.setKey(key);
-         return &s.seBasics;
-@@ -47,25 +41,19 @@ Rock::DirMap::add(const cache_key *const key, const sfileno fileno)
- }
- 
- void
--Rock::DirMap::added(const cache_key *const key)
-+Rock::DirMap::closeForWriting(const sfileno fileno)
- {
--    Slot &s = slot(key);
--    assert(s.checkKey(key));
-+    assert(valid(fileno));
-+    Slot &s = shared->slots[fileno];
-     assert(s.state == Slot::Writing);
-     ++shared->count;
-     assert(s.state.swap_if(Slot::Writing, Slot::Usable));
- }
- 
- bool
--Rock::DirMap::free(const cache_key *const key)
--{
--    return free(slotIdx(key));
--}
--
--bool
--Rock::DirMap::free(const int fileno)
-+Rock::DirMap::free(const sfileno fileno)
- {
--    if (open(fileno)) {
-+    if (openForReadingAt(fileno)) {
-         Slot &s = shared->slots[fileno];
-         s.state.swap_if(Slot::Usable, Slot::WaitingToBeFreed);
-         --s.readLevel;
-@@ -76,8 +64,21 @@ Rock::DirMap::free(const int fileno)
- }
- 
- const StoreEntryBasics *
--Rock::DirMap::open(const sfileno fileno)
-+Rock::DirMap::openForReading(const cache_key *const key, sfileno &fileno)
++#include "squid.h"
++#include "comm.h"
++#include "log/File.h"
++#include "log/ModTcp.h"
++#include "Parsing.h"
++
++/*
++ * This logfile TCP module is mostly inspired by a patch by Tim Starling
++ * from Wikimedia.
++ *
++ * It doesn't do any TCP buffering - it'd be quite a bit of work for
++ * something which the kernel could be doing for you!
++ */
++
++typedef struct {
++    int fd;
++    char *buf;
++    size_t bufsz;
++    int offset;
++} l_tcp_t;
++
++static void
++logfile_mod_tcp_write(Logfile * lf, const char *buf, size_t len)
 +{
-+    const int idx = slotIdx(key);
-+    const StoreEntryBasics *const seBasics = openForReadingAt(idx);
-+    if (seBasics && shared->slots[idx].checkKey(key)) {
-+        fileno = idx;
-+        return seBasics;
++    l_tcp_t *ll = (l_tcp_t *) lf->data;
++    ssize_t s;
++    s = write(ll->fd, (char const *) buf, len);
++
++    fd_bytes(ll->fd, s, FD_WRITE);
++#if 0
++    if (s < 0) {
++        debugs(1, 1, "logfile (tcp): got errno (" << errno << "):" << xstrerror());
 +    }
-+    return 0;
++    if (s != len) {
++        debugs(1, 1, "logfile (tcp): len=" << len << ", wrote=" << s);
++    }
++#endif
++
++    /* We don't worry about network errors for now */
 +}
 +
-+const StoreEntryBasics *
-+Rock::DirMap::openForReadingAt(const sfileno fileno)
- {
-+    assert(valid(fileno));
-     Slot &s = shared->slots[fileno];
-     ++s.readLevel;
-     if (s.state == Slot::Usable)
-@@ -87,23 +88,11 @@ Rock::DirMap::open(const sfileno fileno)
-     return 0;
- }
- 
--const StoreEntryBasics *
--Rock::DirMap::open(const cache_key *const key, sfileno &fileno)
--{
--    const int idx = slotIdx(key);
--    const StoreEntryBasics *const seBasics = open(idx);
--    if (seBasics && shared->slots[fileno].checkKey(key)) {
--        fileno = idx;
--        return seBasics;
--    }
--    return 0;
--}
--
- void
--Rock::DirMap::close(const cache_key *const key)
-+Rock::DirMap::closeForReading(const sfileno fileno)
- {
--    Slot &s = slot(key);
--    assert(s.checkKey(key));
-+    assert(valid(fileno));
-+    Slot &s = shared->slots[fileno];
-     assert(s.readLevel > 0);
-     --s.readLevel;
-     freeIfNeeded(s);
-@@ -175,6 +164,21 @@ Rock::DirMap::SharedSize(const int limit)
-     return sizeof(Shared) + limit * sizeof(Slot);
- }
- 
-+String
-+Rock::DirMap::SharedMemoryName(const char *path)
++static void
++logfile_mod_tcp_flush(Logfile * lf)
 +{
-+    String result;
-+    for (const char *p = strchr(path, '/'); p; p = strchr(path, '/')) {
-+        if (path != p) {
-+            result.append('.');
-+            result.append(path, p - path);
-+        }
-+        path = p + 1;
-+    }
-+    result.append(path);
-+    return result;
++    l_tcp_t *ll = (l_tcp_t *) lf->data;
++    if (0 == ll->offset)
++        return;
++    logfile_mod_tcp_write(lf, ll->buf, (size_t) ll->offset);
++    ll->offset = 0;
 +}
 +
- void
- Rock::DirMap::Slot::setKey(const cache_key *const aKey)
- {
-@@ -191,3 +195,16 @@ Rock::DirMap::Slot::checkKey(const cache_key *const aKey) const
- Rock::DirMap::Shared::Shared(const int aLimit): limit(aLimit), count(0)
- {
- }
-+
-+void
-+StoreEntryBasics::set(const StoreEntry &from)
++static void
++logfile_mod_tcp_writeline(Logfile * lf, const char *buf, size_t len)
 +{
-+    memset(this, 0, sizeof(*this));
-+    timestamp = from.timestamp;
-+    lastref = from.lastref;
-+    expires = from.expires;
-+    lastmod = from.lastmod;
-+    swap_file_sz = from.swap_file_sz;
-+    refcount = from.refcount;
-+    flags = from.flags;
++    l_tcp_t *ll = (l_tcp_t *) lf->data;
++
++    if (0 == ll->bufsz) {
++        /* buffering disabled */
++        logfile_mod_tcp_write(lf, buf, len);
++        return;
++    }
++    if (ll->offset > 0 && (ll->offset + len + 4) > ll->bufsz)
++        logfile_mod_tcp_flush(lf);
++
++    if (len > ll->bufsz) {
++        /* too big to fit in buffer */
++        logfile_mod_tcp_write(lf, buf, len);
++        return;
++    }
++    /* buffer it */
++    xmemcpy(ll->buf + ll->offset, buf, len);
++
++    ll->offset += len;
++
++    assert(ll->offset >= 0);
++
++    assert((size_t) ll->offset <= ll->bufsz);
 +}
-@@ -6,6 +6,8 @@
- 
- class StoreEntryBasics {
- public:
-+    void set(const StoreEntry &from);
 +
-     /* START OF ON-DISK STORE_META_STD TLV field */
-     time_t timestamp;
-     time_t lastref;
-@@ -24,23 +26,23 @@ namespace Rock {
- class DirMap
- {
- public:
--    DirMap(const int id, const int limit); ///< create a new shared DirMap
--    DirMap(const int id); ///< open an existing shared DirMap
-+    DirMap(const char *const path, const int limit); ///< create a new shared DirMap
-+    DirMap(const char *const path); ///< open an existing shared DirMap
- 
--    /// start adding a new entry
--    StoreEntryBasics *add(const cache_key *const key);
--    /// start adding a new entry, with fileno check
--    StoreEntryBasics *add(const cache_key *const key, const sfileno fileno);
--    /// finish adding a new entry
--    void added(const cache_key *const key);
-+    /// start writing a new entry
-+    StoreEntryBasics *openForWriting(const cache_key *const key, sfileno &fileno);
-+    /// finish writing a new entry
-+    void closeForWriting(const sfileno fileno);
- 
-     /// mark slot as waiting to be freed, will be freed when no one uses it
--    bool free(const cache_key *const key);
-+    bool free(const sfileno fileno);
- 
-     /// open slot for reading, increments read level
--    const StoreEntryBasics *open(const cache_key *const key, sfileno &fileno);
-+    const StoreEntryBasics *openForReading(const cache_key *const key, sfileno &fileno);
-+    /// open slot for reading, increments read level
-+    const StoreEntryBasics *openForReadingAt(const sfileno fileno);
-     /// close slot after reading, decrements read level
--    void close(const cache_key *const key);
-+    void closeForReading(const sfileno fileno);
- 
-     bool full() const; ///< there are no empty slots left
-     bool valid(int n) const; ///< whether n is a valid slot coordinate
-@@ -79,11 +81,11 @@ class DirMap
- 
-     int slotIdx(const cache_key *const key) const;
-     Slot &slot(const cache_key *const key);
--    bool free(const sfileno fileno);
--    const StoreEntryBasics *open(const sfileno fileno);
-+    const StoreEntryBasics *openForReading(Slot &s);
-     void freeIfNeeded(Slot &s);
- 
-     static int SharedSize(const int limit);
-+    static String SharedMemoryName(const char *path);
- 
-     SharedMemory shm; ///< shared memory segment
-     Shared *shared; ///< pointer to shared memory
-@@ -20,13 +20,14 @@
- // must be divisible by 1024 due to cur_size and max_size KB madness
- const int64_t Rock::SwapDir::HeaderSize = 16*1024;
- 
--Rock::SwapDir::SwapDir(): ::SwapDir("rock"), filePath(NULL), io(NULL)
-+Rock::SwapDir::SwapDir(): ::SwapDir("rock"), filePath(NULL), io(NULL), map(NULL)
- {
- }
- 
- Rock::SwapDir::~SwapDir()
- {
-     delete io;
-+    delete map;
-     safe_free(filePath);
- }
- 
-@@ -41,7 +42,7 @@ StoreEntry *
- Rock::SwapDir::get(const cache_key *key)
- {
-     sfileno fileno;
--    const StoreEntryBasics *const basics = map.open(key, fileno);
-+    const StoreEntryBasics *const basics = map->openForReading(key, fileno);
-     if (!basics)
-         return NULL;
- 
-@@ -173,6 +174,10 @@ Rock::SwapDir::parse(int anIndex, char *aPath)
- 
-     repl = createRemovalPolicy(Config.replPolicy);
- 
-+    // map size is set when shared memory segment is created
-+    if (!map)
-+        map = new DirMap(path);
++static void
++logfile_mod_tcp_linestart(Logfile * lf)
++{
++}
 +
-     validateOptions();
- }
- 
-@@ -210,12 +215,14 @@ Rock::SwapDir::validateOptions()
-     if (ps > 0 && (max_objsize % ps != 0))
-         fatal("Rock store max-size should be a multiple of page size");
- 
-+    /*
-     const int64_t eLimitHi = 0xFFFFFF; // Core sfileno maximum
-     const int64_t eLimitLo = map.entryLimit(); // dynamic shrinking unsupported
-     const int64_t eWanted = (maximumSize() - HeaderSize)/max_objsize;
-     const int64_t eAllowed = min(max(eLimitLo, eWanted), eLimitHi);
- 
-     map.resize(eAllowed); // the map may decide to use an even lower limit
-+    */
- 
-     // Note: We could try to shrink max_size now. It is stored in KB so we
-     // may not be able to make it match the end of the last entry exactly.
-@@ -226,10 +233,10 @@ Rock::SwapDir::validateOptions()
-     assert(diskOffsetLimit() <= maximumSize());
- 
-     // warn if maximum db size is not reachable due to sfileno limit
--    if (map.entryLimit() == map.AbsoluteEntryLimit() &&
-+    if (map->entryLimit() == map->AbsoluteEntryLimit() &&
-         totalWaste > roundingWasteMx) {
-         debugs(47, 0, "Rock store cache_dir[" << index << "]:");
--        debugs(47, 0, "\tmaximum number of entries: " << map.entryLimit());
-+        debugs(47, 0, "\tmaximum number of entries: " << map->entryLimit());
-         debugs(47, 0, "\tmaximum entry size: " << max_objsize << " bytes");
-         debugs(47, 0, "\tmaximum db size: " << maximumSize() << " bytes");
-         debugs(47, 0, "\tusable db size:  " << diskOffsetLimit() << " bytes");
-@@ -243,7 +250,7 @@ Rock::SwapDir::validateOptions()
-         // not fatal because it can be added later
- 	}
- 
--    cur_size = (HeaderSize + max_objsize * map.entryCount()) >> 10;
-+    cur_size = (HeaderSize + max_objsize * map->entryCount()) >> 10;
- }
- 
- void
-@@ -259,29 +266,27 @@ Rock::SwapDir::rebuild() {
- 
- /* Add a new object to the cache with empty memory copy and pointer to disk
-  * use to rebuild store from disk. XXX: dupes UFSSwapDir::addDiskRestore */
--void
-+bool
- Rock::SwapDir::addEntry(const int fileno, const StoreEntry &from)
- {
-     const cache_key *const key = reinterpret_cast<const cache_key *>(from.key);
-     debugs(47, 5, HERE << &from << ' ' << storeKeyText(key)
-        << ", fileno="<< std::setfill('0') << std::hex << std::uppercase <<
-        std::setw(8) << fileno);
- 
--    StoreEntryBasics *const basics = map.add(key, fileno);
--    if (!basics) {
--        debugs(47, 5, HERE << "Rock::SwapDir::addEntry: map.add failed");
-+    int idx;
-+    StoreEntryBasics *const basics = map->openForWriting(key, idx);
-+    if (!basics || fileno != idx) {
-+        debugs(47, 5, HERE << "Rock::SwapDir::addEntry: map->add failed");
-+        if (basics) {
-+            map->closeForWriting(idx);
-+            map->free(idx);
++static void
++logfile_mod_tcp_lineend(Logfile * lf)
++{
++}
++
++static void
++logfile_mod_tcp_rotate(Logfile * lf)
++{
++    return;
++}
++
++static void
++logfile_mod_tcp_close(Logfile * lf)
++{
++    l_tcp_t *ll = (l_tcp_t *) lf->data;
++    lf->f_flush(lf);
++
++    if (ll->fd >= 0)
++        file_close(ll->fd);
++
++    if (ll->buf)
++        xfree(ll->buf);
++
++    xfree(lf->data);
++    lf->data = NULL;
++}
++
++
++
++/*
++ * This code expects the path to be //host:port
++ */
++int
++logfile_mod_tcp_open(Logfile * lf, const char *path, size_t bufsz, int fatal_flag)
++{
++    debugs(5, 3, "Tcp Open called");	
++    IpAddress addr;
++    	
++    char *strAddr;
++
++    lf->f_close = logfile_mod_tcp_close;
++    lf->f_linewrite = logfile_mod_tcp_writeline;
++    lf->f_linestart = logfile_mod_tcp_linestart;
++    lf->f_lineend = logfile_mod_tcp_lineend;
++    lf->f_flush = logfile_mod_tcp_flush;
++    lf->f_rotate = logfile_mod_tcp_rotate;
++
++    l_tcp_t *ll = static_cast<l_tcp_t*>(xcalloc(1, sizeof(*ll)));
++    lf->data = ll;
++
++    if (strncmp(path, "//", 2) == 0) {
++        path += 2;
++    }
++    strAddr = xstrdup(path);
++
++    if (!GetHostWithPort(strAddr, &addr)) {
++        if (lf->flags.fatal) {
++            fatalf("Invalid TCP logging address '%s'\n", lf->path);
++        } else {
++            debugs(50, DBG_IMPORTANT, "Invalid TCP logging address '" << lf->path << "'");
++            safe_free(strAddr);
++            return FALSE;
 +        }
-+        return false;
-     }
--
--    memset(basics, 0, sizeof(*basics));
--    basics->timestamp = from.timestamp;
--    basics->lastref = from.lastref;
--    basics->expires = from.expires;
--    basics->lastmod = from.lastmod;
--    basics->swap_file_sz = from.swap_file_sz;
--    basics->refcount = from.refcount;
--    basics->flags = from.flags;
--
--    map.added(key);
-+    basics->set(from);
-+    map->closeForWriting(fileno);
-+    return true;
- }
- 
- 
-@@ -307,16 +312,19 @@ Rock::SwapDir::createStoreIO(StoreEntry &e, StoreIOState::STFNCB *cbFile, StoreI
-         return NULL;
-     }
- 
--    if (full()) {
--        maintain();
--        if (full()) // maintain() above warns when it fails
--            return NULL;
-+    sfileno fileno;
-+    StoreEntryBasics *const basics =
-+        map->openForWriting(reinterpret_cast<const cache_key *>(e.key), fileno);
-+    if (!basics) {
-+        debugs(47, 5, HERE << "Rock::SwapDir::createStoreIO: map->add failed");
-+        return NULL;
-     }
-+    basics->set(e);
- 
-     IoState *sio = new IoState(this, &e, cbFile, cbIo, data);
- 
-     sio->swap_dirn = index;
--    sio->swap_filen = map.useNext();
-+    sio->swap_filen = fileno;
-     sio->offset_ = diskOffset(sio->swap_filen);
-     sio->entrySize = e.objectLen() + e.mem_obj->swap_hdr_sz;
- 
-@@ -343,7 +351,7 @@ Rock::SwapDir::diskOffset(int filen) const
- int64_t
- Rock::SwapDir::diskOffsetLimit() const
- {
--    return diskOffset(map.entryLimit());
-+    return diskOffset(map->entryLimit());
- }
- 
- StoreIOState::Pointer
-@@ -354,6 +362,13 @@ Rock::SwapDir::openStoreIO(StoreEntry &e, StoreIOState::STFNCB *cbFile, StoreIOS
-         return NULL;
-     }
- 
-+    if (!map->openForReadingAt(e.swap_filen)) {
-+        debugs(47,1, HERE << "bug: dir " << index << " lost fileno: " <<
-+            std::setfill('0') << std::hex << std::uppercase << std::setw(8) <<
-+            e.swap_filen);
-+        return NULL;
 +    }
 +
-     IoState *sio = new IoState(this, &e, cbFile, cbIo, data);
- 
-     sio->swap_dirn = index;
-@@ -362,18 +377,11 @@ Rock::SwapDir::openStoreIO(StoreEntry &e, StoreIOState::STFNCB *cbFile, StoreIOS
-         std::setfill('0') << std::hex << std::uppercase << std::setw(8) <<
-         sio->swap_filen);
- 
--    assert(map.valid(sio->swap_filen));
-+    assert(map->valid(sio->swap_filen));
-     sio->offset_ = diskOffset(sio->swap_filen);
-     sio->entrySize = e.swap_file_sz;
-     assert(sio->entrySize <= max_objsize);
- 
--    if (!map.has(sio->swap_filen)) {
--        debugs(47,1, HERE << "bug: dir " << index << " lost fileno: " <<
--            std::setfill('0') << std::hex << std::uppercase << std::setw(8) <<
--            sio->swap_filen);
--        return NULL;
--    }
--
-     assert(sio->offset_ + sio->entrySize <= diskOffsetLimit());
- 
-     sio->file(theFile);
-@@ -394,12 +402,12 @@ Rock::SwapDir::ioCompletedNotification()
-         fatalf("Rock cache_dir failed to open db file: %s", filePath);
- 	}
- 
--    cur_size = (HeaderSize + max_objsize * map.entryCount()) >> 10;
-+    cur_size = (HeaderSize + max_objsize * map->entryCount()) >> 10;
- 
-     // TODO: lower debugging level
-     debugs(47,1, "Rock cache_dir[" << index << "] limits: " << 
-         std::setw(12) << maximumSize() << " disk bytes and " <<
--        std::setw(7) << map.entryLimit() << " entries");
-+        std::setw(7) << map->entryLimit() << " entries");
- }
- 
- void
-@@ -414,6 +422,7 @@ Rock::SwapDir::readCompleted(const char *buf, int rlen, int errflag, RefCount< :
-     ReadRequest *request = dynamic_cast<Rock::ReadRequest*>(r.getRaw());
-     assert(request);
-     IoState::Pointer sio = request->sio;
-+    map->closeForReading(sio->swap_filen);
- 
-     // do not increment sio->offset_: callers always supply relative offset
- 
-@@ -432,12 +441,13 @@ Rock::SwapDir::writeCompleted(int errflag, size_t rlen, RefCount< ::WriteRequest
-     assert(request);
-     assert(request->sio !=  NULL);
-     IoState &sio = *request->sio;
-+    map->closeForWriting(sio.swap_filen);
-     if (errflag != DISK_OK)
--        map.clear(sio.swap_filen); // TODO: test by forcing failure
-+        map->free(sio.swap_filen); // TODO: test by forcing failure
-     // else sio.offset_ += rlen;
- 
-     // TODO: always compute cur_size based on map, do not store it
--    cur_size = (HeaderSize + max_objsize * map.entryCount()) >> 10;
-+    cur_size = (HeaderSize + max_objsize * map->entryCount()) >> 10;
-     assert(sio.offset_ <= diskOffsetLimit()); // post-factum check
- 
-     sio.finishedWriting(errflag);
-@@ -446,15 +456,15 @@ Rock::SwapDir::writeCompleted(int errflag, size_t rlen, RefCount< ::WriteRequest
- bool
- Rock::SwapDir::full() const
- {
--    return map.full();
-+    return map->full();
- }
- 
- void
- Rock::SwapDir::updateSize(int64_t size, int sign)
- {
-     // it is not clear what store_swap_size really is; TODO: move low-level
- 	// size maintenance to individual store dir types
--    cur_size = (HeaderSize + max_objsize * map.entryCount()) >> 10;
-+    cur_size = (HeaderSize + max_objsize * map->entryCount()) >> 10;
-     store_swap_size = cur_size;
- 
-     if (sign > 0)
-@@ -489,7 +499,7 @@ Rock::SwapDir::maintain()
-         return; // no need (to find a victim)
- 
-     debugs(47,3, HERE << "cache_dir[" << index << "] state: " << 
--        map.full() << ' ' << currentSize() << " < " << diskOffsetLimit());
-+        map->full() << ' ' << currentSize() << " < " << diskOffsetLimit());
- 
-     // Hopefully, we find a removable entry much sooner (TODO: use time?)
-     const int maxProbed = 10000;
-@@ -538,7 +548,7 @@ Rock::SwapDir::unlink(StoreEntry &e)
- {
-     debugs(47, 5, HERE << &e << ' ' << e.swap_dirn << ' ' << e.swap_filen);
-     ignoreReferences(e);
--    map.free(e.key);
-+    map->free(e.swap_filen);
- }
- 
- void
-@@ -564,9 +574,9 @@ Rock::SwapDir::statfs(StoreEntry &e) const
-     storeAppendPrintf(&e, "Current Size: %"PRIu64" KB %.2f%%\n", cur_size,
-                       100.0 * cur_size / max_size);
- 
--    storeAppendPrintf(&e, "Maximum entries: %9d\n", map.entryLimit());
-+    storeAppendPrintf(&e, "Maximum entries: %9d\n", map->entryLimit());
-     storeAppendPrintf(&e, "Current entries: %9d %.2f%%\n",
--        map.entryCount(), (100.0 * map.entryCount() / map.entryLimit()));
-+        map->entryCount(), (100.0 * map->entryCount() / map->entryLimit()));
- 
-     storeAppendPrintf(&e, "Pending operations: %d out of %d\n",
-         store_open_disk_fd, Config.max_open_disk_fds);
-@@ -53,7 +53,7 @@ class SwapDir: public ::SwapDir, public IORequestor
- 
-     void rebuild(); ///< starts loading and validating stored entry metadata
-     ///< used to add entries successfully loaded during rebuild
--    void addEntry(const int fileno, const StoreEntry &from);
-+    bool addEntry(const int fileno, const StoreEntry &from);
- 
-     bool full() const; ///< no more entries can be stored without purging
-     void trackReferences(StoreEntry &e); ///< add to replacement policy scope
-@@ -64,15 +64,15 @@ class SwapDir: public ::SwapDir, public IORequestor
-     int64_t maximumSize() const { return static_cast<int64_t>(max_size) << 10;}
-     int64_t diskOffset(int filen) const;
-     int64_t diskOffsetLimit() const;
--    int entryLimit() const { return map.entryLimit(); }
-+    int entryLimit() const { return map->entryLimit(); }
- 
-     friend class Rebuild;
-     const char *filePath; ///< location of cache storage file inside path/
- 
- private:
-     DiskIOStrategy *io;
-     RefCount<DiskFile> theFile; ///< cache storage for this cache_dir
--    DirMap map;
-+    DirMap *map;
- 
-     static const int64_t HeaderSize; ///< on-disk db header size
- };
-@@ -16,8 +16,8 @@
- #include <sys/types.h>
- #include <unistd.h>
- 
--SharedMemory::SharedMemory(const String &id, const int magic):
--    theName(GenerateName(id, magic)), theFD(-1), theSize(-1), theMem(NULL)
-+SharedMemory::SharedMemory(const String &id):
-+    theName(GenerateName(id)), theFD(-1), theSize(-1), theMem(NULL)
- {
- }
- 
-@@ -35,7 +35,7 @@ SharedMemory::create(const int aSize)
-     assert(aSize > 0);
-     assert(theFD < 0);
- 
--    theFD = shm_open(theName.termedBuf(), O_CREAT | O_EXCL | O_RDWR,
-+    theFD = shm_open(theName.termedBuf(), O_CREAT | O_RDWR,
-                      S_IRUSR | S_IWUSR);
-     if (theFD < 0) {
-         debugs(54, 5, "SharedMemory::create: shm_open: " << xstrerror());
-@@ -60,15 +60,19 @@ SharedMemory::open()
-     theFD = shm_open(theName.termedBuf(), O_RDWR, 0);
-     if (theFD < 0) {
-         debugs(54, 5, "SharedMemory::open: shm_open: " << xstrerror());
--        fatal("SharedMemory::open failed");
-+        String s = "SharedMemory::open failed 1 ";
-+        s.append(theName);
-+        fatal(s.termedBuf());
-     }
- 
-     {
-         struct stat s;
-         memset(&s, 0, sizeof(s));
-         if (fstat(theFD, &s)) {
-             debugs(54, 5, "SharedMemory::open: fstat: " << xstrerror());
--            fatal("SharedMemory::open failed");
-+        String s = "SharedMemory::open failed 2 ";
-+        s.append(theName);
-+        fatal(s.termedBuf());
-         }
- 
-         theSize = s.st_size;
-@@ -108,21 +112,11 @@ SharedMemory::detach()
-     theMem = 0;
- }
- 
--/// Generate name for shared memory segment. Uses the master process
--/// PID to avoid conflicts with other Squid instances.
-+/// Generate name for shared memory segment.
- String
--SharedMemory::GenerateName(const String &id, const int magic)
-+SharedMemory::GenerateName(const String &id)
- {
-     String name("/squid-");
-     name.append(id);
--    name.append('-');
--    {
--        const int pid = IamMasterProcess() ? getpid() : getppid();
--        name.append(pid);
--    }
--    if (magic) {
--        name.append('-');
--        name.append(magic);
--    }
-     return name;
- }
-@@ -11,9 +11,8 @@
- /// POSIX shared memory segment
- class SharedMemory {
- public:
--    /// Create a shared memory segment. Id is a human-readable name,
--    /// optional magic is unique key (e.g. kid id).
--    SharedMemory(const String &id, const int magic = 0);
-+    /// Create a shared memory segment.
-+    SharedMemory(const String &id);
-     ~SharedMemory();
- 
-     /// Create a new shared memory segment. Fails if a segment with
-@@ -29,7 +28,7 @@ class SharedMemory {
-     void attach();
-     void detach();
- 
--    static String GenerateName(const String &id, const int magic);
-+    static String GenerateName(const String &id);
- 
-     const String theName; ///< shared memory segment file name
-     int theFD; ///< shared memory segment file descriptor
-@@ -73,6 +73,7 @@
- #include "MemPool.h"
- #include "icmp/IcmpSquid.h"
- #include "icmp/net_db.h"
-+#include "fs/rock/RockDirMap.h"
- 
- #if USE_LOADABLE_MODULES
- #include "LoadableModules.h"
-@@ -763,6 +764,7 @@ mainReconfigureFinish(void *)
- 
-     // parse the config returns a count of errors encountered.
-     const int oldWorkers = Config.workers;
++safe_free(strAddr);
 +
-     if ( parseConfigFile(ConfigFile) != 0) {
-         // for now any errors are a fatal condition...
-         self_destruct();
-@@ -1368,6 +1370,15 @@ SquidMain(int argc, char **argv)
- 
-         Ip::ProbeTransport(); // determine IPv4 or IPv6 capabilities before parsing.
- 
-+        debugs(0,0, HERE << '1');
-+        if (IamMasterProcess()) {
-+            debugs(0,0, HERE << '2');
-+            new Rock::DirMap("/home/dikk/projects/factory/squid/rock_smp/rock1", 1000);
-+            new Rock::DirMap("/home/dikk/projects/factory/squid/rock_smp/rock2", 1000);
-+            new Rock::DirMap("/home/dikk/projects/factory/squid/rock_smp/rock3", 1000);
++    IpAddress any_addr;
++    any_addr.SetAnyAddr();
++
++#if USE_IPV6
++    // require the sending TCP port to be of the right family for the destination address.
++    if (addr.IsIPv4())
++        no_addr.SetIPv4();
++#endif
++
++    ll->fd = comm_open(SOCK_STREAM, IPPROTO_TCP, any_addr, COMM_NONBLOCKING, "TCP log socket");
++    if (ll->fd < 0) {
++        if (lf->flags.fatal) {
++            fatalf("Unable to open TCP socket for logging\n");
++        } else {
++            debugs(50, DBG_IMPORTANT, "Unable to open TCP socket for logging");
++            return FALSE;
 +        }
-+        debugs(0,0, HERE << '3');
++    } else if (!comm_connect_addr(ll->fd, &addr)) {
++        if (lf->flags.fatal) {
++            fatalf("Unable to connect to %s for TCP log: %s\n", lf->path, xstrerror());
++        } else {
++            debugs(50, DBG_IMPORTANT, "Unable to connect to " << lf->path << " for TCP log: " << xstrerror());
++            return FALSE;
++        }
++    }
++    if (ll->fd == -1) {
++        if (ENOENT == errno && fatal_flag) {
++            fatalf("Cannot open '%s' because\n"
++                   "\tthe parent directory does not exist.\n"
++                   "\tPlease create the directory.\n", path);
++        } else if (EACCES == errno && fatal_flag) {
++            fatalf("Cannot open '%s' for writing.\n"
++                   "\tThe parent directory must be writeable by the\n"
++                   "\tuser '%s', which is the cache_effective_user\n"
++                   "\tset in squid.conf.", path, Config.effectiveUser);
++        } else {
++            debugs(50, DBG_IMPORTANT, "logfileOpen (TCP): " << lf->path << ": " << xstrerror());
++            return 0;
++        }
++    }
 +
-         parse_err = parseConfigFile(ConfigFile);
- 
-         Mem::Report();
-@@ -1695,7 +1706,7 @@ watch_child(char *argv[])
-     }
-     TheKids.init();
- 
--syslog(LOG_NOTICE, "XXX: will start %d kids", TheKids.count());
-+syslog(LOG_NOTICE, "XXX: will start %d kids", (int)TheKids.count());
- 
-     // keep [re]starting kids until it is time to quit
-     for (;;) {
++    bufsz = 65536;
++    if (bufsz > 0) {
++        ll->buf = static_cast<char*>(xmalloc(bufsz));
++        ll->bufsz = bufsz;
++    }
++
++    return 1;
++}
+@@ -0,0 +1,44 @@
++/*
++ * $Id$
++ *
++ * DEBUG: section 50    Log file handling
++ * AUTHOR: Dhaval Varia
++ * Developed based on ModUdp.* by Adrian Chadd
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sources; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ */
++#ifndef _SQUID_SRC_LOG_MODTCP_H
++#define _SQUID_SRC_LOG_MODTCP_H
++
++#include "config.h"
++
++class Logfile;
++
++extern int logfile_mod_tcp_open(Logfile * lf, const char *path, size_t bufsz, int fatal_flag);
++
++#endif /* _SQUID_SRC_LOG_MODTCP_H */

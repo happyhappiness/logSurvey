@@ -1,261 +1,59 @@
-@@ -23,9 +23,6 @@ class User : public Auth::User
-     User(Auth::Config *);
-     ~User();
-     bool authenticated() const;
--    void queueRequest(AuthUserRequest::Pointer auth_user_request, RH * handler, void *data);
--    void submitRequest(AuthUserRequest::Pointer auth_user_request, RH * handler, void *data);
--
-     bool valid() const;
- 
-     /** Update the cached password for a username. */
-@@ -2,8 +2,15 @@
- #include "auth/basic/auth_basic.h"
- #include "auth/basic/User.h"
- #include "auth/basic/UserRequest.h"
-+#include "auth/State.h"
-+#include "charset.h"
-+#include "rfc1738.h"
- #include "SquidTime.h"
- 
-+#if !defined(HELPER_INPUT_BUFFER)
-+#define HELPER_INPUT_BUFFER  8192
-+#endif
-+
- int
- AuthBasicUserRequest::authenticated() const
+@@ -8,6 +8,7 @@ namespace Icap
  {
-@@ -86,10 +93,98 @@ AuthBasicUserRequest::module_start(RH * handler, void *data)
-     /* check to see if the auth_user already has a request outstanding */
-     if (user()->credentials() == Auth::Pending) {
-         /* there is a request with the same credentials already being verified */
--        basic_auth->queueRequest(this, handler, data);
+ 
+ const XactOutcome xoUnknown = "ICAP_ERR_UNKNOWN";
++const XactOutcome xoRace = "ICAP_ERR_RACE";
+ const XactOutcome xoError = "ICAP_ERR_OTHER";
+ const XactOutcome xoOpt = "ICAP_OPT";
+ const XactOutcome xoEcho = "ICAP_ECHO";
+@@ -64,6 +64,7 @@ using Adaptation::vectPointStr;
+ 
+ typedef const char *XactOutcome; ///< transaction result for logging
+ extern const XactOutcome xoUnknown; ///< initial value: outcome was not set
++extern const XactOutcome xoRace; ///< ICAP server closed pconn when we started
+ extern const XactOutcome xoError; ///< all kinds of transaction errors
+ extern const XactOutcome xoOpt; ///< OPTION transaction
+ extern const XactOutcome xoEcho; ///< preserved virgin message (ICAP 204)
+@@ -268,7 +268,9 @@ void Adaptation::Icap::Xaction::handleCommTimedout()
+            theService->cfg().methodStr() << " " <<
+            theService->cfg().uri << status());
+     reuseConnection = false;
+-    throw TexcHere(connector != NULL ?
++    const bool whileConnecting = connector != NULL;
++    closeConnection(); // so that late Comm callbacks do not disturb bypass
++    throw TexcHere(whileConnecting ?
+                    "timed out while connecting to the ICAP service" :
+                    "timed out while talking to the ICAP service");
+ }
+@@ -354,6 +356,18 @@ void Adaptation::Icap::Xaction::noteCommRead(const CommIoCbParams &io)
+     Must(io.flag == COMM_OK);
+     Must(io.size >= 0);
+ 
++    if (!io.size) {
++        commEof = true;
++        reuseConnection = false;
 +
-+        BasicAuthQueueNode *node = static_cast<BasicAuthQueueNode *>(xcalloc(1, sizeof(BasicAuthQueueNode)));
-+        assert(node);
-+        node->auth_user_request = this;
-+        node->handler = handler;
-+        node->data = cbdataReference(data);
-+
-+        /* queue this validation request to be infored of the pending lookup results */
-+        node->next = basic_auth->auth_queue;
-+        basic_auth->auth_queue = node;
-         return;
-     }
--
--    basic_auth->submitRequest(this, handler, data);
-+    // otherwise submit this request to the auth helper(s) for validation
-+
-+    /* mark this user as having verification in progress */
-+    user()->credentials(Auth::Pending);
-+    char buf[HELPER_INPUT_BUFFER];
-+    static char username[HELPER_INPUT_BUFFER];
-+    static char pass[HELPER_INPUT_BUFFER];
-+    if (static_cast<Auth::Basic::Config*>(user()->config)->utf8) {
-+        latin1_to_utf8(username, sizeof(username), user()->username());
-+        latin1_to_utf8(pass, sizeof(pass), basic_auth->passwd);
-+        xstrncpy(username, rfc1738_escape(username), sizeof(username));
-+        xstrncpy(pass, rfc1738_escape(pass), sizeof(pass));
++        // detect a pconn race condition: eof on the first pconn read
++        if (!al.icap.bytesRead && retriable()) {
++            setOutcome(xoRace);
++            mustStop("pconn race");
++            return;
++        }
 +    } else {
-+        xstrncpy(username, rfc1738_escape(user()->username()), sizeof(username));
-+        xstrncpy(pass, rfc1738_escape(basic_auth->passwd), sizeof(pass));
-+    }
-+    int sz = snprintf(buf, sizeof(buf), "%s %s\n", username, pass);
-+    if (sz<=0) {
-+        debugs(9, DBG_CRITICAL, "ERROR: Basic Authentication Failure. Can not build helper validation request.");
-+        handler(data, NULL);
-+    } else if (sz>=sizeof(buf)) {
-+        debugs(9, DBG_CRITICAL, "ERROR: Basic Authentication Failure. user:password exceeds " << sizeof(buf) << " bytes.");
-+        handler(data, NULL);
-+    } else
-+        helperSubmit(basicauthenticators, buf, AuthBasicUserRequest::HandleReply,
-+                     new Auth::StateData(this, handler, data));
- }
++
+     al.icap.bytesRead+=io.size;
  
-+void
-+AuthBasicUserRequest::HandleReply(void *data, char *reply)
-+{
-+    Auth::StateData *r = static_cast<Auth::StateData *>(data);
-+    BasicAuthQueueNode *tmpnode;
-+    char *t = NULL;
-+    void *cbdata;
-+    debugs(29, 9, HERE << "{" << (reply ? reply : "<NULL>") << "}");
-+
-+    if (reply) {
-+        if ((t = strchr(reply, ' ')))
-+            *t++ = '\0';
-+
-+        if (*reply == '\0')
-+            reply = NULL;
-+    }
-+
-+    assert(r->auth_user_request != NULL);
-+    assert(r->auth_user_request->user()->auth_type == Auth::AUTH_BASIC);
-+
-+    /* this is okay since we only play with the Auth::Basic::User child fields below
-+     * and dont pass the pointer itself anywhere */
-+    Auth::Basic::User *basic_auth = dynamic_cast<Auth::Basic::User *>(r->auth_user_request->user().getRaw());
-+
-+    assert(basic_auth != NULL);
-+
-+    if (reply && (strncasecmp(reply, "OK", 2) == 0))
-+        basic_auth->credentials(Auth::Ok);
-+    else {
-+        basic_auth->credentials(Auth::Failed);
-+
-+        if (t && *t)
-+            r->auth_user_request->setDenyMessage(t);
-+    }
-+
-+    basic_auth->expiretime = squid_curtime;
-+
-+    if (cbdataReferenceValidDone(r->data, &cbdata))
-+        r->handler(cbdata, NULL);
-+
-+    cbdataReferenceDone(r->data);
-+
-+    while (basic_auth->auth_queue) {
-+        tmpnode = basic_auth->auth_queue->next;
-+
-+        if (cbdataReferenceValidDone(basic_auth->auth_queue->data, &cbdata))
-+            basic_auth->auth_queue->handler(cbdata, NULL);
-+
-+        xfree(basic_auth->auth_queue);
-+
-+        basic_auth->auth_queue = tmpnode;
-+    }
-+
-+    delete r;
-+}
-@@ -22,6 +22,9 @@ class AuthBasicUserRequest : public AuthUserRequest
-     virtual void authenticate(HttpRequest * request, ConnStateData *conn, http_hdr_type type);
-     virtual Auth::Direction module_direction();
-     virtual void module_start(RH *, void *);
-+
-+private:
-+    static HLPCB HandleReply;
- };
+     updateTimeout();
+@@ -365,12 +379,8 @@ void Adaptation::Icap::Xaction::noteCommRead(const CommIoCbParams &io)
+      * here instead of reading directly into readBuf.buf.
+      */
  
- MEMPROXY_CLASS_INLINE(AuthBasicUserRequest);
-@@ -54,10 +54,9 @@
- #include "SquidTime.h"
- 
- /* Basic Scheme */
--static HLPCB authenticateBasicHandleReply;
- static AUTHSSTATS authenticateBasicStats;
- 
--static helper *basicauthenticators = NULL;
-+helper *basicauthenticators = NULL;
- 
- static int authbasic_initialised = 0;
- 
-@@ -135,62 +134,6 @@ Auth::Basic::Config::done()
-         safe_free(basicAuthRealm);
- }
- 
--static void
--authenticateBasicHandleReply(void *data, char *reply)
--{
--    Auth::StateData *r = static_cast<Auth::StateData *>(data);
--    BasicAuthQueueNode *tmpnode;
--    char *t = NULL;
--    void *cbdata;
--    debugs(29, 9, HERE << "{" << (reply ? reply : "<NULL>") << "}");
--
--    if (reply) {
--        if ((t = strchr(reply, ' ')))
--            *t++ = '\0';
--
--        if (*reply == '\0')
--            reply = NULL;
--    }
--
--    assert(r->auth_user_request != NULL);
--    assert(r->auth_user_request->user()->auth_type == Auth::AUTH_BASIC);
--
--    /* this is okay since we only play with the Auth::Basic::User child fields below
--     * and dont pass the pointer itself anywhere */
--    Auth::Basic::User *basic_auth = dynamic_cast<Auth::Basic::User *>(r->auth_user_request->user().getRaw());
--
--    assert(basic_auth != NULL);
--
--    if (reply && (strncasecmp(reply, "OK", 2) == 0))
--        basic_auth->credentials(Auth::Ok);
--    else {
--        basic_auth->credentials(Auth::Failed);
--
--        if (t && *t)
--            r->auth_user_request->setDenyMessage(t);
--    }
--
--    basic_auth->expiretime = squid_curtime;
--
--    if (cbdataReferenceValidDone(r->data, &cbdata))
--        r->handler(cbdata, NULL);
--
--    cbdataReferenceDone(r->data);
--
--    while (basic_auth->auth_queue) {
--        tmpnode = basic_auth->auth_queue->next;
--
--        if (cbdataReferenceValidDone(basic_auth->auth_queue->data, &cbdata))
--            basic_auth->auth_queue->handler(cbdata, NULL);
--
--        xfree(basic_auth->auth_queue);
--
--        basic_auth->auth_queue = tmpnode;
--    }
--
--    delete r;
--}
--
- void
- Auth::Basic::Config::dump(StoreEntry * entry, const char *name, Auth::Config * scheme)
- {
-@@ -426,40 +369,3 @@ Auth::Basic::Config::registerWithCacheManager(void)
-                         "Basic User Authenticator Stats",
-                         authenticateBasicStats, 0, 1);
- }
--
--// XXX: this is a auth management function. Surely not in scope for the credentials storage object
--void
--Auth::Basic::User::queueRequest(AuthUserRequest::Pointer auth_user_request, RH * handler, void *data)
--{
--    BasicAuthQueueNode *node;
--    node = static_cast<BasicAuthQueueNode *>(xcalloc(1, sizeof(BasicAuthQueueNode)));
--    assert(node);
--    /* save the details */
--    node->next = auth_queue;
--    auth_queue = node;
--    node->auth_user_request = auth_user_request;
--    node->handler = handler;
--    node->data = cbdataReference(data);
--}
--
--// XXX: this is a auth management function. Surely not in scope for the credentials storage object
--void
--Auth::Basic::User::submitRequest(AuthUserRequest::Pointer auth_user_request, RH * handler, void *data)
--{
--    /* mark the user as having verification in progress */
--    credentials(Auth::Pending);
--    char buf[8192];
--    char user[1024], pass[1024];
--    if (static_cast<Auth::Basic::Config*>(config)->utf8) {
--        latin1_to_utf8(user, sizeof(user), username());
--        latin1_to_utf8(pass, sizeof(pass), passwd);
--        xstrncpy(user, rfc1738_escape(user), sizeof(user));
--        xstrncpy(pass, rfc1738_escape(pass), sizeof(pass));
+-    if (io.size > 0) {
+         readBuf.append(commBuf, io.size);
+         disableRetries(); // because pconn did not fail
 -    } else {
--        xstrncpy(user, rfc1738_escape(username()), sizeof(user));
--        xstrncpy(pass, rfc1738_escape(passwd), sizeof(pass));
--    }
--    snprintf(buf, sizeof(buf), "%s %s\n", user, pass);
--    helperSubmit(basicauthenticators, buf, authenticateBasicHandleReply,
--                 new Auth::StateData(auth_user_request, handler, data));
--}
-@@ -61,4 +61,6 @@ class Config : public Auth::Config
- } // namespace Basic
- } // namespace Auth
+-        reuseConnection = false;
+-        commEof = true;
+     }
  
-+extern helper *basicauthenticators;
-+
- #endif /* __AUTH_BASIC_H__ */
+     handleCommRead(io.size);

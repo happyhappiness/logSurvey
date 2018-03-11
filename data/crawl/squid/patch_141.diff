@@ -1,21 +1,163 @@
-@@ -2234,12 +2234,19 @@ parse_wccp2_service_ports(char *options, int portlist[])
+@@ -67,22 +67,13 @@ class AccessLogEntry: public RefCountable
+             method(Http::METHOD_NONE),
+             code(0),
+             content_type(NULL),
+-            timedout(false),
+-            aborted(false),
+             clientRequestSz(),
+             clientReplySz() {}
  
-     int i = 0;
-     char *tmp = options;
-+    static char copy[10];
+         HttpRequestMethod method;
+         int code;
+         const char *content_type;
+         AnyP::ProtocolVersion version;
+-        bool timedout; ///< terminated due to a lifetime or I/O timeout
+-        bool aborted; ///< other abnormal termination (e.g., I/O error)
+-
+-        /// compute suffix for the status access.log field
+-        const char *statusSfx() const {
+-            return timedout ? "_TIMEDOUT" : (aborted ? "_ABORTED" : "");
+-        }
  
-     while (size_t len = strcspn(tmp, ",")) {
-         if (i >= WCCP2_NUMPORTS) {
-             fatalf("parse_wccp2_service_ports: too many ports (maximum: 8) in list '%s'\n", options);
-         }
--        int p = xatoi(tmp);
-+        if (len > 6) { // 6 because "65535,"
-+            fatalf("parse_wccp2_service_ports: port value '%s' isn't valid (1..65535)\n", tmp);
-+        }
+         /// counters for the original request received from client
+         // TODO calculate header and payload better (by parser)
+@@ -37,10 +37,30 @@ const char * LogTags::Str_[] = {
+ 	"TYPE_MAX"
+ };
+ 
++/*
++ * This method is documented in http://wiki.squid-cache.org/SquidFaq/SquidLogs#Squid_result_codes
++ * Please keep the wiki up to date
++ */
+ const char *
+ LogTags::c_str() const
+ {
+-    return Str_[oldType];
++    static char buf[1024];
++    *buf = 0;
++    int pos = 0;
 +
-+        memcpy(copy, tmp, len);
-+        copy[len] = '\0';
-+        int p = xatoi(copy);
++    // source tags
++    if (oldType && oldType < LOG_TYPE_MAX)
++        pos += snprintf(buf, sizeof(buf), "%s",Str_[oldType]);
++    else
++        pos += snprintf(buf, sizeof(buf), "NONE");
++
++    // error tags
++    if (err.timedout)
++        pos += snprintf(buf+pos,sizeof(buf)-pos, "_TIMEDOUT");
++    if (err.aborted)
++        pos += snprintf(buf+pos,sizeof(buf)-pos, "_ABORTED");
++
++    return buf;
+ }
  
-         if (p < 1 || p > 65535) {
-             fatalf("parse_wccp2_service_ports: port value '%s' isn't valid (1..65535)\n", tmp);
+ bool
+@@ -50,11 +50,20 @@ class LogTags
+     LogTags(LogTags_ot t) : oldType(t) {assert(oldType < LOG_TYPE_MAX);}
+     LogTags &operator =(const LogTags_ot &t) {assert(t < LOG_TYPE_MAX); oldType = t; return *this;}
+ 
++    /// compute the status access.log field
+     const char *c_str() const;
+ 
+     /// determine if the log tag code indicates a cache HIT
+     bool isTcpHit() const;
+ 
++    /// error states terminating the transaction
++    struct Errors {
++        Errors() : timedout(false), aborted(false) {}
++
++        bool timedout; ///< tag: TIMEDOUT - terminated due to a lifetime or I/O timeout
++        bool aborted;  ///< tag: ABORTED  - other abnormal termination (e.g., I/O error)
++    } err;
++
+ private:
+     /// list of string representations for LogTags_ot
+     static const char *Str_[];
+@@ -1771,10 +1771,9 @@ void
+ ClientSocketContext::noteIoError(const int xerrno)
+ {
+     if (http) {
+-        if (xerrno == ETIMEDOUT)
+-            http->al->http.timedout = true;
+-        else // even if xerrno is zero (which means read abort/eof)
+-            http->al->http.aborted = true;
++        http->logType.err.timedout = (xerrno == ETIMEDOUT);
++        // aborted even if xerrno is zero (which means read abort/eof)
++        http->logType.err.aborted = (xerrno != ETIMEDOUT);
+     }
+ }
+ 
+@@ -3361,7 +3360,7 @@ clientLifetimeTimeout(const CommTimeoutCbParams &io)
+     ClientHttpRequest *http = static_cast<ClientHttpRequest *>(io.data);
+     debugs(33, DBG_IMPORTANT, "WARNING: Closing client connection due to lifetime timeout");
+     debugs(33, DBG_IMPORTANT, "\t" << http->uri);
+-    http->al->http.timedout = true;
++    http->logType.err.timedout = true;
+     if (Comm::IsConnOpen(io.conn))
+         io.conn->close();
+ }
+@@ -877,13 +877,7 @@ Format::Format::assemble(MemBuf &mb, const AccessLogEntry::Pointer &al, int logS
+             break;
+ 
+         case LFT_SQUID_STATUS:
+-            if (al->http.timedout || al->http.aborted) {
+-                snprintf(tmp, sizeof(tmp), "%s%s", al->cache.code.c_str(), al->http.statusSfx());
+-                out = tmp;
+-            } else {
+-                out = al->cache.code.c_str();
+-            }
+-
++            out = al->cache.code.c_str();
+             break;
+ 
+         case LFT_SQUID_ERROR:
+@@ -51,7 +51,7 @@ Log::Format::HttpdCombined(const AccessLogEntry::Pointer &al, Logfile * logfile)
+     else
+         method = al->http.method.image();
+ 
+-    logfilePrintf(logfile, "%s %s %s [%s] \"" SQUIDSBUFPH " %s %s/%d.%d\" %d %" PRId64 " \"%s\" \"%s\" %s%s:%s%s",
++    logfilePrintf(logfile, "%s %s %s [%s] \"" SQUIDSBUFPH " %s %s/%d.%d\" %d %" PRId64 " \"%s\" \"%s\" %s:%s%s",
+                   clientip,
+                   user_ident ? user_ident : dash_str,
+                   user_auth ? user_auth : dash_str,
+@@ -65,7 +65,6 @@ Log::Format::HttpdCombined(const AccessLogEntry::Pointer &al, Logfile * logfile)
+                   referer,
+                   agent,
+                   al->cache.code.c_str(),
+-                  al->http.statusSfx(),
+                   hier_code_str[al->hier.code],
+                   (Config.onoff.log_mime_hdrs?"":"\n"));
+ 
+@@ -38,7 +38,7 @@ Log::Format::HttpdCommon(const AccessLogEntry::Pointer &al, Logfile * logfile)
+     else
+         method = al->http.method.image();
+ 
+-    logfilePrintf(logfile, "%s %s %s [%s] \"" SQUIDSBUFPH " %s %s/%d.%d\" %d %" PRId64 " %s%s:%s%s",
++    logfilePrintf(logfile, "%s %s %s [%s] \"" SQUIDSBUFPH " %s %s/%d.%d\" %d %" PRId64 " %s:%s%s",
+                   clientip,
+                   user_ident ? user_ident : dash_str,
+                   user_auth ? user_auth : dash_str,
+@@ -50,7 +50,6 @@ Log::Format::HttpdCommon(const AccessLogEntry::Pointer &al, Logfile * logfile)
+                   al->http.code,
+                   al->http.clientReplySz.messageTotal(),
+                   al->cache.code.c_str(),
+-                  al->http.statusSfx(),
+                   hier_code_str[al->hier.code],
+                   (Config.onoff.log_mime_hdrs?"":"\n"));
+ 
+@@ -54,13 +54,12 @@ Log::Format::SquidNative(const AccessLogEntry::Pointer &al, Logfile * logfile)
+     else
+         method = al->http.method.image();
+ 
+-    logfilePrintf(logfile, "%9ld.%03d %6ld %s %s%s/%03d %" PRId64 " " SQUIDSBUFPH " %s %s %s%s/%s %s%s",
++    logfilePrintf(logfile, "%9ld.%03d %6ld %s %s/%03d %" PRId64 " " SQUIDSBUFPH " %s %s %s%s/%s %s%s",
+                   (long int) current_time.tv_sec,
+                   (int) current_time.tv_usec / 1000,
+                   tvToMsec(al->cache.trTime),
+                   clientip,
+                   al->cache.code.c_str(),
+-                  al->http.statusSfx(),
+                   al->http.code,
+                   al->http.clientReplySz.messageTotal(),
+                   SQUIDSBUFPRINT(method),

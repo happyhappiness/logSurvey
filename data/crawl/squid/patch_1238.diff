@@ -1,0 +1,1607 @@
+@@ -74,13 +74,15 @@ my_free(void *p)
+ }
+ 
+ static void
+-read_passwd_file(const char *passwdfile)
++read_passwd_file(const char *passwdfile, int ha1mode)
+ {
+     FILE *f;
+     char buf[8192];
+     user_data *u;
+     char *user;
+     char *passwd;
++    int passwdha1;
++
+     if (hash != NULL) {
+ 	hashFreeItems(hash, my_free);
+     }
+@@ -98,11 +100,20 @@ read_passwd_file(const char *passwdfile)
+ 	user = strtok(buf, ":\n");
+ 	passwd = strtok(NULL, ":\n");
+ 	if ((strlen(user) > 0) && passwd) {
+-	    u = xmalloc(sizeof(*u));
+-	    u->hash.key = xstrdup(user);
+-	    u->passwd = xstrdup(passwd);
+-	    hash_join(hash, &u->hash);
+-	}
++ 	    passwdha1 = (strncmp("{HHA1}", passwd, 6))?0:1;
++ 	    if (!ha1mode || passwdha1) {
++		u = xmalloc(sizeof(*u));
++		u->hash.key = xstrdup(user);
++		u->passwd = xstrdup(passwd);
++		hash_join(hash, &u->hash);
++	    } else {
++		/* We cannot accept plaintext passwords when using HA1 encoding,
++		 * as the passwords may be output to cache.log if debugging is on.
++		 */
++		fprintf(stderr, "digest_pw_auth: ignoring %s password for %s\n",
++			"plaintext", user);
++ 	    }
++  	}
+     }
+     fclose(f);
+ }
+@@ -113,28 +124,42 @@ main(int argc, char **argv)
+     struct stat sb;
+     time_t change_time = 0;
+     char buf[256];
+-    char *user, *realm, *p;
++    char *user, *realm, *p, *passwdfile=NULL;
+     user_data *u;
+     HASH HA1;
+     HASHHEX HHA1;
++    int ha1mode=0;
++
+     setbuf(stdout, NULL);
+-    if (argc != 2) {
+-	fprintf(stderr, "Usage: digest_pw_auth <passwordfile>\n");
++    if(argc == 2){
++        passwdfile = argv[1];
++    }
++    if((argc == 3) && !strcmp("-c", argv[1])){
++        ha1mode=1;
++        passwdfile = argv[2];
++    }
++    if (!passwdfile) {
++        fprintf(stderr, "Usage: digest_pw_auth [OPTIONS] <passwordfile>\n");
++        fprintf(stderr, "  -c   accept HHA1 passwords rather than plaintext in passwordfile\n");
+ 	exit(1);
+     }
+-    if (stat(argv[1], &sb) != 0) {
+-	fprintf(stderr, "cannot stat %s\n", argv[1]);
++    if (stat(passwdfile, &sb) != 0) {
++	fprintf(stderr, "cannot stat %s\n", passwdfile);
+ 	exit(1);
+     }
+     while (fgets(buf, 256, stdin) != NULL) {
+ 	if ((p = strchr(buf, '\n')) != NULL)
+ 	    *p = '\0';		/* strip \n */
+-	if (stat(argv[1], &sb) == 0) {
++	if (stat(passwdfile, &sb) == 0) {
+ 	    if (sb.st_mtime != change_time) {
+-		read_passwd_file(argv[1]);
++		read_passwd_file(passwdfile, ha1mode);
+ 		change_time = sb.st_mtime;
+ 	    }
+ 	}
++	if (!hash) {
++	    printf("ERR\n");
++	    continue;
++	}
+ 	if ((user = strtok(buf, "\"")) == NULL) {
+ 	    printf("ERR\n");
+ 	    continue;
+@@ -151,8 +176,17 @@ main(int argc, char **argv)
+ 	if (u == NULL) {
+ 	    printf("ERR\n");
+ 	} else {
+-	    DigestCalcHA1("md5", user, realm, u->passwd, NULL, NULL, HA1, HHA1);
+-	    printf("%s\n", HHA1);
++
++	    if(! ha1mode )
++            {
++                DigestCalcHA1("md5", user, realm, u->passwd, NULL, NULL, HA1, HHA1);
++                printf("%s\n", HHA1);
++                /* fprintf(stderr, "digest_pw_auth: %s:{HHA1}%s\n", user, HHA1); */
++            }
++            else
++            {
++		printf("%s\n", &u->passwd[6]);
++            }
+ 	}
+     }
+     exit(0);
+@@ -5,6 +5,7 @@
+ 
+ #ifndef __AUTH_BASIC_H__
+ #define __AUTH_BASIC_H__
++#include "authenticate.h"
+ 
+ #define DefaultAuthenticateChildrenMax  32	/* 32 processes */
+ 
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: auth_digest.cc,v 1.21 2003/02/21 22:50:27 robertc Exp $
++ * $Id: auth_digest.cc,v 1.22 2003/02/26 06:11:41 robertc Exp $
+  *
+  * DEBUG: section 29    Authenticator
+  * AUTHOR: Robert Collins
+@@ -46,32 +46,21 @@
+ 
+ extern AUTHSSETUP authSchemeSetup_digest;
+ 
+-static void
+-authenticateStateFree(DigestAuthenticateStateData * r)
+-{
+-    cbdataFree(r);
+-}
+-
+ /* Digest Scheme */
+ 
+ static HLPCB authenticateDigestHandleReply;
+ static AUTHSACTIVE authenticateDigestActive;
+-static AUTHSADDHEADER authDigestAddHeader;
+ #if WAITING_FOR_TE
+ static AUTHSADDTRAILER authDigestAddTrailer;
+ #endif
+-static AUTHSAUTHED authDigestAuthenticated;
+-static AUTHSAUTHUSER authenticateDigestAuthenticateUser;
+ static AUTHSCONFIGURED authDigestConfigured;
+-static AUTHSDIRECTION authenticateDigestDirection;
+ static AUTHSDECODE authenticateDigestDecodeAuth;
+ static AUTHSDUMP authDigestCfgDump;
+ static AUTHSFIXERR authenticateDigestFixHeader;
+ static AUTHSFREE authenticateDigestUserFree;
+ static AUTHSFREECONFIG authDigestFreeConfig;
+ static AUTHSINIT authDigestInit;
+ static AUTHSPARSE authDigestParse;
+-static AUTHSREQFREE authDigestAURequestFree;
+ static AUTHSSTART authenticateDigestStart;
+ static AUTHSSTATS authenticateDigestStats;
+ static AUTHSUSERNAME authenticateDigestUsername;
+@@ -84,8 +73,6 @@ static hash_table *digest_nonce_cache;
+ static auth_digest_config *digestConfig = NULL;
+ 
+ static int authdigest_initialised = 0;
+-static MemPool *digest_user_pool = NULL;
+-static MemPool *digest_request_pool = NULL;
+ static MemPool *digest_nonce_pool = NULL;
+ 
+ CBDATA_TYPE(DigestAuthenticateStateData);
+@@ -161,16 +148,16 @@ authenticateDigestNonceNew(void)
+      * 
+      * Now for my reasoning:
+      * We will not accept a unrecognised nonce->we have all recognisable
+-     * nonces stored If we send out unique base64 encodings we guarantee
++     * nonces stored. If we send out unique base64 encodings we guarantee
+      * that a given nonce applies to only one user (barring attacks or
+      * really bad timing with expiry and creation).  Using a random
+      * component in the nonce allows us to loop to find a unique nonce.
+      * We use H(nonce_data) so the nonce is meaningless to the reciever.
+      * So our nonce looks like base64(H(timestamp,pointertohash,randomdata))
+      * And even if our randomness is not very random (probably due to
+      * bad coding on my part) we don't really care - the timestamp and
+-     * memory pointer should provide enough protection for the users
+-     * authentication.
++     * memory pointer also guarantee local uniqueness in the input to the hash
++     * function.
+      */
+ 
+     /* create a new nonce */
+@@ -504,19 +491,6 @@ authDigestUserFindUsername(const char *username)
+     return NULL;
+ }
+ 
+-static digest_user_h *
+-authDigestUserNew(void)
+-{
+-    return static_cast < digest_user_h * >(memPoolAlloc(digest_user_pool));
+-}
+-
+-static void
+-authDigestUserSetup(void)
+-{
+-    if (!digest_user_pool)
+-        digest_user_pool = memPoolCreate("Digest Scheme User Data", sizeof(digest_user_h));
+-}
+-
+ static void
+ authDigestUserShutdown(void)
+ {
+@@ -535,92 +509,31 @@ authDigestUserShutdown(void)
+             /* it's digest */
+             authenticateAuthUserUnlock(auth_user);
+     }
+-
+-#if DEBUGSHUTDOWN
+-    if (digest_user_pool) {
+-        memPoolDestroy(&digest_user_pool);
+-    }
+-
+-#endif
+ }
+ 
+ 
+ /* request related functions */
+ 
+-/* delete the digest reuqest structure. Does NOT delete related structures */
+-static void
+-authDigestRequestDelete(digest_request_h * digest_request)
++/* delete the digest request structure. Does NOT delete related structures */
++digest_request_h::~digest_request_h()
+ {
+-    if (digest_request->nonceb64)
+-        xfree(digest_request->nonceb64);
+-
+-    if (digest_request->cnonce)
+-        xfree(digest_request->cnonce);
+-
+-    if (digest_request->realm)
+-        xfree(digest_request->realm);
+-
+-    if (digest_request->pszPass)
+-        xfree(digest_request->pszPass);
+-
+-    if (digest_request->algorithm)
+-        xfree(digest_request->algorithm);
+-
+-    if (digest_request->pszMethod)
+-        xfree(digest_request->pszMethod);
+-
+-    if (digest_request->qop)
+-        xfree(digest_request->qop);
+-
+-    if (digest_request->uri)
+-        xfree(digest_request->uri);
+-
+-    if (digest_request->response)
+-        xfree(digest_request->response);
+-
+-    if (digest_request->nonce)
+-        authDigestNonceUnlink(digest_request->nonce);
+-
+-    memPoolFree(digest_request_pool, digest_request);
++    safe_free (nonceb64);
++    safe_free (cnonce);
++    safe_free (realm);
++    safe_free (pszPass);
++    safe_free (algorithm);
++    safe_free (pszMethod);
++    safe_free (qop);
++    safe_free (uri);
++    safe_free (response);
++
++    if (nonce)
++        authDigestNonceUnlink(nonce);
++
++    if (theUser)
++        authenticateAuthUserUnlock(theUser);
+ }
+ 
+-static void
+-authDigestAURequestFree(auth_user_request_t * auth_user_request)
+-{
+-    if (auth_user_request->scheme_data != NULL)
+-        authDigestRequestDelete(static_cast < digest_request_h * >(auth_user_request->scheme_data));
+-}
+-
+-static digest_request_h *
+-authDigestRequestNew(void)
+-{
+-    digest_request_h *tmp;
+-    tmp = static_cast < digest_request_h * >(memPoolAlloc(digest_request_pool));
+-    assert(tmp != NULL);
+-    return tmp;
+-}
+-
+-static void
+-authDigestRequestSetup(void)
+-{
+-    if (!digest_request_pool)
+-        digest_request_pool = memPoolCreate("Digest Scheme Request Data", sizeof(digest_request_h));
+-}
+-
+-static void
+-authDigestRequestShutdown(void)
+-{
+-    /* No requests should be in progress when we get here */
+-#if DEBUGSHUTDOWN
+-
+-    if (digest_request_pool) {
+-        memPoolDestroy(&digest_request_pool);
+-    }
+-
+-#endif
+-}
+-
+-
+ static void
+ authDigestDone(void)
+ {
+@@ -639,7 +552,6 @@ authDigestDone(void)
+         digestauthenticators = NULL;
+     }
+ 
+-    authDigestRequestShutdown();
+     authDigestUserShutdown();
+     authenticateDigestNonceShutdown();
+     debug(29, 2) ("authenticateDigestDone: Digest authentication shut down.\n");
+@@ -676,11 +588,10 @@ authSchemeSetup_digest(authscheme_entry_t * authscheme)
+     authscheme->freeconfig = authDigestFreeConfig;
+     authscheme->dump = authDigestCfgDump;
+     authscheme->init = authDigestInit;
+-    authscheme->authAuthenticate = authenticateDigestAuthenticateUser;
+-    authscheme->authenticated = authDigestAuthenticated;
++    authscheme->authAuthenticate = NULL;
++    authscheme->authenticated = NULL;
+     authscheme->authFixHeader = authenticateDigestFixHeader;
+     authscheme->FreeUser = authenticateDigestUserFree;
+-    authscheme->AddHeader = authDigestAddHeader;
+ #if WAITING_FOR_TE
+ 
+     authscheme->AddTrailer = authDigestAddTrailer;
+@@ -689,11 +600,11 @@ authSchemeSetup_digest(authscheme_entry_t * authscheme)
+     authscheme->authStart = authenticateDigestStart;
+     authscheme->authStats = authenticateDigestStats;
+     authscheme->authUserUsername = authenticateDigestUsername;
+-    authscheme->getdirection = authenticateDigestDirection;
++    authscheme->getdirection = NULL;
+     authscheme->oncloseconnection = NULL;
+     authscheme->decodeauth = authenticateDigestDecodeAuth;
+     authscheme->donefunc = authDigestDone;
+-    authscheme->requestFree = authDigestAURequestFree;
++    authscheme->requestFree = NULL;
+     authscheme->authConnLastHeader = NULL;
+ }
+ 
+@@ -714,21 +625,19 @@ authDigestConfigured(void)
+     return 0;
+ }
+ 
+-static int
+-authDigestAuthenticated(auth_user_request_t * auth_user_request)
++int
++digest_request_h::authenticated() const
+ {
+-    digest_user_h *digest_user = static_cast < digest_user_h * >(auth_user_request->auth_user->scheme_data);
+-
+-    if (digest_user->flags.credentials_ok == 1)
++    if (credentials() == Ok)
+         return 1;
+-    else
+-        return 0;
++
++    return 0;
+ }
+ 
+ /* log a digest user in
+  */
+-static void
+-authenticateDigestAuthenticateUser(auth_user_request_t * auth_user_request, request_t * request, ConnStateData * conn, http_hdr_type type)
++void
++digest_request_h::authenticate(request_t * request, ConnStateData * conn, http_hdr_type type)
+ {
+     auth_user_t *auth_user;
+     digest_request_h *digest_request;
+@@ -738,39 +647,30 @@ authenticateDigestAuthenticateUser(auth_user_request_t * auth_user_request, requ
+     HASHHEX HA2 = "";
+     HASHHEX Response;
+ 
+-    assert(auth_user_request->auth_user != NULL);
+-    auth_user = auth_user_request->auth_user;
++    assert(authUser() != NULL);
++    auth_user = authUser();
+ 
+     assert(auth_user->scheme_data != NULL);
+     digest_user = static_cast < digest_user_h * >(auth_user->scheme_data);
+ 
+     /* if the check has corrupted the user, just return */
+ 
+-    if (digest_user->flags.credentials_ok == 3) {
++    if (credentials() == Failed) {
+         return;
+     }
+ 
+-    assert(auth_user_request->scheme_data != NULL);
+-    digest_request = static_cast < digest_request_h * >(auth_user_request->scheme_data);
++    digest_request = this;
+ 
+     /* do we have the HA1 */
+ 
+     if (!digest_user->HA1created) {
+-        digest_user->flags.credentials_ok = 2;
++        credentials(Pending);
+         return;
+     }
+ 
+     if (digest_request->nonce == NULL) {
+         /* this isn't a nonce we issued */
+-        /* TODO: record breaks in authentication at the request level
+-         * This is probably best done with support changes at the
+-         * auth_rewrite level -RBC
+-         * and can wait for auth_rewrite V2.
+-         * RBC 20010902 further note: flags.credentials ok is now
+-         * a local scheme flag, so we can move this to the request
+-         * level at any time.
+-         */
+-        digest_user->flags.credentials_ok = 3;
++        credentials(Failed);
+         return;
+     }
+ 
+@@ -786,11 +686,11 @@ authenticateDigestAuthenticateUser(auth_user_request_t * auth_user_request, requ
+                   "squid is = '%s'\n", digest_request->response, Response);
+ 
+     if (strcasecmp(digest_request->response, Response)) {
+-        digest_user->flags.credentials_ok = 3;
++        credentials(Failed);
+         return;
+     }
+ 
+-    digest_user->flags.credentials_ok = 1;
++    credentials(Ok);
+     /* password was checked and did match */
+     debug(29, 4) ("authenticateDigestAuthenticateuser: user '%s' validated OK\n",
+                   digest_user->username);
+@@ -801,50 +701,40 @@ authenticateDigestAuthenticateUser(auth_user_request_t * auth_user_request, requ
+     return;
+ }
+ 
+-static int
+-authenticateDigestDirection(auth_user_request_t * auth_user_request)
++int
++digest_request_h::direction()
+ {
+-    digest_request_h *digest_request;
+-    digest_user_h *digest_user = static_cast < digest_user_h * >(auth_user_request->auth_user->scheme_data);
+-    /* null auth_user is checked for by authenticateDirection */
+-
+-    switch (digest_user->flags.credentials_ok) {
++    switch (credentials()) {
+ 
+-    case 0:			/* not checked */
++    case Unchecked:
+         return -1;
+ 
+-    case 1:			/* checked & ok */
+-        digest_request = static_cast < digest_request_h * >(auth_user_request->scheme_data);
++    case Ok:
+ 
+-        if (authDigestNonceIsStale(digest_request->nonce))
++        if (authDigestNonceIsStale(nonce))
+             /* send stale response to the client agent */
+             return -2;
+ 
+         return 0;
+ 
+-    case 2:			/* partway through checking. */
++    case Pending:
+         return -1;
+ 
+-    case 3:			/* authentication process failed. */
++    case Failed:
+         return -2;
+     }
+ 
+     return -2;
+ }
+ 
+ /* add the [proxy]authorisation header */
+-static void
+-authDigestAddHeader(auth_user_request_t * auth_user_request, HttpReply * rep, int accel)
++void
++digest_request_h::addHeader(HttpReply * rep, int accel)
+ {
+     enum http_hdr_type type;
+-    digest_request_h *digest_request;
+-
+-    if (!auth_user_request)
+-        return;
+-
+-    digest_request = static_cast < digest_request_h * >(auth_user_request->scheme_data);
+ 
+     /* don't add to authentication error pages */
++
+     if ((!accel && rep->sline.status == HTTP_PROXY_AUTHENTICATION_REQUIRED)
+             || (accel && rep->sline.status == HTTP_UNAUTHORIZED))
+         return;
+@@ -858,10 +748,10 @@ authDigestAddHeader(auth_user_request_t * auth_user_request, HttpReply * rep, in
+ 
+ #endif
+ 
+-    if ((digestConfig->authenticate) && authDigestNonceLastRequest(digest_request->nonce)) {
+-        digest_request->flags.authinfo_sent = 1;
+-        debug(29, 9) ("authDigestAddHead: Sending type:%d header: 'nextnonce=\"%s\"", type, authenticateDigestNonceNonceb64(digest_request->nonce));
+-        httpHeaderPutStrf(&rep->header, type, "nextnonce=\"%s\"", authenticateDigestNonceNonceb64(digest_request->nonce));
++    if ((digestConfig->authenticate) && authDigestNonceLastRequest(nonce)) {
++        flags.authinfo_sent = 1;
++        debug(29, 9) ("authDigestAddHead: Sending type:%d header: 'nextnonce=\"%s\"", type, authenticateDigestNonceNonceb64(nonce));
++        httpHeaderPutStrf(&rep->header, type, "nextnonce=\"%s\"", authenticateDigestNonceNonceb64(nonce));
+     }
+ }
+ 
+@@ -876,7 +766,7 @@ authDigestAddTrailer(auth_user_request_t * auth_user_request, HttpReply * rep, i
+     if (!auth_user_request)
+         return;
+ 
+-    digest_request = static_cast < digest_request_h * >(auth_user_request->scheme_data);
++    digest_request = dynamic_cast < digest_request_h * >(auth_user_request->state());
+ 
+     /* has the header already been send? */
+     if (digest_request->flags.authinfo_sent)
+@@ -901,53 +791,67 @@ authDigestAddTrailer(auth_user_request_t * auth_user_request, HttpReply * rep, i
+ void
+ authenticateDigestFixHeader(auth_user_request_t * auth_user_request, HttpReply * rep, http_hdr_type type, request_t * request)
+ {
+-    digest_request_h *digest_request;
++    if (!digestConfig->authenticate)
++        return;
++
+     int stale = 0;
+-    digest_nonce_h *nonce = authenticateDigestNonceNew();
+ 
+-    if (auth_user_request && authDigestAuthenticated(auth_user_request) && auth_user_request->scheme_data) {
+-        digest_request = static_cast < digest_request_h * >(auth_user_request->scheme_data);
+-        stale = authDigestNonceIsStale(digest_request->nonce);
+-    }
++    if (auth_user_request && auth_user_request->state()) {
++        digest_request_h *digest_request;
++        digest_request = dynamic_cast < digest_request_h * >(auth_user_request->state());
++        assert (digest_request);
+ 
+-    if (digestConfig->authenticate) {
+-        debug(29, 9) ("authenticateFixHeader: Sending type:%d header: 'Digest realm=\"%s\", nonce=\"%s\", qop=\"%s\", stale=%s\n", type, digestConfig->digestAuthRealm, authenticateDigestNonceNonceb64(nonce), QOP_AUTH, stale ? "true" : "false");
+-        /* in the future, for WWW auth we may want to support the domain entry */
+-        httpHeaderPutStrf(&rep->header, type, "Digest realm=\"%s\", nonce=\"%s\", qop=\"%s\", stale=%s", digestConfig->digestAuthRealm, authenticateDigestNonceNonceb64(nonce), QOP_AUTH, stale ? "true" : "false");
++        if (digest_request->authenticated())
++            /* stale indicates that the old nonce can't be used
++             * and we are providing a new one.
++             */
++            stale = authDigestNonceIsStale(digest_request->nonce);
+     }
++
++    /* on a 407 or 401 we always use a new nonce */
++    digest_nonce_h *nonce = authenticateDigestNonceNew();
++
++    debug(29, 9) ("authenticateFixHeader: Sending type:%d header: 'Digest realm=\"%s\", nonce=\"%s\", qop=\"%s\", stale=%s\n", type, digestConfig->digestAuthRealm, authenticateDigestNonceNonceb64(nonce), QOP_AUTH, stale ? "true" : "false");
++
++    /* in the future, for WWW auth we may want to support the domain entry */
++    httpHeaderPutStrf(&rep->header, type, "Digest realm=\"%s\", nonce=\"%s\", qop=\"%s\", stale=%s", digestConfig->digestAuthRealm, authenticateDigestNonceNonceb64(nonce), QOP_AUTH, stale ? "true" : "false");
+ }
+ 
+ static void
+ authenticateDigestUserFree(auth_user_t * auth_user)
+ {
+     digest_user_h *digest_user = static_cast < digest_user_h * >(auth_user->scheme_data);
+-    dlink_node *link, *tmplink;
+     debug(29, 9) ("authenticateDigestFreeUser: Clearing Digest scheme data\n");
+ 
+     if (!digest_user)
+         return;
+ 
+-    safe_free(digest_user->username);
++    delete digest_user;
+ 
+-    link = digest_user->nonces.head;
++    auth_user->scheme_data = NULL;
++}
++
++digest_user_h::~digest_user_h()
++{
++    safe_free(username);
++
++    dlink_node *link, *tmplink;
++    link = nonces.head;
+ 
+     while (link) {
+         tmplink = link;
+         link = link->next;
+-        dlinkDelete(tmplink, &digest_user->nonces);
++        dlinkDelete(tmplink, &nonces);
+         authDigestNoncePurge(static_cast < digest_nonce_h * >(tmplink->data));
+         authDigestNonceUnlink(static_cast < digest_nonce_h * >(tmplink->data));
+         dlinkNodeDelete(tmplink);
+     }
+-
+-    memPoolFree(digest_user_pool, auth_user->scheme_data);
+-    auth_user->scheme_data = NULL;
+ }
+ 
+ static void
+ authenticateDigestHandleReply(void *data, char *reply)
+ {
+-    DigestAuthenticateStateData *r = static_cast < DigestAuthenticateStateData * >(data);
++    DigestAuthenticateStateData *replyData = static_cast < DigestAuthenticateStateData * >(data);
+     auth_user_request_t *auth_user_request;
+     digest_request_h *digest_request;
+     digest_user_h *digest_user;
+@@ -963,23 +867,23 @@ authenticateDigestHandleReply(void *data, char *reply)
+             reply = NULL;
+     }
+ 
+-    assert(r->auth_user_request != NULL);
+-    auth_user_request = r->auth_user_request;
+-    assert(auth_user_request->scheme_data != NULL);
+-    digest_request = static_cast < digest_request_h * >(auth_user_request->scheme_data);
++    assert(replyData->auth_user_request != NULL);
++    auth_user_request = replyData->auth_user_request;
++    assert(auth_user_request->state() != NULL);
++    digest_request = dynamic_cast < digest_request_h * >(auth_user_request->state());
+     digest_user = static_cast < digest_user_h * >(auth_user_request->auth_user->scheme_data);
+ 
+     if (reply && (strncasecmp(reply, "ERR", 3) == 0))
+-        digest_user->flags.credentials_ok = 3;
++        digest_request->credentials(digest_request_h::Failed);
+     else {
+         CvtBin(reply, digest_user->HA1);
+         digest_user->HA1created = 1;
+     }
+ 
+-    if (cbdataReferenceValidDone(r->data, &cbdata))
+-        r->handler(cbdata, NULL);
++    if (cbdataReferenceValidDone(replyData->data, &cbdata))
++        replyData->handler(cbdata, NULL);
+ 
+-    authenticateStateFree(r);
++    cbdataFree(replyData);
+ }
+ 
+ /* Initialize helpers and the like for this auth scheme. Called AFTER parsing the
+@@ -990,8 +894,6 @@ authDigestInit(authScheme * scheme)
+     static int init = 0;
+ 
+     if (digestConfig->authenticate) {
+-        authDigestUserSetup();
+-        authDigestRequestSetup();
+         authenticateDigestNonceSetup();
+         authdigest_initialised = 1;
+ 
+@@ -1193,7 +1095,7 @@ authDigestLogUsername(auth_user_request_t * auth_user_request, char *username)
+     /* new auth_user */
+     auth_user = authenticateAuthUserNew("digest");
+     /* new scheme data */
+-    digest_user = authDigestUserNew();
++    digest_user = new digest_user_h;
+     /* save the credentials */
+     digest_user->username = username;
+     /* link the scheme data in */
+@@ -1229,8 +1131,9 @@ authenticateDigestDecodeAuth(auth_user_request_t * auth_user_request, const char
+ 
+     debug(29, 9) ("authenticateDigestDecodeAuth: beginning\n");
+     assert(auth_user_request != NULL);
++    assert (auth_user_request->state() == NULL);
+ 
+-    digest_request = authDigestRequestNew();
++    digest_request = new digest_request_h;
+ 
+     /* trim DIGEST from string */
+ 
+@@ -1378,8 +1281,7 @@ authenticateDigestDecodeAuth(auth_user_request_t * auth_user_request, const char
+         authDigestLogUsername(auth_user_request, username);
+ 
+         /* we don't need the scheme specific data anymore */
+-        authDigestRequestDelete(digest_request);
+-        auth_user_request->scheme_data = NULL;
++        delete digest_request;
+         return;
+     }
+ 
+@@ -1392,8 +1294,7 @@ authenticateDigestDecodeAuth(auth_user_request_t * auth_user_request, const char
+         authDigestLogUsername(auth_user_request, username);
+ 
+         /* we don't need the scheme specific data anymore */
+-        authDigestRequestDelete(digest_request);
+-        auth_user_request->scheme_data = NULL;
++        delete digest_request;
+         return;
+     }
+ 
+@@ -1409,8 +1310,7 @@ authenticateDigestDecodeAuth(auth_user_request_t * auth_user_request, const char
+         authDigestLogUsername(auth_user_request, username);
+ 
+         /* we don't need the scheme specific data anymore */
+-        authDigestRequestDelete(digest_request);
+-        auth_user_request->scheme_data = NULL;
++        delete digest_request;
+         return;
+     }
+ 
+@@ -1424,8 +1324,7 @@ authenticateDigestDecodeAuth(auth_user_request_t * auth_user_request, const char
+         authDigestLogUsername(auth_user_request, username);
+ 
+         /* we don't need the scheme specific data anymore */
+-        authDigestRequestDelete(digest_request);
+-        auth_user_request->scheme_data = NULL;
++        delete digest_request;
+         return;
+     }
+ 
+@@ -1435,8 +1334,7 @@ authenticateDigestDecodeAuth(auth_user_request_t * auth_user_request, const char
+         authDigestLogUsername(auth_user_request, username);
+ 
+         /* we don't need the scheme specific data anymore */
+-        authDigestRequestDelete(digest_request);
+-        auth_user_request->scheme_data = NULL;
++        delete digest_request;
+         return;
+     }
+ 
+@@ -1446,8 +1344,7 @@ authenticateDigestDecodeAuth(auth_user_request_t * auth_user_request, const char
+         authDigestLogUsername(auth_user_request, username);
+ 
+         /* we don't need the scheme specific data anymore */
+-        authDigestRequestDelete(digest_request);
+-        auth_user_request->scheme_data = NULL;
++        delete digest_request;
+         return;
+     }
+ 
+@@ -1458,8 +1355,7 @@ authenticateDigestDecodeAuth(auth_user_request_t * auth_user_request, const char
+         authDigestLogUsername(auth_user_request, username);
+ 
+         /* we don't need the scheme specific data anymore */
+-        authDigestRequestDelete(digest_request);
+-        auth_user_request->scheme_data = NULL;
++        delete digest_request;
+         return;
+     }
+ 
+@@ -1472,8 +1368,7 @@ authenticateDigestDecodeAuth(auth_user_request_t * auth_user_request, const char
+         authDigestLogUsername(auth_user_request, username);
+ 
+         /* we don't need the scheme specific data anymore */
+-        authDigestRequestDelete(digest_request);
+-        auth_user_request->scheme_data = NULL;
++        delete digest_request;
+         return;
+     }
+ 
+@@ -1490,7 +1385,7 @@ authenticateDigestDecodeAuth(auth_user_request_t * auth_user_request, const char
+         /* new auth_user */
+         auth_user = authenticateAuthUserNew("digest");
+         /* new scheme user data */
+-        digest_user = authDigestUserNew();
++        digest_user = new digest_user_h;
+         /* save the username */
+         digest_user->username = username;
+         /* link the primary struct in */
+@@ -1516,7 +1411,9 @@ authenticateDigestDecodeAuth(auth_user_request_t * auth_user_request, const char
+     /*link the request and the user */
+     auth_user_request->auth_user = auth_user;
+ 
+-    auth_user_request->scheme_data = digest_request;
++    auth_user_request->state(digest_request);
++
++    digest_request->authUser (auth_user);
+ 
+     /* lock for the request link */
+     authenticateAuthUserLock(auth_user);
+@@ -1546,8 +1443,8 @@ authenticateDigestStart(auth_user_request_t * auth_user_request, RH * handler, v
+     assert(handler);
+     assert(auth_user_request->auth_user->auth_type == AUTH_DIGEST);
+     assert(auth_user_request->auth_user->scheme_data != NULL);
+-    assert(auth_user_request->scheme_data != NULL);
+-    digest_request = static_cast < digest_request_h * >(auth_user_request->scheme_data);
++    digest_request = dynamic_cast < digest_request_h * >(auth_user_request->state());
++    assert(digest_request);
+     digest_user = static_cast < digest_user_h * >(auth_user_request->auth_user->scheme_data);
+     debug(29, 9) ("authenticateStart: '\"%s\":\"%s\"'\n", digest_user->username,
+                   digest_request->realm);
+@@ -1564,3 +1461,94 @@ authenticateDigestStart(auth_user_request_t * auth_user_request, RH * handler, v
+     snprintf(buf, 8192, "\"%s\":\"%s\"\n", digest_user->username, digest_request->realm);
+     helperSubmit(digestauthenticators, buf, authenticateDigestHandleReply, r);
+ }
++
++
++MemPool *digest_user_h::Pool(NULL);
++void *
++digest_user_h::operator new (size_t byteCount)
++{
++    /* derived classes with different sizes must implement their own new */
++    assert (byteCount == sizeof (digest_user_h));
++
++    if (!Pool)
++        Pool = memPoolCreate("digest_user_h", sizeof (digest_user_h));
++
++    return memPoolAlloc(Pool);
++}
++
++void
++digest_user_h::operator delete (void *address)
++{
++    memPoolFree (Pool, address);
++}
++
++void
++digest_user_h::deleteSelf() const
++{
++    delete this;
++}
++
++digest_user_h::digest_user_h () : username (NULL), HA1created (0)
++{}
++
++MemPool *digest_request_h::Pool(NULL);
++void *
++digest_request_h::operator new (size_t byteCount)
++{
++    /* derived classes with different sizes must implement their own new */
++    assert (byteCount == sizeof (digest_request_h));
++
++    if (!Pool)
++        Pool = memPoolCreate("digest_request_h", sizeof (digest_request_h));
++
++    return memPoolAlloc(Pool);
++}
++
++void
++digest_request_h::operator delete (void *address)
++{
++    memPoolFree (Pool, address);
++}
++
++void
++digest_request_h::deleteSelf() const
++{
++    delete this;
++}
++
++digest_request_h::digest_request_h () : theUser (NULL)
++        , credentials_ok (Unchecked)
++{}
++
++digest_request_h::digest_request_h (auth_user_t *aUser) : theUser (aUser)
++        , credentials_ok (Unchecked)
++{
++    authenticateAuthUserLock(theUser);
++}
++
++auth_user_t *
++digest_request_h::authUser() const
++{
++    return theUser;
++}
++
++void
++digest_request_h::authUser(auth_user_t *aUser)
++{
++    assert (!authUser());
++    authenticateAuthUserLock(aUser);
++    theUser = aUser;
++}
++
++digest_request_h::CredentialsState
++digest_request_h::credentials() const
++{
++    return credentials_ok;
++
++}
++
++void
++digest_request_h::credentials(CredentialsState newCreds)
++{
++    credentials_ok = newCreds;
++}
+@@ -6,7 +6,7 @@
+ #ifndef __AUTH_DIGEST_H__
+ #define __AUTH_DIGEST_H__
+ #include "rfc2617.h"
+-
++#include "authenticate.h"
+ /* Generic */
+ 
+ class DigestAuthenticateStateData
+@@ -18,36 +18,58 @@ class DigestAuthenticateStateData
+     RH *handler;
+ };
+ 
+-typedef struct _digest_request_h digest_request_h;
+-
+-typedef struct _digest_user_h digest_user_h;
+-
+ typedef struct _digest_nonce_data digest_nonce_data;
+ 
+ typedef struct _digest_nonce_h digest_nonce_h;
+ 
+-struct _digest_user_h
++class digest_user_h
+ {
++
++public:
++    void *operator new(size_t);
++    void operator delete (void *);
++    void deleteSelf() const;
++
++    digest_user_h();
++    ~digest_user_h();
++    int authenticated() const;
+     char *username;
+     HASH HA1;
+     int HA1created;
+ 
+-    struct
+-    {
+-
+-unsigned int credentials_ok:
+-        2;	/*0=unchecked,1=ok,2=failed */
+-    }
+-
+-    flags;
+     /* what nonces have been allocated to this user */
+     dlink_list nonces;
++
++private:
++    static MemPool *Pool;
+ };
+ 
+ /* the digest_request structure is what follows the http_request around */
+ 
+-struct _digest_request_h
++class digest_request_h : public AuthUserRequestState
+ {
++
++public:
++    enum CredentialsState {Unchecked, Ok, Pending, Failed};
++    void *operator new(size_t);
++    void operator delete (void *);
++    void deleteSelf() const;
++
++    digest_request_h();
++    digest_request_h(auth_user_t *);
++    ~digest_request_h();
++
++    int authenticated() const;
++    virtual void authenticate(request_t * request, ConnStateData * conn, http_hdr_type type);
++    virtual int direction();
++    virtual void addHeader(HttpReply * rep, int accel);
++
++    CredentialsState credentials() const;
++    void credentials(CredentialsState);
++
++    void authUser(auth_user_t *);
++    auth_user_t *authUser() const;
++
+     char *nonceb64;		/* "dcd98b7102dd2f0e8b11d0f600bfb0c093" */
+     char *cnonce;		/* "0a4f113b" */
+     char *realm;		/* = "testrealm@host.com" */
+@@ -68,6 +90,11 @@ unsigned int authinfo_sent:
+ 
+     flags;
+     digest_nonce_h *nonce;
++    auth_user_t *theUser;
++
++private:
++    static MemPool *Pool;
++    CredentialsState credentials_ok;
+ };
+ 
+ /* data to be encoded into the nonce's b64 representation */
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: auth_ntlm.cc,v 1.29 2003/02/21 22:50:28 robertc Exp $
++ * $Id: auth_ntlm.cc,v 1.30 2003/02/26 06:11:41 robertc Exp $
+  *
+  * DEBUG: section 29    NTLM Authenticator
+  * AUTHOR: Robert Collins
+@@ -55,20 +55,17 @@ authenticateStateFree(authenticateStateData * r)
+ static HLPSCB authenticateNTLMHandleReply;
+ static HLPSCB authenticateNTLMHandleplaceholder;
+ static AUTHSACTIVE authenticateNTLMActive;
+-static AUTHSAUTHED authNTLMAuthenticated;
+ static AUTHSAUTHUSER authenticateNTLMAuthenticateUser;
+ static AUTHSCONFIGURED authNTLMConfigured;
+ static AUTHSFIXERR authenticateNTLMFixErrorHeader;
+ static AUTHSFREE authenticateNTLMFreeUser;
+-static AUTHSDIRECTION authenticateNTLMDirection;
+ static AUTHSDECODE authenticateDecodeNTLMAuth;
+ static AUTHSDUMP authNTLMCfgDump;
+ static AUTHSFREECONFIG authNTLMFreeConfig;
+ static AUTHSINIT authNTLMInit;
+ static AUTHSONCLOSEC authenticateNTLMOnCloseConnection;
+ static AUTHSCONNLASTHEADER NTLMLastHeader;
+ static AUTHSUSERNAME authenticateNTLMUsername;
+-static AUTHSREQFREE authNTLMAURequestFree;
+ static AUTHSPARSE authNTLMParse;
+ static AUTHSSTART authenticateNTLMStart;
+ static AUTHSSTATS authenticateNTLMStats;
+@@ -86,7 +83,6 @@ static int authntlm_initialised = 0;
+ 
+ static MemPool *ntlm_helper_state_pool = NULL;
+ static MemPool *ntlm_user_pool = NULL;
+-static MemPool *ntlm_request_pool = NULL;
+ static MemPool *ntlm_user_hash_pool = NULL;
+ 
+ static auth_ntlm_config *ntlmConfig = NULL;
+@@ -123,10 +119,6 @@ authNTLMDone(void)
+         memPoolDestroy(&ntlm_helper_state_pool);
+     }
+ 
+-    if (ntlm_request_pool) {
+-        memPoolDestroy(&ntlm_request_pool);
+-    }
+-
+     if (ntlm_user_pool) {
+         memPoolDestroy(&ntlm_user_pool);
+     }
+@@ -225,17 +217,17 @@ authSchemeSetup_ntlm(authscheme_entry_t * authscheme)
+     authscheme->configured = authNTLMConfigured;
+     authscheme->parse = authNTLMParse;
+     authscheme->dump = authNTLMCfgDump;
+-    authscheme->requestFree = authNTLMAURequestFree;
++    authscheme->requestFree = NULL;
+     authscheme->freeconfig = authNTLMFreeConfig;
+     authscheme->init = authNTLMInit;
+     authscheme->authAuthenticate = authenticateNTLMAuthenticateUser;
+-    authscheme->authenticated = authNTLMAuthenticated;
++    authscheme->authenticated = NULL;
+     authscheme->authFixHeader = authenticateNTLMFixErrorHeader;
+     authscheme->FreeUser = authenticateNTLMFreeUser;
+     authscheme->authStart = authenticateNTLMStart;
+     authscheme->authStats = authenticateNTLMStats;
+     authscheme->authUserUsername = authenticateNTLMUsername;
+-    authscheme->getdirection = authenticateNTLMDirection;
++    authscheme->getdirection = NULL;
+     authscheme->decodeauth = authenticateDecodeNTLMAuth;
+     authscheme->donefunc = authNTLMDone;
+     authscheme->oncloseconnection = authenticateNTLMOnCloseConnection;
+@@ -256,9 +248,6 @@ authNTLMInit(authScheme * scheme)
+         if (!ntlm_user_pool)
+             ntlm_user_pool = memPoolCreate("NTLM Scheme User Data", sizeof(ntlm_user_t));
+ 
+-        if (!ntlm_request_pool)
+-            ntlm_request_pool = memPoolCreate("NTLM Scheme Request Data", sizeof(ntlm_request_t));
+-
+         if (!ntlm_user_hash_pool)
+ 
+             ntlm_user_hash_pool = memPoolCreate("NTLM Header Hash Data", sizeof(struct ProxyAuthCachePointer));
+@@ -326,31 +315,39 @@ authNTLMConfigured()
+ }
+ 
+ /* NTLM Scheme */
+-
+-static int
+-authenticateNTLMDirection(auth_user_request_t * auth_user_request)
++int
++ntlm_request_t::direction()
+ {
+-    ntlm_request_t *ntlm_request = static_cast< ntlm_request_t *>(auth_user_request->scheme_data);
+     /* null auth_user is checked for by authenticateDirection */
+ 
+-    switch (ntlm_request->auth_state) {
++    switch (auth_state) {
+ 
+-    case AUTHENTICATE_STATE_NONE:	/* no progress at all. */
+-        debug(29, 1) ("authenticateNTLMDirection: called before NTLM Authenticate!. Report a bug to squid-dev. au %p\n", auth_user_request);
++        /* no progress at all. */
++
++    case AUTHENTICATE_STATE_NONE:
++        debug(29, 1) ("ntlm_request_t::direction: called before NTLM Authenticate!. Report a bug to squid-dev.\n");
+         /* fall thru */
+ 
+     case AUTHENTICATE_STATE_FAILED:
+         return -2;
+ 
+-    case AUTHENTICATE_STATE_NEGOTIATE:		/* send to helper */
++        /* send to helper */
++
++    case AUTHENTICATE_STATE_NEGOTIATE:
++
++        /*send to helper */
+ 
+-    case AUTHENTICATE_STATE_RESPONSE:	/*send to helper */
++    case AUTHENTICATE_STATE_RESPONSE:
+         return -1;
+ 
+-    case AUTHENTICATE_STATE_CHALLENGE:		/* send to client */
++        /* send to client */
++
++    case AUTHENTICATE_STATE_CHALLENGE:
+         return 1;
+ 
+-    case AUTHENTICATE_STATE_DONE:	/* do nothing.. */
++        /* do nothing.. */
++
++    case AUTHENTICATE_STATE_DONE:
+         return 0;
+     }
+ 
+@@ -379,7 +376,8 @@ authenticateNTLMFixErrorHeader(auth_user_request_t * auth_user_request, HttpRepl
+              * I haven't checked the RFC compliance of this hack - RBCollins */
+             request->flags.proxy_keepalive = 0;
+         } else {
+-            ntlm_request = static_cast< ntlm_request_t *>(auth_user_request->scheme_data);
++            ntlm_request = dynamic_cast< ntlm_request_t *>(auth_user_request->state());
++            assert (ntlm_request);
+ 
+             switch (ntlm_request->auth_state) {
+ 
+@@ -410,36 +408,22 @@ authenticateNTLMFixErrorHeader(auth_user_request_t * auth_user_request, HttpRepl
+     }
+ }
+ 
+-static void
+-authNTLMRequestFree(ntlm_request_t * ntlm_request)
++ntlm_request_t::~ntlm_request_t()
+ {
+-    if (!ntlm_request)
+-        return;
++    if (ntlmnegotiate)
++        xfree(ntlmnegotiate);
+ 
+-    if (ntlm_request->ntlmnegotiate)
+-        xfree(ntlm_request->ntlmnegotiate);
++    if (authchallenge)
++        xfree(authchallenge);
+ 
+-    if (ntlm_request->authchallenge)
+-        xfree(ntlm_request->authchallenge);
++    if (ntlmauthenticate)
++        xfree(ntlmauthenticate);
+ 
+-    if (ntlm_request->ntlmauthenticate)
+-        xfree(ntlm_request->ntlmauthenticate);
+-
+-    if (ntlm_request->authserver != NULL && ntlm_request->authserver_deferred) {
+-        debug(29, 9) ("authenticateNTLMRequestFree: releasing server '%p'\n", ntlm_request->authserver);
+-        helperStatefulReleaseServer(ntlm_request->authserver);
+-        ntlm_request->authserver = NULL;
++    if (authserver != NULL && authserver_deferred) {
++        debug(29, 9) ("authenticateNTLMRequestFree: releasing server '%p'\n", authserver);
++        helperStatefulReleaseServer(authserver);
++        authserver = NULL;
+     }
+-
+-    memPoolFree(ntlm_request_pool, ntlm_request);
+-}
+-
+-static void
+-authNTLMAURequestFree(auth_user_request_t * auth_user_request)
+-{
+-    if (auth_user_request->scheme_data)
+-        authNTLMRequestFree(static_cast< ntlm_request_t *>(auth_user_request->scheme_data));
+-    auth_user_request->scheme_data = NULL;
+ }
+ 
+ static void
+@@ -554,7 +538,7 @@ authenticateNTLMHandleReply(void *data, void *lastserver, char *reply)
+ 
+         auth_user_request = r->auth_user_request;
+ 
+-        ntlm_request = static_cast< ntlm_request_t *>(auth_user_request->scheme_data);
++        ntlm_request = dynamic_cast< ntlm_request_t *>(auth_user_request->state());
+ 
+         assert(ntlm_request != NULL);
+ 
+@@ -576,8 +560,8 @@ authenticateNTLMHandleReply(void *data, void *lastserver, char *reply)
+         assert(r->auth_user_request != NULL);
+         assert(r->auth_user_request->auth_user->auth_type == AUTH_NTLM);
+         auth_user_request = r->auth_user_request;
+-        assert(auth_user_request->scheme_data != NULL);
+-        ntlm_request = static_cast< ntlm_request_t *>(auth_user_request->scheme_data);
++        ntlm_request = dynamic_cast< ntlm_request_t *>(auth_user_request->state());
++        assert(ntlm_request);
+         auth_user = auth_user_request->auth_user;
+         ntlm_user = static_cast<ntlm_user_t *>(auth_user_request->auth_user->scheme_data);
+         assert(ntlm_user != NULL);
+@@ -602,8 +586,8 @@ authenticateNTLMHandleReply(void *data, void *lastserver, char *reply)
+         assert(r->auth_user_request != NULL);
+         assert(r->auth_user_request->auth_user->auth_type == AUTH_NTLM);
+         auth_user_request = r->auth_user_request;
+-        assert(auth_user_request->scheme_data != NULL);
+-        ntlm_request = static_cast< ntlm_request_t *>(auth_user_request->scheme_data);
++        ntlm_request = dynamic_cast< ntlm_request_t *>(auth_user_request->state());
++        assert(ntlm_request);
+         auth_user = auth_user_request->auth_user;
+         ntlm_user = static_cast<ntlm_user_t *>(auth_user_request->auth_user->scheme_data);
+         assert(ntlm_user != NULL);
+@@ -626,7 +610,7 @@ authenticateNTLMHandleReply(void *data, void *lastserver, char *reply)
+         auth_user = auth_user_request->auth_user;
+         assert(auth_user != NULL);
+         ntlm_user = static_cast<ntlm_user_t *>(auth_user->scheme_data);
+-        ntlm_request = static_cast< ntlm_request_t *>(auth_user_request->scheme_data);
++        ntlm_request = dynamic_cast< ntlm_request_t *>(auth_user_request->state());
+         assert((ntlm_user != NULL) && (ntlm_request != NULL));
+         /* todo: action of Negotiate state on error */
+         result = S_HELPER_RELEASE;	/*some error has occured. no more requests */
+@@ -651,10 +635,11 @@ authenticateNTLMHandleReply(void *data, void *lastserver, char *reply)
+         auth_user = auth_user_request->auth_user;
+         assert(auth_user != NULL);
+         ntlm_user = static_cast<ntlm_user_t *>(auth_user->scheme_data);
+-        ntlm_request = static_cast< ntlm_request_t *>(auth_user_request->scheme_data);
++        ntlm_request = dynamic_cast< ntlm_request_t *>(auth_user_request->state());
+         assert((ntlm_user != NULL) && (ntlm_request != NULL));
+-        result = S_HELPER_RELEASE;	/*some error has occured. no more requests for
+-        				                					 * this helper */
++        /*some error has occured. no more requests for
++                                               				                					 * this helper */
++        result = S_HELPER_RELEASE;
+         assert(ntlm_request->authserver ? ntlm_request->authserver == lastserver : 1);
+         helperstate = static_cast<ntlm_helper_state_t *>(helperStatefulServerGetData(ntlm_request->authserver));
+         ntlm_request->authserver = NULL;
+@@ -695,7 +680,7 @@ authenticateNTLMHandleReply(void *data, void *lastserver, char *reply)
+         auth_user = auth_user_request->auth_user;
+         assert(auth_user != NULL);
+         ntlm_user = static_cast<ntlm_user_t *>(auth_user->scheme_data);
+-        ntlm_request = static_cast< ntlm_request_t *>(auth_user_request->scheme_data);
++        ntlm_request = dynamic_cast< ntlm_request_t *>(auth_user_request->state());
+         assert((ntlm_user != NULL) && (ntlm_request != NULL));
+         debug(29, 1) ("authenticateNTLMHandleReply: *** Unsupported helper response ***, '%s'\n", reply);
+         /* **** NOTE THIS CODE IS EFFECTIVELY UNTESTED **** */
+@@ -776,7 +761,7 @@ authenticateNTLMStart(auth_user_request_t * auth_user_request, RH * handler, voi
+     assert(auth_user_request);
+     auth_user = auth_user_request->auth_user;
+     ntlm_user = static_cast<ntlm_user_t *>(auth_user->scheme_data);
+-    ntlm_request = static_cast< ntlm_request_t *>(auth_user_request->scheme_data);
++    ntlm_request = dynamic_cast< ntlm_request_t *>(auth_user_request->state());
+     assert(ntlm_user);
+     assert(ntlm_request);
+     assert(handler);
+@@ -941,8 +926,8 @@ authenticateNTLMReleaseServer(auth_user_request_t * auth_user_request)
+ {
+     ntlm_request_t *ntlm_request;
+     assert(auth_user_request->auth_user->auth_type == AUTH_NTLM);
+-    assert(auth_user_request->scheme_data != NULL);
+-    ntlm_request = static_cast< ntlm_request_t *>(auth_user_request->scheme_data);
++    ntlm_request = dynamic_cast< ntlm_request_t *>(auth_user_request->state());
++    assert (ntlm_request);
+     debug(29, 9) ("authenticateNTLMReleaseServer: releasing server '%p'\n", ntlm_request->authserver);
+     helperStatefulReleaseServer(ntlm_request->authserver);
+     ntlm_request->authserver = NULL;
+@@ -956,8 +941,8 @@ authenticateNTLMOnCloseConnection(ConnStateData * conn)
+     assert(conn != NULL);
+ 
+     if (conn->auth_user_request != NULL) {
+-        assert(conn->auth_user_request->scheme_data != NULL);
+-        ntlm_request = static_cast< ntlm_request_t *>(conn->auth_user_request->scheme_data);
++        ntlm_request = dynamic_cast< ntlm_request_t *>(conn->auth_user_request->state());
++        assert (ntlm_request);
+         assert(ntlm_request->conn == conn);
+ 
+         if (ntlm_request->authserver != NULL && ntlm_request->authserver_deferred)
+@@ -999,8 +984,8 @@ NTLMLastHeader(auth_user_request_t * auth_user_request)
+ {
+     ntlm_request_t *ntlm_request;
+     assert(auth_user_request != NULL);
+-    assert(auth_user_request->scheme_data != NULL);
+-    ntlm_request = static_cast< ntlm_request_t *>(auth_user_request->scheme_data);
++    ntlm_request = dynamic_cast< ntlm_request_t *>(auth_user_request->state());
++    assert (ntlm_request);
+     return ntlm_request->ntlmauthenticate;
+ }
+ 
+@@ -1017,8 +1002,7 @@ authenticateDecodeNTLMAuth(auth_user_request_t * auth_user_request, const char *
+     auth_user_request->auth_user = authenticateAuthUserNew("ntlm");
+     auth_user_request->auth_user->auth_type = AUTH_NTLM;
+     auth_user_request->auth_user->scheme_data = memPoolAlloc(ntlm_user_pool);
+-    auth_user_request->scheme_data = memPoolAlloc(ntlm_request_pool);
+-    memset(auth_user_request->scheme_data, '\0', sizeof(ntlm_request_t));
++    auth_user_request->state (new ntlm_request_t);
+     /* lock for the auth_user_request link */
+     authenticateAuthUserLock(auth_user_request->auth_user);
+     node = dlinkNodeNew();
+@@ -1066,20 +1050,23 @@ authenticateProxyAuthCacheAddLink(const char *key, auth_user_t * auth_user)
+     hash_join(proxy_auth_cache, (hash_link *) proxy_auth_hash);
+ }
+ 
+-
+-static int
+-authNTLMAuthenticated(auth_user_request_t * auth_user_request)
++int
++ntlm_request_t::authenticated() const
+ {
+-    ntlm_request_t *ntlm_request = static_cast< ntlm_request_t *>(auth_user_request->scheme_data);
+-
+-    if (ntlm_request->auth_state == AUTHENTICATE_STATE_DONE)
++    if (auth_state == AUTHENTICATE_STATE_DONE)
+         return 1;
+ 
+     debug(29, 9) ("User not fully authenticated.\n");
+ 
+     return 0;
+ }
+ 
++void
++ntlm_request_t::authenticate(request_t * request, ConnStateData * conn, http_hdr_type type)
++{
++    fatal ("unusable");
++}
++
+ static void
+ authenticateNTLMAuthenticateUser(auth_user_request_t * auth_user_request, request_t * request, ConnStateData * conn, http_hdr_type type)
+ {
+@@ -1098,9 +1085,9 @@ authenticateNTLMAuthenticateUser(auth_user_request_t * auth_user_request, reques
+     assert(auth_user);
+     assert(auth_user->auth_type == AUTH_NTLM);
+     assert(auth_user->scheme_data != NULL);
+-    assert(auth_user_request->scheme_data != NULL);
+     ntlm_user = static_cast<ntlm_user_t *>(auth_user->scheme_data);
+-    ntlm_request = static_cast< ntlm_request_t *>(auth_user_request->scheme_data);
++    ntlm_request = dynamic_cast< ntlm_request_t *>(auth_user_request->state());
++    assert (ntlm_request);
+     /* Check that we are in the client side, where we can generate
+      * auth challenges */
+ 
+@@ -1245,3 +1232,28 @@ authenticateNTLMAuthenticateUser(auth_user_request_t * auth_user_request, reques
+ 
+     return;
+ }
++
++MemPool *ntlm_request_t::Pool(NULL);
++void *
++ntlm_request_t::operator new (size_t byteCount)
++{
++    /* derived classes with different sizes must implement their own new */
++    assert (byteCount == sizeof (ntlm_request_t));
++
++    if (!Pool)
++        Pool = memPoolCreate("ntlm_request_t", sizeof (ntlm_request_t));
++
++    return memPoolAlloc(Pool);
++}
++
++void
++ntlm_request_t::operator delete (void *address)
++{
++    memPoolFree (Pool, address);
++}
++
++void
++ntlm_request_t::deleteSelf() const
++{
++    delete this;
++}
+@@ -5,6 +5,7 @@
+ 
+ #ifndef __AUTH_NTLM_H__
+ #define __AUTH_NTLM_H__
++#include "authenticate.h"
+ 
+ #define DefaultAuthenticateChildrenMax  32	/* 32 processes */
+ 
+@@ -35,8 +36,18 @@ struct _ntlm_user
+     dlink_list proxy_auth_list;
+ };
+ 
+-struct _ntlm_request
++class ntlm_request_t : public AuthUserRequestState
+ {
++
++public:
++    void *operator new(size_t);
++    void operator delete (void *);
++    void deleteSelf() const;
++
++    ~ntlm_request_t();
++    virtual int authenticated() const;
++    virtual void authenticate(request_t * request, ConnStateData * conn, http_hdr_type type);
++    virtual int direction();
+     /* what negotiate string did the client use? */
+     char *ntlmnegotiate;
+     /* what challenge did we give the client? */
+@@ -51,6 +62,9 @@ struct _ntlm_request
+     int authserver_deferred;
+     /* what connection is this associated with */
+     ConnStateData *conn;
++
++private:
++    static MemPool *Pool;
+ };
+ 
+ struct _ntlm_helper_state_t
+@@ -80,7 +94,6 @@ struct ProxyAuthCachePointer : public hash_link
+ 
+ typedef struct _ntlm_user ntlm_user_t;
+ 
+-typedef struct _ntlm_request ntlm_request_t;
+ 
+ typedef struct _ntlm_helper_state_t ntlm_helper_state_t;
+ 
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: authenticate.cc,v 1.54 2003/02/21 22:50:06 robertc Exp $
++ * $Id: authenticate.cc,v 1.55 2003/02/26 06:11:38 robertc Exp $
+  *
+  * DEBUG: section 29    Authenticator
+  * AUTHOR:  Robert Collins
+@@ -273,8 +273,8 @@ AuthUserRequest::operator delete (void *address)
+     memPoolFree(pool, address);
+ }
+ 
+-AuthUserRequest::AuthUserRequest():auth_user(NULL), scheme_data (NULL), message(NULL),
+-        references (0), lastReply (AUTH_ACL_CANNOT_AUTHENTICATE)
++AuthUserRequest::AuthUserRequest():auth_user(NULL), message(NULL),
++        references (0), lastReply (AUTH_ACL_CANNOT_AUTHENTICATE), state_ (NULL)
+ {}
+ 
+ AuthUserRequest::~AuthUserRequest()
+@@ -284,12 +284,16 @@ AuthUserRequest::~AuthUserRequest()
+     assert(references == 0);
+ 
+     if (auth_user) {
+-        if (scheme_data != NULL) {
++        if (state() != NULL) {
+             /* we MUST know the module */
+             assert(auth_user->auth_module > 0);
+-            /* and the module MUST support requestFree if it has created scheme data */
+-            assert(authscheme_list[auth_user->auth_module - 1].requestFree != NULL);
+-            authscheme_list[auth_user->auth_module - 1].requestFree(this);
++
++            if (authscheme_list[auth_user->auth_module - 1].requestFree != NULL)
++                authscheme_list[auth_user->auth_module - 1].requestFree(this);
++            else {
++                state()->deleteSelf();
++                state(NULL);
++            }
+         }
+ 
+         /* unlink from the auth_user struct */
+@@ -309,7 +313,7 @@ AuthUserRequest::~AuthUserRequest()
+ 
+         auth_user = NULL;
+     } else
+-        assert(scheme_data == NULL);
++        assert(state() == NULL);
+ 
+     safe_free (message);
+ }
+@@ -510,9 +514,17 @@ authenticateUserAuthenticated(auth_user_request_t * auth_user_request)
+     if (!authenticateValidateUser(auth_user_request))
+         return 0;
+ 
+-    if (auth_user_request->auth_user->auth_module > 0)
+-        return authscheme_list[auth_user_request->auth_user->auth_module - 1].authenticated(auth_user_request);
+-    else
++    if (auth_user_request->auth_user->auth_module > 0) {
++        /* legacy interface */
++
++        if (authscheme_list[auth_user_request->auth_user->auth_module - 1].authenticated)
++            return authscheme_list[auth_user_request->auth_user->auth_module - 1].authenticated(auth_user_request);
++        else {
++            /* state interface */
++            assert (auth_user_request->state());
++            return auth_user_request->state()->authenticated();
++        }
++    } else
+         return 0;
+ }
+ 
+@@ -527,8 +539,14 @@ authenticateAuthenticateUser(auth_user_request_t * auth_user_request, request_t
+ {
+     assert(auth_user_request != NULL);
+ 
+-    if (auth_user_request->auth_user->auth_module > 0)
+-        authscheme_list[auth_user_request->auth_user->auth_module - 1].authAuthenticate(auth_user_request, request, conn, type);
++    if (auth_user_request->auth_user->auth_module > 0) {
++        if (authscheme_list[auth_user_request->auth_user->auth_module - 1].authAuthenticate)
++            authscheme_list[auth_user_request->auth_user->auth_module - 1].authAuthenticate(auth_user_request, request, conn, type);
++        else {
++            assert (auth_user_request->state());
++            auth_user_request->state()->authenticate(request, conn, type);
++        }
++    }
+ }
+ 
+ static auth_user_request_t *
+@@ -817,8 +835,14 @@ authenticateDirection(auth_user_request_t * auth_user_request)
+     if (authenticateUserAuthenticated(auth_user_request))
+         return 0;
+ 
+-    if (auth_user_request->auth_user->auth_module > 0)
+-        return authscheme_list[auth_user_request->auth_user->auth_module - 1].getdirection(auth_user_request);
++    if (auth_user_request->auth_user->auth_module > 0) {
++        if (authscheme_list[auth_user_request->auth_user->auth_module - 1].getdirection)
++            return authscheme_list[auth_user_request->auth_user->auth_module - 1].getdirection(auth_user_request);
++        else {
++            assert (auth_user_request->state());
++            return auth_user_request->state()->direction();
++        }
++    }
+ 
+     return -2;
+ }
+@@ -956,9 +980,8 @@ AuthUserRequest::addReplyAuthHeader(HttpReply * rep, auth_user_request_t * auth_
+      * response - ie digest auth
+      */
+ 
+-    if ((auth_user_request != NULL) && (auth_user_request->auth_user->auth_module > 0)
+-            && (authscheme_list[auth_user_request->auth_user->auth_module - 1].AddHeader))
+-        authscheme_list[auth_user_request->auth_user->auth_module - 1].AddHeader(auth_user_request, rep, accelerated);
++    if (auth_user_request != NULL && auth_user_request->state())
++        auth_user_request->state()->addHeader (rep, accelerated);
+ 
+     if (auth_user_request != NULL)
+         auth_user_request->lastReply = AUTH_ACL_CANNOT_AUTHENTICATE;
+@@ -1336,3 +1359,14 @@ authUserHashPointerUser (auth_user_hash_pointer *aHashEntry)
+     return aHashEntry->user();
+ }
+ 
++void *
++AuthUserRequestState::operator new (size_t)
++{
++    fatal ("unusable\n");
++}
++
++void
++AuthUserRequestState::operator delete (void *)
++{
++    fatal ("unusable\n");
++}
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: authenticate.h,v 1.7 2003/02/21 22:50:06 robertc Exp $
++ * $Id: authenticate.h,v 1.8 2003/02/26 06:11:40 robertc Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -104,6 +104,24 @@ struct AuthUser
+     static MemPool *pool;
+ };
+ 
++/* Per scheme request data ABC */
++
++class AuthUserRequestState
++{
++
++public:
++    void *operator new (size_t);
++    void operator delete (void *);
++    virtual void deleteSelf() const = 0;
++    virtual ~AuthUserRequestState(){}
++
++    virtual int authenticated() const = 0;
++    virtual void authenticate(request_t * request, ConnStateData * conn, http_hdr_type type) = 0;
++    virtual int direction() = 0;
++    virtual void addHeader(HttpReply * rep, int accel) {}}
++
++;
++
+ class AuthUserRequest
+ {
+ 
+@@ -112,8 +130,9 @@ class AuthUserRequest
+     /* it has request specific data, and links to user specific data */
+     /* the user */
+     auth_user_t *auth_user;
+-    /* any scheme specific request related data */
+-    void *scheme_data;
++    AuthUserRequestState *state() const { return state_;}
++
++    void state( AuthUserRequestState *aState) {assert ((!state() && aState) || (state() && !aState)); state_ = aState;}
+ 
+ public:
+ 
+@@ -158,6 +177,8 @@ class AuthUserRequest
+      * when using connection based authentication
+      */
+     auth_acl_t lastReply;
++
++    AuthUserRequestState *state_;
+ };
+ 
+ /* authenticate.c authenticate scheme routines typedefs */
+@@ -169,7 +190,6 @@ typedef void AUTHSDECODE(auth_user_request_t *, const char *);
+ typedef int AUTHSDIRECTION(auth_user_request_t *);
+ typedef void AUTHSDUMP(StoreEntry *, const char *, authScheme *);
+ typedef void AUTHSFIXERR(auth_user_request_t *, HttpReply *, http_hdr_type, request_t *);
+-typedef void AUTHSADDHEADER(auth_user_request_t *, HttpReply *, int);
+ typedef void AUTHSADDTRAILER(auth_user_request_t *, HttpReply *, int);
+ typedef void AUTHSFREE(auth_user_t *);
+ typedef void AUTHSFREECONFIG(authScheme *);
+@@ -243,7 +263,6 @@ struct _authscheme_entry
+ {
+     const char *typestr;
+     AUTHSACTIVE *Active;
+-    AUTHSADDHEADER *AddHeader;
+     AUTHSADDTRAILER *AddTrailer;
+     AUTHSAUTHED *authenticated;
+     AUTHSAUTHUSER *authAuthenticate;
+@@ -281,5 +300,4 @@ struct _authScheme
+     void *scheme_data;
+ };
+ 
+-
+ #endif /* SQUID_AUTHENTICATE_H */

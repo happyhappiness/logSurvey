@@ -1,1175 +1,904 @@
-@@ -14,6 +14,8 @@ class ClientHttpRequest;
- class DnsLookupDetails;
- class ErrorState;
+@@ -8,6 +8,7 @@ namespace Adaptation
  
-+class HelperReply;
-+
- class ClientRequestContext : public RefCountable
- {
+ typedef enum { methodNone, methodReqmod, methodRespmod, methodOptions } Method;
+ typedef enum { pointNone, pointPreCache, pointPostCache } VectPoint;
++typedef enum { srvBlock, srvBypass, srvWait, srvForce} SrvBehaviour;
  
-@@ -32,7 +34,7 @@ class ClientRequestContext : public RefCountable
-     void clientAccessCheck2();
-     void clientAccessCheckDone(const allow_t &answer);
-     void clientRedirectStart();
--    void clientRedirectDone(char *result);
-+    void clientRedirectDone(const HelperReply &reply);
-     void checkNoCache();
-     void checkNoCacheDone(const allow_t &answer);
- #if USE_ADAPTATION
-@@ -0,0 +1,96 @@
-+#include "squid.h"
-+#include "HelperReply.h"
-+#include "helper.h"
+ extern const char *crlf;
+ extern const char *methodStr(Method); // TODO: make into a stream operator?
+@@ -9,7 +9,8 @@
+ 
+ Adaptation::ServiceConfig::ServiceConfig():
+         port(-1), method(methodNone), point(pointNone),
+-        bypass(false), routing(false), ipv6(false)
++        bypass(false), maxConn(-1), onOverload(srvWait),
++        routing(false), ipv6(false)
+ {}
+ 
+ const char *
+@@ -70,6 +71,7 @@ Adaptation::ServiceConfig::parse()
+     // handle optional service name=value parameters
+     const char *lastOption = NULL;
+     bool grokkedUri = false;
++    bool onOverloadSet = false;
+     while (char *option = strtok(NULL, w_space)) {
+         if (strcmp(option, "0") == 0) { // backward compatibility
+             bypass = false;
+@@ -91,23 +93,32 @@ Adaptation::ServiceConfig::parse()
+ 
+         // TODO: warn if option is set twice?
+         bool grokked = false;
+-        if (strcmp(name, "bypass") == 0)
++        if (strcmp(name, "bypass") == 0) {
+             grokked = grokBool(bypass, name, value);
+-        else if (strcmp(name, "routing") == 0)
++        } else if (strcmp(name, "routing") == 0)
+             grokked = grokBool(routing, name, value);
+         else if (strcmp(name, "uri") == 0)
+             grokked = grokkedUri = grokUri(value);
+         else if (strcmp(name, "ipv6") == 0) {
+             grokked = grokBool(ipv6, name, value);
+             if (grokked && ipv6 && !Ip::EnableIpv6)
+                 debugs(3, DBG_IMPORTANT, "WARNING: IPv6 is disabled. ICAP service option ignored.");
++        } else if (strcmp(name, "max-conn") == 0)
++            grokked = grokLong(maxConn, name, value);
++        else if (strcmp(name, "on-overload") == 0) {
++            grokked = grokOnOverload(onOverload, value);
++            onOverloadSet = true;
+         } else
+             grokked = grokExtension(name, value);
+ 
+         if (!grokked)
+             return false;
+     }
+ 
++    // set default on-overload value if needed
++    if (!onOverloadSet)
++        onOverload = bypass ? srvBypass : srvWait;
 +
-+#if 0
-+HelperReply::HelperReply(const HelperReply &r) :
-+        result(r.result)
-+        other_(r.other()),
+     // what is left must be the service URI
+     if (!grokkedUri && !grokUri(lastOption))
+         return false;
+@@ -246,6 +257,41 @@ Adaptation::ServiceConfig::grokBool(bool &var, const char *name, const char *val
+     return true;
+ }
+ 
++bool
++Adaptation::ServiceConfig::grokLong(long &var, const char *name, const char *value)
 +{
++    char *bad = NULL;
++    const long p = strtol(value, &bad, 0);
++    if (p < 0 || bad == value) {
++        debugs(3, DBG_CRITICAL, "ERROR: " << cfg_filename << ':' <<
++               config_lineno << ": " << "wrong value for " << name << "; " <<
++               "a non-negative integer expected but got: " << value);
++        return false;
++    }
++    var = p;
++    return true;
 +}
-+#endif
 +
-+HelperReply::HelperReply(const char *buf, size_t len) :
-+        result(HelperReply::Unknown),
-+        whichServer(NULL)
++bool
++Adaptation::ServiceConfig::grokOnOverload(SrvBehaviour &var, const char *value)
 +{
-+    // check we have something to parse
-+    if (!buf || len < 1)
++    if (strcmp(value, "block") == 0)
++        var = srvBlock;
++    else if (strcmp(value, "bypass") == 0)
++        var = srvBypass;
++    else if (strcmp(value, "wait") == 0)
++        var = srvWait;
++    else if (strcmp(value, "force") == 0)
++        var = srvForce;
++    else {
++        debugs(3, DBG_CRITICAL, "ERROR: " << cfg_filename << ':' <<
++               config_lineno << ": " << "wrong value for on-overload; " <<
++               "'block', 'bypass', 'wait' or 'force' expected but got: " << value);
++        return false;
++    }
++    return true;
++}
++
+ bool
+ Adaptation::ServiceConfig::grokExtension(const char *name, const char *value)
+ {
+@@ -32,6 +32,10 @@ class ServiceConfig: public RefCountable
+     Method method;   // what is being adapted (REQMOD vs RESPMOD)
+     VectPoint point; // where the adaptation happens (pre- or post-cache)
+     bool bypass;
++
++    // options
++    long maxConn; ///< maximum number of concurrent service transactions
++    SrvBehaviour onOverload; ///< how to handle Max-Connections feature
+     bool routing; ///< whether this service may determine the next service(s)
+     bool ipv6;    ///< whether this service uses IPv6 transport (default IPv4)
+ 
+@@ -42,6 +46,9 @@ class ServiceConfig: public RefCountable
+     /// interpret parsed values
+     bool grokBool(bool &var, const char *name, const char *value);
+     bool grokUri(const char *value);
++    bool grokLong(long &var, const char *name, const char *value);
++    /// handle on-overload configuration option
++    bool grokOnOverload(SrvBehaviour &var, const char *value);
+     /// handle name=value configuration option with name unknown to Squid
+     virtual bool grokExtension(const char *name, const char *value);
+ };
+@@ -86,36 +86,81 @@ void Adaptation::Icap::ModXact::start()
+     canStartBypass = service().cfg().bypass;
+ 
+     // it is an ICAP violation to send request to a service w/o known OPTIONS
+-
+-    if (service().up())
++    // and the service may is too busy for us: honor Max-Connections and such
++    if (service().up() && service().availableForNew())
+         startWriting();
+     else
+         waitForService();
+ }
+ 
+ void Adaptation::Icap::ModXact::waitForService()
+ {
++    const char *comment;
+     Must(!state.serviceWaiting);
+-    debugs(93, 7, HERE << "will wait for the ICAP service" << status());
+-    typedef NullaryMemFunT<ModXact> Dialer;
+-    AsyncCall::Pointer call = JobCallback(93,5,
+-                                          Dialer, this, Adaptation::Icap::ModXact::noteServiceReady);
+-    service().callWhenReady(call);
++
++    if (!service().up()) {
++        AsyncCall::Pointer call = JobCallback(93,5,
++                                              ConnWaiterDialer, this, Adaptation::Icap::ModXact::noteServiceReady);
++
++        service().callWhenReady(call);
++        comment = "to be up";
++    } else {
++        //The service is unavailable because of max-connection or other reason
++
++        if (service().cfg().onOverload != srvWait) {
++            // The service is overloaded, but waiting to be available prohibited by
++            // user configuration (onOverload is set to "block" or "bypass")
++            if (service().cfg().onOverload == srvBlock)
++                disableBypass("not available", true);
++            else //if (service().cfg().onOverload == srvBypass)
++                canStartBypass = true;
++
++            disableRetries();
++            disableRepeats("ICAP service is not available");
++
++            debugs(93, 7, HERE << "will not wait for the service to be available" <<
++                   status());
++
++            throw TexcHere("ICAP service is not available");
++        }
++
++        AsyncCall::Pointer call = JobCallback(93,5,
++                                              ConnWaiterDialer, this, Adaptation::Icap::ModXact::noteServiceAvailable);
++        service().callWhenAvailable(call, state.waitedForService);
++        comment = "to be available";
++    }
++
++    debugs(93, 7, HERE << "will wait for the service " << comment <<  status());
+     state.serviceWaiting = true; // after callWhenReady() which may throw
++    state.waitedForService = true;
+ }
+ 
+ void Adaptation::Icap::ModXact::noteServiceReady()
+ {
+     Must(state.serviceWaiting);
+     state.serviceWaiting = false;
+ 
+-    if (service().up()) {
+-        startWriting();
+-    } else {
++    if (!service().up()) {
+         disableRetries();
+         disableRepeats("ICAP service is unusable");
+         throw TexcHere("ICAP service is unusable");
+     }
++
++    if (service().availableForOld())
++        startWriting();
++    else
++        waitForService();
++}
++
++void Adaptation::Icap::ModXact::noteServiceAvailable()
++{
++    Must(state.serviceWaiting);
++    state.serviceWaiting = false;
++
++    if (service().up() && service().availableForOld())
++        startWriting();
++    else
++        waitForService();
+ }
+ 
+ void Adaptation::Icap::ModXact::startWriting()
+@@ -157,6 +157,7 @@ class ModXact: public Xaction, public BodyProducer, public BodyConsumer
+ 
+     // service waiting
+     void noteServiceReady();
++    void noteServiceAvailable();
+ 
+ public:
+     InOut virgin;
+@@ -303,6 +304,7 @@ class ModXact: public Xaction, public BodyProducer, public BodyConsumer
+         bool allowedPostview206; // must handle 206 Partial Content outside preview
+         bool allowedPreview206; // must handle 206 Partial Content inside preview
+         bool readyForUob; ///< got a 206 response and expect a use-origin-body
++        bool waitedForService; ///< true if was queued at least once
+ 
+         // will not write anything [else] to the ICAP server connection
+         bool doneWriting() const { return writing == writingReallyDone; }
+@@ -98,6 +98,8 @@ void Adaptation::Icap::Options::configure(const HttpReply *reply)
+     }
+ 
+     cfgIntHeader(h, "Max-Connections", max_connections);
++    if (max_connections == 0)
++        debugs(93, DBG_IMPORTANT, "WARNING: Max-Connections is set to zero! ");
+ 
+     cfgIntHeader(h, "Options-TTL", theTTL);
+ 
+@@ -11,19 +11,27 @@
+ #include "adaptation/icap/ServiceRep.h"
+ #include "base/TextException.h"
+ #include "ConfigParser.h"
++#include "ip/tools.h"
+ #include "HttpReply.h"
+ #include "SquidTime.h"
++#include "fde.h"
+ 
+ CBDATA_NAMESPACED_CLASS_INIT(Adaptation::Icap, ServiceRep);
+ 
+ Adaptation::Icap::ServiceRep::ServiceRep(const ServiceConfigPointer &svcCfg):
+         AsyncJob("Adaptation::Icap::ServiceRep"), Adaptation::Service(svcCfg),
+         theOptions(NULL), theOptionsFetcher(0), theLastUpdate(0),
++        theBusyConns(0),
++        theAllWaiters(0),
++        connOverloadReported(false),
++        theIdleConns("ICAP Service"),
+         isSuspended(0), notifying(false),
+         updateScheduled(false),
+         wasAnnouncedUp(true), // do not announce an "up" service at startup
+         isDetached(false)
+-{}
++{
++    setMaxConnections();
++}
+ 
+ Adaptation::Icap::ServiceRep::~ServiceRep()
+ {
+@@ -72,6 +80,157 @@ void Adaptation::Icap::ServiceRep::noteFailure()
+     // should be configurable.
+ }
+ 
++// returns a persistent or brand new connection; negative int on failures
++int Adaptation::Icap::ServiceRep::getConnection(bool retriableXact, bool &reused)
++{
++    Ip::Address client_addr;
++
++    int connection = theIdleConns.pop(cfg().host.termedBuf(), cfg().port, NULL, client_addr,
++                                      retriableXact);
++
++    reused = connection >= 0; // reused a persistent connection
++
++    if (!reused) { // need a new connection
++        Ip::Address outgoing;  // default: IP6_ANY_ADDR
++        if (!Ip::EnableIpv6)
++            outgoing.SetIPv4();
++        else if (Ip::EnableIpv6&IPV6_SPECIAL_SPLITSTACK &&  !cfg().ipv6) {
++            /* split-stack for now requires default IPv4-only socket */
++            outgoing.SetIPv4();
++        }
++        connection = comm_open(SOCK_STREAM, 0, outgoing, COMM_NONBLOCKING, cfg().uri.termedBuf());
++    }
++
++    if (connection >= 0)
++        ++theBusyConns;
++
++    return connection;
++}
++
++// pools connection if it is reusable or closes it
++void Adaptation::Icap::ServiceRep::putConnection(int fd, bool isReusable, const char *comment)
++{
++    Must(fd >= 0);
++    // do not pool an idle connection if we owe connections
++    if (isReusable && excessConnections() == 0) {
++        debugs(93, 3, HERE << "pushing pconn" << comment);
++        commSetTimeout(fd, -1, NULL, NULL);
++        Ip::Address anyAddr;
++        theIdleConns.push(fd, cfg().host.termedBuf(), cfg().port, NULL, anyAddr);
++    } else {
++        debugs(93, 3, HERE << "closing pconn" << comment);
++        // comm_close will clear timeout
++        comm_close(fd);
++    }
++
++    Must(theBusyConns > 0);
++    --theBusyConns;
++    // a connection slot released. Check if there are waiters....
++    busyCheckpoint();
++}
++
++// a wrapper to avoid exposing theIdleConns
++void Adaptation::Icap::ServiceRep::noteConnectionUse(int fd)
++{
++    Must(fd >= 0);
++    fd_table[fd].noteUse(&theIdleConns);
++}
++
++void Adaptation::Icap::ServiceRep::setMaxConnections()
++{
++    if (cfg().maxConn >= 0)
++        theMaxConnections = cfg().maxConn;
++    else if (theOptions && theOptions->max_connections >= 0)
++        theMaxConnections = theOptions->max_connections;
++    else {
++        theMaxConnections = -1;
++        return;
++    }
++
++    if (::Config.workers > 1 )
++        theMaxConnections /= ::Config.workers;
++}
++
++int Adaptation::Icap::ServiceRep::availableConnections() const
++{
++    if (theMaxConnections < 0)
++        return -1;
++
++    // we are available if we can open or reuse connections
++    // in other words, if we will not create debt
++    int available = max(0, theMaxConnections - theBusyConns);
++
++    if (!available && !connOverloadReported) {
++        debugs(93, DBG_IMPORTANT, "WARNING: ICAP Max-Connections limit " <<
++               "exceeded for service " << cfg().uri << ". Open connections now: " <<
++               theBusyConns + theIdleConns.count() << ", including " <<
++               theIdleConns.count() << " idle persistent connections.");
++        connOverloadReported = true;
++    }
++
++    if (cfg().onOverload == srvForce)
++        return -1;
++
++    return available;
++}
++
++// The number of connections which excess the Max-Connections limit
++int Adaptation::Icap::ServiceRep::excessConnections() const
++{
++    if (theMaxConnections < 0)
++        return 0;
++
++    // Waiters affect the number of needed connections but a needed
++    // connection may still be excessive from Max-Connections p.o.v.
++    // so we should not account for waiting transaction needs here.
++    const int debt =  theBusyConns + theIdleConns.count() - theMaxConnections;
++    if (debt > 0)
++        return debt;
++    else
++        return 0;
++}
++
++void Adaptation::Icap::ServiceRep::noteGoneWaiter()
++{
++    theAllWaiters--;
++
++    // in case the notified transaction did not take the connection slot
++    busyCheckpoint();
++}
++
++// called when a connection slot may become available
++void Adaptation::Icap::ServiceRep::busyCheckpoint()
++{
++    if (theNotificationWaiters.empty()) // nobody is waiting for a slot
 +        return;
 +
-+    const char *p = buf;
++    int freed = 0;
++    int available = availableConnections();
 +
-+    if (len >= 2) {
-+        // NOTE: only increment 'p' if a result code is found.
-+        // some helper formats (digest auth, URL-rewriter) just send a data string
-+        // we must also check for the ' ' character after the response token here
-+        if (!strncmp(p,"OK ",3)) {
-+            result = HelperReply::Okay;
-+            p+=2;
-+        } else if (!strncmp(p,"ERR ",4)) {
-+            result = HelperReply::Error;
-+            p+=3;
-+        } else if (!strncmp(p,"BH ",3)) {
-+            result = HelperReply::BrokenHelper;
-+            p+=2;
-+        } else if (!strncmp(p,"TT ",3)) {
-+            // NTLM challenge token
-+            result = HelperReply::TT;
-+            p+=2;
-+        } else if (!strncmp(p,"AF ",3)) {
-+            // NTLM OK response
-+            result = HelperReply::AF;
-+            p+=2;
-+        } else if (!strncmp(p,"NA ",3)) {
-+            // NTLM fail-closed ERR response
-+            result = HelperReply::NA;
-+            p+=2;
-+        }
-+
-+        for(;xisspace(*p);p++); // skip whitespace
++    if (available < 0) {
++        // It is possible to have waiters when no limit on connections exist in
++        // case of reconfigure or because new Options received.
++        // In this case, notify all waiting transactions.
++        freed  = theNotificationWaiters.size();
++    } else {
++        // avoid notifying more waiters than there will be available slots
++        const int notifiedWaiters = theAllWaiters - theNotificationWaiters.size();
++        freed = available - notifiedWaiters;
 +    }
 +
-+    const mb_size_t blobSize = (buf+len-p);
-+    other_.init(blobSize, blobSize+1);
-+    other_.append(p, blobSize); // remainders of the line.
++    debugs(93,7, HERE << "Available connections: " << available <<
++           " freed slots: " << freed <<
++           " waiting in queue: " << theNotificationWaiters.size());
 +
-+    // NULL-terminate so the helper callback handlers do not buffer-overrun
-+    other_.terminate();
++    while (freed > 0 && !theNotificationWaiters.empty()) {
++        Client i = theNotificationWaiters.front();
++        theNotificationWaiters.pop_front();
++        ScheduleCallHere(i.callback);
++        i.callback = NULL;
++        --freed;
++    }
 +}
 +
-+std::ostream &
-+operator <<(std::ostream &os, const HelperReply &r)
+ void Adaptation::Icap::ServiceRep::suspend(const char *reason)
+ {
+     if (isSuspended) {
+@@ -99,6 +258,25 @@ bool Adaptation::Icap::ServiceRep::up() const
+     return !isSuspended && hasOptions();
+ }
+ 
++bool Adaptation::Icap::ServiceRep::availableForNew() const
 +{
-+    os << "{result=";
-+    switch(r.result)
-+    {
-+    case HelperReply::Okay:
-+        os << "OK";
-+        break;
-+    case HelperReply::Error:
-+        os << "ERR";
-+        break;	
-+    case HelperReply::BrokenHelper:
-+        os << "BH";
-+        break;
-+    case HelperReply::TT:
-+        os << "TT";
-+        break;
-+    case HelperReply::AF:
-+        os << "AF";
-+        break;
-+    case HelperReply::NA:
-+        os << "NA";
-+        break;
-+    case HelperReply::Unknown:
-+        os << "Unknown";
-+        break;
++    Must(up());
++    int available = availableConnections();
++    if (available < 0)
++        return true;
++    else
++        return (available - theAllWaiters > 0);
++}
++
++bool Adaptation::Icap::ServiceRep::availableForOld() const
++{
++    Must(up());
++
++    int available = availableConnections();
++    return (available != 0); // it is -1 (no limit) or has available slots
++}
++
++
+ bool Adaptation::Icap::ServiceRep::wantsUrl(const String &urlPath) const
+ {
+     Must(hasOptions());
+@@ -187,6 +365,24 @@ void Adaptation::Icap::ServiceRep::noteTimeToNotify()
+     notifying = false;
+ }
+ 
++void Adaptation::Icap::ServiceRep::callWhenAvailable(AsyncCall::Pointer &cb, bool priority)
++{
++    debugs(93,8, "ICAPServiceRep::callWhenAvailable");
++    Must(cb!=NULL);
++    Must(up());
++    Must(!theIdleConns.count()); // or we should not be waiting
++
++    Client i;
++    i.service = Pointer(this);
++    i.callback = cb;
++    if (priority)
++        theNotificationWaiters.push_front(i);
++    else
++        theNotificationWaiters.push_back(i);
++
++    busyCheckpoint();
++}
++
+ void Adaptation::Icap::ServiceRep::callWhenReady(AsyncCall::Pointer &cb)
+ {
+     Must(cb!=NULL);
+@@ -351,6 +547,17 @@ void Adaptation::Icap::ServiceRep::handleNewOptions(Adaptation::Icap::Options *n
+     debugs(93,3, HERE << "got new options and is now " << status());
+ 
+     scheduleUpdate(optionsFetchTime());
++
++    setMaxConnections();
++    const int excess = excessConnections();
++    // if we owe connections and have idle pconns, close the latter
++    if (excess && theIdleConns.count() > 0) {
++        const int n = min(excess, theIdleConns.count());
++        debugs(93,5, HERE << "closing " << n << " pconns to relief debt");
++        Ip::Address anyAddr;
++        theIdleConns.closeN(n, cfg().host.termedBuf(), cfg().port, NULL, anyAddr);
 +    }
 +
-+    if (r.other().hasContent())
-+        os << ", other: \"" << r.other().content() << '\"';
+     scheduleNotification();
+ }
+ 
+@@ -486,3 +693,22 @@ bool Adaptation::Icap::ServiceRep::detached() const
+ {
+     return isDetached;
+ }
 +
-+    os << '}';
-+
-+    return os;
-+}
-@@ -0,0 +1,67 @@
-+#ifndef _SQUID_SRC_HELPERREPLY_H
-+#define _SQUID_SRC_HELPERREPLY_H
-+
-+#include "base/CbcPointer.h"
-+#include "MemBuf.h"
-+
-+#if HAVE_OSTREAM
-+#include <ostream>
-+#endif
-+
-+class helper_stateful_server;
-+
-+/**
-+ * This object stores the reply message from a helper lookup
-+ * It provides parser routing to accept a raw buffer and process the
-+ * helper reply into fields for easy access by callers
-+ */
-+class HelperReply
++Adaptation::Icap::ConnWaiterDialer::ConnWaiterDialer(const CbcPointer<ModXact> &xact,
++        Adaptation::Icap::ConnWaiterDialer::Parent::Method aHandler):
++        Parent(xact, aHandler)
 +{
-+private:
-+    // implicit creation and copy are prohibited explicitly
-+    HelperReply();
-+    HelperReply(const HelperReply &r);
-+    HelperReply &operator =(const HelperReply &r);
++    theService = &xact->service();
++    theService->noteNewWaiter();
++}
 +
++Adaptation::Icap::ConnWaiterDialer::ConnWaiterDialer(const Adaptation::Icap::ConnWaiterDialer &aConnWaiter): Parent(aConnWaiter)
++{
++    theService = aConnWaiter.theService;
++    theService->noteNewWaiter();
++}
++
++Adaptation::Icap::ConnWaiterDialer::~ConnWaiterDialer()
++{
++    theService->noteGoneWaiter();
++}
+@@ -40,7 +40,10 @@
+ #include "adaptation/forward.h"
+ #include "adaptation/Initiator.h"
+ #include "adaptation/icap/Elements.h"
+-
++#include "base/AsyncJobCalls.h"
++#include "comm.h"
++#include "pconn.h"
++#include <deque>
+ 
+ namespace Adaptation
+ {
+@@ -94,19 +97,29 @@ class ServiceRep : public RefCountable, public Adaptation::Service,
+ 
+     virtual bool probed() const; // see comments above
+     virtual bool up() const; // see comments above
++    bool availableForNew() const; ///< a new transaction may start communicating with the service
++    bool availableForOld() const; ///< a transaction notified about connection slot availability may start communicating with the service
+ 
+     virtual Initiate *makeXactLauncher(HttpMsg *virginHeader, HttpRequest *virginCause);
+ 
++    void callWhenAvailable(AsyncCall::Pointer &cb, bool priority = false);
+     void callWhenReady(AsyncCall::Pointer &cb);
+ 
+     // the methods below can only be called on an up() service
+     bool wantsUrl(const String &urlPath) const;
+     bool wantsPreview(const String &urlPath, size_t &wantedSize) const;
+     bool allows204() const;
+     bool allows206() const;
++    int getConnection(bool isRetriable, bool &isReused);
++    void putConnection(int fd, bool isReusable, const char *comment);
++    void noteConnectionUse(int fd);
+ 
+     void noteFailure(); // called by transactions to report service failure
+ 
++    void noteNewWaiter() {theAllWaiters++;} ///< New xaction waiting for service to be up or available
++    void noteGoneWaiter(); ///< An xaction is not waiting any more for service to be available
++    bool existWaiters() const {return (theAllWaiters > 0);} ///< if there are xactions waiting for the service to be available
++
+     //AsyncJob virtual methods
+     virtual bool doneAll() const { return Adaptation::Initiator::doneAll() && false;}
+     virtual void callException(const std::exception &e);
+@@ -130,12 +143,25 @@ class ServiceRep : public RefCountable, public Adaptation::Service,
+     };
+ 
+     typedef Vector<Client> Clients;
++    // TODO: rename to theUpWaiters
+     Clients theClients; // all clients waiting for a call back
+ 
+     Options *theOptions;
+     CbcPointer<Adaptation::Initiate> theOptionsFetcher; // pending ICAP OPTIONS transaction
+     time_t theLastUpdate; // time the options were last updated
+ 
++    /// FIFO queue of xactions waiting for a connection slot and not yet notified
++    /// about it; xaction is removed when notification is scheduled
++    std::deque<Client> theNotificationWaiters;
++    int theBusyConns;   ///< number of connections given to active transactions
++    /// number of xactions waiting for a connection slot (notified and not)
++    /// the number is decreased after the xaction receives notification
++    int theAllWaiters;
++    int theMaxConnections; ///< the maximum allowed connections to the service
++    // TODO: use a better type like the FadingCounter for connOverloadReported
++    mutable bool connOverloadReported; ///< whether we reported exceeding theMaxConnections
++    PconnPool theIdleConns; ///< idle persistent connection pool
++
+     FadingCounter theSessionFailures;
+     const char *isSuspended; // also stores suspension reason for debugging
+ 
+@@ -162,13 +188,40 @@ class ServiceRep : public RefCountable, public Adaptation::Service,
+ 
+     void announceStatusChange(const char *downPhrase, bool important) const;
+ 
++    /// Set the maximum allowed connections for the service
++    void setMaxConnections();
++    /// The number of connections which excess the Max-Connections limit
++    int excessConnections() const;
++    /**
++     * The available connections slots to the ICAP server
++     \return the available slots, or -1 if there is no limit on allowed connections
++     */
++    int availableConnections() const;
++    /**
++     * If there are xactions waiting for the service to be available, notify
++     * as many xactions as the available connections slots.
++     */
++    void busyCheckpoint();
++
+     const char *status() const;
+ 
+     mutable bool wasAnnouncedUp; // prevent sequential same-state announcements
+     bool isDetached;
+     CBDATA_CLASS2(ServiceRep);
+ };
+ 
++class ModXact;
++/// Custom dialer to call Service::noteNewWaiter and noteGoneWaiter
++/// to maintain Service idea of waiting and being-notified transactions.
++class ConnWaiterDialer: public NullaryMemFunT<ModXact>
++{
 +public:
-+    // create/parse details from the msg buffer provided
-+    HelperReply(const char *buf, size_t len);
-+    ~HelperReply() {}
-+
-+    const MemBuf &other() const { return other_; }
-+
-+    /// backward compatibility:
-+    /// access to modifiable blob, required by redirectHandleReply()
-+    /// and by urlParse() in ClientRequestContext::clientRedirectDone()
-+    /// and by token blob/arg parsing in Negotiate auth handler
-+    MemBuf &modifiableOther() const { return *const_cast<MemBuf*>(&other_); }
-+
-+public:
-+    /// The helper response 'result' field.
-+    enum Result_ {
-+        Unknown,      // no result code received, or unknown result code
-+        Okay,         // "OK" indicating success/positive result
-+        Error,        // "ERR" indicating failure/negative result
-+        BrokenHelper, // "BH" indicating failure due to helper internal problems.
-+
-+        // some result codes for backward compatibility with NTLM/Negotiate
-+        // TODO: migrate these into variants of the above results with key-pair parameters
-+        TT,
-+        AF,
-+        NA
-+    } result;
-+
-+// TODO other key=pair values. when the callbacks actually use this object.
-+// for now they retain their own parsing routines handling other()
-+
-+    /// for stateful replies the responding helper 'server' needs to be preserved across callbacks
-+    CbcPointer<helper_stateful_server> whichServer;
-+
-+private:
-+    /// the remainder of the line
-+    MemBuf other_;
++    typedef NullaryMemFunT<ModXact> Parent;
++    ServiceRep::Pointer theService;
++    ConnWaiterDialer(const CbcPointer<ModXact> &xact, Parent::Method aHandler);
++    ConnWaiterDialer(const Adaptation::Icap::ConnWaiterDialer &aConnWaiter);
++    ~ConnWaiterDialer();
 +};
-+
-+std::ostream &operator <<(std::ostream &os, const HelperReply &r);
-+
-+#endif /* _SQUID_SRC_HELPERREPLY_H */
-@@ -354,6 +354,8 @@ squid_SOURCES = \
- 	helper.h \
- 	HelperChildConfig.h \
- 	HelperChildConfig.cc \
-+	HelperReply.cc \
-+	HelperReply.h \
- 	hier_code.h \
- 	HierarchyLogEntry.h \
- 	$(HTCPSOURCE) \
-@@ -1414,6 +1416,8 @@ tests_testCacheManager_SOURCES = \
- 	helper.cc \
- 	HelperChildConfig.h \
- 	HelperChildConfig.cc \
-+	HelperReply.cc \
-+	HelperReply.h \
- 	$(HTCPSOURCE) \
- 	http.cc \
- 	HttpBody.h \
-@@ -1799,6 +1803,8 @@ tests_testEvent_SOURCES = \
- 	helper.cc \
- 	HelperChildConfig.h \
- 	HelperChildConfig.cc \
-+	HelperReply.cc \
-+	HelperReply.h \
- 	hier_code.h \
- 	$(HTCPSOURCE) \
- 	http.cc \
-@@ -2031,6 +2037,8 @@ tests_testEventLoop_SOURCES = \
- 	helper.cc \
- 	HelperChildConfig.h \
- 	HelperChildConfig.cc \
-+	HelperReply.cc \
-+	HelperReply.h \
- 	hier_code.h \
- 	$(HTCPSOURCE) \
- 	http.cc \
-@@ -2260,6 +2268,8 @@ tests_test_http_range_SOURCES = \
- 	helper.cc \
- 	HelperChildConfig.h \
- 	HelperChildConfig.cc \
-+	HelperReply.cc \
-+	HelperReply.h \
- 	hier_code.h \
- 	$(HTCPSOURCE) \
- 	http.cc \
-@@ -2537,6 +2547,8 @@ tests_testHttpRequest_SOURCES = \
- 	helper.cc \
- 	HelperChildConfig.h \
- 	HelperChildConfig.cc \
-+	HelperReply.cc \
-+	HelperReply.h \
- 	hier_code.h \
- 	$(HTCPSOURCE) \
- 	http.cc \
-@@ -3580,6 +3592,8 @@ tests_testURL_SOURCES = \
- 	helper.cc \
- 	HelperChildConfig.h \
- 	HelperChildConfig.cc \
-+	HelperReply.cc \
-+	HelperReply.h \
- 	hier_code.h \
- 	$(HTCPSOURCE) \
- 	http.cc \
-@@ -1,6 +1,10 @@
- #ifndef SQUID_DNS_H
- #define SQUID_DNS_H
  
-+#if USE_DNSHELPER
-+#include "helper.h"
-+#endif
-+
- namespace Ip
- {
- class Address;
-@@ -5,6 +5,7 @@
- 
- #include "auth/UserRequest.h"
- #include "cbdata.h"
-+#include "helper.h"
- 
- namespace Auth
- {
-@@ -37,7 +37,7 @@
- #include "auth/User.h"
- #include "dlink.h"
- #include "ip/Address.h"
--#include "typedefs.h"
-+#include "helper.h"
- #include "HttpHeader.h"
- 
- class ConnStateData;
-@@ -5,6 +5,7 @@
- #include "auth/State.h"
- #include "charset.h"
- #include "Debug.h"
-+#include "HelperReply.h"
- #include "rfc1738.h"
+ } // namespace Icap
+ } // namespace Adaptation
+@@ -21,8 +21,6 @@
  #include "SquidTime.h"
+ #include "err_detail_type.h"
  
-@@ -135,23 +136,12 @@ Auth::Basic::UserRequest::module_start(AUTHCB * handler, void *data)
+-static PconnPool *icapPconnPool = new PconnPool("ICAP Servers");
+-
+ 
+ //CBDATA_NAMESPACED_CLASS_INIT(Adaptation::Icap, Xaction);
+ 
+@@ -90,19 +88,24 @@ void Adaptation::Icap::Xaction::start()
+ // TODO: obey service-specific, OPTIONS-reported connection limit
+ void Adaptation::Icap::Xaction::openConnection()
+ {
+-    Ip::Address client_addr;
+-
+     Must(connection < 0);
+ 
+-    const Adaptation::Service &s = service();
++    Adaptation::Icap::ServiceRep &s = service();
+ 
+     if (!TheConfig.reuse_connections)
+         disableRetries(); // this will also safely drain pconn pool
+ 
+-    // TODO: check whether NULL domain is appropriate here
+-    connection = icapPconnPool->pop(s.cfg().host.termedBuf(), s.cfg().port, NULL, client_addr, isRetriable);
+-    if (connection >= 0) {
+-        debugs(93,3, HERE << "reused pconn FD " << connection);
++    bool wasReused = false;
++    connection = s.getConnection(isRetriable, wasReused);
++    if (connection < 0)
++        dieOnConnectionFailure(); // throws
++
++    if (wasReused) {
++        // Set comm Close handler
++        typedef CommCbMemFunT<Adaptation::Icap::Xaction, CommCloseCbParams> CloseDialer;
++        closer =  asyncCall(93, 5, "Adaptation::Icap::Xaction::noteCommClosed",
++                            CloseDialer(this,&Adaptation::Icap::Xaction::noteCommClosed));
++        comm_add_close_handler(connection, closer);
+ 
+         // fake the connect callback
+         // TODO: can we sync call Adaptation::Icap::Xaction::noteCommConnected here instead?
+@@ -119,39 +122,25 @@ void Adaptation::Icap::Xaction::openConnection()
+ 
+     disableRetries(); // we only retry pconn failures
+ 
+-    Ip::Address outgoing;
+-    if (!Ip::EnableIpv6 && !outgoing.SetIPv4()) {
+-        debugs(31, DBG_CRITICAL, "ERROR: IPv6 is disabled. " << outgoing << " is not an IPv4 address.");
+-        dieOnConnectionFailure(); // throws
+-    }
+-    /* split-stack for now requires default IPv4-only socket */
+-    if (Ip::EnableIpv6&IPV6_SPECIAL_SPLITSTACK && outgoing.IsAnyAddr() && !s.cfg().ipv6) {
+-        outgoing.SetIPv4();
+-    }
+-
+-    connection = comm_open(SOCK_STREAM, 0, outgoing,
+-                           COMM_NONBLOCKING, s.cfg().uri.termedBuf());
+ 
+-    if (connection < 0)
+-        dieOnConnectionFailure(); // throws
+-
+-    debugs(93,3, typeName << " opens connection to " << s.cfg().host << ":" << s.cfg().port);
++    debugs(93,3, typeName << " opens connection to " << s.cfg().host.termedBuf() << ":" << s.cfg().port);
+ 
+     // TODO: service bypass status may differ from that of a transaction
+     typedef CommCbMemFunT<Adaptation::Icap::Xaction, CommTimeoutCbParams> TimeoutDialer;
+-    AsyncCall::Pointer timeoutCall = JobCallback(93, 5,
+-                                     TimeoutDialer, this, Adaptation::Icap::Xaction::noteCommTimedout);
++    AsyncCall::Pointer timeoutCall =  asyncCall(93, 5, "Adaptation::Icap::Xaction::noteCommTimedout",
++                                      TimeoutDialer(this,&Adaptation::Icap::Xaction::noteCommTimedout));
++
+     commSetTimeout(connection, TheConfig.connect_timeout(
+                        service().cfg().bypass), timeoutCall);
+ 
+     typedef CommCbMemFunT<Adaptation::Icap::Xaction, CommCloseCbParams> CloseDialer;
+-    closer = JobCallback(93, 5,
+-                         CloseDialer, this, Adaptation::Icap::Xaction::noteCommClosed);
++    closer =  asyncCall(93, 5, "Adaptation::Icap::Xaction::noteCommClosed",
++                        CloseDialer(this,&Adaptation::Icap::Xaction::noteCommClosed));
+     comm_add_close_handler(connection, closer);
+ 
+     typedef CommCbMemFunT<Adaptation::Icap::Xaction, CommConnectCbParams> ConnectDialer;
+-    connector = JobCallback(93,3,
+-                            ConnectDialer, this, Adaptation::Icap::Xaction::noteCommConnected);
++    connector = asyncCall(93,3, "Adaptation::Icap::Xaction::noteCommConnected",
++                          ConnectDialer(this, &Adaptation::Icap::Xaction::noteCommConnected));
+     commConnectStart(connection, s.cfg().host.termedBuf(), s.cfg().port, connector);
  }
  
- void
--Auth::Basic::UserRequest::HandleReply(void *data, char *reply)
-+Auth::Basic::UserRequest::HandleReply(void *data, const HelperReply &reply)
- {
-     Auth::StateData *r = static_cast<Auth::StateData *>(data);
-     BasicAuthQueueNode *tmpnode;
--    char *t = NULL;
-     void *cbdata;
--    debugs(29, 5, HERE << "{" << (reply ? reply : "<NULL>") << "}");
--
--    if (reply) {
--        if ((t = strchr(reply, ' '))) {
--            *t = '\0';
--            ++t;
+@@ -186,21 +175,11 @@ void Adaptation::Icap::Xaction::closeConnection()
+             reuseConnection = false;
+         }
+ 
+-        if (reuseConnection) {
+-            Ip::Address client_addr;
+-            //status() adds leading spaces.
+-            debugs(93,3, HERE << "pushing pconn" << status());
+-            AsyncCall::Pointer call = NULL;
+-            commSetTimeout(connection, -1, call);
+-            icapPconnPool->push(connection, theService->cfg().host.termedBuf(),
+-                                theService->cfg().port, NULL, client_addr);
++        if (reuseConnection)
+             disableRetries();
+-        } else {
+-            //status() adds leading spaces.
+-            debugs(93,3, HERE << "closing pconn" << status());
+-            // comm_close will clear timeout
+-            comm_close(connection);
 -        }
--
--        if (*reply == '\0')
--            reply = NULL;
--    }
-+    debugs(29, 5, HERE << "reply=" << reply);
++
++        Adaptation::Icap::ServiceRep &s = service();
++        s.putConnection(connection, reuseConnection, status());
  
-     assert(r->auth_user_request != NULL);
-     assert(r->auth_user_request->user()->auth_type == Auth::AUTH_BASIC);
-@@ -162,13 +152,13 @@ Auth::Basic::UserRequest::HandleReply(void *data, char *reply)
+         writer = NULL;
+         reader = NULL;
+@@ -218,7 +197,7 @@ void Adaptation::Icap::Xaction::noteCommConnected(const CommConnectCbParams &io)
+     if (io.flag != COMM_OK)
+         dieOnConnectionFailure(); // throws
  
-     assert(basic_auth != NULL);
+-    fd_table[connection].noteUse(icapPconnPool);
++    service().noteConnectionUse(connection);
  
--    if (reply && (strncasecmp(reply, "OK", 2) == 0))
-+    if (reply.result == HelperReply::Okay)
-         basic_auth->credentials(Auth::Ok);
-     else {
-         basic_auth->credentials(Auth::Failed);
- 
--        if (t && *t)
--            r->auth_user_request->setDenyMessage(t);
-+        if (reply.other().hasContent())
-+            r->auth_user_request->setDenyMessage(reply.other().content());
-     }
- 
-     basic_auth->expiretime = squid_curtime;
-@@ -272,45 +272,47 @@ Auth::Digest::UserRequest::module_start(AUTHCB * handler, void *data)
+     handleCommConnected();
  }
+@@ -138,6 +138,7 @@ class Xaction: public Adaptation::Initiate
+     void setOutcome(const XactOutcome &xo);
+     virtual void finalizeLogInfo();
  
- void
--Auth::Digest::UserRequest::HandleReply(void *data, char *reply)
-+Auth::Digest::UserRequest::HandleReply(void *data, const HelperReply &reply)
- {
-     Auth::StateData *replyData = static_cast<Auth::StateData *>(data);
--    char *t = NULL;
--    void *cbdata;
--    debugs(29, 9, HERE << "{" << (reply ? reply : "<NULL>") << "}");
--
--    if (reply) {
--        if ((t = strchr(reply, ' '))) {
--            *t = '\0';
--            ++t;
--        }
--
--        if (*reply == '\0' || *reply == '\n')
--            reply = NULL;
--    }
-+    debugs(29, 9, HERE << "reply=" << reply);
- 
-     assert(replyData->auth_user_request != NULL);
-     Auth::UserRequest::Pointer auth_user_request = replyData->auth_user_request;
- 
--    if (reply && (strncasecmp(reply, "ERR", 3) == 0)) {
-+    switch(reply.result)
-+    {
-+    case HelperReply::Error:
-+    {
-         /* allow this because the digest_request pointer is purely local */
-         Auth::Digest::UserRequest *digest_request = dynamic_cast<Auth::Digest::UserRequest *>(auth_user_request.getRaw());
-         assert(digest_request);
- 
-         digest_request->user()->credentials(Auth::Failed);
-         digest_request->flags.invalid_password = 1;
- 
--        if (t && *t)
--            digest_request->setDenyMessage(t);
--    } else if (reply) {
-+        if (reply.other().hasContent())
-+            digest_request->setDenyMessage(reply.other().content());
-+    }
-+        break;
-+
-+    case HelperReply::Unknown: // Squid 3.2 and older the digest helper only returns a HA1 hash (no "OK")
-+    case HelperReply::Okay:
-+    {
-         /* allow this because the digest_request pointer is purely local */
-         Auth::Digest::User *digest_user = dynamic_cast<Auth::Digest::User *>(auth_user_request->user().getRaw());
-         assert(digest_user != NULL);
- 
--        CvtBin(reply, digest_user->HA1);
-+        CvtBin(reply.other().content(), digest_user->HA1);
-         digest_user->HA1created = 1;
-     }
-+        break;
-+
-+    default:
-+        ; // XXX: handle other states properly.
-+    }
- 
-+    void *cbdata = NULL;
-     if (cbdataReferenceValidDone(replyData->data, &cbdata))
-         replyData->handler(cbdata);
- 
-@@ -232,25 +232,18 @@ Auth::Negotiate::UserRequest::authenticate(HttpRequest * aRequest, ConnStateData
- }
- 
- void
--Auth::Negotiate::UserRequest::HandleReply(void *data, void *lastserver, char *reply)
-+Auth::Negotiate::UserRequest::HandleReply(void *data, const HelperReply &reply)
- {
-     Auth::StateData *r = static_cast<Auth::StateData *>(data);
- 
--    char *blob, *arg = NULL;
--
--    debugs(29, 8, HERE << "helper: '" << lastserver << "' sent us '" << (reply ? reply : "<NULL>") << "'");
-+    debugs(29, 8, HERE << "helper: '" << reply.whichServer << "' sent us reply=" << reply);
- 
-     if (!cbdataReferenceValid(r->data)) {
--        debugs(29, DBG_IMPORTANT, "ERROR: Negotiate Authentication invalid callback data. helper '" << lastserver << "'.");
-+        debugs(29, DBG_IMPORTANT, "ERROR: Negotiate Authentication invalid callback data. helper '" << reply.whichServer << "'.");
-         delete r;
-         return;
-     }
- 
--    if (!reply) {
--        debugs(29, DBG_IMPORTANT, "ERROR: Negotiate Authentication Helper '" << lastserver << "' crashed!.");
--        reply = (char *)"BH Internal error";
--    }
--
-     Auth::UserRequest::Pointer auth_user_request = r->auth_user_request;
-     assert(auth_user_request != NULL);
- 
-@@ -265,26 +258,26 @@ Auth::Negotiate::UserRequest::HandleReply(void *data, void *lastserver, char *re
-     assert(auth_user_request->user()->auth_type == Auth::AUTH_NEGOTIATE);
- 
-     if (lm_request->authserver == NULL)
--        lm_request->authserver = static_cast<helper_stateful_server*>(lastserver);
-+        lm_request->authserver = reply.whichServer.get(); // XXX: no locking?
-     else
--        assert(lm_request->authserver == lastserver);
-+        assert(lm_request->authserver == reply.whichServer.raw());
- 
-     /* seperate out the useful data */
--    blob = strchr(reply, ' ');
--
--    if (blob) {
--        ++blob;
--        arg = strchr(blob + 1, ' ');
--    } else {
--        arg = NULL;
--    }
--
--    if (strncasecmp(reply, "TT ", 3) == 0) {
--        /* we have been given a blob to send to the client */
-+    char *modifiableBlob = reply.modifiableOther().content();
-+    char *arg = NULL;
-+    if (modifiableBlob && *modifiableBlob != '\0') {
-+        arg = strchr(modifiableBlob + 1, ' ');
-         if (arg) {
-             *arg = '\0';
-             ++arg;
-         }
-+    }
-+    const char *blob = modifiableBlob;
-+
-+    switch(reply.result)
-+    {
-+    case HelperReply::TT:
-+        /* we have been given a blob to send to the client */
-         safe_free(lm_request->server_blob);
-         lm_request->request->flags.must_keepalive = 1;
-         if (lm_request->request->flags.proxy_keepalive) {
-@@ -296,14 +289,19 @@ Auth::Negotiate::UserRequest::HandleReply(void *data, void *lastserver, char *re
-             auth_user_request->user()->credentials(Auth::Failed);
-             auth_user_request->denyMessage("NTLM authentication requires a persistent connection");
-         }
--    } else if (strncasecmp(reply, "AF ", 3) == 0 && arg != NULL) {
--        /* we're finished, release the helper */
-+        break;
- 
--        if (arg) {
--            *arg = '\0';
--            ++arg;
-+    case HelperReply::AF:
-+    case HelperReply::Okay:
-+    {
-+        if (arg == NULL) {
-+            // XXX: handle a success with no username better
-+            /* protocol error */
-+            fatalf("authenticateNegotiateHandleReply: *** Unsupported helper response ***, '%s'\n", reply.other().content());
-+            break;
-         }
- 
-+        /* we're finished, release the helper */
-         auth_user_request->user()->username(arg);
-         auth_user_request->denyMessage("Login successful");
-         safe_free(lm_request->server_blob);
-@@ -336,23 +334,32 @@ Auth::Negotiate::UserRequest::HandleReply(void *data, void *lastserver, char *re
-          * existing user or a new user */
-         local_auth_user->expiretime = current_time.tv_sec;
-         auth_user_request->user()->credentials(Auth::Ok);
--        debugs(29, 4, HERE << "Successfully validated user via Negotiate. Username '" << blob << "'");
--
--    } else if (strncasecmp(reply, "NA ", 3) == 0 && arg != NULL) {
--        /* authentication failure (wrong password, etc.) */
-+        debugs(29, 4, HERE << "Successfully validated user via Negotiate. Username '" << arg << "'");
-+    }
-+        break;
- 
--        if (arg) {
--            *arg = '\0';
--            ++arg;
-+    case HelperReply::NA:
-+    case HelperReply::Error:
-+        if (arg == NULL) {
-+            /* protocol error */
-+            fatalf("authenticateNegotiateHandleReply: *** Unsupported helper response ***, '%s'\n", reply.other().content());
-+            break;
-         }
--
-+        /* authentication failure (wrong password, etc.) */
-         auth_user_request->denyMessage(arg);
-         auth_user_request->user()->credentials(Auth::Failed);
-         safe_free(lm_request->server_blob);
-         lm_request->server_blob = xstrdup(blob);
-         lm_request->releaseAuthServer();
--        debugs(29, 4, HERE << "Failed validating user via Negotiate. Error returned '" << blob << "'");
--    } else if (strncasecmp(reply, "BH ", 3) == 0) {
-+        debugs(29, 4, HERE << "Failed validating user via Negotiate. Error returned '" << reply << "'");
-+        break;
-+
-+    case HelperReply::Unknown:
-+        debugs(29, DBG_IMPORTANT, "ERROR: Negotiate Authentication Helper '" << reply.whichServer << "' crashed!.");
-+        blob = "Internal error";
-+        /* continue to the next case */
-+
-+    case HelperReply::BrokenHelper:
-         /* TODO kick off a refresh process. This can occur after a YR or after
-          * a KK. If after a YR release the helper and resubmit the request via
-          * Authenticate Negotiate start.
-@@ -362,12 +369,10 @@ Auth::Negotiate::UserRequest::HandleReply(void *data, void *lastserver, char *re
-         auth_user_request->user()->credentials(Auth::Failed);
-         safe_free(lm_request->server_blob);
-         lm_request->releaseAuthServer();
--        debugs(29, DBG_IMPORTANT, "ERROR: Negotiate Authentication validating user. Error returned '" << reply << "'");
--    } else {
--        /* protocol error */
--        fatalf("authenticateNegotiateHandleReply: *** Unsupported helper response ***, '%s'\n", reply);
-+        debugs(29, DBG_IMPORTANT, "ERROR: Negotiate Authentication validating user. Error returned " << reply);
-     }
- 
-+    xfree(arg);
-     if (lm_request->request) {
-         HTTPMSGUNLOCK(lm_request->request);
-         lm_request->request = NULL;
-@@ -52,7 +52,7 @@ class UserRequest : public Auth::UserRequest
-     HttpRequest *request;
++public:
+     ServiceRep &service();
  
  private:
--    static HLPSCB HandleReply;
-+    static HLPCB HandleReply;
- };
+@@ -6546,6 +6546,26 @@ DOC_START
+ 		is to use IPv4-only connections. When set to 'on' this option will
+ 		make Squid use IPv6-only connections to contact this ICAP service.
  
- } // namespace Negotiate
-@@ -225,24 +225,18 @@ Auth::Ntlm::UserRequest::authenticate(HttpRequest * aRequest, ConnStateData * co
- }
++	on-overload=block|bypass|wait|force
++		If the service Max-Connections limit has been reached, do
++		one of the following for each new ICAP transaction:
++		  * block:  send an HTTP error response to the client
++		  * bypass: ignore the "over-connected" ICAP service
++		  * wait:   wait (in a FIFO queue) for an ICAP connection slot
++		  * force:  proceed, ignoring the Max-Connections limit 
++
++		In SMP mode with N workers, each worker assumes the service
++		connection limit is Max-Connections/N, even though not all
++		workers may use a given service.
++
++		The default value is "bypass" if service is bypassable,
++		otherwise it is set to "wait".
++		
++
++	max-conn=number
++		Use the given number as the Max-Connections limit, regardless
++		of the Max-Connections value given by the service, if any.
++
+ 	Older icap_service format without optional named parameters is
+ 	deprecated but supported for backward compatibility.
  
- void
--Auth::Ntlm::UserRequest::HandleReply(void *data, void *lastserver, char *reply)
-+Auth::Ntlm::UserRequest::HandleReply(void *data, const HelperReply &reply)
- {
-     Auth::StateData *r = static_cast<Auth::StateData *>(data);
--    char *blob;
+@@ -1490,7 +1490,7 @@ _comm_close(int fd, char const *file, int line)
+     commCallCloseHandlers(fd);
  
--    debugs(29, 8, HERE << "helper: '" << lastserver << "' sent us '" << (reply ? reply : "<NULL>") << "'");
-+    debugs(29, 8, HERE << "helper: '" << reply.whichServer << "' sent us reply=" << reply);
+     if (F->pconn.uses)
+-        F->pconn.pool->count(F->pconn.uses);
++        F->pconn.pool->noteUses(F->pconn.uses);
  
-     if (!cbdataReferenceValid(r->data)) {
--        debugs(29, DBG_IMPORTANT, "ERROR: NTLM Authentication invalid callback data. helper '" << lastserver << "'.");
-+        debugs(29, DBG_IMPORTANT, "ERROR: NTLM Authentication invalid callback data. helper '" << reply.whichServer << "'.");
-         delete r;
-         return;
+     comm_empty_os_read_buffers(fd);
+ 
+@@ -94,6 +94,9 @@ IdleConnList::removeFD(int fd)
+     for (; index < nfds - 1; index++)
+         fds[index] = fds[index + 1];
+ 
++    if (parent)
++        parent->noteConnectionRemoved();
++
+     if (--nfds == 0) {
+         debugs(48, 3, "IdleConnList::removeFD: deleting " << hashKeyStr(&hash));
+         delete this;
+@@ -123,6 +126,9 @@ IdleConnList::push(int fd)
+             xfree(old);
      }
  
--    if (!reply) {
--        debugs(29, DBG_IMPORTANT, "ERROR: NTLM Authentication Helper '" << lastserver << "' crashed!.");
--        reply = (char *)"BH Internal error";
--    }
--
-     Auth::UserRequest::Pointer auth_user_request = r->auth_user_request;
-     assert(auth_user_request != NULL);
- 
-@@ -257,16 +251,16 @@ Auth::Ntlm::UserRequest::HandleReply(void *data, void *lastserver, char *reply)
-     assert(auth_user_request->user()->auth_type == Auth::AUTH_NTLM);
- 
-     if (lm_request->authserver == NULL)
--        lm_request->authserver = static_cast<helper_stateful_server*>(lastserver);
-+        lm_request->authserver = reply.whichServer.get(); // XXX: no locking?
-     else
--        assert(lm_request->authserver == lastserver);
-+        assert(lm_request->authserver == reply.whichServer.raw());
- 
-     /* seperate out the useful data */
--    blob = strchr(reply, ' ');
--    if (blob)
--        ++blob;
-+    const char *blob = reply.other().content();
- 
--    if (strncasecmp(reply, "TT ", 3) == 0) {
-+    switch(reply.result)
-+    {
-+    case HelperReply::TT:
-         /* we have been given a blob to send to the client */
-         safe_free(lm_request->server_blob);
-         lm_request->request->flags.must_keepalive = 1;
-@@ -279,7 +273,11 @@ Auth::Ntlm::UserRequest::HandleReply(void *data, void *lastserver, char *reply)
-             auth_user_request->user()->credentials(Auth::Failed);
-             auth_user_request->denyMessage("NTLM authentication requires a persistent connection");
-         }
--    } else if (strncasecmp(reply, "AF ", 3) == 0) {
-+        break;
++    if (parent)
++        parent->noteConnectionAdded();
 +
-+    case HelperReply::AF:
-+    case HelperReply::Okay:
-+    {
-         /* we're finished, release the helper */
-         auth_user_request->user()->username(blob);
-         auth_user_request->denyMessage("Login successful");
-@@ -314,15 +312,25 @@ Auth::Ntlm::UserRequest::HandleReply(void *data, void *lastserver, char *reply)
-         local_auth_user->expiretime = current_time.tv_sec;
-         auth_user_request->user()->credentials(Auth::Ok);
-         debugs(29, 4, HERE << "Successfully validated user via NTLM. Username '" << blob << "'");
-+    }
-+        break;
+     fds[nfds++] = fd;
+     comm_read(fd, fakeReadBuf, sizeof(fakeReadBuf), IdleConnList::read, this);
+     commSetTimeout(fd, Config.Timeout.pconn, IdleConnList::timeout, this);
+@@ -230,7 +236,8 @@ PconnPool::dumpHash(StoreEntry *e)
  
--    } else if (strncasecmp(reply, "NA ", 3) == 0) {
-+    case HelperReply::NA:
-+    case HelperReply::Error:
-         /* authentication failure (wrong password, etc.) */
-         auth_user_request->denyMessage(blob);
-         auth_user_request->user()->credentials(Auth::Failed);
-         safe_free(lm_request->server_blob);
-         lm_request->releaseAuthServer();
-         debugs(29, 4, HERE << "Failed validating user via NTLM. Error returned '" << blob << "'");
--    } else if (strncasecmp(reply, "BH ", 3) == 0) {
-+        break;
-+
-+    case HelperReply::Unknown:
-+        debugs(29, DBG_IMPORTANT, "ERROR: NTLM Authentication Helper '" << reply.whichServer << "' crashed!.");
-+        blob = "Internal error";
-+        /* continue to the next case */
-+
-+    case HelperReply::BrokenHelper:
-         /* TODO kick off a refresh process. This can occur after a YR or after
-          * a KK. If after a YR release the helper and resubmit the request via
-          * Authenticate NTLM start.
-@@ -333,9 +341,7 @@ Auth::Ntlm::UserRequest::HandleReply(void *data, void *lastserver, char *reply)
-         safe_free(lm_request->server_blob);
-         lm_request->releaseAuthServer();
-         debugs(29, DBG_IMPORTANT, "ERROR: NTLM Authentication validating user. Error returned '" << reply << "'");
--    } else {
--        /* protocol error */
--        fatalf("authenticateNTLMHandleReply: *** Unsupported helper response ***, '%s'\n", reply);
-+        break;
-     }
+ /* ========== PconnPool PUBLIC FUNCTIONS ============================================ */
  
-     if (lm_request->request) {
-@@ -48,7 +48,7 @@ class UserRequest : public Auth::UserRequest
-     HttpRequest *request;
- 
- private:
--    static HLPSCB HandleReply;
-+    static HLPCB HandleReply;
- };
- 
- } // namespace Ntlm
-@@ -3678,23 +3678,23 @@ httpsAccept(const CommAcceptCbParams &params)
- }
- 
- void
--ConnStateData::sslCrtdHandleReplyWrapper(void *data, char *reply)
-+ConnStateData::sslCrtdHandleReplyWrapper(void *data, const HelperReply &reply)
+-PconnPool::PconnPool(const char *aDescr) : table(NULL), descr(aDescr)
++PconnPool::PconnPool(const char *aDescr) : table(NULL), descr(aDescr),
++        theCount(0)
  {
-     ConnStateData * state_data = (ConnStateData *)(data);
-     state_data->sslCrtdHandleReply(reply);
- }
- 
- void
--ConnStateData::sslCrtdHandleReply(const char * reply)
-+ConnStateData::sslCrtdHandleReply(const HelperReply &reply)
- {
--    if (!reply) {
-+    if (!reply.other().hasContent()) {
-         debugs(1, DBG_IMPORTANT, HERE << "\"ssl_crtd\" helper return <NULL> reply");
-     } else {
-         Ssl::CrtdMessage reply_message;
--        if (reply_message.parse(reply, strlen(reply)) != Ssl::CrtdMessage::OK) {
-+        if (reply_message.parse(reply.other().content(), reply.other().contentSize()) != Ssl::CrtdMessage::OK) {
-             debugs(33, 5, HERE << "Reply from ssl_crtd for " << sslConnectHostOrIp << " is incorrect");
-         } else {
--            if (reply_message.getCode() != "OK") {
-+            if (reply.result != HelperReply::Okay) {
-                 debugs(33, 5, HERE << "Certificate for " << sslConnectHostOrIp << " cannot be generated. ssl_crtd response: " << reply_message.getBody());
-             } else {
-                 debugs(33, 5, HERE << "Certificate for " << sslConnectHostOrIp << " was successfully recieved from ssl_crtd");
-@@ -53,6 +53,7 @@ class ConnStateData;
- class ClientHttpRequest;
- class clientStreamNode;
- class ChunkedCodingParser;
-+class HelperReply;
- 
- /**
-  * Badly named.
-@@ -338,9 +339,9 @@ class ConnStateData : public BodyProducer, public HttpControlMsgSink
-      */
-     void getSslContextDone(SSL_CTX * sslContext, bool isNew = false);
-     /// Callback function. It is called when squid receive message from ssl_crtd.
--    static void sslCrtdHandleReplyWrapper(void *data, char *reply);
-+    static void sslCrtdHandleReplyWrapper(void *data, const HelperReply &reply);
-     /// Proccess response from ssl_crtd.
--    void sslCrtdHandleReply(const char * reply);
-+    void sslCrtdHandleReply(const HelperReply &reply);
- 
-     void switchToHttps(HttpRequest *request, Ssl::BumpMode bumpServerMode);
-     bool switchedToHttps() const { return switchedToHttps_; }
-@@ -57,6 +57,7 @@
- #include "fde.h"
- #include "format/Token.h"
- #include "gopher.h"
-+#include "helper.h"
- #include "http.h"
- #include "HttpHdrCc.h"
- #include "HttpReply.h"
-@@ -67,6 +68,7 @@
- #include "MemObject.h"
- #include "Parsing.h"
- #include "profiler/Profiler.h"
-+#include "redirect.h"
- #include "SquidTime.h"
- #include "Store.h"
- #include "StrList.h"
-@@ -128,7 +130,7 @@ static void sslBumpAccessCheckDoneWrapper(allow_t, void *);
- #endif
- static int clientHierarchical(ClientHttpRequest * http);
- static void clientInterpretRequestHeaders(ClientHttpRequest * http);
--static RH clientRedirectDoneWrapper;
-+static HLPCB clientRedirectDoneWrapper;
- static void checkNoCacheDoneWrapper(allow_t, void *);
- extern "C" CSR clientGetMoreData;
- extern "C" CSS clientReplyStatus;
-@@ -899,7 +901,7 @@ clientRedirectAccessCheckDone(allow_t answer, void *data)
-     if (answer == ACCESS_ALLOWED)
-         redirectStart(http, clientRedirectDoneWrapper, context);
-     else
--        context->clientRedirectDone(NULL);
-+        context->clientRedirectDone(HelperReply(NULL,0));
- }
- 
- void
-@@ -1185,7 +1187,7 @@ clientInterpretRequestHeaders(ClientHttpRequest * http)
- }
- 
- void
--clientRedirectDoneWrapper(void *data, char *result)
-+clientRedirectDoneWrapper(void *data, const HelperReply &result)
- {
-     ClientRequestContext *calloutContext = (ClientRequestContext *)data;
- 
-@@ -1196,22 +1198,27 @@ clientRedirectDoneWrapper(void *data, char *result)
- }
- 
- void
--ClientRequestContext::clientRedirectDone(char *result)
-+ClientRequestContext::clientRedirectDone(const HelperReply &reply)
- {
-     HttpRequest *old_request = http->request;
--    debugs(85, 5, "clientRedirectDone: '" << http->uri << "' result=" << (result ? result : "NULL"));
-+    debugs(85, 5, HERE << "'" << http->uri << "' result=" << reply);
-     assert(redirect_state == REDIRECT_PENDING);
-     redirect_state = REDIRECT_DONE;
- 
--    if (result) {
-+    if (reply.other().hasContent()) {
-+        /* 2012-06-28: This cast is due to urlParse() truncating too-long URLs itself.
-+         * At this point altering the helper buffer in that way is not harmful, but annoying.
-+         * When Bug 1961 is resolved and urlParse has a const API, this needs to die.
-+         */
-+        char * result = const_cast<char*>(reply.other().content());
-         http_status status = (http_status) atoi(result);
- 
-         if (status == HTTP_MOVED_PERMANENTLY
-                 || status == HTTP_MOVED_TEMPORARILY
-                 || status == HTTP_SEE_OTHER
-                 || status == HTTP_PERMANENT_REDIRECT
-                 || status == HTTP_TEMPORARY_REDIRECT) {
--            char *t = result;
-+            char *t = NULL;
- 
-             if ((t = strchr(result, ':')) != NULL) {
-                 http->redirect.status = status;
-@@ -207,7 +207,6 @@ extern int clientHttpRequestStatus(int fd, ClientHttpRequest const *http);
- extern void clientAccessCheck(ClientHttpRequest *);
- 
- /* ones that should be elsewhere */
--extern void redirectStart(ClientHttpRequest *, RH *, void *);
- extern void tunnelStart(ClientHttpRequest *, int64_t *, int *);
- 
- #if _USE_INLINE_
-@@ -37,6 +37,7 @@
- #include "SquidTime.h"
- #include "mgr/Registration.h"
- #include "helper.h"
-+#include "HelperReply.h"
- 
- /* MS VisualStudio Projects are monolitich, so we need the following
-    #if to include the external DNS code in compile process when
-@@ -128,8 +129,8 @@ dnsSubmit(const char *lookup, HLPCB * callback, void *data)
- 
-         debugs(34, DBG_IMPORTANT, "dnsSubmit: queue overload, rejecting " << lookup);
- 
--        callback(data, (char *)"$fail Temporary network problem, please retry later");
--
-+        const char *t = "$fail Temporary network problem, please retry later";
-+        callback(data, HelperReply(t, strlen(t)));
-         return;
-     }
- 
-@@ -1305,30 +1305,28 @@ free_externalAclState(void *data)
-  * the whitespace escaped using \ (\ escaping obviously also applies to
-  * any " characters)
+     int i;
+     table = hash_create((HASHCMP *) strcmp, 229, hash_string);
+@@ -291,6 +298,7 @@ PconnPool::push(int fd, const char *host, u_short port, const char *domain, Ip::
+  * We close available persistent connection if the caller transaction is not
+  * retriable to avoid having a growing number of open connections when many
+  * transactions create persistent connections but are not retriable.
++ * PconnPool::closeN() relies on that behavior as well.
   */
--
- static void
--externalAclHandleReply(void *data, char *reply)
-+externalAclHandleReply(void *data, const HelperReply &reply)
- {
-     externalAclState *state = static_cast<externalAclState *>(data);
-     externalAclState *next;
--    char *status;
--    char *token;
--    char *value;
-     char *t = NULL;
-     ExternalACLEntryData entryData;
-     entryData.result = ACCESS_DENIED;
-     external_acl_entry *entry = NULL;
- 
--    debugs(82, 2, "externalAclHandleReply: reply=\"" << reply << "\"");
-+    debugs(82, 2, HERE << "reply=" << reply);
- 
--    if (reply) {
--        status = strwordtok(reply, &t);
-+    if (reply.result == HelperReply::Okay)
-+        entryData.result = ACCESS_ALLOWED;
-+    // XXX: handle other non-DENIED results better
- 
--        if (status && strcmp(status, "OK") == 0)
--            entryData.result = ACCESS_ALLOWED;
-+    if (reply.other().hasContent()) {
-+        char *temp = reply.modifiableOther().content();
-+        char *token = strwordtok(temp, &t);
- 
-         while ((token = strwordtok(NULL, &t))) {
--            value = strchr(token, '=');
-+            char *value = strchr(token, '=');
- 
-             if (value) {
-                 *value = '\0';	/* terminate the token, and move up to the value */
-@@ -1362,7 +1360,8 @@ externalAclHandleReply(void *data, char *reply)
-     dlinkDelete(&state->list, &state->def->queue);
- 
-     if (cbdataReferenceValid(state->def)) {
--        if (reply)
-+        // only cache OK and ERR results.
-+        if (reply.result == HelperReply::Okay || reply.result == HelperReply::Error)
-             entry = external_acl_cache_add(state->def, state->key, entryData);
-         else {
-             external_acl_entry *oldentry = (external_acl_entry *)hash_lookup(state->def->cache, state->key);
-@@ -34,6 +34,7 @@
- #include "cbdata.h"
- #include "DnsLookupDetails.h"
- #include "event.h"
-+#include "HelperReply.h"
- #include "Mem.h"
- #include "mgr/Registration.h"
- #include "SquidDns.h"
-@@ -496,7 +497,7 @@ fqdncacheParse(fqdncache_entry *f, const rfc1035_rr * answers, int nr, const cha
-  */
- static void
- #if USE_DNSHELPER
--fqdncacheHandleReply(void *data, char *reply)
-+fqdncacheHandleReply(void *data, const HelperReply &reply)
- #else
- fqdncacheHandleReply(void *data, const rfc1035_rr * answers, int na, const char *error_message)
- #endif
-@@ -508,7 +509,7 @@ fqdncacheHandleReply(void *data, const rfc1035_rr * answers, int na, const char
-     statCounter.dns.svcTime.count(age);
- #if USE_DNSHELPER
- 
--    fqdncacheParse(f, reply);
-+    fqdncacheParse(f, reply.other().content());
- #else
- 
-     fqdncacheParse(f, answers, na, error_message);
-@@ -389,7 +389,7 @@ helperSubmit(helper * hlp, const char *buf, HLPCB * callback, void *data)
- {
-     if (hlp == NULL) {
-         debugs(84, 3, "helperSubmit: hlp == NULL");
--        callback(data, NULL);
-+        callback(data, HelperReply(NULL,0));
-         return;
-     }
- 
-@@ -410,11 +410,11 @@ helperSubmit(helper * hlp, const char *buf, HLPCB * callback, void *data)
- 
- /// lastserver = "server last used as part of a reserved request sequence"
- void
--helperStatefulSubmit(statefulhelper * hlp, const char *buf, HLPSCB * callback, void *data, helper_stateful_server * lastserver)
-+helperStatefulSubmit(statefulhelper * hlp, const char *buf, HLPCB * callback, void *data, helper_stateful_server * lastserver)
- {
-     if (hlp == NULL) {
-         debugs(84, 3, "helperStatefulSubmit: hlp == NULL");
--        callback(data, 0, NULL);
-+        callback(data, HelperReply(NULL,0));
-         return;
-     }
- 
-@@ -734,11 +734,12 @@ helperServerFree(helper_server *srv)
-     }
- 
-     for (i = 0; i < concurrency; ++i) {
-+        // XXX: re-schedule these on another helper?
-         if ((r = srv->requests[i])) {
-             void *cbdata;
- 
-             if (cbdataReferenceValidDone(r->data, &cbdata))
--                r->callback(cbdata, NULL);
-+                r->callback(cbdata, HelperReply(NULL,0));
- 
-             helperRequestFree(r);
- 
-@@ -797,8 +798,11 @@ helperStatefulServerFree(helper_stateful_server *srv)
-     if ((r = srv->request)) {
-         void *cbdata;
- 
--        if (cbdataReferenceValidDone(r->data, &cbdata))
--            r->callback(cbdata, srv, NULL);
-+        if (cbdataReferenceValidDone(r->data, &cbdata)) {
-+            HelperReply nilReply(NULL,0);
-+            nilReply.whichServer = srv;
-+            r->callback(cbdata, nilReply);
-+        }
- 
-         helperStatefulRequestFree(r);
- 
-@@ -814,10 +818,14 @@ helperStatefulServerFree(helper_stateful_server *srv)
+ int
+ PconnPool::pop(const char *host, u_short port, const char *domain, Ip::Address &client_address, bool isRetriable)
+@@ -321,13 +329,23 @@ PconnPool::pop(const char *host, u_short port, const char *domain, Ip::Address &
  }
  
- /// Calls back with a pointer to the buffer with the helper output
--static void helperReturnBuffer(int request_number, helper_server * srv, helper * hlp, char * msg, char * msg_end)
-+static void
-+helperReturnBuffer(int request_number, helper_server * srv, helper * hlp, char * msg, char * msg_end)
- {
-     helper_request *r = srv->requests[request_number];
-     if (r) {
-+// TODO: parse the reply into new helper reply object
-+// pass that to the callback instead of msg
+ void
+-PconnPool::unlinkList(IdleConnList *list) const
++PconnPool::closeN(int n, const char *host, u_short port, const char *domain, Ip::Address &client_address)
++{
++    // TODO: optimize: we can probably do hash_lookup just once
++    for (int i = 0; i < n; ++i)
++        pop(host, port, domain, client_address, false); // may fail!
++}
 +
-         HLPCB *callback = r->callback;
- 
-         srv->requests[request_number] = NULL;
-@@ -826,7 +834,7 @@ static void helperReturnBuffer(int request_number, helper_server * srv, helper *
- 
-         void *cbdata = NULL;
-         if (cbdataReferenceValidDone(r->data, &cbdata))
--            callback(cbdata, msg);
-+            callback(cbdata, HelperReply(msg, (msg_end-msg)));
- 
-         -- srv->stats.pending;
- 
-@@ -995,7 +1003,9 @@ helperStatefulHandleRead(const Comm::ConnectionPointer &conn, char *buf, size_t
-         *t = '\0';
- 
-         if (r && cbdataReferenceValid(r->data)) {
--            r->callback(r->data, srv, srv->rbuf);
-+            HelperReply res(srv->rbuf, (t - srv->rbuf));
-+            res.whichServer = srv;
-+            r->callback(r->data, res);
-         } else {
-             debugs(84, DBG_IMPORTANT, "StatefulHandleRead: no callback data registered");
-             called = 0;
-@@ -1324,11 +1334,13 @@ helperStatefulDispatch(helper_stateful_server * srv, helper_stateful_request * r
-         /* a callback is needed before this request can _use_ a helper. */
-         /* we don't care about releasing this helper. The request NEVER
-          * gets to the helper. So we throw away the return code */
--        r->callback(r->data, srv, NULL);
-+        HelperReply nilReply(NULL,0);
-+        nilReply.whichServer = srv;
-+        r->callback(r->data, nilReply);
-         /* throw away the placeholder */
-         helperStatefulRequestFree(r);
-         /* and push the queue. Note that the callback may have submitted a new
--         * request to the helper which is why we test for the request*/
-+         * request to the helper which is why we test for the request */
- 
-         if (srv->request == NULL)
-             helperStatefulServerDone(srv);
-@@ -39,10 +39,11 @@
- #include "dlink.h"
- #include "ip/Address.h"
- #include "HelperChildConfig.h"
-+#include "HelperReply.h"
- 
- class helper_request;
- 
--typedef void HLPSCB(void *, void *lastserver, char *buf);
-+typedef void HLPCB(void *, const HelperReply &reply);
- 
- class helper
++void
++PconnPool::unlinkList(IdleConnList *list)
  {
-@@ -194,7 +195,7 @@ class helper_stateful_request
++    theCount -= list->count();
++    assert(theCount >= 0);
+     hash_remove_link(table, &list->hash);
+ }
+ 
+ void
+-PconnPool::count(int uses)
++PconnPool::noteUses(int uses)
+ {
+     if (uses >= PCONN_HIST_SZ)
+         uses = PCONN_HIST_SZ - 1;
+@@ -32,14 +32,15 @@ class IdleConnList
  public:
-     MEMPROXY_CLASS(helper_stateful_request);
-     char *buf;
--    HLPSCB *callback;
-+    HLPCB *callback;
-     int placeholder;		/* if 1, this is a dummy request waiting for a stateful helper to become available */
-     void *data;
+     IdleConnList(const char *key, PconnPool *parent);
+     ~IdleConnList();
+-    int numIdle() { return nfds; }
+ 
+     int findFDIndex(int fd); ///< search from the end of array
+     void removeFD(int fd);
+     void push(int fd);
+     int findUseableFD();     ///< find first from the end not pending read fd.
+     void clearHandlers(int fd);
+ 
++    int count() const { return nfds; }
++
+ private:
+     static IOCB read;
+     static PF timeout;
+@@ -82,10 +83,14 @@ class PconnPool
+     void moduleInit();
+     void push(int fd, const char *host, u_short port, const char *domain, Ip::Address &client_address);
+     int pop(const char *host, u_short port, const char *domain, Ip::Address &client_address, bool retriable);
+-    void count(int uses);
++    void noteUses(int uses);
+     void dumpHist(StoreEntry *e);
+     void dumpHash(StoreEntry *e);
+-    void unlinkList(IdleConnList *list) const;
++    void unlinkList(IdleConnList *list);
++    void closeN(int n, const char *host, u_short port, const char *domain, Ip::Address &client_address);
++    int count() const { return theCount; }
++    void noteConnectionAdded() { ++theCount; }
++    void noteConnectionRemoved() { assert(theCount > 0); --theCount; }
+ 
+ private:
+ 
+@@ -94,7 +99,7 @@ class PconnPool
+     int hist[PCONN_HIST_SZ];
+     hash_table *table;
+     const char *descr;
+-
++    int theCount; ///< the number of pooled connections
  };
-@@ -205,7 +206,7 @@ MEMPROXY_CLASS_INLINE(helper_stateful_request);
- SQUIDCEXTERN void helperOpenServers(helper * hlp);
- SQUIDCEXTERN void helperStatefulOpenServers(statefulhelper * hlp);
- SQUIDCEXTERN void helperSubmit(helper * hlp, const char *buf, HLPCB * callback, void *data);
--SQUIDCEXTERN void helperStatefulSubmit(statefulhelper * hlp, const char *buf, HLPSCB * callback, void *data, helper_stateful_server * lastserver);
-+SQUIDCEXTERN void helperStatefulSubmit(statefulhelper * hlp, const char *buf, HLPCB * callback, void *data, helper_stateful_server * lastserver);
- SQUIDCEXTERN void helperStats(StoreEntry * sentry, helper * hlp, const char *label = NULL);
- SQUIDCEXTERN void helperStatefulStats(StoreEntry * sentry, statefulhelper * hlp, const char *label = NULL);
- SQUIDCEXTERN void helperShutdown(helper * hlp);
-@@ -594,7 +594,7 @@ ipcacheParse(ipcache_entry *i, const rfc1035_rr * answers, int nr, const char *e
- /// \ingroup IPCacheInternal
- static void
- #if USE_DNSHELPER
--ipcacheHandleReply(void *data, char *reply)
-+ipcacheHandleReply(void *data, const HelperReply &reply)
- #else
- ipcacheHandleReply(void *data, const rfc1035_rr * answers, int na, const char *error_message)
- #endif
-@@ -606,7 +606,7 @@ ipcacheHandleReply(void *data, const rfc1035_rr * answers, int na, const char *e
-     statCounter.dns.svcTime.count(age);
  
- #if USE_DNSHELPER
--    ipcacheParse(i, reply);
-+    ipcacheParse(i, reply.other().content());
- #else
  
-     int done = ipcacheParse(i, answers, na, error_message);
-@@ -40,7 +40,6 @@
- #include "fqdncache.h"
- #include "globals.h"
- #include "HttpRequest.h"
--#include "helper.h"
- #include "mgr/Registration.h"
- #include "redirect.h"
- #include "rfc1738.h"
-@@ -62,7 +61,7 @@ typedef struct {
-     Ip::Address client_addr;
-     const char *client_ident;
-     const char *method_s;
--    RH *handler;
-+    HLPCB *handler;
- } redirectStateData;
- 
- static HLPCB redirectHandleReply;
-@@ -73,21 +72,36 @@ static int n_bypassed = 0;
- CBDATA_TYPE(redirectStateData);
- 
- static void
--redirectHandleReply(void *data, char *reply)
-+redirectHandleReply(void *data, const HelperReply &reply)
- {
-     redirectStateData *r = static_cast<redirectStateData *>(data);
--    char *t;
--    void *cbdata;
--    debugs(61, 5, "redirectHandleRead: {" << (reply && *reply != '\0' ? reply : "<NULL>") << "}");
--
--    if (reply) {
--        if ((t = strchr(reply, ' ')))
--            *t = '\0';
--
--        if (*reply == '\0')
--            reply = NULL;
-+    debugs(61, 5, HERE << "reply=" << reply);
-+
-+    // XXX: This funtion is now kept only to check for and display this garbage use-case
-+    // it can be removed when the helpers are all updated to the normalized "OK/ERR key-pairs" format
-+
-+    if (reply.result == HelperReply::Unknown) {
-+        // BACKWARD COMPATIBILITY 2012-06-15:
-+        // Some nasty old helpers send back the entire input line including extra format keys.
-+        // This is especially bad for simple perl search-replace filter scripts.
-+        //
-+        // * trim all but the first word off the response.
-+        // * warn once every 50 responses that this will stop being fixed-up soon.
-+        //
-+        if (const char * res = reply.other().content()) {
-+            if (const char *t = strchr(res, ' ')) {
-+                static int warn = 0;
-+                debugs(61, (!(warn++%50)? DBG_CRITICAL:2), "UPGRADE WARNING: URL rewriter reponded with garbage '" << t <<
-+                           "'. Future Squid will treat this as part of the URL.");
-+                const mb_size_t garbageLength = reply.other().contentSize() - (t-res);
-+                reply.modifiableOther().truncate(garbageLength);
-+            }
-+            if (reply.other().hasContent() && *res == '\0')
-+                reply.modifiableOther().clean(); // drop the whole buffer of garbage.
-+        }
-     }
- 
-+    void *cbdata;
-     if (cbdataReferenceValidDone(r->data, &cbdata))
-         r->handler(cbdata, reply);
- 
-@@ -119,7 +133,7 @@ redirectStats(StoreEntry * sentry)
- /**** PUBLIC FUNCTIONS ****/
- 
- void
--redirectStart(ClientHttpRequest * http, RH * handler, void *data)
-+redirectStart(ClientHttpRequest * http, HLPCB * handler, void *data)
- {
-     ConnStateData * conn = http->getConn();
-     redirectStateData *r = NULL;
-@@ -136,7 +150,7 @@ redirectStart(ClientHttpRequest * http, RH * handler, void *data)
-     if (Config.onoff.redirector_bypass && redirectors->stats.queue_size) {
-         /* Skip redirector if there is one request queued */
-         ++n_bypassed;
--        handler(data, NULL);
-+        handler(data, HelperReply(NULL,0));
-         return;
-     }
- 
-@@ -33,7 +33,12 @@
-  *
-  */
- 
-+#include "helper.h"
-+
-+class ClientHttpRequest;
-+
- extern void redirectInit(void);
- extern void redirectShutdown(void);
-+extern void redirectStart(ClientHttpRequest *, HLPCB *, void *);
- 
- #endif /* SQUID_REDIRECT_H_ */
-@@ -96,7 +96,8 @@ void Ssl::Helper::sslSubmit(CrtdMessage const & message, HLPCB * callback, void
-         if (squid_curtime - first_warn > 3 * 60)
-             fatal("SSL servers not responding for 3 minutes");
-         debugs(34, DBG_IMPORTANT, HERE << "Queue overload, rejecting");
--        callback(data, (char *)"error 45 Temporary network problem, please retry later");
-+        const char *errMsg = "BH error 45 Temporary network problem, please retry later"; // XXX: upgrade to message=""
-+        callback(data, HelperReply(errMsg,strlen(errMsg)));
-         return;
-     }
- 
-@@ -5,7 +5,7 @@
- #include "tests/STUB.h"
- 
- void helperSubmit(helper * hlp, const char *buf, HLPCB * callback, void *data) STUB
--void helperStatefulSubmit(statefulhelper * hlp, const char *buf, HLPSCB * callback, void *data, helper_stateful_server * lastserver) STUB
-+void helperStatefulSubmit(statefulhelper * hlp, const char *buf, HLPCB * callback, void *data, helper_stateful_server * lastserver) STUB
- helper::~helper() STUB
- CBDATA_CLASS_INIT(helper);
- 
-@@ -122,7 +122,6 @@ typedef void IDCB(const char *ident, void *data);
- #include "anyp/ProtocolType.h"
- typedef void IRCB(struct peer *, peer_t, AnyP::ProtocolType, void *, void *data);
- 
--typedef void RH(void *data, char *);
- /* in wordlist.h */
- 
- class wordlist;
-@@ -137,7 +136,6 @@ class StoreEntry;
- typedef void OBJH(StoreEntry *);
- typedef void SIGHDLR(int sig);
- typedef void STVLDCB(void *, int, int);
--typedef void HLPCB(void *, char *buf);
- typedef int HLPSAVAIL(void *);
- typedef void HLPSONEQ(void *);
- typedef void HLPCMDOPTS(int *argc, char **argv);

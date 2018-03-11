@@ -1,0 +1,350 @@
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: HttpReply.cc,v 1.46 2001/04/14 00:25:17 hno Exp $
++ * $Id: HttpReply.cc,v 1.47 2001/07/28 09:21:31 hno Exp $
+  *
+  * DEBUG: section 58    HTTP Reply (Response)
+  * AUTHOR: Alex Rousskov
+@@ -82,6 +82,7 @@ httpReplyInit(HttpReply * rep)
+ {
+     assert(rep);
+     rep->hdr_sz = 0;
++    rep->maxBodySize = 0;
+     rep->pstate = psReadyToParseStartLine;
+     httpBodyInit(&rep->body);
+     httpHeaderInit(&rep->header, hoReply);
+@@ -463,3 +464,28 @@ httpReplyBodySize(method_t method, HttpReply * reply)
+ 	return 0;
+     return reply->content_length;
+ }
++
++/*
++ * Calculates the maximum size allowed for an HTTP response
++ */
++void
++httpReplyBodyBuildSize(request_t *request, HttpReply * reply, dlink_list *bodylist)
++{
++    body_size *bs;
++    aclCheck_t *checklist;
++    bs = (body_size *) bodylist->head;
++    while (bs) {
++	checklist = aclChecklistCreate(bs->access_list, request, NULL);
++	checklist->reply = reply;
++	if (1 != aclCheckFast(bs->access_list, checklist)) {
++	    /* deny - skip this entry */
++	    bs = (body_size *) bs->node.next;
++	} else {
++	    /* Allow - use this entry */
++	    reply->maxBodySize = bs->maxsize;
++	    bs = NULL;
++	    debug (58, 3) ("httpReplyBodyBuildSize: Setting maxBodySize to %d\n", reply->maxBodySize);
++	}
++	aclChecklistFree(checklist); 
++    }
++}
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: cache_cf.cc,v 1.386 2001/06/27 17:46:42 wessels Exp $
++ * $Id: cache_cf.cc,v 1.387 2001/07/28 09:21:31 hno Exp $
+  *
+  * DEBUG: section 3     Configuration File Parsing
+  * AUTHOR: Harvest Derived
+@@ -1870,6 +1870,65 @@ parse_b_size_t(size_t * var)
+     parseBytesLine(var, B_BYTES_STR);
+ }
+ 
++CBDATA_TYPE (body_size);
++
++static void
++parse_body_size_t(dlink_list *bodylist)
++{
++    body_size *bs;
++    CBDATA_INIT_TYPE (body_size);
++    bs = cbdataAlloc(body_size);
++    parse_size_t (&bs->maxsize);
++    aclParseAccessLine(&bs->access_list);
++
++    dlinkAddTail(bs, &bs->node, bodylist);
++}
++
++static void
++dump_body_size_t(StoreEntry * entry, const char *name, dlink_list bodylist)
++{
++    body_size *bs;
++    bs = (body_size *) bodylist.head;
++    while (bs) {
++        acl_list *l;
++	acl_access *head = bs->access_list;
++	while (head != NULL) {
++            storeAppendPrintf(entry, "%s %d %s", name, bs->maxsize, 
++		head->allow ? "Allow" : "Deny");
++	    for (l = head->acl_list; l != NULL; l = l->next) {
++	        storeAppendPrintf(entry, " %s%s",
++		    l->op ? null_string : "!",
++		    l->acl->name);
++	    }
++	    storeAppendPrintf(entry, "\n");
++	    head = head->next;
++	}	    
++	bs = (body_size *) bs->node.next;
++    }
++}
++
++static void
++free_body_size_t(dlink_list * bodylist) //acl_access ** head)
++{
++    body_size *bs, *tempnode;
++    bs = (body_size *) bodylist->head;
++    while (bs) {
++        bs->maxsize = 0;
++	aclDestroyAccessList(&bs->access_list);
++	tempnode = (body_size *) bs->node.next;
++	dlinkDelete (&bs->node, bodylist);
++	cbdataFree (bs);
++	bs = tempnode;
++    }
++}
++
++static int
++check_null_body_size_t(dlink_list bodylist)
++{
++    return bodylist.head == NULL;
++}
++
++
+ static void
+ parse_kb_size_t(size_t * var)
+ {
+@@ -1,6 +1,6 @@
+ 
+ #
+-# $Id: cf.data.pre,v 1.221 2001/07/12 12:59:31 hno Exp $
++# $Id: cf.data.pre,v 1.222 2001/07/28 09:21:31 hno Exp $
+ #
+ #
+ # SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -1464,33 +1464,6 @@ DOC_START
+ 	imposed.
+ DOC_END
+ 
+-NAME: reply_body_max_size
+-COMMENT: (KB)
+-TYPE: b_size_t
+-DEFAULT: 0
+-LOC: Config.maxReplyBodySize
+-DOC_START
+-	This option specifies the maximum size of a reply body.  It
+-	can be used to prevent users from downloading very large files,
+-	such as MP3's and movies.   The reply size is checked twice.
+-	First when we get the reply headers, we check the
+-	content-length value.  If the content length value exists and
+-	is larger than this parameter, the request is denied and the
+-	user receives an error message that says "the request or reply
+-	is too large." If there is no content-length, and the reply
+-	size exceeds this limit, the client's connection is just closed
+-	and they will receive a partial reply.
+-
+-	NOTE: downstream caches probably can not detect a partial reply
+-	if there is no content-length header, so they will cache
+-	partial responses and give them out as hits.  You should NOT
+-	use this option if you have downstream caches.
+-
+-	If you set this parameter to zero (the default), there will be
+-	no limit imposed.
+-DOC_END
+-
+-
+ NAME: refresh_pattern
+ TYPE: refreshpattern
+ LOC: Config.Refresh
+@@ -2123,6 +2096,40 @@ DOC_START
+ DOC_END
+ 
+ 
++NAME: reply_body_max_size
++COMMENT: bytes allow|deny acl acl...
++TYPE: body_size_t
++DEFAULT: none
++DEFAULT_IF_NONE: 0 allow all
++LOC: Config.ReplyBodySize
++DOC_START
++        This option specifies the maximum size of a reply body.  It
++	can be used to prevent users from downloading very large files,
++	such as MP3's and movies. When the reply headers are recieved,
++	the reply_body_max_size lines are processed, and the first line with
++	a result of "allow" is used as the maximum body size for this reply.
++	This size is then checked twice. First when we get the reply headers,
++	we check the content-length value.  If the content length value exists
++	and is larger than the allowed size, the request is denied and the
++	user receives an error message that says "the request or reply
++	is too large." If there is no content-length, and the reply
++	size exceeds this limit, the client's connection is just closed
++	and they will receive a partial reply.
++
++	WARNING: downstream caches probably can not detect a partial reply
++	if there is no content-length header, so they will cache
++	partial responses and give them out as hits.  You should NOT
++	use this option if you have downstream caches.
++
++	WARNING: A maximum size larger than the size of squid's error messages 
++	will cause an infinite loop and crash squid. Ensure that the smallest
++	non-zero value you use is greater that the maximum header size plus
++	the size of your largest error page.
++
++	If you set this parameter to zero (the default), there will be
++	no limit imposed.
++DOC_END
++
+ COMMENT_START
+  ADMINISTRATIVE PARAMETERS
+  -----------------------------------------------------------------------------
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: client_side.cc,v 1.540 2001/07/17 09:50:38 hno Exp $
++ * $Id: client_side.cc,v 1.541 2001/07/28 09:21:31 hno Exp $
+  *
+  * DEBUG: section 33    Client-side Routines
+  * AUTHOR: Duane Wessels
+@@ -114,7 +114,7 @@ static int clientHierarchical(clientHttpRequest * http);
+ static int clientCheckContentLength(request_t * r);
+ static DEFER httpAcceptDefer;
+ static log_type clientProcessRequest2(clientHttpRequest * http);
+-static int clientReplyBodyTooLarge(int clen);
++static int clientReplyBodyTooLarge(HttpReply *, int clen);
+ static int clientRequestBodyTooLarge(int clen);
+ static void clientProcessBody(ConnStateData * conn);
+ 
+@@ -1760,13 +1760,13 @@ clientPackMoreRanges(clientHttpRequest * http, const char *buf, ssize_t size, Me
+ }
+ 
+ static int
+-clientReplyBodyTooLarge(int clen)
++clientReplyBodyTooLarge(HttpReply *rep, int clen)
+ {
+-    if (0 == Config.maxReplyBodySize)
++    if (0 == rep->maxBodySize)
+ 	return 0;		/* disabled */
+     if (clen < 0)
+ 	return 0;		/* unknown */
+-    if (clen > Config.maxReplyBodySize)
++    if (clen > rep->maxBodySize)
+ 	return 1;		/* too large */
+     return 0;
+ }
+@@ -1865,20 +1865,22 @@ clientSendMoreData(void *data, char *buf, ssize_t size)
+ 	    }
+ 	}
+ 	rep = clientBuildReply(http, buf, size);
+-	if (rep && clientReplyBodyTooLarge(rep->content_length)) {
+-	    ErrorState *err = errorCon(ERR_TOO_BIG, HTTP_FORBIDDEN);
+-	    err->request = requestLink(http->request);
+-	    storeUnregister(http->sc, http->entry, http);
+-	    http->sc = NULL;
+-	    storeUnlockObject(http->entry);
+-	    http->entry = clientCreateStoreEntry(http, http->request->method,
+-		null_request_flags);
+-	    errorAppendEntry(http->entry, err);
+-	    httpReplyDestroy(rep);
+-	    return;
+-	} else if (rep) {
++	if (rep) {
+ 	    aclCheck_t *ch;
+ 	    int rv;
++	    httpReplyBodyBuildSize(http->request, rep, &Config.ReplyBodySize);
++	    if (clientReplyBodyTooLarge(rep, rep->content_length)) {
++	    	ErrorState *err = errorCon(ERR_TOO_BIG, HTTP_FORBIDDEN);
++	    	err->request = requestLink(http->request);
++	    	storeUnregister(http->sc, http->entry, http);
++	    	http->sc = NULL;
++	    	storeUnlockObject(http->entry);
++	    	http->entry = clientCreateStoreEntry(http, http->request->method,
++		    null_request_flags);
++	    	errorAppendEntry(http->entry, err);
++	    	httpReplyDestroy(rep);
++	    return;
++	    }
+ 	    body_size = size - rep->hdr_sz;
+ 	    assert(body_size >= 0);
+ 	    body_buf = buf + rep->hdr_sz;
+@@ -2095,7 +2097,7 @@ clientWriteComplete(int fd, char *bufnotused, size_t size, int errflag, void *da
+ 	} else {
+ 	    comm_close(fd);
+ 	}
+-    } else if (clientReplyBodyTooLarge((int) http->out.offset)) {
++    } else if (clientReplyBodyTooLarge(entry->mem_obj->reply, (int) http->out.offset)) {
+ 	comm_close(fd);
+     } else {
+ 	/* More data will be coming from primary server; register with 
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: protos.h,v 1.407 2001/05/21 04:50:57 hno Exp $
++ * $Id: protos.h,v 1.408 2001/07/28 09:21:32 hno Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -495,6 +495,7 @@ extern time_t httpReplyExpires(const HttpReply * rep);
+ extern int httpReplyHasCc(const HttpReply * rep, http_hdr_cc_type type);
+ extern void httpRedirectReply(HttpReply *, http_status, const char *);
+ extern int httpReplyBodySize(method_t, HttpReply *);
++extern void httpReplyBodyBuildSize(request_t *, HttpReply *, dlink_list *);
+ 
+ /* Http Request */
+ extern request_t *requestCreate(method_t, protocol_t, const char *urlpath);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: structs.h,v 1.394 2001/07/09 19:12:21 wessels Exp $
++ * $Id: structs.h,v 1.395 2001/07/28 09:21:32 hno Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -197,6 +197,12 @@ struct _header_mangler {
+     char *replacement;
+ };
+ 
++struct _body_size {
++    dlink_node node;
++    acl_access *access_list;
++    size_t maxsize;
++};
++
+ struct _http_version_t {
+     unsigned int major;
+     unsigned int minor;
+@@ -378,7 +384,7 @@ struct _SquidConfig {
+     } Timeout;
+     size_t maxRequestHeaderSize;
+     size_t maxRequestBodySize;
+-    size_t maxReplyBodySize;
++    dlink_list ReplyBodySize;
+     struct {
+ 	u_short icp;
+ #if USE_HTCP
+@@ -910,6 +916,7 @@ struct _HttpReply {
+     HttpStatusLine sline;
+     HttpHeader header;
+     HttpBody body;		/* for small constant memory-resident text bodies only */
++    size_t maxBodySize;
+ };
+ 
+ struct _http_state_flags {
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: typedefs.h,v 1.128 2001/05/08 15:24:35 hno Exp $
++ * $Id: typedefs.h,v 1.129 2001/07/28 09:21:32 hno Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -143,6 +143,7 @@ typedef struct _helper_flags helper_flags;
+ typedef struct _helper_stateful_flags helper_stateful_flags;
+ typedef struct _http_state_flags http_state_flags;
+ typedef struct _header_mangler header_mangler;
++typedef struct _body_size body_size;
+ typedef struct _request_t request_t;
+ typedef struct _AccessLogEntry AccessLogEntry;
+ typedef struct _cachemgr_passwd cachemgr_passwd;

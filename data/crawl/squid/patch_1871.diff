@@ -1,0 +1,764 @@
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: main.cc,v 1.139 1997/03/29 04:45:17 wessels Exp $
++ * $Id: main.cc,v 1.140 1997/04/25 06:38:21 wessels Exp $
+  *
+  * DEBUG: section 1     Startup and Main Loop
+  * AUTHOR: Harvest Derived
+@@ -692,7 +692,7 @@ main(int argc, char **argv)
+ 	    ftpServerClose();
+ 	    icmpClose();
+ 	    _db_rotate_log();	/* cache.log */
+-	    storeWriteCleanLog();
++	    storeWriteCleanLogs();
+ 	    storeRotateLog();	/* store.log */
+ 	    stat_rotate_log();	/* access.log */
+ 	    useragentRotateLog();	/* useragent.log */
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: store.cc,v 1.217 1997/04/02 05:22:15 wessels Exp $
++ * $Id: store.cc,v 1.218 1997/04/25 06:38:22 wessels Exp $
+  *
+  * DEBUG: section 20    Storeage Manager
+  * AUTHOR: Harvest Derived
+@@ -185,16 +185,23 @@ const char *swapStatusStr[] =
+     "SWAP_OK"
+ };
+ 
+-struct storeRebuild_data {
+-    FILE *log;
++struct storeRebuildState {
++    struct _rebuild_dir {
++	int dirn;
++    	FILE *log;
++	int speed;
++	int clean;
++	struct _rebuild_dir *next;
++    } *rebuild_dir;
+     int objcount;		/* # objects successfully reloaded */
+     int expcount;		/* # objects expired */
+     int linecount;		/* # lines parsed from cache logfile */
+     int clashcount;		/* # swapfile clashes avoided */
+     int dupcount;		/* # duplicates purged */
+-    time_t start, stop;
+-    int speed;			/* # Objects per run */
+-    char line_in[4096];
++    time_t start;
++    time_t stop;
++    char *line_in;
++    size_t line_in_sz;
+ };
+ 
+ struct _bucketOrder {
+@@ -284,7 +291,6 @@ static void storeDeleteBehind _PARAMS((StoreEntry *));
+ static void storePurgeMem _PARAMS((StoreEntry *));
+ static void storeSetMemStatus _PARAMS((StoreEntry *, mem_status_t));
+ static void storeStartRebuildFromDisk _PARAMS((void));
+-static void storeSwapLog _PARAMS((const StoreEntry *));
+ static void storeSwapOutStart _PARAMS((StoreEntry * e));
+ static void storeSwapOutStartComplete _PARAMS((void *, int));
+ static void storeSwapOutHandle _PARAMS((int, int, StoreEntry *));
+@@ -296,7 +302,7 @@ static void storeCleanup _PARAMS((void *data));
+ static void storeCleanupComplete _PARAMS((void *data, int));
+ static void storeValidate _PARAMS((StoreEntry *, void (*)(), void *));
+ static void storeValidateComplete _PARAMS((void *data, int, int));
+-static void storeRebuiltFromDisk _PARAMS((struct storeRebuild_data * data));
++static void storeRebuiltFromDisk _PARAMS((struct storeRebuildState * data));
+ static unsigned int getKeyCounter _PARAMS((void));
+ 
+ /* Now, this table is inaccessible to outsider. They have to use a method
+@@ -321,8 +327,6 @@ static int storelog_fd = -1;
+ 
+ /* key temp buffer */
+ static char key_temp_buffer[MAX_URL + 100];
+-static char swaplog_file[SQUID_MAXPATHLEN];
+-static char tmp_filename[SQUID_MAXPATHLEN];
+ 
+ /* expiration parameters and stats */
+ static int store_buckets;
+@@ -332,7 +336,7 @@ static int scan_revolutions;
+ static struct _bucketOrder *MaintBucketsOrder = NULL;
+ 
+ /* Dirty/Clean rebuild status parameter */
+-static int store_validating = 1;
++static int store_validating = 0;
+ 
+ static MemObject *
+ new_MemObject(void)
+@@ -1253,7 +1257,7 @@ storeSwapOutHandle(int fd, int flag, StoreEntry * e)
+ 	debug(20, 5, "storeSwapOutHandle: SwapOut complete: '%s' to %s.\n",
+ 	    e->url, storeSwapFullPath(e->swap_file_number, NULL));
+ 	put_free_8k_page(mem->e_swap_buf);
+-	storeSwapLog(e);
++	storeDirSwapLog(e);
+ 	HTTPCacheInfo->proto_newobject(HTTPCacheInfo,
+ 	    mem->request->protocol,
+ 	    e->object_len,
+@@ -1378,7 +1382,7 @@ storeSwapOutStartComplete(void *data, int fd)
+ static void
+ storeDoRebuildFromDisk(void *data)
+ {
+-    struct storeRebuild_data *rebuildData = data;
++    struct storeRebuildState *RB = data;
+     LOCAL_ARRAY(char, swapfile, MAXPATHLEN);
+     LOCAL_ARRAY(char, url, MAX_URL);
+     StoreEntry *e = NULL;
+@@ -1393,29 +1397,40 @@ storeDoRebuildFromDisk(void *data)
+     int sfileno = 0;
+     int count;
+     int x;
++    struct _rebuild_dir *d;
++    struct _rebuild_dir **D;
+     /* load a number of objects per invocation */
+-    for (count = 0; count < rebuildData->speed; count++) {
+-	if (fgets(rebuildData->line_in, 4095, rebuildData->log) == NULL) {
+-	    diskWriteIsComplete(swaplog_fd);
+-	    storeRebuiltFromDisk(rebuildData);
++    if ((d = RB->rebuild_dir) == NULL) {
++	    storeRebuiltFromDisk(RB);
+ 	    return;
++    }
++    for (count = 0; count < d->speed; count++) {
++	if (fgets(RB->line_in, RB->line_in_sz, d->log) == NULL) {
++		debug(20,1,"Done reading Cache Dir #%d swap log\n", d->dirn);
++		fclose(d->log);
++		d->log = NULL;
++		storeDirCloseTmpSwapLog(d->dirn);
++		RB->rebuild_dir = d->next;
++		safe_free(d);
++		return;
+ 	}
+-	if ((++rebuildData->linecount & 0xFFF) == 0)
+-	    debug(20, 1, "  %7d Lines read so far.\n", rebuildData->linecount);
+-
+-	debug(20, 9, "line_in: %s", rebuildData->line_in);
+-	if ((rebuildData->line_in[0] == '\0') || (rebuildData->line_in[0] == '\n') ||
+-	    (rebuildData->line_in[0] == '#'))
+-	    continue;		/* skip bad lines */
+-
++	if ((++RB->linecount & 0x3FFF) == 0)
++	    debug(20, 1, "  %7d Lines read so far.\n", RB->linecount);
++	debug(20, 9, "line_in: %s", RB->line_in);
++	if (RB->line_in[0] == '\0')
++	    continue;
++	if (RB->line_in[0] == '\n')
++	    continue;
++	if (RB->line_in[0] == '#')
++	    continue;
+ 	url[0] = '\0';
+ 	swapfile[0] = '\0';
+ 	sfileno = 0;
+ 	scan1 = 0;
+ 	scan2 = 0;
+ 	scan3 = 0;
+ 	scan4 = 0;
+-	x = sscanf(rebuildData->line_in, "%x %x %x %x %d %s",
++	x = sscanf(RB->line_in, "%x %x %x %x %d %s",
+ 	    &sfileno,		/* swap_file_number */
+ 	    &scan1,		/* timestamp */
+ 	    &scan2,		/* expires */
+@@ -1438,41 +1453,45 @@ storeDoRebuildFromDisk(void *data)
+ 	    if (e->timestamp > timestamp) {
+ 		/* already have a newer object in memory, throw old one away */
+ 		debug(20, 3, "storeRebuildFromDisk: Replaced: %s\n", url);
+-		rebuildData->dupcount++;
++		RB->dupcount++;
+ 		continue;
+ 	    }
+ 	    debug(20, 6, "storeRebuildFromDisk: Duplicate: '%s'\n", url);
+ 	    storeRelease(e);
+-	    rebuildData->objcount--;
+-	    rebuildData->dupcount++;
++	    RB->objcount--;
++	    RB->dupcount++;
+ 	}
+ 	/* Is the swap file number already taken? */
+ 	if (storeDirMapBitTest(sfileno)) {
+ 	    /* Yes it is, we can't use this swapfile */
+ 	    debug(20, 2, "storeRebuildFromDisk: Line %d Active clash: file #%d\n",
+-		rebuildData->linecount,
++		RB->linecount,
+ 		sfileno);
+ 	    debug(20, 3, "storeRebuildFromDisk: --> '%s'\n", url);
+ 	    /* don't unlink the file!  just skip this log entry */
+-	    rebuildData->clashcount++;
++	    RB->clashcount++;
+ 	    continue;
+ 	}
+ 	/* update store_swap_size */
+ 	store_swap_size += (int) ((size + 1023) >> 10);
+-	rebuildData->objcount++;
++	RB->objcount++;
+ 	e = storeAddDiskRestore(url,
+ 	    sfileno,
+ 	    (int) size,
+ 	    expires,
+ 	    timestamp,
+ 	    lastmod);
+-	storeSwapLog(e);
++	storeDirSwapLog(e);
+ 	HTTPCacheInfo->proto_newobject(HTTPCacheInfo,
+ 	    urlParseProtocol(url),
+ 	    (int) size,
+ 	    TRUE);
+     }
+-    eventAdd("storeRebuild", storeDoRebuildFromDisk, rebuildData, 0);
++    RB->rebuild_dir = d->next;
++    for (D = &RB->rebuild_dir; (*D)->next; D = &(*D)->next);
++    *D = d;
++    d->next = NULL;
++    eventAdd("storeRebuild", storeDoRebuildFromDisk, RB, 0);
+ }
+ 
+ 
+@@ -1582,7 +1601,7 @@ storeValidateComplete(void *data, int retcode, int errcode)
+ 
+ /* meta data recreated from disk image in swap directory */
+ static void
+-storeRebuiltFromDisk(struct storeRebuild_data *data)
++storeRebuiltFromDisk(struct storeRebuildState *data)
+ {
+     time_t r;
+     time_t stop;
+@@ -1598,17 +1617,8 @@ storeRebuiltFromDisk(struct storeRebuild_data *data)
+ 	r > 0 ? r : 0, (double) data->objcount / (r > 0 ? r : 1));
+     debug(20, 1, "  store_swap_size = %dk\n", store_swap_size);
+     store_rebuilding = STORE_NOT_REBUILDING;
+-    fclose(data->log);
++    safe_free(data->line_in);
+     safe_free(data);
+-    sprintf(tmp_filename, "%s.new", swaplog_file);
+-    if (rename(tmp_filename, swaplog_file) < 0) {
+-	debug(50, 0, "storeRebuiltFromDisk: %s,%s: %s\n",
+-	    tmp_filename, swaplog_file, xstrerror());
+-	fatal_dump("storeRebuiltFromDisk: rename failed");
+-    }
+-    file_close(swaplog_fd);
+-    if ((swaplog_fd = file_open(swaplog_file, NULL, O_WRONLY | O_CREAT, NULL, NULL)) < 0)
+-	fatal_dump("storeRebuiltFromDisk: file_open(swaplog_file) failed");
+     if (store_validating) {
+ 	debug(20, 1, "Beginning Validation Procedure\n");
+ 	eventAdd("storeCleanup", storeCleanup, NULL, 0);
+@@ -1618,59 +1628,35 @@ storeRebuiltFromDisk(struct storeRebuild_data *data)
+ static void
+ storeStartRebuildFromDisk(void)
+ {
+-    struct stat sb;
+     int i;
+-    struct storeRebuild_data *data;
+-    time_t last_clean;
+-    if (stat(swaplog_file, &sb) < 0) {
+-	debug(20, 1, "storeRebuildFromDisk: No log file\n");
+-	store_rebuilding = STORE_NOT_REBUILDING;
+-	return;
+-    }
+-    data = xcalloc(1, sizeof(*data));
+-    for (i = 0; i < ncache_dirs; i++)
+-	debug(20, 1, "Rebuilding storage from disk image in %s\n", storeSwapDir(i));
+-    data->start = getCurrentTime();
+-    /* Check if log is clean */
+-    sprintf(tmp_filename, "%s-last-clean", swaplog_file);
+-    if (stat(tmp_filename, &sb) >= 0) {
+-	last_clean = sb.st_mtime;
+-	if (stat(swaplog_file, &sb) >= 0)
+-	    store_rebuilding = (sb.st_mtime <= last_clean) ?
+-		STORE_REBUILDING_CLEAN : STORE_REBUILDING_DIRTY;
+-    }
+-    /* Remove timestamp in case we crash during rebuild */
+-    safeunlink(tmp_filename, 1);
+-    /* close the existing write-only swaplog, and open a temporary
+-     * write-only swaplog  */
+-    if (swaplog_fd > -1)
+-	file_close(swaplog_fd);
+-    sprintf(tmp_filename, "%s.new", swaplog_file);
+-    swaplog_fd = file_open(tmp_filename, NULL, O_WRONLY | O_CREAT | O_TRUNC, NULL, NULL);
+-    debug(20, 3, "swaplog_fd %d is now '%s'\n", swaplog_fd, tmp_filename);
+-    if (swaplog_fd < 0) {
+-	debug(50, 0, "storeStartRebuildFromDisk: %s: %s\n",
+-	    tmp_filename, xstrerror());
+-	fatal("storeStartRebuildFromDisk: Can't open tmp swaplog");
+-    }
+-    /* Open the existing swap log for reading */
+-    if ((data->log = fopen(swaplog_file, "r")) == (FILE *) NULL) {
+-	sprintf(tmp_error_buf, "storeRebuildFromDisk: %s: %s",
+-	    swaplog_file, xstrerror());
+-	fatal(tmp_error_buf);
+-    }
+-    debug(20, 3, "data->log %d is now '%s'\n", fileno(data->log), swaplog_file);
+-    debug(20, 1, "Rebuilding in %s log.\n",
+-	store_rebuilding == STORE_REBUILDING_CLEAN ? "CLEAN" : "DIRTY");
+-    store_validating = store_rebuilding == STORE_REBUILDING_CLEAN ? 0 : 1;
+-    memset(data->line_in, '\0', 4096);
+-    data->speed = 50;
+-    /* Start reading the log file */
++    struct storeRebuildState *RB;
++    struct _rebuild_dir *d;
++    FILE *fp;
++    int clean;
++    RB = xcalloc(1, sizeof(struct storeRebuildState));
++    RB->start = squid_curtime;
++    for (i = 0; i < ncache_dirs; i++) {
++	fp = storeDirOpenTmpSwapLog(i, &clean);
++	if (fp == NULL)
++	    continue;
++	d = xcalloc(1, sizeof(struct _rebuild_dir));
++	d->dirn = i;
++	d->log = fp;
++	d->clean = clean;
++	d->speed = opt_foreground_rebuild ? 1 << 30 : 50;
++	d->next = RB->rebuild_dir;
++	RB->rebuild_dir = d;
++	if (!clean)
++	    store_validating = 1;
++	debug(20, 1, "Rebuilding storage in Cache Dir #%d (%s)\n",
++	    i, clean ? "CLEAN" : "DIRTY");
++    }
++    RB->line_in_sz = 4096;
++    RB->line_in = xcalloc(1, RB->line_in_sz);
+     if (opt_foreground_rebuild) {
+-	data->speed = 1 << 30;
+-	storeDoRebuildFromDisk(data);
++	storeDoRebuildFromDisk(RB);
+     } else {
+-	eventAdd("storeRebuild", storeDoRebuildFromDisk, data, 0);
++	eventAdd("storeRebuild", storeDoRebuildFromDisk, RB, 0);
+     }
+ }
+ 
+@@ -2563,39 +2549,48 @@ storeMaintainSwapSpace(void *unused)
+ 
+ 
+ /*
+- *  storeWriteCleanLog
++ *  storeWriteCleanLogs
+  * 
+  *  Writes a "clean" swap log file from in-memory metadata.
+  */
+ int
+-storeWriteCleanLog(void)
++storeWriteCleanLogs(void)
+ {
+     StoreEntry *e = NULL;
+-    int fd = -1;
+-    char line[16384];
++    int fd[ncache_dirs];
++    char *line;
+     int n = 0;
+     time_t start, stop, r;
+     struct stat sb;
+-
++    char *cur[ncache_dirs];
++    char *new[ncache_dirs];
++    char *cln[ncache_dirs];
++    int dirn;
+     if (store_rebuilding) {
+-	debug(20, 1, "storeWriteCleanLog: Not currently OK to rewrite swap log.\n");
+-	debug(20, 1, "storeWriteCleanLog: Operation aborted.\n");
++	debug(20, 1, "Not currently OK to rewrite swap log.\n");
++	debug(20, 1, "storeWriteCleanLogs: Operation aborted.\n");
+ 	return 0;
+     }
+-    debug(20, 1, "storeWriteCleanLog: Starting...\n");
+-    sprintf(tmp_filename, "%s-last-clean", swaplog_file);
+-    unlink(tmp_filename);
++    debug(20, 1, "storeWriteCleanLogs: Starting...\n");
+     start = getCurrentTime();
+-    sprintf(tmp_filename, "%s_clean", swaplog_file);
+-    unlink(tmp_filename);
+-    if ((fd = open(tmp_filename, O_WRONLY | O_APPEND | O_CREAT | O_TRUNC, 0644)) < 0) {
+-	debug(50, 0, "storeWriteCleanLog: %s: %s\n", tmp_filename, xstrerror());
+-	return 0;
+-    }
++    for (dirn = 0; dirn< ncache_dirs; dirn++) {
++        fd[dirn] = -1;
++    	cur[dirn] = xstrdup(storeDirSwapLogFile(dirn, NULL));
++    	new[dirn] = xstrdup(storeDirSwapLogFile(dirn, ".clean"));
++    	cln[dirn] = xstrdup(storeDirSwapLogFile(dirn, ".last-clean"));
++        safeunlink(new[dirn], 1);
++        safeunlink(cln[dirn], 1);
++        fd[dirn] = open(new[dirn], O_WRONLY | O_APPEND | O_CREAT | O_TRUNC, 0644);
++        if (fd[dirn] < 0) {
++	    debug(50, 0, "storeWriteCleanLogs: %s: %s\n", new[dirn], xstrerror());
++	    continue;
++	}
+ #if HAVE_FCHMOD
+-    if (stat(swaplog_file, &sb) == 0)
+-	fchmod(fd, sb.st_mode);
++        if (stat(cur[dirn], &sb) == 0)
++	    fchmod(fd[dirn], sb.st_mode);
+ #endif
++    }
++    line = xcalloc(1, 16384);
+     for (e = storeGetFirst(); e; e = storeGetNext()) {
+ 	if (e->swap_file_number < 0)
+ 	    continue;
+@@ -2607,52 +2602,56 @@ storeWriteCleanLog(void)
+ 	    continue;
+ 	if (BIT_TEST(e->flag, KEY_PRIVATE))
+ 	    continue;
++	if ((dirn = storeDirNumber(e->swap_file_number)) >= ncache_dirs) {
++	    debug_trap("storeWriteCleanLogss: dirn out of range");
++	    continue;
++	}
++	if (fd[dirn] < 0)
++	    continue;
+ 	sprintf(line, "%08x %08x %08x %08x %9d %s\n",
+ 	    (int) e->swap_file_number,
+ 	    (int) e->timestamp,
+ 	    (int) e->expires,
+ 	    (int) e->lastmod,
+ 	    e->object_len,
+ 	    e->url);
+-	if (write(fd, line, strlen(line)) < 0) {
+-	    debug(50, 0, "storeWriteCleanLog: %s: %s\n", tmp_filename, xstrerror());
+-	    debug(20, 0, "storeWriteCleanLog: Current swap logfile not replaced.\n");
+-	    close(fd);
+-	    safeunlink(tmp_filename, 0);
+-	    return 0;
++	if (write(fd[dirn], line, strlen(line)) < 0) {
++	    debug(50, 0, "storeWriteCleanLogs: %s: %s\n", new[dirn], xstrerror());
++	    debug(20, 0, "storeWriteCleanLogs: Current swap logfile not replaced.\n");
++	    file_close(fd[dirn]);
++	    fd[dirn] = -1;
++	    safeunlink(cln[dirn], 0);
++	    continue;
+ 	}
+-	if ((++n & 0xFFF) == 0) {
++	if ((++n & 0x3FFF) == 0) {
+ 	    getCurrentTime();
+ 	    debug(20, 1, "  %7d lines written so far.\n", n);
+ 	}
+     }
+-    if (close(fd) < 0) {
+-	debug(50, 0, "storeWriteCleanLog: %s: %s\n", tmp_filename, xstrerror());
+-	debug(20, 0, "storeWriteCleanLog: Current swap logfile not replaced.\n");
+-	safeunlink(tmp_filename, 0);
+-	return 0;
+-    }
+-    if (rename(tmp_filename, swaplog_file) < 0) {
+-	debug(50, 0, "storeWriteCleanLog: rename failed: %s\n",
+-	    xstrerror());
+-	return 0;
+-    }
+-    file_close(swaplog_fd);
+-    swaplog_fd = file_open(swaplog_file, NULL, O_WRONLY | O_CREAT, NULL, NULL);
+-    if (swaplog_fd < 0) {
+-	sprintf(tmp_error_buf, "Cannot open swap logfile: %s", swaplog_file);
+-	fatal(tmp_error_buf);
+-    }
++    safe_free(line);
++    for (dirn=0; dirn<ncache_dirs; dirn++) {
++        file_close(fd[dirn]);
++        fd[dirn] = -1;
++        if (rename(new[dirn], cur[dirn]) < 0) {
++	    debug(50, 0, "storeWriteCleanLogs: rename failed: %s\n",
++	        xstrerror());
++        }
++    }
++    storeDirCloseSwapLogs();
++    storeDirOpenSwapLogs();
+     stop = getCurrentTime();
+     r = stop - start;
+     debug(20, 1, "  Finished.  Wrote %d lines.\n", n);
+     debug(20, 1, "  Took %d seconds (%6.1lf lines/sec).\n",
+ 	r > 0 ? r : 0, (double) n / (r > 0 ? r : 1));
+-
+     /* touch a timestamp file if we're not still validating */
+-    if (!store_validating) {
+-	sprintf(tmp_filename, "%s-last-clean", swaplog_file);
+-	file_close(file_open(tmp_filename, NULL, O_WRONLY | O_CREAT | O_TRUNC, NULL, NULL));
++    for (dirn=0; dirn<ncache_dirs; dirn++) {
++        if (!store_validating)
++	    file_close(file_open(cln[dirn], NULL,
++		O_WRONLY | O_CREAT | O_TRUNC, NULL, NULL));
++	safe_free(cur[dirn]);
++	safe_free(new[dirn]);
++	safe_free(cln[dirn]);
+     }
+     return n;
+ }
+@@ -2813,8 +2812,6 @@ storeDescribeStatus(const StoreEntry * e)
+ void
+ storeCloseLog(void)
+ {
+-    if (swaplog_fd >= 0)
+-	file_close(swaplog_fd);
+     if (storelog_fd >= 0)
+ 	file_close(storelog_fd);
+ }
+@@ -12,6 +12,7 @@ int ncache_dirs = 0;
+ 
+ /* LOCALS */
+ static int SwapDirsAllocated = 0;
++static SwapDir *SwapDirs = NULL;
+ 
+ /* return full name to swapfile */
+ char *
+@@ -58,30 +59,31 @@ storeAddSwapDisk(const char *path, int size, int l1, int l2, int read_only)
+ 	fatal_dump("cache_dir pathname is too long");
+     if (SwapDirs == NULL) {
+ 	SwapDirsAllocated = 4;
+-	SwapDirs = xcalloc(SwapDirsAllocated, sizeof(char *));
++	SwapDirs = xcalloc(SwapDirsAllocated, sizeof(SwapDir *));
+     }
+     if (SwapDirsAllocated == ncache_dirs) {
+ 	SwapDirsAllocated <<= 1;
+-	tmp = xcalloc(SwapDirsAllocated, sizeof(char *));
++	tmp = xcalloc(SwapDirsAllocated, sizeof(SwapDir *));
+ 	for (i = 0; i < ncache_dirs; i++)
+ 	    tmp[i] = SwapDirs[i];
+ 	xfree(SwapDirs);
+ 	SwapDirs = tmp;
+     }
+-    SwapDirs[ncache_dirs].path = xstrdup(path);
+-    SwapDirs[ncache_dirs].max_size = size;
+-    SwapDirs[ncache_dirs].l1 = l1;
+-    SwapDirs[ncache_dirs].l2 = l2;
+-    SwapDirs[ncache_dirs].read_only = read_only;
+-    SwapDirs[ncache_dirs].map = file_map_create(MAX_FILES_PER_DIR);
++    tmp = SwapDirs+ncache_dirs;
++    tmp->path = xstrdup(path);
++    tmp->max_size = size;
++    tmp->l1 = l1;
++    tmp->l2 = l2;
++    tmp->read_only = read_only;
++    tmp->map = file_map_create(MAX_FILES_PER_DIR);
+     return ++ncache_dirs;
+ }
+ 
+ static int
+ storeVerifyOrCreateDir(const char *path)
+ {
+     struct stat sb;
+-    if (stat(path, &sb) == 0 && S_ISDIR(sb.st_mode) == 0)
++    if (stat(path, &sb) == 0 && S_ISDIR(sb.st_mode))
+ 	return 0;
+     safeunlink(path, 0);
+     if (mkdir(path, 0777) < 0) {
+@@ -94,9 +96,9 @@ storeVerifyOrCreateDir(const char *path)
+     }
+     debug(20, 1, "Created directory %s\n", path);
+     if (stat(path, &sb) == 0 && S_ISDIR(sb.st_mode) != 0) {
+-        sprintf(tmp_error_buf,
++	sprintf(tmp_error_buf,
+ 	    "Failed to create directory %s: %s", path, xstrerror());
+-        fatal(tmp_error_buf);
++	fatal(tmp_error_buf);
+     }
+     return 1;
+ }
+@@ -196,6 +198,12 @@ storeSwapDir(int dirn)
+     return SwapDirs[dirn].path;
+ }
+ 
++int
++storeDirNumber(int swap_file_number)
++{
++    return swap_file_number >> SWAP_DIR_SHIFT;
++}
++
+ void
+ storeDirSwapLog(const StoreEntry * e)
+ {
+@@ -206,47 +214,49 @@ storeDirSwapLog(const StoreEntry * e)
+     dirn = e->swap_file_number >> SWAP_DIR_SHIFT;
+     /* Note this printf format appears in storeWriteCleanLog() too */
+     sprintf(logmsg, "%08x %08x %08x %08x %9d %s\n",
+-        (int) e->swap_file_number,
+-        (int) e->timestamp,
+-        (int) e->expires,
+-        (int) e->lastmod,
+-        e->object_len,
+-        e->url);
++	(int) e->swap_file_number,
++	(int) e->timestamp,
++	(int) e->expires,
++	(int) e->lastmod,
++	e->object_len,
++	e->url);
+     file_write(SwapDirs[dirn].swaplog_fd,
+-        xstrdup(logmsg),
+-        strlen(logmsg),
+-        NULL,
+-        NULL,
+-        xfree);
++	xstrdup(logmsg),
++	strlen(logmsg),
++	NULL,
++	NULL,
++	xfree);
+ }
+ 
+-static char *
+-storeDirSwapLogFile(int dirn)
++char *
++storeDirSwapLogFile(int dirn, const char *ext)
+ {
+     LOCAL_ARRAY(char, path, SQUID_MAXPATHLEN);
+     LOCAL_ARRAY(char, digit, 32);
+     if (Config.Log.swap) {
+ 	xstrncpy(path, Config.Log.swap, SQUID_MAXPATHLEN - 64);
+ 	strcat(path, ".");
+ 	sprintf(digit, "%02d", dirn);
+-	strncat(path, digit, 32);
++	strncat(path, digit, 3);
+     } else {
+ 	xstrncpy(path, storeSwapDir(dirn), SQUID_MAXPATHLEN - 64);
+ 	strcat(path, "/log");
+     }
++    if (ext)
++	strncat(path, ext, 16);
+     return path;
+ }
+ 
+ void
+ storeDirOpenSwapLogs(void)
+ {
+     int i;
+-    int fd;
+     char *path;
++    int fd;
+     SwapDir *SD;
+     for (i = 0; i < ncache_dirs; i++) {
+ 	SD = &SwapDirs[i];
+-	path = storeDirSwapLogFile(i);
++	path = storeDirSwapLogFile(i, NULL);
+ 	fd = file_open(path, NULL, O_WRONLY | O_CREAT, NULL, NULL);
+ 	if (fd < 0) {
+ 	    debug(50, 1, "%s: %s\n", path, xstrerror());
+@@ -255,3 +265,81 @@ storeDirOpenSwapLogs(void)
+ 	SD->swaplog_fd = fd;
+     }
+ }
++
++void
++storeDirCloseSwapLogs(void)
++{
++    int i;
++    SwapDir *SD;
++    for (i = 0; i < ncache_dirs; i++) {
++	SD = &SwapDirs[i];
++	file_close(SD->swaplog_fd);
++    }
++}
++
++FILE *
++storeDirOpenTmpSwapLog(int dirn, int *clean_flag)
++{
++    char *swaplog_path = xstrdup(storeDirSwapLogFile(dirn, NULL));
++    char *clean_path = xstrdup(storeDirSwapLogFile(dirn, ".last-clean"));
++    char *new_path = xstrdup(storeDirSwapLogFile(dirn, ".new"));
++    struct stat log_sb;
++    struct stat clean_sb;
++    SwapDir *SD = &SwapDirs[dirn];
++    FILE *fp;
++    int fd;
++    if (stat(swaplog_path, &log_sb) < 0) {
++	debug(20, 1, "Cache Dir #%d: No log file\n", dirn);
++	safe_free(swaplog_path);
++	safe_free(clean_path);
++	safe_free(new_path);
++	return NULL;
++    }
++    debug(20, 1, "Rebuilding storage from %s\n", swaplog_path);
++    /* close the existing write-only FD */
++    file_close(SD->swaplog_fd);
++    /* open a write-only FD for the new log */
++    fd = file_open(new_path, NULL, O_WRONLY | O_CREAT, NULL, NULL);
++    if (fd < 0) {
++	debug(50, 1, "%s: %s\n", new_path, xstrerror());
++	fatal("storeDirOpenTmpSwapLog: Failed to open swap log.");
++    }
++    SD->swaplog_fd = fd;
++    /* open a read-only stream of the old log */
++    fp = fopen(swaplog_path, "r");
++    if (fp == NULL) {
++	debug(50, 0, "%s: %s\n", swaplog_path, xstrerror());
++	fatal("Failed to open swap log for reading");
++    }
++    if (stat(clean_path, &clean_sb) < 0)
++	*clean_flag = 0;
++    else if (clean_sb.st_mtime < log_sb.st_mtime)
++	*clean_flag = 0;
++    else
++	*clean_flag = 1;
++    safeunlink(clean_path, 1);
++    safe_free(swaplog_path);
++    safe_free(clean_path);
++    safe_free(new_path);
++    return fp;
++}
++
++void
++storeDirCloseTmpSwapLog(int dirn)
++{
++    char *swaplog_path = xstrdup(storeDirSwapLogFile(dirn, NULL));
++    char *new_path = xstrdup(storeDirSwapLogFile(dirn, ".new"));
++    SwapDir *SD = &SwapDirs[dirn];
++    int fd;
++    if (rename(new_path, swaplog_path) < 0) {
++	debug(50, 0, "%s,%s: %s\n", new_path, swaplog_path, xstrerror());
++	fatal("storeDirCloseTmpSwapLog: rename failed");
++    }
++    file_close(SD->swaplog_fd);
++    fd = file_open(swaplog_path, NULL, O_WRONLY | O_CREAT, NULL, NULL);
++    if (fd < 0) {
++	debug(50, 1, "%s: %s\n", swaplog_path, xstrerror());
++	fatal("storeDirCloseTmpSwapLog: Failed to open swap log.");
++    }
++    SD->swaplog_fd = fd;
++}
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: tools.cc,v 1.97 1997/02/26 19:46:26 wessels Exp $
++ * $Id: tools.cc,v 1.98 1997/04/25 06:38:25 wessels Exp $
+  *
+  * DEBUG: section 21    Misc Functions
+  * AUTHOR: Harvest Derived
+@@ -277,7 +277,7 @@ death(int sig)
+ 	(void) close(theHttpConnection);
+     if (theInIcpConnection >= 0)
+ 	(void) close(theInIcpConnection);
+-    storeWriteCleanLog();
++    storeWriteCleanLogs();
+     PrintRusage(NULL, debug_log);
+     if (squid_curtime - SQUID_RELEASE_TIME < 864000) {
+ 	/* skip if more than 10 days old */
+@@ -335,7 +335,7 @@ normal_shutdown(void)
+ 	safeunlink(Config.pidFilename, 0);
+ 	leave_suid();
+     }
+-    storeWriteCleanLog();
++    storeWriteCleanLogs();
+     PrintRusage(NULL, debug_log);
+     storeCloseLog();
+     statCloseLog();
+@@ -382,7 +382,7 @@ fatal(const char *message)
+      * used in early initialization phases, long before we ever
+      * get to the store log. */
+     if (!store_rebuilding)
+-	storeWriteCleanLog();
++	storeWriteCleanLogs();
+     fatal_common(message);
+     exit(1);
+ }
+@@ -394,7 +394,7 @@ fatal_dump(const char *message)
+     if (message)
+ 	fatal_common(message);
+     if (opt_catch_signals)
+-	storeWriteCleanLog();
++	storeWriteCleanLogs();
+     abort();
+ }
+ 
+@@ -471,7 +471,7 @@ safeunlink(const char *s, int quiet)
+ 	quiet ? NULL : xstrdup(s));
+ #else
+     if (unlink(s) < 0 && !quiet)
+-	debug(50, 1, "safeunlink: Couldn't delete %s. %s\n", s, xstrerror());
++	debug(50, 1, "safeunlink: Couldn't delete %s: %s\n", s, xstrerror());
+ #endif
+ }
+ 

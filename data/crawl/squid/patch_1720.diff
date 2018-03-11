@@ -1,0 +1,700 @@
+@@ -1,7 +1,7 @@
+ #
+ #  Makefile for the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.121 1998/02/10 21:44:30 wessels Exp $
++#  $Id: Makefile.in,v 1.122 1998/02/19 23:09:46 wessels Exp $
+ #
+ #  Uncomment and customize the following to suit your needs:
+ #
+@@ -101,7 +101,7 @@ OBJS	 	= \
+ 		multicast.o \
+ 		neighbors.o \
+ 		net_db.o \
+-		objcache.o \
++		cache_manager.o \
+ 		pass.o \
+ 		pconn.o \
+ 		peer_select.o \
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: cache_cf.cc,v 1.247 1998/02/06 17:50:19 wessels Exp $
++ * $Id: cache_cf.cc,v 1.248 1998/02/19 23:09:47 wessels Exp $
+  *
+  * DEBUG: section 3     Configuration File Parsing
+  * AUTHOR: Harvest Derived
+@@ -179,6 +179,10 @@ parseConfigFile(const char *file_name)
+     fclose(fp);
+     defaults_if_none();
+     configDoConfigure();
++    cachemgrRegister("config",
++	"Current Squid Configuration",
++	dump_config,
++	1);
+     return 0;
+ }
+ 
+@@ -704,10 +708,15 @@ parse_cachemgrpasswd(cachemgr_passwd ** head)
+ {
+     char *passwd = NULL;
+     wordlist *actions = NULL;
++    cachemgr_passwd *p;
++    cachemgr_passwd **P;
+     parse_string(&passwd);
+     parse_wordlist(&actions);
+-    objcachePasswdAdd(head, passwd, actions);
+-    wordlistDestroy(&actions);
++    p = xcalloc(1, sizeof(cachemgr_passwd));
++    p->passwd = passwd;
++    p->actions = actions;
++    for (P = head; *P; P = &(*P)->next);
++    *P = p;
+ }
+ 
+ static void
+@@ -717,11 +726,11 @@ free_cachemgrpasswd(cachemgr_passwd ** head)
+     while ((p = *head) != NULL) {
+ 	*head = p->next;
+ 	xfree(p->passwd);
++	wordlistDestroy(&p->actions);
+ 	xfree(p);
+     }
+ }
+ 
+-
+ static void
+ dump_denyinfo(StoreEntry * entry, const char *name, acl_deny_info_list * var)
+ {
+@@ -0,0 +1,223 @@
++
++/*
++ * $Id: cache_manager.cc,v 1.1 1998/02/19 23:09:48 wessels Exp $
++ *
++ * DEBUG: section 16    Cache Manager Objects
++ * AUTHOR: Duane Wessels
++ *
++ * SQUID Internet Object Cache  http://squid.nlanr.net/Squid/
++ * --------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from the
++ *  Internet community.  Development is led by Duane Wessels of the
++ *  National Laboratory for Applied Network Research and funded by
++ *  the National Science Foundation.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ *  
++ */
++
++#include "squid.h"
++
++#define MGR_PASSWD_SZ 128
++
++typedef struct {
++    StoreEntry *entry;
++    char *action;
++    char *passwd;
++} cachemgrStateData;
++
++typedef struct _action_table {
++    char *action;
++    char *desc;
++    OBJH *handler;
++    int pw_req_flag;
++    struct _action_table *next;
++} action_table;
++
++static action_table * cachemgrFindAction(const char *action);
++static cachemgrStateData *cachemgrParse(const char *url);
++static int cachemgrCheckPassword(cachemgrStateData *);
++static void cachemgrStateFree(cachemgrStateData *mgr);
++static char *cachemgrPasswdGet(cachemgr_passwd *, const char *);
++static OBJH cachemgrShutdown;
++static OBJH cachemgrMenu;
++
++action_table *ActionTable = NULL;
++
++void
++cachemgrRegister(const char *action, const char *desc, OBJH * handler, int pw_req_flag)
++{
++    action_table *a;
++    action_table **A;
++    assert(cachemgrFindAction(action) == NULL);
++    a = xcalloc(1, sizeof(action_table));
++    a->action = xstrdup(action);
++    a->desc = xstrdup(desc);
++    a->handler = handler;
++    a->pw_req_flag = pw_req_flag;
++    for (A = &ActionTable; *A; A = &(*A)->next);
++    *A = a;
++    debug(16, 1)("cachemgrRegister: registered %s\n", action);
++}
++
++static action_table *
++cachemgrFindAction(const char *action)
++{
++    action_table *a;
++    for (a = ActionTable; a != NULL; a = a->next) {
++	if (0 == strcmp(a->action, action))
++	    return a;
++    }
++    return NULL;
++}
++
++static cachemgrStateData *
++cachemgrParse(const char *url)
++{
++    int t;
++    LOCAL_ARRAY(char, host, MAX_URL);
++    LOCAL_ARRAY(char, request, MAX_URL);
++    LOCAL_ARRAY(char, password, MAX_URL);
++    action_table *a;
++    cachemgrStateData *mgr = NULL;
++    t = sscanf(url, "cache_object://%[^/]/%[^@]@%s", host, request, password);
++    if (t < 2) {
++	xstrncpy(request, "menu", MAX_URL);
++    } else if ((a = cachemgrFindAction(request)) == NULL) {
++	debug(16, 0) ("cachemgrParse: action '%s' not found\n", request);
++	return NULL;
++    }
++    mgr = xcalloc(1, sizeof(cachemgrStateData));
++    mgr->passwd = xstrdup(t == 3 ? password : "nopassword");
++    mgr->action = xstrdup(request);
++    return mgr;
++}
++
++/*
++ * return 0 if mgr->password is good
++ */
++static int
++cachemgrCheckPassword(cachemgrStateData * mgr)
++{
++    char *pwd = cachemgrPasswdGet(Config.passwd_list, mgr->action);
++    action_table *a = cachemgrFindAction(mgr->action);
++    assert(a != NULL);
++    if (pwd == NULL)
++	return a->pw_req_flag;
++    if (strcmp(pwd, "disable") == 0)
++	return 1;
++    if (strcmp(pwd, "none") == 0)
++	return 0;
++    return strcmp(pwd, mgr->passwd);
++}
++
++static void
++cachemgrStateFree(cachemgrStateData *mgr)
++{
++	safe_free(mgr->action);
++	safe_free(mgr->passwd);
++	xfree(mgr);
++}
++
++void
++cachemgrStart(int fd, StoreEntry * entry)
++{
++    cachemgrStateData *mgr = NULL;
++    ErrorState *err = NULL;
++    char *hdr;
++    action_table *a;
++    debug(16, 3) ("objectcacheStart: '%s'\n", storeUrl(entry));
++    if ((mgr = cachemgrParse(storeUrl(entry))) == NULL) {
++	err = errorCon(ERR_INVALID_URL, HTTP_NOT_FOUND);
++	err->url = xstrdup(storeUrl(entry));
++	errorAppendEntry(entry, err);
++	entry->expires = squid_curtime;
++	return;
++    }
++    mgr->entry = entry;
++    entry->expires = squid_curtime;
++    debug(16, 1) ("CACHEMGR: %s requesting '%s'\n",
++	fd_table[fd].ipaddr, mgr->action);
++    /* Check password */
++    if (cachemgrCheckPassword(mgr) != 0) {
++	cachemgrStateFree(mgr);
++	debug(16, 1) ("WARNING: Incorrect Cachemgr Password!\n");
++	err = errorCon(ERR_INVALID_URL, HTTP_NOT_FOUND);
++	errorAppendEntry(entry, err);
++	entry->expires = squid_curtime;
++	storeComplete(entry);
++	return;
++    }
++    /* retrieve object requested */
++    a = cachemgrFindAction(mgr->action);
++    assert(a != NULL);
++    storeBuffer(entry);
++    hdr = httpReplyHeader((double) 1.0,
++	HTTP_OK,
++	"text/plain",
++	-1,			/* Content-Length */
++	squid_curtime,		/* LMT */
++	squid_curtime);
++    storeAppend(entry, hdr, strlen(hdr));
++    storeAppend(entry, "\r\n", 2);
++    a->handler(entry);
++    storeBufferFlush(entry);
++    storeComplete(entry);
++    cachemgrStateFree(mgr);
++}
++
++static void
++cachemgrShutdown(StoreEntry * entryunused)
++{
++    debug(16, 0) ("Shutdown by command.\n");
++    shut_down(0);
++}
++
++static void
++cachemgrMenu(StoreEntry *sentry)
++{
++	action_table *a;
++	for (a = ActionTable; a != NULL; a = a->next) {
++		storeAppendPrintf(sentry, " %-22s\t%s\n", a->action, a->desc);
++	}
++}
++
++static char *
++cachemgrPasswdGet(cachemgr_passwd * a, const char *action)
++{
++    wordlist *w;
++    while (a != NULL) {
++	for (w = a->actions; w != NULL; w = w->next) {
++	    if (0 == strcmp(w->key, action))
++		return a->passwd;
++	    if (0 == strcmp(w->key, "all"))
++		return a->passwd;
++	}
++	a = a->next;
++    }
++    return NULL;
++}
++
++void
++cachemgrInit(void)
++{
++    cachemgrRegister("menu",
++	"This Cachemanager Menu",
++	cachemgrMenu, 0);
++    cachemgrRegister("shutdown",
++	"Shut Down the Squid Process",
++	cachemgrShutdown, 1);
++}
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: cbdata.cc,v 1.14 1998/01/12 04:30:35 wessels Exp $
++ * $Id: cbdata.cc,v 1.15 1998/02/19 23:09:49 wessels Exp $
+  *
+  * DEBUG: section 45    Callback Data Registry
+  * AUTHOR: Duane Wessels
+@@ -99,6 +99,9 @@ cbdataInit(void)
+ {
+     debug(45, 3) ("cbdataInit\n");
+     htable = hash_create(cbdata_cmp, 1 << 8, cbdata_hash);
++    cachemgrRegister("cbdata",
++	"Callback Data Registry Contents",
++	cbdataDump, 0);
+ }
+ 
+ void
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: client_db.cc,v 1.20 1998/02/07 08:13:36 wessels Exp $
++ * $Id: client_db.cc,v 1.21 1998/02/19 23:09:49 wessels Exp $
+  *
+  * DEBUG: section 0     Client Database
+  * AUTHOR: Duane Wessels
+@@ -63,6 +63,10 @@ clientdbInit(void)
+ 	return;
+     client_table = hash_create((HASHCMP *) strcmp, 229, hash_string);
+     client_info_sz = sizeof(ClientInfo);
++    cachemgrRegister("client_list",
++	"Cache Client List",
++	clientdbDump,
++	0);
+ }
+ 
+ void
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: dns.cc,v 1.55 1998/02/18 00:34:36 wessels Exp $
++ * $Id: dns.cc,v 1.56 1998/02/19 23:09:50 wessels Exp $
+  *
+  * DEBUG: section 34    Dnsserver interface
+  * AUTHOR: Harvest Derived
+@@ -214,6 +214,8 @@ dnsOpenServers(void)
+     }
+     if (NDnsServersAlloc == 0 && Config.dnsChildren > 0)
+ 	fatal("Failed to start any dnsservers");
++    cachemgrRegister("dns", "dnsserver child process information",
++	dnsStats, 0);
+     debug(34, 1) ("Started %d 'dnsserver' processes\n", NDnsServersAlloc);
+ }
+ 
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: fqdncache.cc,v 1.81 1998/02/18 22:53:59 wessels Exp $
++ * $Id: fqdncache.cc,v 1.82 1998/02/19 23:09:50 wessels Exp $
+  *
+  * DEBUG: section 35    FQDN Cache
+  * AUTHOR: Harvest Derived
+@@ -468,8 +468,8 @@ fqdncache_dnsHandleRead(int fd, void *data)
+ 	fatal_dump("fqdncache_dnsHandleRead: bad status");
+     if (strstr(dnsData->ip_inbuf, "$end\n")) {
+ 	/* end of record found */
+-        statLogHistCount(&Counter.dns.svc_time,
+-            tvSubMsec(dnsData->dispatch_time, current_time));
++	statLogHistCount(&Counter.dns.svc_time,
++	    tvSubMsec(dnsData->dispatch_time, current_time));
+ 	if ((x = fqdncache_parsebuffer(dnsData->ip_inbuf, dnsData)) == NULL) {
+ 	    debug(35, 0) ("fqdncache_dnsHandleRead: fqdncache_parsebuffer failed?!\n");
+ 	} else {
+@@ -636,6 +636,9 @@ fqdncache_init(void)
+ 	    (float) FQDN_HIGH_WATER) / (float) 100);
+     fqdncache_low = (long) (((float) MAX_FQDN *
+ 	    (float) FQDN_LOW_WATER) / (float) 100);
++    cachemgrRegister("fqdncache",
++	"FQDN Cache Stats and Contents",
++	fqdnStats, 0);
+ }
+ 
+ /* clean up the pending entries in dnsserver */
+@@ -742,7 +745,7 @@ fqdnStats(StoreEntry * sentry)
+ 	    (int) f->name_count);
+ 	for (k = 0; k < (int) f->name_count; k++)
+ 	    storeAppendPrintf(sentry, " %s", f->names[k]);
+-        storeAppendPrintf(sentry, "\n");
++	storeAppendPrintf(sentry, "\n");
+     }
+ }
+ 
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: http.cc,v 1.237 1998/02/07 08:13:38 wessels Exp $
++ * $Id: http.cc,v 1.238 1998/02/19 23:09:52 wessels Exp $
+  *
+  * DEBUG: section 11    Hypertext Transfer Protocol (HTTP)
+  * AUTHOR: Harvest Derived
+@@ -1135,6 +1135,14 @@ httpReplyHeaderStats(StoreEntry * entry)
+ 	    ReplyHeaderStats.cc[i]);
+ }
+ 
++void
++httpInit(void)
++{
++    cachemgrRegister("reply_headers",
++	"HTTP Reply Header Histograms",
++	httpReplyHeaderStats, 0);
++}
++
+ static void
+ httpAbort(void *data)
+ {
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: ipcache.cc,v 1.156 1998/02/18 22:54:00 wessels Exp $
++ * $Id: ipcache.cc,v 1.157 1998/02/19 23:09:52 wessels Exp $
+  *
+  * DEBUG: section 14    IP Cache
+  * AUTHOR: Harvest Derived
+@@ -518,7 +518,7 @@ ipcache_dnsHandleRead(int fd, void *data)
+     assert(i->status == IP_DISPATCHED);
+     if (strstr(dnsData->ip_inbuf, "$end\n")) {
+ 	/* end of record found */
+-        statLogHistCount(&Counter.dns.svc_time,
++	statLogHistCount(&Counter.dns.svc_time,
+ 	    tvSubMsec(dnsData->dispatch_time, current_time));
+ 	if ((x = ipcache_parsebuffer(dnsData->ip_inbuf, dnsData)) == NULL) {
+ 	    debug(14, 0) ("ipcache_dnsHandleRead: ipcache_parsebuffer failed?!\n");
+@@ -699,6 +699,9 @@ ipcache_init(void)
+ 	    (float) Config.ipcache.high) / (float) 100);
+     ipcache_low = (long) (((float) Config.ipcache.size *
+ 	    (float) Config.ipcache.low) / (float) 100);
++    cachemgrRegister("ipcache",
++	"IP Cache Stats and Contents",
++	stat_ipcache_get, 0);
+ }
+ 
+ int
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: main.cc,v 1.222 1998/02/18 01:00:43 wessels Exp $
++ * $Id: main.cc,v 1.223 1998/02/19 23:09:53 wessels Exp $
+  *
+  * DEBUG: section 1     Startup and Main Loop
+  * AUTHOR: Harvest Derived
+@@ -451,9 +451,10 @@ mainInitialize(void)
+     if (!configured_once) {
+ 	unlinkdInit();
+ 	urlInitialize();
+-	objcacheInit();
++	cachemgrInit();
+ 	statInit();
+ 	storeInit();
++	httpInit();
+ 	asnAclInitialize(Config.aclList);
+ 	if (Config.effectiveUser) {
+ 	    /* we were probably started as root, so cd to a swap
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: mem.cc,v 1.3 1998/02/10 22:17:54 wessels Exp $
++ * $Id: mem.cc,v 1.4 1998/02/19 23:09:54 wessels Exp $
+  *
+  * DEBUG: section 13    Memory Pool Management
+  * AUTHOR: Harvest Derived
+@@ -227,6 +227,9 @@ memInit(void)
+ 	 */
+ 	assert(m->size);
+     }
++    cachemgrRegister("mem",
++	"Memory Utilization",
++	memStats, 0);
+ }
+ 
+ void
+@@ -1,5 +1,6 @@
++
+ /*
+- * $Id: neighbors.cc,v 1.174 1998/02/17 19:05:27 wessels Exp $
++ * $Id: neighbors.cc,v 1.175 1998/02/19 23:09:55 wessels Exp $
+  *
+  * DEBUG: section 15    Neighbor Routines
+  * AUTHOR: Harvest Derived
+@@ -388,6 +389,9 @@ neighbors_open(int fd)
+ 	echo_port = sep ? ntohs((u_short) sep->s_port) : 7;
+     }
+     first_ping = Config.peers;
++    cachemgrRegister("non_peers",
++	"List of Unknown sites sending ICP messages",
++	neighborDumpNonPeers, 0);
+ }
+ 
+ int
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: net_db.cc,v 1.65 1998/02/07 08:13:40 wessels Exp $
++ * $Id: net_db.cc,v 1.66 1998/02/19 23:09:56 wessels Exp $
+  *
+  * DEBUG: section 37    Network Measurement Database
+  * AUTHOR: Duane Wessels
+@@ -484,6 +484,9 @@ netdbInit(void)
+     host_table = hash_create((HASHCMP *) strcmp, 467, hash_string);
+     eventAdd("netdbSaveState", netdbSaveState, NULL, 3617);
+     netdbReloadState();
++    cachemgrRegister("netdb",
++	"Network Measurement Database",
++	netdbDump, 0);
+ #endif
+ }
+ 
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: pconn.cc,v 1.10 1997/11/20 17:47:12 wessels Exp $
++ * $Id: pconn.cc,v 1.11 1998/02/19 23:09:57 wessels Exp $
+  *
+  * DEBUG: section 48    Persistent Connections
+  * AUTHOR: Duane Wessels
+@@ -124,6 +124,9 @@ pconnInit(void)
+ {
+     assert(table == NULL);
+     table = hash_create((HASHCMP *) strcmp, 229, hash_string);
++    cachemgrRegister("pconn",
++	"Persistent Connection Utilization Histograms",
++	pconnHistDump, 0);
+     debug(48, 3) ("persistent connection module initialized\n");
+ }
+ 
+@@ -217,6 +217,7 @@ extern char *httpReplyHeader(double ver,
+     int clen,
+     time_t lmt,
+     time_t expires);
++extern void httpInit(void);
+ 
+ 
+ extern void icmpOpen(void);
+@@ -329,10 +330,9 @@ extern int netdbHostHops(const char *host);
+ extern int netdbHostRtt(const char *host);
+ extern void netdbUpdatePeer(request_t *, peer * e, int rtt, int hops);
+ 
+-extern void objcachePasswdAdd(cachemgr_passwd **, char *, wordlist *);
+-extern void objcachePasswdDestroy(cachemgr_passwd ** a);
+-extern void objcacheStart(int fd, StoreEntry *);
+-extern void objcacheInit(void);
++extern void cachemgrStart(int fd, StoreEntry *);
++extern void cachemgrRegister(const char *, const char *, OBJH *, int);
++extern void cachemgrInit(void);
+ 
+ extern void peerSelect(request_t *, StoreEntry *, PSC *, PSC *, void *data);
+ extern peer *peerGetSomeParent(request_t *, hier_code *);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: redirect.cc,v 1.55 1998/02/07 08:13:40 wessels Exp $
++ * $Id: redirect.cc,v 1.56 1998/02/19 23:09:59 wessels Exp $
+  *
+  * DEBUG: section 29    Redirector
+  * AUTHOR: Duane Wessels
+@@ -353,6 +353,9 @@ redirectOpenServers(void)
+     if (first_time == 0) {
+ 	first_time++;
+ 	memset(&RedirectStats, '\0', sizeof(RedirectStats));
++	cachemgrRegister("redirector",
++	    "URL Redirector Stats",
++	    redirectStats, 0);
+     }
+ }
+ 
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: stat.cc,v 1.200 1998/02/18 22:55:44 wessels Exp $
++ * $Id: stat.cc,v 1.201 1998/02/19 23:10:00 wessels Exp $
+  *
+  * DEBUG: section 18    Cache Manager Statistics
+  * AUTHOR: Harvest Derived
+@@ -119,7 +119,7 @@ static void statLogHistInit(StatLogHist *, double, double);
+ static int statLogHistBin(StatLogHist *, double);
+ static double statLogHistVal(StatLogHist *, double);
+ static double statLogHistDeltaMedian(StatLogHist * A, StatLogHist * B);
+-static void statLogHistDump(StoreEntry *sentry, StatLogHist * H);
++static void statLogHistDump(StoreEntry * sentry, StatLogHist * H);
+ 
+ #ifdef XMALLOC_STATISTICS
+ static void info_get_mallstat(int, int, StoreEntry *);
+@@ -136,12 +136,6 @@ int server_pconn_hist[PCONN_HIST_SZ];
+ static StatCounters CountHist[N_COUNT_HIST];
+ static int NCountHist = 0;
+ 
+-void
+-stat_utilization_get(StoreEntry * e)
+-{
+-    /* MAKE SOMETHING UP */
+-}
+-
+ void
+ stat_io_get(StoreEntry * sentry)
+ {
+@@ -276,7 +270,7 @@ statObjects(StoreEntry * sentry, int vm_or_not)
+ 	if (vm_or_not && mem == NULL)
+ 	    continue;
+ 	if ((++N & 0xFF) == 0) {
+-	    debug(18, 3) ("stat_objects_get:  Processed %d objects...\n", N);
++	    debug(18, 3) ("statObjects:  Processed %d objects...\n", N);
+ 	}
+ 	storeBuffer(sentry);
+ 	storeAppendPrintf(sentry, "KEY %s\n", storeKeyText(entry->key));
+@@ -765,6 +759,33 @@ statInit(void)
+ 	statCounterInit(&CountHist[i]);
+     statCounterInit(&Counter);
+     eventAdd("statAvgTick", statAvgTick, NULL, 60);
++    cachemgrRegister("info",
++	"General Runtime Information",
++	info_get, 0);
++    cachemgrRegister("filedescriptors",
++	"Process Filedescriptor Allocation",
++	statFiledescriptors, 0);
++    cachemgrRegister("objects",
++	"All Cache Objects",
++	stat_objects_get, 0);
++    cachemgrRegister("vm_objects",
++	"In-Memory and In-Transit Objects",
++	stat_vmobjects_get, 0);
++    cachemgrRegister("io",
++	"Server-side network read() size histograms",
++	stat_io_get, 0);
++    cachemgrRegister("counters",
++	"Traffic and Resource Counters",
++	statCounters, 0);
++    cachemgrRegister("5min",
++	"5 Minute Average of Counters",
++	statAvg5min, 0);
++    cachemgrRegister("60min",
++	"60 Minute Average of Counters",
++	statAvg60min, 0);
++    cachemgrRegister("server_list",
++	"Neighbor Cache Stats",
++	server_list, 0);
+ }
+ 
+ void
+@@ -932,15 +953,15 @@ statLogHistVal(StatLogHist * H, double bin)
+ }
+ 
+ static void
+-statLogHistDump(StoreEntry *sentry, StatLogHist * H)
++statLogHistDump(StoreEntry * sentry, StatLogHist * H)
+ {
+-	int i;
+-	for (i=0; i<STAT_LOG_HIST_BINS; i++) {
+-		if (H->bins[i] == 0)
+-			continue;
+-		storeAppendPrintf(sentry, "\t%3d/%f\t%d\n",
+-			i,
+-			statLogHistVal(H, 0.5 + i),
+-			H->bins[i]);
+-	}
++    int i;
++    for (i = 0; i < STAT_LOG_HIST_BINS; i++) {
++	if (H->bins[i] == 0)
++	    continue;
++	storeAppendPrintf(sentry, "\t%3d/%f\t%d\n",
++	    i,
++	    statLogHistVal(H, 0.5 + i),
++	    H->bins[i]);
++    }
+ }
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: store.cc,v 1.381 1998/02/12 23:36:01 wessels Exp $
++ * $Id: store.cc,v 1.382 1998/02/19 23:10:02 wessels Exp $
+  *
+  * DEBUG: section 20    Storeage Manager
+  * AUTHOR: Harvest Derived
+@@ -842,6 +842,9 @@ storeInit(void)
+     store_list.head = store_list.tail = NULL;
+     inmem_list.head = inmem_list.tail = NULL;
+     storeRebuildStart();
++    cachemgrRegister("store_dir",
++	"Store Directory Stats",
++	storeDirStats, 0);
+ }
+ 
+ void
+@@ -880,7 +880,7 @@ struct _request_t {
+ 
+ struct _cachemgr_passwd {
+     char *passwd;
+-    long actions;
++    wordlist *actions;
+     struct _cachemgr_passwd *next;
+ };
+ 
+@@ -18,6 +18,7 @@ typedef struct _acl_ip_data acl_ip_data;
+ typedef struct _acl_time_data acl_time_data;
+ typedef struct _acl_name_list acl_name_list;
+ typedef struct _acl_deny_info_list acl_deny_info_list;
++typedef struct _acl_proxy_auth acl_proxy_auth;
+ typedef struct _acl acl;
+ typedef struct _snmpconf snmpconf;
+ typedef struct _acl_list acl_list;

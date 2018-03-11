@@ -1,1083 +1,485 @@
-@@ -22,8 +22,6 @@
+@@ -33,8 +33,7 @@ Comm::ConnOpener::ConnOpener(Comm::ConnectionPointer &c, AsyncCall::Pointer &han
+         callback_(handler),
+         totalTries_(0),
+         failRetries_(0),
+-        connectTimeout_(ctimeout),
+-        connectStart_(0)
++        deadline_(squid_curtime + static_cast<time_t>(ctimeout))
+ {}
  
- #include "MemPool.h"
+ Comm::ConnOpener::~ConnOpener()
+@@ -55,36 +54,24 @@ Comm::ConnOpener::doneAll() const
+         return AsyncJob::doneAll();
+     }
  
--#include <stack>
--
- /// \ingroup MemPoolsAPI
- class MemPoolMalloc : public MemImplementingAllocator
- {
-@@ -44,7 +42,7 @@ class MemPoolMalloc : public MemImplementingAllocator
-     virtual void *allocate();
-     virtual void deallocate(void *, bool aggressive);
- private:
--    std::stack<void *> freelist;
-+    Stack<void *> freelist;
- };
- 
- #endif /* _MEM_POOL_MALLOC_H_ */
-@@ -0,0 +1,67 @@
-+/*
-+ * AUTHOR: Alex Rousskov
-+ *
-+ * SQUID Web Proxy Cache          http://www.squid-cache.org/
-+ * ----------------------------------------------------------
-+ *
-+ *  Squid is the result of efforts by numerous individuals from
-+ *  the Internet community; see the CONTRIBUTORS file for full
-+ *  details.   Many organizations have provided support for Squid's
-+ *  development; see the SPONSORS file for full details.  Squid is
-+ *  Copyrighted (C) 2001 by the Regents of the University of
-+ *  California; see the COPYRIGHT file for full details.  Squid
-+ *  incorporates software developed and/or copyrighted by other
-+ *  sources; see the CREDITS file for full details.
-+ *
-+ *  This program is free software; you can redistribute it and/or modify
-+ *  it under the terms of the GNU General Public License as published by
-+ *  the Free Software Foundation; either version 2 of the License, or
-+ *  (at your option) any later version.
-+ *
-+ *  This program is distributed in the hope that it will be useful,
-+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
-+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-+ *  GNU General Public License for more details.
-+ *
-+ *  You should have received a copy of the GNU General Public License
-+ *  along with this program; if not, write to the Free Software
-+ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
-+ *
-+ */
-+
-+#ifndef SQUID_STACK_H
-+#define SQUID_STACK_H
-+
-+#include "base/Vector.h"
-+
-+/* RBC: 20030714 Composition might be better long-term, but for now,
-+ * there's no reason to do so.
-+ */
-+
-+template <class S = void *>
-+
-+class Stack : public Vector<S>
-+{
-+public:
-+    using Vector<S>::count;
-+    using Vector<S>::items;
-+    typedef typename Vector<S>::value_type value_type;
-+    typedef typename Vector<S>::pointer pointer;
-+    value_type pop() {
-+        if (!count)
-+            return value_type();
-+
-+        value_type result = items[--count];
-+
-+        this->items[count] = value_type();
-+
-+        return result;
-+    }
-+
-+    /* todo, fatal on empty Top call */
-+    value_type top() const {
-+        return count ? items[count - 1] : value_type();
-+    }
-+};
-+
-+#endif /* SQUID_STACK_H */
-@@ -3,9 +3,7 @@
- 
- #if defined(__cplusplus)
- 
--#include "fatal.h"
--
--#include <stack>
-+#include "Stack.h"
- 
- template <class V>
- class SplayNode
-@@ -378,7 +376,7 @@ class SplayConstIterator
-     void advance();
-     void addLeftPath(SplayNode<V> *aNode);
-     void init(SplayNode<V> *);
--    std::stack<SplayNode<V> *> toVisit;
-+    Stack<SplayNode<V> *> toVisit;
- };
- 
- template <class V>
-@@ -391,12 +389,7 @@ template <class V>
- bool
- SplayConstIterator<V>::operator == (SplayConstIterator const &right) const
- {
--    if (toVisit.empty() && right.toVisit.empty())
--        return true;
--    if (!toVisit.empty() && !right.toVisit.empty())
--        return toVisit.top() == right.toVisit.top();
--    // only one of the two is empty
--    return false;
-+    return toVisit.top() == right.toVisit.top();
++    // otherwise, we must be waiting for something
++    Must(temporaryFd_ >= 0 || calls_.sleep_);
+     return false;
  }
  
- template <class V>
-@@ -428,21 +421,19 @@ template <class V>
  void
- SplayConstIterator<V>::advance()
+ Comm::ConnOpener::swanSong()
  {
--    if (toVisit.empty())
-+    if (toVisit.size() == 0)
-         return;
- 
-     toVisit.pop();
- 
--    if (toVisit.empty())
-+    if (toVisit.size() == 0)
-         return;
- 
--    // not empty
--    SplayNode<V> *currentNode = toVisit.top();
--    toVisit.pop();
-+    SplayNode<V> *currentNode = toVisit.pop();
- 
-     addLeftPath(currentNode->right);
- 
--    toVisit.push(currentNode);
-+    toVisit.push_back(currentNode);
- }
- 
- template <class V>
-@@ -453,7 +444,7 @@ SplayConstIterator<V>::addLeftPath(SplayNode<V> *aNode)
-         return;
- 
-     do {
--        toVisit.push(aNode);
-+        toVisit.push_back(aNode);
-         aNode = aNode->left;
-     } while (aNode != NULL);
- }
-@@ -46,11 +46,7 @@ extern time_t squid_curtime;
- void *
- MemPoolMalloc::allocate()
- {
--    void *obj = NULL;
--    if (!freelist.empty()) {
--        obj = freelist.top();
--        freelist.pop();
+-    // cancel any event watchers
+-    // done here to get the "swanSong" mention in cancel debugging.
+-    if (calls_.earlyAbort_ != NULL) {
+-        calls_.earlyAbort_->cancel("Comm::ConnOpener::swanSong");
+-        calls_.earlyAbort_ = NULL;
 -    }
-+    void *obj = freelist.pop();
-     if (obj) {
-         memMeterDec(meter.idle);
-         ++saved_calls;
-@@ -76,7 +72,7 @@ MemPoolMalloc::deallocate(void *obj, bool aggressive)
-         if (doZero)
-             memset(obj, 0, obj_size);
-         memMeterInc(meter.idle);
--        freelist.push(obj);
-+        freelist.push_back(obj);
+-    if (calls_.timeout_ != NULL) {
+-        calls_.timeout_->cancel("Comm::ConnOpener::swanSong");
+-        calls_.timeout_ = NULL;
+-    }
+-
+     if (callback_ != NULL) {
+-        if (callback_->canceled())
+-            callback_ = NULL;
+-        else
+-            // inform the still-waiting caller we are dying
+-            doneConnecting(COMM_ERR_CONNECT, 0);
++        // inform the still-waiting caller we are dying
++        sendAnswer(COMM_ERR_CONNECT, 0, "Comm::ConnOpener::swanSong");
      }
+ 
+-    // rollback what we can from the job state
+-    if (temporaryFd_ >= 0) {
+-        // doneConnecting() handles partial FD connection cleanup
+-        doneConnecting(COMM_ERR_CONNECT, 0);
+-    }
++    if (temporaryFd_ >= 0)
++        closeFd();
++
++    if (calls_.sleep_)
++        cancelSleep();
+ 
+     AsyncJob::swanSong();
  }
- 
-@@ -132,9 +128,7 @@ MemPoolMalloc::idleTrigger(int shift) const
- void
- MemPoolMalloc::clean(time_t maxage)
- {
--    while (!freelist.empty()) {
--        void *obj = freelist.top();
--        freelist.pop();
-+    while (void *obj = freelist.pop()) {
-         memMeterDec(meter.idle);
-         memMeterDec(meter.alloc);
-         xfree(obj);
-@@ -38,6 +38,7 @@
- 
- #include "auth/Gadgets.h"
- #include "auth/User.h"
-+#include "base/Vector.h"
- #include "CompositePoolNode.h"
- #include "DelayBucket.h"
- #include "DelayIdComposite.h"
-@@ -58,6 +58,18 @@ T& for_each(dlink_list const &collection, T& visitor)
-     return visitor;
- }
- 
-+template <class S>
-+class Stack;
-+
-+template <class E, class T>
-+T& for_each(Stack<E> const &collection, T& visitor)
-+{
-+    for (size_t index = 0; index < collection.count; ++index)
-+        visitor(*(typename T::argument_type const *)collection.items[index]);
-+
-+    return visitor;
-+};
-+
- /* RBC 20030718 - use this to provide instance expecting classes a pointer to a
-  * singleton
+@@ -110,14 +97,13 @@ Comm::ConnOpener::getHost() const
+ /**
+  * Connection attempt are completed. One way or the other.
+  * Pass the results back to the external handler.
+- * NP: on errors the earlyAbort call should be cancelled first with a reason.
   */
-@@ -52,10 +52,6 @@
- 
- #include <algorithm>
- 
--/* XXX: the whole set of API managing the entries vector should be rethought
-- *      after the parse4r-ng effort is complete.
-- */
--
- /*
-  * On naming conventions:
-  *
-@@ -441,6 +437,8 @@ HttpHeader::operator =(const HttpHeader &other)
  void
- HttpHeader::clean()
+-Comm::ConnOpener::doneConnecting(comm_err_t errFlag, int xerrno)
++Comm::ConnOpener::sendAnswer(comm_err_t errFlag, int xerrno, const char *why)
  {
-+    HttpHeaderPos pos = HttpHeaderInitPos;
-+    HttpHeaderEntry *e;
- 
-     assert(owner > hoNone && owner < hoEnd);
-     debugs(55, 7, "cleaning hdr: " << this << " owner: " << owner);
-@@ -466,19 +464,18 @@ HttpHeader::clean()
-         HttpHeaderStats[owner].busyDestroyedCount += entries.size() > 0;
-     } // if (owner <= hoReply)
- 
--    for (std::vector<HttpHeaderEntry *>::iterator i = entries.begin(); i != entries.end(); ++i) {
--        HttpHeaderEntry *e = *i;
--        if (e == NULL)
--            continue;
-+    while ((e = getEntry(&pos))) {
-+        /* tmp hack to try to avoid coredumps */
-+
-         if (e->id < 0 || e->id >= HDR_ENUM_END) {
--            debugs(55, DBG_CRITICAL, "BUG: invalid entry (" << e->id << "). Ignored.");
-+            debugs(55, DBG_CRITICAL, "HttpHeader::clean BUG: entry[" << pos << "] is invalid (" << e->id << "). Ignored.");
-         } else {
-             if (owner <= hoReply)
-                 HttpHeaderStats[owner].fieldTypeDistr.count(e->id);
-+            /* yes, this deletion leaves us in an inconsistent state */
-             delete e;
-         }
+     // only mark the address good/bad AFTER connect is finished.
+     if (host_ != NULL) {
+-        if (xerrno == 0)
++        if (xerrno == 0) // XXX: should not we use errFlag instead?
+             ipcacheMarkGoodAddr(host_, conn_->remote);
+         else {
+             ipcacheMarkBadAddr(host_, conn_->remote);
+@@ -129,52 +115,146 @@ Comm::ConnOpener::doneConnecting(comm_err_t errFlag, int xerrno)
      }
--
-     entries.clear();
-     httpHeaderMaskInit(&mask, 0);
-     len = 0;
-@@ -1077,7 +1077,8 @@ check_PROGRAMS+=\
- 	tests/testSBuf \
- 	tests/testSBufList \
- 	tests/testConfigParser \
--	tests/testStatHist
-+	tests/testStatHist \
-+	tests/testVector
  
- if HAVE_FS_ROCK
- check_PROGRAMS += tests/testRock
-@@ -3825,6 +3826,21 @@ tests_testStatHist_LDADD = \
- 	$(COMPAT_LIB)
- tests_testStatHist_DEPENDENCIES = $(SQUID_CPPUNIT_LA)
+     if (callback_ != NULL) {
+-        typedef CommConnectCbParams Params;
+-        Params &params = GetCommParams<Params>(callback_);
+-        params.conn = conn_;
+-        params.flag = errFlag;
+-        params.xerrno = xerrno;
+-        ScheduleCallHere(callback_);
++        // avoid scheduling cancelled callbacks, assuming they are common
++        // enough to make this extra check an optimization
++        if (callback_->canceled()) {
++            debugs(5, 4, conn_ << " not calling canceled " << *callback_ <<
++                   " [" << callback_->id << ']' );
++        } else {
++            typedef CommConnectCbParams Params;
++            Params &params = GetCommParams<Params>(callback_);
++            params.conn = conn_;
++            params.flag = errFlag;
++            params.xerrno = xerrno;
++            ScheduleCallHere(callback_);
++        }
+         callback_ = NULL;
+     }
  
-+tests_testVector_SOURCES = \
-+	tests/testVector.cc \
-+	tests/testMain.cc \
-+	tests/testVector.h
-+nodist_tests_testVector_SOURCES = \
-+	$(TESTSOURCES)
-+tests_testVector_LDADD= \
-+	$(SQUID_CPPUNIT_LIBS) \
-+	$(COMPAT_LIB) \
-+	$(XTRA_LIBS)
-+tests_testVector_LDFLAGS = $(LIBADD_DL)
-+tests_testVector_DEPENDENCIES = \
-+	$(SQUID_CPPUNIT_LA)
+-    if (temporaryFd_ >= 0) {
+-        debugs(5, 4, HERE << conn_ << " closing temp FD " << temporaryFd_);
+-        // it never reached fully open, so cleanup the FD handlers
+-        // Note that comm_close() sequence does not happen for partially open FD
+-        Comm::SetSelect(temporaryFd_, COMM_SELECT_WRITE, NULL, NULL, 0);
++    // The job will stop without this call because nil callback_ makes
++    // doneAll() true, but this explicit call creates nicer debugging.
++    mustStop(why);
++}
 +
-+
- TESTS += testHeaders
- 
- ## Special Universal .h dependency test script
-@@ -23,7 +23,9 @@ libbase_la_SOURCES = \
- 	RunnersRegistry.h \
- 	Subscription.h \
- 	TextException.cc \
--	TextException.h
-+	TextException.h \
-+	Vector.cc \
-+	Vector.h
- 
- EXTRA_PROGRAMS = \
- 	testCharacterSet
-@@ -0,0 +1,48 @@
-+/*
-+ * AUTHOR: Alex Rousskov
-+ *
-+ * SQUID Web Proxy Cache          http://www.squid-cache.org/
-+ * ----------------------------------------------------------
-+ *
-+ *  Squid is the result of efforts by numerous individuals from
-+ *  the Internet community; see the CONTRIBUTORS file for full
-+ *  details.   Many organizations have provided support for Squid's
-+ *  development; see the SPONSORS file for full details.  Squid is
-+ *  Copyrighted (C) 2001 by the Regents of the University of
-+ *  California; see the COPYRIGHT file for full details.  Squid
-+ *  incorporates software developed and/or copyrighted by other
-+ *  sources; see the CREDITS file for full details.
-+ *
-+ *  This program is free software; you can redistribute it and/or modify
-+ *  it under the terms of the GNU General Public License as published by
-+ *  the Free Software Foundation; either version 2 of the License, or
-+ *  (at your option) any later version.
-+ *
-+ *  This program is distributed in the hope that it will be useful,
-+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
-+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-+ *  GNU General Public License for more details.
-+ *
-+ *  You should have received a copy of the GNU General Public License
-+ *  along with this program; if not, write to the Free Software
-+ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
-+ *
-+ */
-+
-+/*
-+ * Array is an array of (void*) items with unlimited capacity
-+ *
-+ * Array grows when arrayAppend() is called and no space is left
-+ * Currently, array does not have an interface for deleting an item because
-+ *     we do not need such an interface yet.
-+ */
-+
-+#include "squid.h"
-+#include "base/Vector.h"
-+
-+#if HAVE_ASSERT_H
-+#include <assert.h>
-+#endif
-+#if HAVE_STRING_H
-+#include <string.h>
-+#endif
-@@ -0,0 +1,471 @@
-+/*
-+ * AUTHOR: Alex Rousskov
-+ *
-+ * SQUID Web Proxy Cache          http://www.squid-cache.org/
-+ * ----------------------------------------------------------
-+ *
-+ *  Squid is the result of efforts by numerous individuals from
-+ *  the Internet community; see the CONTRIBUTORS file for full
-+ *  details.   Many organizations have provided support for Squid's
-+ *  development; see the SPONSORS file for full details.  Squid is
-+ *  Copyrighted (C) 2001 by the Regents of the University of
-+ *  California; see the COPYRIGHT file for full details.  Squid
-+ *  incorporates software developed and/or copyrighted by other
-+ *  sources; see the CREDITS file for full details.
-+ *
-+ *  This program is free software; you can redistribute it and/or modify
-+ *  it under the terms of the GNU General Public License as published by
-+ *  the Free Software Foundation; either version 2 of the License, or
-+ *  (at your option) any later version.
-+ *
-+ *  This program is distributed in the hope that it will be useful,
-+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
-+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-+ *  GNU General Public License for more details.
-+ *
-+ *  You should have received a copy of the GNU General Public License
-+ *  along with this program; if not, write to the Free Software
-+ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
-+ *
-+ */
-+#ifndef SQUID_ARRAY_H
-+#define SQUID_ARRAY_H
-+
-+/**
-+ \todo remove this after replacing with STL
-+ */
-+
-+#include "fatal.h"
-+#include "util.h"
-+
-+/* users of this template also need assert() */
-+#include "compat/assert.h"
-+
-+/* iterator support */
-+#include <iterator>
-+
-+template <class C>
-+class VectorIteratorBase
++/// cleans up this job I/O state without closing temporaryFd
++/// required before closing temporaryFd or keeping it in conn_
++/// leaves FD bare so must only be called via closeFd() or keepFd()
++void
++Comm::ConnOpener::cleanFd()
 +{
-+public:
-+    typedef typename C::value_type value_type;
-+    typedef std::forward_iterator_tag iterator_category;
-+    typedef typename C::pointer pointer;
-+    typedef typename C::reference reference;
-+    typedef typename C::difference_type difference_type;
++    debugs(5, 4, HERE << conn_ << " closing temp FD " << temporaryFd_);
 +
-+    VectorIteratorBase();
-+    VectorIteratorBase(C &);
-+    VectorIteratorBase(size_t, C &);
-+    VectorIteratorBase & operator =(VectorIteratorBase const &);
-+    bool operator != (VectorIteratorBase const &rhs) const;
-+    bool operator == (VectorIteratorBase const &rhs) const;
-+    VectorIteratorBase & operator ++();
-+    VectorIteratorBase operator ++(int);
-+    typename C::value_type & operator *() const {
-+        return theVector->items[pos];
++    Must(temporaryFd_ >= 0);
++    fde &f = fd_table[temporaryFd_];
++
++    // Our write_handler was set without using Comm::Write API, so we cannot
++    // use a cancellable Pointer-free job callback and simply cancel it here.
++    if (f.write_handler) {
++
++        /* XXX: We are about to remove write_handler, which was responsible
++         * for deleting write_data, so we have to delete write_data
++         * ourselves. Comm currently calls SetSelect handlers synchronously
++         * so if write_handler is set, we know it has not been called yet.
++         * ConnOpener converts that sync call into an async one, but only
++         * after deleting ptr, so that is not a problem.
++         */
++
++        delete static_cast<Pointer*>(f.write_data);
++        f.write_data = NULL;
++        f.write_handler = NULL;
 +    }
-+
-+    typename C::value_type * operator -> () const {
-+        return &theVector->items[pos];
++    // Comm::DoSelect does not do this when calling and resetting write_handler
++    // (because it expects more writes to come?). We could mimic that 
++    // optimization by resetting Comm "Select" state only when the FD is
++    // actually closed.
++    Comm::SetSelect(temporaryFd_, COMM_SELECT_WRITE, NULL, NULL, 0);
++ 
++    if (calls_.timeout_ != NULL) {
++        calls_.timeout_->cancel("Comm::ConnOpener::cleanFd");
++        calls_.timeout_ = NULL;
 +    }
++    // Comm checkTimeouts() and commCloseAllSockets() do not clear .timeout 
++    // when calling timeoutHandler (XXX fix them), so we clear unconditionally.
++    f.timeoutHandler = NULL;
++    f.timeout = 0;
 +
-+    ssize_t operator - (VectorIteratorBase const &rhs) const;
-+    bool incrementable() const;
-+
-+private:
-+    size_t pos;
-+    C * theVector;
-+};
-+
-+template<class E>
-+class Vector
-+{
-+public:
-+    typedef E value_type;
-+    typedef E* pointer;
-+    typedef E& reference;
-+    typedef VectorIteratorBase<Vector<E> > iterator;
-+    typedef VectorIteratorBase<Vector<E> const> const_iterator;
-+    typedef ptrdiff_t difference_type;
-+    friend class VectorIteratorBase<Vector<E> >;
-+    friend class VectorIteratorBase<Vector<E> const>;
-+    void *operator new (size_t);
-+    void operator delete (void *);
-+
-+    Vector();
-+    ~Vector();
-+    Vector(Vector const &);
-+    Vector &operator = (Vector const &);
-+    void clear();
-+    void reserve (size_t capacity);
-+    void push_back (E);
-+
-+    void insert (E);
-+    const E &front() const;
-+    E &front();
-+    E &back();
-+    void pop_back();
-+    E shift();         // aka pop_front
-+    void prune(E);
-+    void preAppend(int app_count);
-+    inline bool empty() const;
-+    inline size_t size() const;
-+    iterator begin();
-+    const_iterator begin () const;
-+    iterator end();
-+    const_iterator end () const;
-+    E& at(unsigned i);
-+    const E& at(unsigned i) const;
-+    inline E& operator [] (unsigned i);
-+    inline const E& operator [] (unsigned i) const;
-+    E* data() const { return items; }
-+
-+protected:
-+    size_t capacity;
-+    size_t count;
-+    E *items;
-+};
-+
-+template<class E>
-+void *
-+Vector<E>::operator new(size_t size)
-+{
-+    return xmalloc(size);
++    if (calls_.earlyAbort_ != NULL) {
++        comm_remove_close_handler(temporaryFd_, calls_.earlyAbort_);
+         calls_.earlyAbort_ = NULL;
+-        if (calls_.timeout_ != NULL) {
+-            calls_.timeout_->cancel("Comm::ConnOpener::doneConnecting");
+-            calls_.timeout_ = NULL;
+-        }
+-        fd_table[temporaryFd_].timeoutHandler = NULL;
+-        fd_table[temporaryFd_].timeout = 0;
+-        close(temporaryFd_);
+-        fd_close(temporaryFd_);
+-        temporaryFd_ = -1;
+     }
 +}
 +
-+template<class E>
++/// cleans I/O state and ends I/O for temporaryFd_
 +void
-+Vector<E>::operator delete (void *address)
++Comm::ConnOpener::closeFd()
 +{
-+    xfree (address);
-+}
-+
-+template<class E>
-+Vector<E>::Vector() : capacity (0), count(0), items (NULL)
-+{}
-+
-+template<class E>
-+Vector<E>::~Vector()
-+{
-+    clear();
-+}
-+
-+template<class E>
-+void
-+Vector<E>::clear()
-+{
-+    /* could also warn if some objects are left */
-+    delete[] items;
-+    items = NULL;
-+    capacity = 0;
-+    count = 0;
-+}
-+
-+/* grows internal buffer to satisfy required minimal capacity */
-+template<class E>
-+void
-+Vector<E>::reserve(size_t min_capacity)
-+{
-+    const int min_delta = 16;
-+    int delta;
-+
-+    if (capacity >= min_capacity)
++    if (temporaryFd_ < 0)
 +        return;
 +
-+    delta = min_capacity;
++    cleanFd();
+ 
+-    /* ensure cleared local state, we are done. */
+-    conn_ = NULL;
++    // comm_close() below uses COMMIO_FD_WRITECB(fd)->active() to clear Comm
++    // "Select" state. It will not clear ours. XXX: It should always clear
++    // because a callback may have been active but was called before comm_close
++    // Update: we now do this in cleanFd()
++    // Comm::SetSelect(temporaryFd_, COMM_SELECT_WRITE, NULL, NULL, 0);
 +
-+    /* make delta a multiple of min_delta */
-+    delta += min_delta - 1;
++    comm_close(temporaryFd_);
++    temporaryFd_ = -1;
++}
 +
-+    delta /= min_delta;
++/// cleans I/O state and moves temporaryFd_ to the conn_ for long-term use
++void
++Comm::ConnOpener::keepFd()
++{
++    Must(conn_ != NULL);
++    Must(temporaryFd_ >= 0);
 +
-+    delta *= min_delta;
++    cleanFd();
 +
-+    /* actual grow */
-+    if (delta < 0)
-+        delta = min_capacity - capacity;
-+
-+    E*newitems = new E[capacity + delta];
-+
-+    for (size_t counter = 0; counter < size(); ++counter) {
-+        newitems[counter] = items[counter];
++    conn_->fd = temporaryFd_;
++    temporaryFd_ = -1;
+ }
+ 
+ void
+ Comm::ConnOpener::start()
+ {
+     Must(conn_ != NULL);
+ 
+-    /* get a socket open ready for connecting with */
++    /* outbound sockets have no need to be protocol agnostic. */
++    if (!(Ip::EnableIpv6&IPV6_SPECIAL_V4MAPPING) && conn_->remote.IsIPv4()) {
++        conn_->local.SetIPv4();
 +    }
 +
-+    capacity += delta;
-+    delete[]items;
-+    items = newitems;
++    if (createFd())
++        connect();
 +}
 +
-+template<class E>
++/// called at the end of Comm::ConnOpener::DelayedConnectRetry event
 +void
-+Vector<E>::push_back(E obj)
-+{
-+    if (size() >= capacity)
-+        reserve (size() + 1);
++Comm::ConnOpener::restart() {
++    debugs(5, 5, conn_ << " restarting after sleep");
++    calls_.sleep_ = false;
 +
-+    items[count++] = obj;
++    if (createFd())
++        connect();
 +}
 +
-+template<class E>
-+void
-+Vector<E>::insert(E obj)
-+{
-+    if (size() >= capacity)
-+        reserve (size() + 1);
-+
-+    int i;
-+
-+    for (i = count; i > 0; i--)
-+        items[i] = items[i - 1];
-+
-+    items[i] = obj;
-+
-+    count += 1;
-+}
-+
-+template<class E>
-+E
-+Vector<E>::shift()
-+{
-+    assert (size());
-+    value_type result = items[0];
-+
-+    for (unsigned int i = 1; i < count; i++)
-+        items[i-1] = items[i];
-+
-+    count--;
-+
-+    /*reset the last (unused) element...*/
-+    items[count] = value_type();
-+
-+    return result;
-+}
-+
-+template<class E>
-+void
-+Vector<E>::pop_back()
-+{
-+    assert (size());
-+    --count;
-+    items[count] = value_type();
-+}
-+
-+template<class E>
-+E &
-+Vector<E>::back()
-+{
-+    assert (size());
-+    return items[size() - 1];
-+}
-+
-+template<class E>
-+const E &
-+Vector<E>::front() const
-+{
-+    assert (size());
-+    return items[0];
-+}
-+
-+template<class E>
-+E &
-+Vector<E>::front()
-+{
-+    assert (size());
-+    return items[0];
-+}
-+
-+template<class E>
-+void
-+Vector<E>::prune(E item)
-+{
-+    unsigned int n = 0;
-+    for (unsigned int i = 0; i < count; i++) {
-+        if (items[i] != item) {
-+            if (i != n)
-+                items[n] = items[i];
-+            n++;
-+        }
-+    }
-+
-+    count = n;
-+}
-+
-+/* if you are going to append a known and large number of items, call this first */
-+template<class E>
-+void
-+Vector<E>::preAppend(int app_count)
-+{
-+    if (size() + app_count > capacity)
-+        reserve(size() + app_count);
-+}
-+
-+template<class E>
-+Vector<E>::Vector (Vector<E> const &rhs)
-+{
-+    items = NULL;
-+    capacity = 0;
-+    count = 0;
-+    reserve (rhs.size());
-+
-+    for (size_t counter = 0; counter < rhs.size(); ++counter)
-+        push_back (rhs.items[counter]);
-+}
-+
-+template<class E>
-+Vector<E> &
-+Vector<E>::operator = (Vector<E> const &old)
-+{
-+    clear();
-+    reserve (old.size());
-+
-+    for (size_t counter = 0; counter < old.size(); ++counter)
-+        push_back (old.items[counter]);
-+
-+    return *this;
-+}
-+
-+template<class E>
++/// Create a socket for the future connection or return false. 
++/// If false is returned, done() is guaranteed to return true and end the job.
 +bool
-+Vector<E>::empty() const
++Comm::ConnOpener::createFd()
 +{
-+    return size() == 0;
-+}
++    Must(temporaryFd_ < 0);
 +
-+template<class E>
-+size_t
-+Vector<E>::size() const
-+{
-+    return count;
-+}
++    // our initators signal abort by cancelling their callbacks
++    if (callback_ == NULL || callback_->canceled())
++        return false;
 +
-+template<class E>
-+typename Vector<E>::iterator
-+Vector<E>::begin()
-+{
-+    return iterator (0, *this);
-+}
-+
-+template<class E>
-+typename Vector<E>::iterator
-+Vector<E>::end()
-+{
-+    return iterator(size(), *this);
-+}
-+
-+template<class E>
-+typename Vector<E>::const_iterator
-+Vector<E>::begin() const
-+{
-+    return const_iterator (0, *this);
-+}
-+
-+template<class E>
-+typename Vector<E>::const_iterator
-+Vector<E>::end() const
-+{
-+    return const_iterator(size(), *this);
-+}
-+
-+template<class E>
-+E &
-+Vector<E>::at(unsigned i)
-+{
-+    assert (size() > i);
-+    return operator[](i);
-+}
-+
-+template<class E>
-+const E &
-+Vector<E>::at(unsigned i) const
-+{
-+    assert (size() > i);
-+    return operator[](i);
-+}
-+
-+template<class E>
-+E &
-+Vector<E>::operator [] (unsigned i)
-+{
-+    return items[i];
-+}
-+
-+template<class E>
-+const E &
-+Vector<E>::operator [] (unsigned i) const
-+{
-+    return items[i];
-+}
-+
-+template<class C>
-+VectorIteratorBase<C>::VectorIteratorBase() : pos(0), theVector(NULL)
-+{}
-+
-+template<class C>
-+VectorIteratorBase<C>::VectorIteratorBase(C &container) : pos(container.begin()), theVector(&container)
-+{}
-+
-+template<class C>
-+VectorIteratorBase<C>::VectorIteratorBase(size_t aPos, C &container) : pos(aPos), theVector(&container) {}
-+
-+template<class C>
-+bool VectorIteratorBase<C>:: operator != (VectorIteratorBase<C> const &rhs) const
-+{
-+    assert (theVector);
-+    return pos != rhs.pos;
-+}
-+
-+template<class C>
-+bool VectorIteratorBase<C>:: operator == (VectorIteratorBase<C> const &rhs) const
-+{
-+    assert (theVector);
-+    return pos == rhs.pos;
-+}
-+
-+template<class C>
-+bool
-+VectorIteratorBase<C>::incrementable() const
-+{
-+    assert (theVector);
-+    return pos != theVector->size();
-+}
-+
-+template<class C>
-+VectorIteratorBase<C> & VectorIteratorBase<C>:: operator ++()
-+{
-+    assert (theVector);
-+
-+    if (!incrementable())
-+        fatal ("domain error");
-+
-+    ++pos;
-+
-+    return *this;
-+}
-+
-+template<class C>
-+VectorIteratorBase<C> VectorIteratorBase<C>:: operator ++(int)
-+{
-+    VectorIteratorBase result(*this);
-+    ++*this;
-+    return result;
-+}
-+
-+template<class C>
-+VectorIteratorBase<C>&
-+VectorIteratorBase<C>::operator =(VectorIteratorBase<C> const &old)
-+{
-+    pos = old.pos;
-+    theVector = old.theVector;
-+    return *this;
-+}
-+
-+template<class C>
-+ssize_t
-+VectorIteratorBase<C>::operator - (VectorIteratorBase<C> const &rhs) const
-+{
-+    assert(theVector == rhs.theVector);
-+    return pos - rhs.pos;
-+}
-+
-+#endif /* SQUID_ARRAY_H */
-@@ -50,13 +50,12 @@
- #include "cbdata.h"
- #include "mgr/Registration.h"
- #include "Store.h"
-+#if USE_CBDATA_DEBUG
-+#include "Stack.h"
-+#endif
- #include "Generic.h"
++    temporaryFd_ = comm_openex(SOCK_STREAM, IPPROTO_TCP, conn_->local, conn_->flags, conn_->tos, conn_->nfmark, host_);
+     if (temporaryFd_ < 0) {
+-        /* outbound sockets have no need to be protocol agnostic. */
+-        if (!(Ip::EnableIpv6&IPV6_SPECIAL_V4MAPPING) && conn_->remote.IsIPv4()) {
+-            conn_->local.SetIPv4();
+-        }
+-        temporaryFd_ = comm_openex(SOCK_STREAM, IPPROTO_TCP, conn_->local, conn_->flags, conn_->tos, conn_->nfmark, host_);
+-        if (temporaryFd_ < 0) {
+-            doneConnecting(COMM_ERR_CONNECT, 0);
+-            return;
+-        }
++        sendAnswer(COMM_ERR_CONNECT, 0, "Comm::ConnOpener::createFd");
++        return false;
+     }
  
- #include <climits>
--#if USE_CBDATA_DEBUG
--#include <algorithm>
--#include <vector>
--#endif
+     typedef CommCbMemFunT<Comm::ConnOpener, CommCloseCbParams> abortDialer;
+@@ -183,26 +263,25 @@ Comm::ConnOpener::start()
  
- #if WITH_VALGRIND
- #define HASHED_CBDATA 1
-@@ -123,7 +122,7 @@ class cbdata
-     dlink_node link;
-     const char *file;
-     int line;
--    std::vector<CBDataCall*> calls; // used as a stack with random access operator
-+    Stack<CBDataCall*> calls;
- #endif
+     typedef CommCbMemFunT<Comm::ConnOpener, CommTimeoutCbParams> timeoutDialer;
+     calls_.timeout_ = JobCallback(5, 4, timeoutDialer, this, Comm::ConnOpener::timeout);
+-    debugs(5, 3, HERE << conn_ << " timeout " << connectTimeout_);
++    debugs(5, 3, conn_ << " will timeout in " << (deadline_ - squid_curtime));
  
-     /* cookie used while debugging */
-@@ -208,11 +207,10 @@ cbdata_hash(const void *p, unsigned int mod)
- cbdata::~cbdata()
+-    // Update the fd_table directly because conn_ is not yet storing the FD
++    // Update the fd_table directly because commSetConnTimeout() needs open conn_
+     assert(temporaryFd_ < Squid_MaxFD);
+     assert(fd_table[temporaryFd_].flags.open);
+     typedef CommTimeoutCbParams Params;
+     Params &params = GetCommParams<Params>(calls_.timeout_);
+     params.conn = conn_;
+     fd_table[temporaryFd_].timeoutHandler = calls_.timeout_;
+-    fd_table[temporaryFd_].timeout = squid_curtime + (time_t) connectTimeout_;
++    fd_table[temporaryFd_].timeout = deadline_;
+ 
+-    connectStart_ = squid_curtime;
+-    connect();
++    return true;
+ }
+ 
+ void
+ Comm::ConnOpener::connected()
  {
- #if USE_CBDATA_DEBUG
-+    CBDataCall *aCall;
+-    conn_->fd = temporaryFd_;
+-    temporaryFd_ = -1;
++    Must(temporaryFd_ >= 0);
++    keepFd();
  
--    while (!calls.empty()) {
--        delete calls.back();
--        calls.pop_back();
--    }
-+    while ((aCall = calls.pop()))
-+        delete aCall;
- 
- #endif
- 
-@@ -316,7 +314,7 @@ cbdataInternalAlloc(cbdata_type type)
- 
-     c->file = file;
-     c->line = line;
--    c->calls = std::vector<CBDataCall *> ();
-+    c->calls = Stack<CBDataCall *> ();
-     c->addHistory("Alloc", file, line);
-     dlinkAdd(c, &c->link, &cbdataEntries);
-     debugs(45, 3, "cbdataAlloc: " << p << " " << file << ":" << line);
-@@ -614,8 +612,8 @@ CBDATA_CLASS_INIT(generic_cbdata);
- struct CBDataCallDumper : public unary_function<CBDataCall, void> {
-     CBDataCallDumper (StoreEntry *anEntry):where(anEntry) {}
- 
--    void operator()(CBDataCall * const &x) {
--        storeAppendPrintf(where, "%s\t%s\t%d\n", x->label, x->file, x->line);
-+    void operator()(CBDataCall const &x) {
-+        storeAppendPrintf(where, "%s\t%s\t%d\n", x.label, x.file, x.line);
-     }
- 
-     StoreEntry *where;
-@@ -628,7 +626,7 @@ struct CBDataHistoryDumper : public CBDataDumper {
-         CBDataDumper::operator()(x);
-         storeAppendPrintf(where, "\n");
-         storeAppendPrintf(where, "Action\tFile\tLine\n");
--        std::for_each (x.calls.begin(), x.calls.end(), callDumper);
-+        for_each (x.calls,callDumper);
-         storeAppendPrintf(where, "\n");
-     }
- 
-@@ -51,6 +51,7 @@
- #include "RequestFlags.h"
- #include "SquidConfig.h"
- #include "SquidTime.h"
-+#include "Stack.h"
- #include "StatCounters.h"
- #include "stmem.h"
- #include "Store.h"
-@@ -71,7 +72,6 @@
- #endif
- 
- #include <climits>
--#include <stack>
- 
- #define REBUILD_TIMESTAMP_DELTA_MAX 2
- 
-@@ -124,7 +124,7 @@ static EVH storeLateRelease;
- /*
-  * local variables
-  */
--static std::stack<StoreEntry*> LateReleaseStack;
-+static Stack<StoreEntry*> LateReleaseStack;
- MemAllocator *StoreEntry::pool = NULL;
- 
- StorePointer Store::CurrentRoot = NULL;
-@@ -1252,7 +1252,7 @@ StoreEntry::release()
-             // lock the entry until rebuilding is done
-             lock("storeLateRelease");
-             setReleaseFlag();
--            LateReleaseStack.push(this);
-+            LateReleaseStack.push_back(this);
-         } else {
-             destroyStoreEntry(static_cast<hash_link *>(this));
-             // "this" is no longer valid
-@@ -1280,21 +1280,21 @@ static void
- storeLateRelease(void *unused)
- {
-     StoreEntry *e;
-+    int i;
-     static int n = 0;
- 
-     if (StoreController::store_dirs_rebuilding) {
-         eventAdd("storeLateRelease", storeLateRelease, NULL, 1.0, 1);
-         return;
-     }
- 
--    // TODO: this works but looks unelegant.
--    for (int i = 0; i < 10; ++i) {
--        if (LateReleaseStack.empty()) {
-+    for (i = 0; i < 10; ++i) {
-+        e = LateReleaseStack.empty() ? NULL : LateReleaseStack.pop();
+     /*
+      * stats.conn_open is used to account for the number of
+@@ -220,64 +299,80 @@ Comm::ConnOpener::connected()
+      *       Also, legacy code still depends on comm_local_port() with no access to Comm::Connection
+      *       when those are done comm_local_port can become one of our member functions to do the below.
+      */
+-    fd_table[conn_->fd].flags.open = true;
++    Must(fd_table[conn_->fd].flags.open);
+     fd_table[conn_->fd].local_addr = conn_->local;
 +
-+        if (e == NULL) {
-+            /* done! */
-             debugs(20, DBG_IMPORTANT, "storeLateRelease: released " << n << " objects");
-             return;
++    sendAnswer(COMM_OK, 0, "Comm::ConnOpener::connected");
+ }
+ 
+-/** Make an FD connection attempt.
+- * Handles the case(s) when a partially setup connection gets closed early.
+- */
++/// Make an FD connection attempt.
+ void
+ Comm::ConnOpener::connect()
+ {
+     Must(conn_ != NULL);
+-
+-    // our parent Jobs signal abort by cancelling their callbacks.
+-    if (callback_ == NULL || callback_->canceled())
+-        return;
++    Must(temporaryFd_ >= 0);
+ 
+     ++ totalTries_;
+ 
+     switch (comm_connect_addr(temporaryFd_, conn_->remote) ) {
+ 
+     case COMM_INPROGRESS:
+-        // check for timeout FIRST.
+-        if (squid_curtime - connectStart_ > connectTimeout_) {
+-            debugs(5, 5, HERE << conn_ << ": * - ERR took too long already.");
+-            calls_.earlyAbort_->cancel("Comm::ConnOpener::connect timed out");
+-            doneConnecting(COMM_TIMEOUT, errno);
+-            return;
 -        } else {
--            e = LateReleaseStack.top();
--            LateReleaseStack.pop();
+-            debugs(5, 5, HERE << conn_ << ": COMM_INPROGRESS");
+-            Comm::SetSelect(temporaryFd_, COMM_SELECT_WRITE, Comm::ConnOpener::InProgressConnectRetry, new Pointer(this), 0);
+-        }
++        debugs(5, 5, HERE << conn_ << ": COMM_INPROGRESS");
++        Comm::SetSelect(temporaryFd_, COMM_SELECT_WRITE, Comm::ConnOpener::InProgressConnectRetry, new Pointer(this), 0);
+         break;
+ 
+     case COMM_OK:
+         debugs(5, 5, HERE << conn_ << ": COMM_OK - connected");
+         connected();
+-        doneConnecting(COMM_OK, 0);
+         break;
+ 
+-    default:
++    default: {
++        const int xerrno = errno;
++
+         ++failRetries_;
++        debugs(5, 7, conn_ << ": failure #" << failRetries_ << " <= " <<
++               Config.connect_retries << ": " << xstrerr(xerrno));
+ 
+-        // check for timeout FIRST.
+-        if (squid_curtime - connectStart_ > connectTimeout_) {
+-            debugs(5, 5, HERE << conn_ << ": * - ERR took too long to receive response.");
+-            calls_.earlyAbort_->cancel("Comm::ConnOpener::connect timed out");
+-            doneConnecting(COMM_TIMEOUT, errno);
+-        } else if (failRetries_ < Config.connect_retries) {
++        if (failRetries_ < Config.connect_retries) {
+             debugs(5, 5, HERE << conn_ << ": * - try again");
+-            eventAdd("Comm::ConnOpener::DelayedConnectRetry", Comm::ConnOpener::DelayedConnectRetry, new Pointer(this), 0.05, 0, false);
++            sleep();
+             return;
+         } else {
+             // send ERROR back to the upper layer.
+             debugs(5, 5, HERE << conn_ << ": * - ERR tried too many times already.");
+-            calls_.earlyAbort_->cancel("Comm::ConnOpener::connect failed");
+-            doneConnecting(COMM_ERR_CONNECT, errno);
++            sendAnswer(COMM_ERR_CONNECT, xerrno, "Comm::ConnOpener::connect");
          }
- 
-         e->unlock("storeLateRelease");
-@@ -0,0 +1,19 @@
-+#define SQUID_UNIT_TEST 1
-+#include "squid.h"
-+#include "base/Vector.h"
-+#include "tests/testVector.h"
-+
-+#include <cppunit/TestAssert.h>
-+
-+CPPUNIT_TEST_SUITE_REGISTRATION( testVector );
-+
-+void testVector::all()
-+{
-+    CPPUNIT_ASSERT_EQUAL(1 ,  1);
-+    Vector<int> aArray;
-+    CPPUNIT_ASSERT_EQUAL(static_cast<size_t>(0), aArray.size());
-+    aArray.push_back(2);
-+    CPPUNIT_ASSERT_EQUAL(static_cast<size_t>(1), aArray.size());
-+    CPPUNIT_ASSERT_EQUAL(2, aArray.back());
-+    CPPUNIT_ASSERT_EQUAL(static_cast<size_t>(1), aArray.size());
+     }
++    }
 +}
-@@ -0,0 +1,24 @@
-+#ifndef SQUID_SRC_TESTS_TESTVECTOR_H
-+#define SQUID_SRC_TESTS_TESTVECTOR_H
 +
-+#include <cppunit/extensions/HelperMacros.h>
-+
-+/*
-+ * A test case that is designed to produce
-+ * example errors and failures
-+ *
-+ */
-+
-+class testVector : public CPPUNIT_NS::TestFixture
-+{
-+    CPPUNIT_TEST_SUITE( testVector );
-+    CPPUNIT_TEST( all );
-+    CPPUNIT_TEST_SUITE_END();
-+
-+public:
-+
-+protected:
-+    void all();
-+};
-+
-+#endif
-@@ -31,6 +31,7 @@ endif
- TESTS += debug \
- 	syntheticoperators \
- 	VirtualDeleteOperator \
-+	StackTest \
- 	splay\
- 	MemPoolTest\
- 	mem_node_test\
-@@ -45,6 +46,7 @@ check_PROGRAMS += debug \
- 		mem_node_test\
- 		mem_hdr_test \
- 		splay \
-+		StackTest \
- 		syntheticoperators \
- 		VirtualDeleteOperator
- 
-@@ -87,6 +89,8 @@ MemPoolTest_SOURCES = MemPoolTest.cc
- 
- splay_SOURCES = splay.cc
- 
-+StackTest_SOURCES = StackTest.cc $(DEBUG_SOURCE)
-+
- syntheticoperators_SOURCES = syntheticoperators.cc $(DEBUG_SOURCE)
- 
- VirtualDeleteOperator_SOURCES = VirtualDeleteOperator.cc $(DEBUG_SOURCE)
-@@ -0,0 +1,56 @@
-+
-+/*
-+ * DEBUG: section 19    Store Memory Primitives
-+ * AUTHOR: Robert Collins
-+ *
-+ * SQUID Web Proxy Cache          http://www.squid-cache.org/
-+ * ----------------------------------------------------------
-+ *
-+ *  Squid is the result of efforts by numerous individuals from
-+ *  the Internet community; see the CONTRIBUTORS file for full
-+ *  details.   Many organizations have provided support for Squid's
-+ *  development; see the SPONSORS file for full details.  Squid is
-+ *  Copyrighted (C) 2001 by the Regents of the University of
-+ *  California; see the COPYRIGHT file for full details.  Squid
-+ *  incorporates software developed and/or copyrighted by other
-+ *  sources; see the CREDITS file for full details.
-+ *
-+ *  This program is free software; you can redistribute it and/or modify
-+ *  it under the terms of the GNU General Public License as published by
-+ *  the Free Software Foundation; either version 2 of the License, or
-+ *  (at your option) any later version.
-+ *
-+ *  This program is distributed in the hope that it will be useful,
-+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
-+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-+ *  GNU General Public License for more details.
-+ *
-+ *  You should have received a copy of the GNU General Public License
-+ *  along with this program; if not, write to the Free Software
-+ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
-+ *
-+ * Copyright (c) 2003  Robert Collins <robertc@squid-cache.org>
-+ */
-+
-+#include "squid.h"
-+#include "Stack.h"
-+
-+int
-+main(int argc, char **argv)
-+{
-+    Stack<int> aStack;
-+    assert (aStack.size() == 0);
-+    aStack.push_back(2);
-+    assert (aStack.size() == 1);
-+    assert (aStack.top() == 2);
-+    assert (aStack.pop() == 2);
-+    assert (aStack.size() == 0);
-+    Stack<> oldStack;
-+    assert (oldStack.size() == 0);
-+    oldStack.push_back(&aStack);
-+    assert (oldStack.size() == 1);
-+    assert (oldStack.top() == &aStack);
-+    assert (oldStack.pop() == &aStack);
-+    assert (oldStack.size() == 0);
-+    return 0;
++/// Close and wait a little before trying to open and connect again.
++void
++Comm::ConnOpener::sleep() {
++    Must(!calls_.sleep_);
++    closeFd();
++    calls_.sleep_ = true;
++    eventAdd("Comm::ConnOpener::DelayedConnectRetry",
++             Comm::ConnOpener::DelayedConnectRetry,
++             new Pointer(this), 0.05, 0, false);
 +}
++
++/// cleans up this job sleep state
++void
++Comm::ConnOpener::cancelSleep()
++{
++    if (calls_.sleep_) {
++       // It would be nice to delete the sleep event, but it might be out of
++       // the event queue and in the async queue already, so (a) we do not know
++       // whether we can safely delete the call ptr here and (b) eventDelete()
++       // will assert if the event went async. Thus, we let the event run so
++       // that it deletes the call ptr [after this job is gone]. Note that we
++       // are called only when the job ends so this "hanging event" will do
++       // nothing but deleting the call ptr.  TODO: Revise eventDelete() API.
++       // eventDelete(Comm::ConnOpener::DelayedConnectRetry, calls_.sleep);
++       calls_.sleep_ = false;
++       debugs(5, 9, conn_ << " stops sleeping");
++    }
+ }
+ 
+ /**
+@@ -308,7 +403,9 @@ void
+ Comm::ConnOpener::earlyAbort(const CommCloseCbParams &io)
+ {
+     debugs(5, 3, HERE << io.conn);
+-    doneConnecting(COMM_ERR_CLOSING, io.xerrno); // NP: is closing or shutdown better?
++    calls_.earlyAbort_ = NULL;
++    // NP: is closing or shutdown better?
++    sendAnswer(COMM_ERR_CLOSING, io.xerrno, "Comm::ConnOpener::earlyAbort");
+ }
+ 
+ /**
+@@ -318,7 +415,9 @@ Comm::ConnOpener::earlyAbort(const CommCloseCbParams &io)
+ void
+ Comm::ConnOpener::timeout(const CommTimeoutCbParams &)
+ {
+-    connect();
++    debugs(5, 5, HERE << conn_ << ": * - ERR took too long to receive response.");
++    calls_.timeout_ = NULL;
++    sendAnswer(COMM_TIMEOUT, ETIMEDOUT, "Comm::ConnOpener::timeout");
+ }
+ 
+ /* Legacy Wrapper for the retry event after COMM_INPROGRESS
+@@ -340,7 +439,7 @@ Comm::ConnOpener::InProgressConnectRetry(int fd, void *data)
+ }
+ 
+ /* Legacy Wrapper for the retry event with small delay after errors.
+- * XXX: As soon as eventAdd() accepts Async calls we can use a ConnOpener::connect call
++ * XXX: As soon as eventAdd() accepts Async calls we can use a ConnOpener::restart call
+  */
+ void
+ Comm::ConnOpener::DelayedConnectRetry(void *data)
+@@ -351,7 +450,7 @@ Comm::ConnOpener::DelayedConnectRetry(void *data)
+         // Ew. we are now outside the all AsyncJob protections.
+         // get back inside by scheduling another call...
+         typedef NullaryMemFunT<Comm::ConnOpener> Dialer;
+-        AsyncCall::Pointer call = JobCallback(5, 4, Dialer, cs, Comm::ConnOpener::connect);
++        AsyncCall::Pointer call = JobCallback(5, 4, Dialer, cs, Comm::ConnOpener::restart);
+         ScheduleCallHere(call);
+     }
+     delete ptr;
+@@ -40,13 +40,23 @@ class ConnOpener : public AsyncJob
+ 
+     void earlyAbort(const CommCloseCbParams &);
+     void timeout(const CommTimeoutCbParams &);
+-    void doneConnecting(comm_err_t errFlag, int xerrno);
++    void sendAnswer(comm_err_t errFlag, int xerrno, const char *why);
+     static void InProgressConnectRetry(int fd, void *data);
+     static void DelayedConnectRetry(void *data);
+     void connect();
+     void connected();
+     void lookupLocalAddress();
+ 
++    void sleep();
++    void restart();
++
++    bool createFd();
++    void closeFd();
++    void keepFd();
++    void cleanFd();
++
++    void cancelSleep();
++
+ private:
+     char *host_;                         ///< domain name we are trying to connect to.
+     int temporaryFd_;                    ///< the FD being opened. Do NOT set conn_->fd until it is fully open.
+@@ -56,19 +66,16 @@ class ConnOpener : public AsyncJob
+     int totalTries_;   ///< total number of connection attempts over all destinations so far.
+     int failRetries_;  ///< number of retries current destination has been tried.
+ 
+-    /**
+-     * time at which to abandon the connection.
+-     * the connection-done callback will be passed COMM_TIMEOUT
+-     */
+-    time_t connectTimeout_;
+-
+-    /// time at which this series of connection attempts was started.
+-    time_t connectStart_;
++    /// if we are not done by then, we will call back with COMM_TIMEOUT
++    time_t deadline_;
+ 
+     /// handles to calls which we may need to cancel.
+     struct Calls {
+         AsyncCall::Pointer earlyAbort_;
+         AsyncCall::Pointer timeout_;
++        /// Whether we are idling before retrying to connect; not yet a call
++        /// [that we can cancel], but it will probably become one eventually.
++        bool sleep_;
+     } calls_;
+ 
+     CBDATA_CLASS2(ConnOpener);

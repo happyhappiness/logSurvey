@@ -1,43 +1,229 @@
-@@ -265,27 +265,23 @@ main(int argc, char *argv[])
-                 break;
+@@ -47,8 +47,21 @@ class DiskFile : public RefCountable
+ {
  
-             case 'A':
--                if (optarg != NULL)
--                    useragent = optarg;
-+                useragent = optarg;
-                 break;
+ public:
++
++    /// generally useful configuration options supported by some children
++    class Config {
++    public:
++        Config(): ioTimeout(0) {}
++
++        /// canRead/Write should return false if expected I/O delay exceeds it
++        time_msec_t ioTimeout; // not enforced if zero, which is the default
++    };
++
+     typedef RefCount<DiskFile> Pointer;
  
-             case 'h':		/* remote host */
--                if (optarg != NULL)
--                    hostname = optarg;
-+                hostname = optarg;
-                 break;
++    /// notes supported configuration options; kids must call this first
++    virtual void configure(const Config &cfg) {}
++
+     virtual void open(int flags, mode_t mode, RefCount<IORequestor> callback) = 0;
+     virtual void create(int flags, mode_t mode, RefCount<IORequestor> callback) = 0;
+     virtual void read(ReadRequest *) = 0;
+@@ -70,6 +70,13 @@ IpcIoFile::~IpcIoFile()
+     }
+ }
  
-             case 'j':
-                 host = optarg;
-                 break;
++void
++IpcIoFile::configure(const Config &cfg)
++{
++    DiskFile::configure(cfg);
++    config = cfg;
++}
++
+ void
+ IpcIoFile::open(int flags, mode_t mode, RefCount<IORequestor> callback)
+ {
+@@ -345,7 +352,7 @@ IpcIoFile::push(IpcIoPendingRequest *const pending)
+ bool
+ IpcIoFile::canWait() const
+ {
+-    if (!Config.Timeout.disk_io)
++    if (!config.ioTimeout)
+         return true; // no timeout specified
  
-             case 'V':
--                if (optarg != NULL)
--                    version = optarg;
-+                version = optarg;
-                 break;
+     IpcIoMsg oldestIo;
+@@ -354,7 +361,7 @@ IpcIoFile::canWait() const
  
-             case 'l':		/* local host */
--                if (optarg != NULL)
--                    localhost = optarg;
-+                localhost = optarg;
-                 break;
+     const int expectedWait = tvSubMsec(oldestIo.start, current_time);
+     if (expectedWait < 0 ||
+-            static_cast<time_msec_t>(expectedWait) < Config.Timeout.disk_io)
++            static_cast<time_msec_t>(expectedWait) < config.ioTimeout)
+         return true; // expected wait time is acceptible
  
-             case 's':		/* silent */
-@@ -418,7 +414,9 @@ main(int argc, char *argv[])
-         setmode(put_fd, O_BINARY);
- #endif
+     debugs(47,2, HERE << "cannot wait: " << expectedWait <<
+@@ -57,6 +57,7 @@ class IpcIoFile: public DiskFile
+     virtual ~IpcIoFile();
  
--        fstat(put_fd, &sb);
-+        if (fstat(put_fd, &sb) < 0) {
-+            fprintf(stderr, "%s: can't identify length of file (%s)\n", argv[0], xstrerror());
-+        }
+     /* DiskFile API */
++    virtual void configure(const Config &cfg);
+     virtual void open(int flags, mode_t mode, RefCount<IORequestor> callback);
+     virtual void create(int flags, mode_t mode, RefCount<IORequestor> callback);
+     virtual void read(ReadRequest *);
+@@ -74,6 +75,8 @@ class IpcIoFile: public DiskFile
+     /// handle queue push notifications from worker or disker
+     static void HandleNotification(const Ipc::TypedMsgHdr &msg);
+ 
++    DiskFile::Config config; ///< supported configuration options
++
+ protected:
+     friend class IpcIoPendingRequest;
+     void openCompleted(const Ipc::StrandSearchResponse *const response);
+@@ -2764,6 +2764,14 @@ DOC_START
+ 	slot size is specified in bytes using the max-size option. See
+ 	below for more info on the max-size option.
+ 
++	swap-timeout=msec: Squid will not start writing a miss to or
++	reading a hit from disk if it estimates that the swap operation
++	will take more than the specified number of milliseconds. By
++	default and when set to zero, disables the disk I/O time limit
++	enforcement. Ignored when using blocking I/O module because
++	blocking synchronous I/O does not allow Squid to estimate the
++	expected swap wait time.
++
+ 	The coss store type:
+ 
+ 	NP: COSS filesystem in Squid-3 has been deemed too unstable for
+@@ -4657,21 +4665,6 @@ DOC_START
+ 	many ident requests going at once.
+ DOC_END
+ 
+-NAME: disk_io_timeout
+-TYPE: time_msec
+-DEFAULT: 0 milliseconds
+-LOC: Config.Timeout.disk_io
+-DOC_START
+-	Squid will not start a new disk I/O operation if it estimates that the
+-	operation will take more than the specified disk I/O timeout.
+-	Only Rock Store supports this timeout for now.
+-
+-	By default and when set to zero, disables the disk I/O time limit
+-	enforcement.
+-DOC_END
+-
+-
+-
+ NAME: shutdown_lifetime
+ COMMENT: time-units
+ TYPE: time_t
+@@ -10,6 +10,7 @@
+ #include "MemObject.h"
+ #include "SquidMath.h"
+ #include "base/RunnersRegistry.h"
++#include "ConfigOption.h"
+ #include "DiskIO/DiskIOModule.h"
+ #include "DiskIO/DiskIOStrategy.h"
+ #include "DiskIO/ReadRequest.h"
+@@ -226,6 +227,7 @@ Rock::SwapDir::init()
      }
  
-     if (!host) {
+     theFile = io->newFile(filePath);
++    theFile->configure(fileConfig);
+     theFile->open(O_RDWR, 0644, this);
+ 
+     // Increment early. Otherwise, if one SwapDir finishes rebuild before
+@@ -281,6 +283,55 @@ Rock::SwapDir::parseSize()
+     max_size = static_cast<uint64_t>(i) << 20; // MBytes to Bytes
+ }
+ 
++ConfigOption *
++Rock::SwapDir::getOptionTree() const
++{
++    ConfigOptionVector *vector = dynamic_cast<ConfigOptionVector*>(::SwapDir::getOptionTree());
++    assert(vector);
++    vector->options.push_back(new ConfigOptionAdapter<SwapDir>(*const_cast<SwapDir *>(this), &SwapDir::parseTimeOption, &SwapDir::dumpTimeOption));
++    return vector;
++}
++
++/// parses time-specific options; mimics ::SwapDir::optionObjectSizeParse()
++bool
++Rock::SwapDir::parseTimeOption(char const *option, const char *value, int reconfiguring)
++{
++    // TODO: ::SwapDir or, better, Config should provide time-parsing routines,
++    // including time unit handling. Same for size.
++
++    time_msec_t *storedTime;
++    if (strcmp(option, "swap-timeout") == 0)
++        storedTime = &fileConfig.ioTimeout;
++    else
++        return false;
++
++    if (!value)
++        self_destruct();
++
++    const time_msec_t newTime = strtoll(value, NULL, 10);
++
++    if (newTime < 0) {
++        debugs(3, DBG_CRITICAL, "FATAL: cache_dir " << path << ' ' << option << " must not be negative but is: " << newTime);
++        self_destruct();
++    }
++
++    if (reconfiguring && *storedTime != newTime)
++        debugs(3, DBG_IMPORTANT, "cache_dir " << path << ' ' << option << " is now " << newTime);
++
++    *storedTime = newTime;
++
++    return true;
++}
++
++/// reports time-specific options; mimics ::SwapDir::optionObjectSizeDump()
++void
++Rock::SwapDir::dumpTimeOption(StoreEntry * e) const
++{
++    if (fileConfig.ioTimeout)
++        storeAppendPrintf(e, " swap-timeout=%"PRId64,
++                          static_cast<int64_t>(fileConfig.ioTimeout));
++}
++
+ /// check the results of the configuration; only level-0 debugging works here
+ void
+ Rock::SwapDir::validateOptions()
+@@ -2,12 +2,12 @@
+ #define SQUID_FS_ROCK_SWAP_DIR_H
+ 
+ #include "SwapDir.h"
++#include "DiskIO/DiskFile.h"
+ #include "DiskIO/IORequestor.h"
+ #include "fs/rock/RockFile.h"
+ #include "ipc/StoreMap.h"
+ 
+ class DiskIOStrategy;
+-class DiskFile;
+ class ReadRequest;
+ class WriteRequest;
+ 
+@@ -43,6 +43,7 @@ class SwapDir: public ::SwapDir, public IORequestor
+     virtual bool needsDiskStrand() const;
+     virtual void create();
+     virtual void init();
++    virtual ConfigOption *getOptionTree() const;
+     virtual bool canStore(const StoreEntry &e, int64_t diskSpaceNeeded, int &load) const;
+     virtual StoreIOState::Pointer createStoreIO(StoreEntry &, StoreIOState::STFNCB *, StoreIOState::STIOCB *, void *);
+     virtual StoreIOState::Pointer openStoreIO(StoreEntry &, StoreIOState::STFNCB *, StoreIOState::STIOCB *, void *);
+@@ -62,6 +63,8 @@ class SwapDir: public ::SwapDir, public IORequestor
+     virtual void parse(int index, char *path);
+     void parseSize(); ///< parses anonymous cache_dir size option
+     void validateOptions(); ///< warns of configuration problems; may quit
++    bool parseTimeOption(char const *option, const char *value, int reconfiguring);
++    void dumpTimeOption(StoreEntry * e) const;
+ 
+     void rebuild(); ///< starts loading and validating stored entry metadata
+     ///< used to add entries successfully loaded during rebuild
+@@ -83,6 +86,9 @@ class SwapDir: public ::SwapDir, public IORequestor
+     RefCount<DiskFile> theFile; ///< cache storage for this cache_dir
+     DirMap *map;
+ 
++    /* configurable options */
++    DiskFile::Config fileConfig; ///< file-level configuration options
++
+     static const int64_t HeaderSize; ///< on-disk db header size
+ };
+ 
+@@ -215,7 +215,6 @@ struct SquidConfig {
+         int icp_query_max;	/* msec */
+         int icp_query_min;	/* msec */
+         int mcast_icp_query;	/* msec */
+-        time_msec_t disk_io;
+ 
+ #if !USE_DNSSERVERS
+ 

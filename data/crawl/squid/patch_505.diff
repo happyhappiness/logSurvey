@@ -1,57 +1,600 @@
-@@ -321,7 +321,7 @@ authenticate(int socket_fd, const char *username, const char *passwd)
-         length = MAXPWNAM;
-     }
-     *ptr = length + 2;
--    ++ptr;
-+    ptr = (unsigned char*)send_buffer + sizeof(AUTH_HDR);
-     memcpy(ptr, username, length);
-     ptr += length;
-     total_length += length + 2;
-@@ -424,7 +424,13 @@ authenticate(int socket_fd, const char *username, const char *passwd)
-          *    Send the request we've built.
-          */
-         gettimeofday(&sent, NULL);
--        send(socket_fd, (char *) auth, total_length, 0);
-+        if (send(socket_fd, (char *) auth, total_length, 0) < 0) {
-+            // EAGAIN is expected at high traffic, just retry
-+            // TODO: block/sleep a few ms to let the apparently full buffer drain ?
-+            if (errno != EAGAIN && errno != EWOULDBLOCK)
-+                fprintf(stderr,"ERROR: RADIUS send() failure: %s\n", xstrerror());
-+            continue;
-+        }
-         while ((time_spent = time_since(&sent)) < 1000000) {
-             struct timeval tv;
-             int rc, len;
-@@ -488,16 +494,16 @@ main(int argc, char **argv)
-             cfname = optarg;
-             break;
-         case 'h':
--            strcpy(server, optarg);
-+            strncpy(server, optarg, sizeof(server));
-             break;
-         case 'p':
--            strcpy(svc_name, optarg);
-+            strncpy(svc_name, optarg, sizeof(svc_name));
-             break;
-         case 'w':
--            strcpy(secretkey, optarg);
-+            strncpy(secretkey, optarg, sizeof(secretkey));
-             break;
-         case 'i':
--            strcpy(identifier, optarg);
-+            strncpy(identifier, optarg, sizeof(identifier));
-             break;
-         case 't':
-             retries = atoi(optarg);
-@@ -565,7 +571,10 @@ main(int argc, char **argv)
-         exit(1);
-     }
- #ifdef O_NONBLOCK
--    fcntl(sockfd, F_SETFL, fcntl(sockfd, F_GETFL, 0) | O_NONBLOCK);
-+    if (fcntl(sockfd, F_SETFL, fcntl(sockfd, F_GETFL, 0) | O_NONBLOCK) < 0) {
-+        fprintf(stderr,"%s| ERROR: fcntl() failure: %s\n", argv[0], xstrerror());
-+        exit(1);
+@@ -37,6 +37,7 @@
+ #include "HttpHeaderRange.h"
+ /* HttpHeader holds a HttpHeaderMask */
+ #include "HttpHeaderMask.h"
++#include "HttpHeaderCacheControl.h"
+ 
+ 
+ /* class forward declarations */
+@@ -0,0 +1,327 @@
++
++/*
++ *
++ * DEBUG: section 65    HTTP Cache Control Header
++ * AUTHOR: Alex Rousskov, Francesco Chemolli
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sources; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ */
++
++#include "squid.h"
++#include "Store.h"
++#include "HttpHeader.h"
++#include "HttpHeaderCacheControl.h"
++
++#if HAVE_MAP
++#include <map>
++#endif
++
++/* this table is used for parsing cache control header and statistics */
++typedef struct {
++    const char *name;
++    http_hdr_cc_type id;
++    HttpHeaderFieldStat stat;
++} HttpHeaderCcFields;
++
++/* order must match that of enum http_hdr_cc_type */
++static HttpHeaderCcFields CcAttrs[CC_ENUM_END] = {
++        {"public", CC_PUBLIC},
++        {"private", CC_PRIVATE},
++        {"no-cache", CC_NO_CACHE},
++        {"no-store", CC_NO_STORE},
++        {"no-transform", CC_NO_TRANSFORM},
++        {"must-revalidate", CC_MUST_REVALIDATE},
++        {"proxy-revalidate", CC_PROXY_REVALIDATE},
++        {"max-age", CC_MAX_AGE},
++        {"s-maxage", CC_S_MAXAGE},
++        {"max-stale", CC_MAX_STALE},
++        {"min-fresh", CC_MIN_FRESH},
++        {"only-if-cached", CC_ONLY_IF_CACHED},
++        {"stale-if-error", CC_STALE_IF_ERROR},
++        {"Other,", CC_OTHER} /* ',' will protect from matches */
++};
++
++typedef std::map<String,http_hdr_cc_type> HdrCcNameToIdMap_t;
++static HdrCcNameToIdMap_t HdrCcNameToIdMap;
++
++http_hdr_cc_type &operator++ (http_hdr_cc_type &aHeader)
++{
++    int tmp = (int)aHeader;
++    aHeader = (http_hdr_cc_type)(++tmp);
++    return aHeader;
++}
++
++
++/* local prototypes */
++static int httpHdrCcParseInit(HttpHdrCc * cc, const String * str);
++
++
++/* module initialization */
++
++void
++httpHdrCcInitModule(void)
++{
++    int32_t i;
++    /* build lookup and accounting structures */
++    for (i=0;i<CC_ENUM_END;i++) {
++        assert(i==CcAttrs[i].id); /* verify assumption: the id is the key into the array */
++        HdrCcNameToIdMap[CcAttrs[i].name]=CcAttrs[i].id;
 +    }
++}
++
++void
++httpHdrCcCleanModule(void)
++{
++    // HdrCcNameToIdMap is self-cleaning
++}
++
++/* implementation */
++
++HttpHdrCc *
++httpHdrCcCreate(void)
++{
++    return new HttpHdrCc();
++}
++
++/* creates an cc object from a 0-terminating string */
++HttpHdrCc *
++httpHdrCcParseCreate(const String * str)
++{
++    HttpHdrCc *cc = httpHdrCcCreate();
++
++    if (!httpHdrCcParseInit(cc, str)) {
++        httpHdrCcDestroy(cc);
++        cc = NULL;
++    }
++
++    return cc;
++}
++
++/* parses a 0-terminating string and inits cc */
++static int
++httpHdrCcParseInit(HttpHdrCc * cc, const String * str)
++{
++    const char *item;
++    const char *p;		/* '=' parameter */
++    const char *pos = NULL;
++    http_hdr_cc_type type;
++    int ilen;
++    int nlen;
++    assert(cc && str);
++
++    /* iterate through comma separated list */
++
++    while (strListGetItem(str, ',', &item, &ilen, &pos)) {
++        String tmpstr;
++        /* isolate directive name */
++
++        if ((p = (const char *)memchr(item, '=', ilen)) && (p - item < ilen))
++            nlen = p++ - item;
++        else
++            nlen = ilen;
++
++        /* find type */
++        tmpstr.limitInit(item,nlen);
++        HdrCcNameToIdMap_t::iterator i;
++        i=HdrCcNameToIdMap.find(tmpstr);
++        if (i==HdrCcNameToIdMap.end())
++            type=CC_OTHER;
++        else
++            type=i->second;
++
++        // ignore known duplicate directives
++        if (EBIT_TEST(cc->mask, type)) {
++            if (type != CC_OTHER) {
++                debugs(65, 2, "hdr cc: ignoring duplicate cache-directive: near '" << item << "' in '" << str << "'");
++                CcAttrs[type].stat.repCount++;
++                continue;
++            }
++        } else {
++            EBIT_SET(cc->mask, type);
++        }
++
++        /* post-processing special cases */
++        switch (type) {
++
++        case CC_MAX_AGE:
++
++            if (!p || !httpHeaderParseInt(p, &cc->max_age)) {
++                debugs(65, 2, "cc: invalid max-age specs near '" << item << "'");
++                cc->max_age = -1;
++                EBIT_CLR(cc->mask, type);
++            }
++
++            break;
++
++        case CC_S_MAXAGE:
++
++            if (!p || !httpHeaderParseInt(p, &cc->s_maxage)) {
++                debugs(65, 2, "cc: invalid s-maxage specs near '" << item << "'");
++                cc->s_maxage = -1;
++                EBIT_CLR(cc->mask, type);
++            }
++
++            break;
++
++        case CC_MAX_STALE:
++
++            if (!p || !httpHeaderParseInt(p, &cc->max_stale)) {
++                debugs(65, 2, "cc: max-stale directive is valid without value");
++                cc->max_stale = -1;
++            }
++
++            break;
++
++        case CC_MIN_FRESH:
++
++            if (!p || !httpHeaderParseInt(p, &cc->min_fresh)) {
++                debugs(65, 2, "cc: invalid min-fresh specs near '" << item << "'");
++                cc->min_fresh = -1;
++                EBIT_CLR(cc->mask, type);
++            }
++
++            break;
++
++        case CC_STALE_IF_ERROR:
++            if (!p || !httpHeaderParseInt(p, &cc->stale_if_error)) {
++                debugs(65, 2, "cc: invalid stale-if-error specs near '" << item << "'");
++                cc->stale_if_error = -1;
++                EBIT_CLR(cc->mask, type);
++            }
++            break;
++
++        case CC_OTHER:
++
++            if (cc->other.size())
++                cc->other.append(", ");
++
++            cc->other.append(item, ilen);
++
++            break;
++
++        default:
++            /* note that we ignore most of '=' specs (RFCVIOLATION) */
++            break;
++        }
++    }
++
++    return cc->mask != 0;
++}
++
++void
++httpHdrCcDestroy(HttpHdrCc * cc)
++{
++    assert(cc);
++    delete cc;
++}
++
++void
++httpHdrCcPackInto(const HttpHdrCc * cc, Packer * p)
++{
++    http_hdr_cc_type flag;
++    int pcount = 0;
++    assert(cc && p);
++
++    for (flag = CC_PUBLIC; flag < CC_ENUM_END; ++flag) {
++        if (EBIT_TEST(cc->mask, flag) && flag != CC_OTHER) {
++
++            /* print option name */
++            packerPrintf(p, (pcount ? ", %s": "%s") , CcAttrs[flag].name);
++
++            /* handle options with values */
++
++            if (flag == CC_MAX_AGE)
++                packerPrintf(p, "=%d", (int) cc->max_age);
++
++            if (flag == CC_S_MAXAGE)
++                packerPrintf(p, "=%d", (int) cc->s_maxage);
++
++            if (flag == CC_MAX_STALE && cc->max_stale >= 0)
++                packerPrintf(p, "=%d", (int) cc->max_stale);
++
++            if (flag == CC_MIN_FRESH)
++                packerPrintf(p, "=%d", (int) cc->min_fresh);
++
++            pcount++;
++        }
++    }
++
++    if (cc->other.size() != 0)
++        packerPrintf(p, (pcount ? ", " SQUIDSTRINGPH : SQUIDSTRINGPH),
++                     SQUIDSTRINGPRINT(cc->other));
++}
++
++/* negative max_age will clean old max_Age setting */
++void
++httpHdrCcSetMaxAge(HttpHdrCc * cc, int max_age)
++{
++    assert(cc);
++    cc->max_age = max_age;
++
++    if (max_age >= 0)
++        EBIT_SET(cc->mask, CC_MAX_AGE);
++    else
++        EBIT_CLR(cc->mask, CC_MAX_AGE);
++}
++
++/* negative s_maxage will clean old s-maxage setting */
++void
++httpHdrCcSetSMaxAge(HttpHdrCc * cc, int s_maxage)
++{
++    assert(cc);
++    cc->s_maxage = s_maxage;
++
++    if (s_maxage >= 0)
++        EBIT_SET(cc->mask, CC_S_MAXAGE);
++    else
++        EBIT_CLR(cc->mask, CC_S_MAXAGE);
++}
++
++void
++httpHdrCcUpdateStats(const HttpHdrCc * cc, StatHist * hist)
++{
++    http_hdr_cc_type c;
++    assert(cc);
++
++    for (c = CC_PUBLIC; c < CC_ENUM_END; ++c)
++        if (EBIT_TEST(cc->mask, c))
++            statHistCount(hist, c);
++}
++
++void
++httpHdrCcStatDumper(StoreEntry * sentry, int idx, double val, double size, int count)
++{
++    extern const HttpHeaderStat *dump_stat;	/* argh! */
++    const int id = (int) val;
++    const int valid_id = id >= 0 && id < CC_ENUM_END;
++    const char *name = valid_id ? CcAttrs[id].name : "INVALID";
++
++    if (count || valid_id)
++        storeAppendPrintf(sentry, "%2d\t %-20s\t %5d\t %6.2f\n",
++                          id, name, count, xdiv(count, dump_stat->ccParsedCount));
++}
+@@ -0,0 +1,65 @@
++/*
++ * HttpHeaderCacheControl.h
++ *
++ *  Created on: Sep 2, 2011
++ *      Author: Francesco Chemolli
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sources; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ */
++
++#ifndef SQUID_HTTPHEADERCACHECONTROL_H_
++#define SQUID_HTTPHEADERCACHECONTROL_H_
++
++#include "config.h"
++#include "MemPool.h"
++#include "SquidString.h"
++
++/* http cache control header field */
++class HttpHdrCc
++{
++
++public:
++    int32_t mask;
++    int32_t max_age;
++    int32_t s_maxage;
++    int32_t max_stale;
++    int32_t stale_if_error;
++    int32_t min_fresh;
++    String other;
++
++    HttpHdrCc(int32_t max_age_=-1, int32_t s_maxage_=-1,
++            int32_t max_stale_=-1, int32_t min_fresh_=-1) :
++            mask(0), max_age(max_age_), s_maxage(s_maxage_),
++            max_stale(max_stale_), stale_if_error(0),
++            min_fresh(min_fresh_) {}
++
++    MEMPROXY_CLASS(HttpHdrCc);
++};
++
++MEMPROXY_CLASS_INLINE(HttpHdrCc);
++
++#endif /* SQUID_HTTPHEADERCACHECONTROL_H_ */
+@@ -341,7 +341,8 @@ squid_SOURCES = \
+ 	HttpStatusCode.h \
+ 	HttpStatusLine.cc \
+ 	HttpStatusLine.h \
+-	HttpHdrCc.cc \
++	HttpHeaderCacheControl.h \
++	HttpHeaderCacheControl.cc \
+ 	HttpHdrRange.cc \
+ 	HttpHdrSc.cc \
+ 	HttpHdrSc.h \
+@@ -1015,7 +1016,8 @@ tests_testHttpReply_SOURCES=\
+ 	cbdata.h \
+ 	ETag.cc \
+ 	HttpBody.cc \
+-	HttpHdrCc.cc \
++	HttpHeaderCacheControl.h \
++	HttpHeaderCacheControl.cc \
+ 	HttpHdrContRange.cc \
+ 	HttpHdrContRange.h \
+ 	HttpHdrRange.cc \
+@@ -1082,7 +1084,7 @@ tests_testHttpReply_DEPENDENCIES= $(SQUID_CPPUNIT_LA)
+ ##	HttpHeader.cc \
+ ##	HttpHeaderTools.cc \
+ ##	HttpHdrContRange.cc \
+-##	HttpHdrCc.cc \
++##	HttpHeaderCacheControl.cc \
+ ##	HttpHdrRange.cc \
+ ##	HttpHdrSc.cc \
+ ##	HttpHdrScTarget.cc \
+@@ -1108,7 +1110,8 @@ tests_testACLMaxUserIP_SOURCES= \
+ 	HttpHeaderTools.cc \
+ 	HttpHdrContRange.cc \
+ 	HttpHdrRange.cc \
+-	HttpHdrCc.cc \
++	HttpHeaderCacheControl.h \
++	HttpHeaderCacheControl.cc \
+ 	HttpHdrSc.cc \
+ 	HttpHdrScTarget.cc \
+ 	HttpMsg.cc \
+@@ -1268,7 +1271,8 @@ tests_testCacheManager_SOURCES = \
+ 	HttpBody.cc \
+ 	HttpHeader.cc \
+ 	HttpHeaderTools.cc \
+-	HttpHdrCc.cc \
++	HttpHeaderCacheControl.h \
++	HttpHeaderCacheControl.cc \
+ 	HttpHdrContRange.cc \
+ 	HttpHdrRange.cc \
+ 	HttpHdrSc.cc \
+@@ -1399,7 +1403,8 @@ tests_testDiskIO_SOURCES = \
+ 	fd.cc \
+ 	filemap.cc \
+ 	HttpBody.cc \
+-	HttpHdrCc.cc \
++	HttpHeaderCacheControl.h \
++	HttpHeaderCacheControl.cc \
+ 	HttpHdrContRange.cc \
+ 	HttpHdrSc.cc \
+ 	HttpHdrScTarget.cc \
+@@ -1571,7 +1576,8 @@ tests_testEvent_SOURCES = \
+ 	HttpBody.cc \
+ 	HttpHeader.cc \
+ 	HttpHeaderTools.cc \
+-	HttpHdrCc.cc \
++	HttpHeaderCacheControl.h \
++	HttpHeaderCacheControl.cc \
+ 	HttpHdrContRange.cc \
+ 	HttpHdrRange.cc \
+ 	HttpHdrSc.cc \
+@@ -1749,7 +1755,8 @@ tests_testEventLoop_SOURCES = \
+ 	HttpBody.cc \
+ 	HttpHeader.cc \
+ 	HttpHeaderTools.cc \
+-	HttpHdrCc.cc \
++	HttpHeaderCacheControl.h \
++	HttpHeaderCacheControl.cc \
+ 	HttpHdrContRange.cc \
+ 	HttpHdrRange.cc \
+ 	HttpHdrSc.cc \
+@@ -1923,7 +1930,8 @@ tests_test_http_range_SOURCES = \
+ 	$(HTCPSOURCE) \
+ 	http.cc \
+ 	HttpBody.cc \
+-	HttpHdrCc.cc \
++	HttpHeaderCacheControl.h \
++	HttpHeaderCacheControl.cc \
+ 	HttpHdrContRange.cc \
+ 	HttpHdrRange.cc \
+ 	HttpHdrSc.cc \
+@@ -2140,7 +2148,8 @@ tests_testHttpRequest_SOURCES = \
+ 	HttpBody.cc \
+ 	HttpHeader.cc \
+ 	HttpHeaderTools.cc \
+-	HttpHdrCc.cc \
++	HttpHeaderCacheControl.h \
++	HttpHeaderCacheControl.cc \
+ 	HttpHdrContRange.cc \
+ 	HttpHdrRange.cc \
+ 	HttpHdrSc.cc \
+@@ -2270,7 +2279,8 @@ tests_testStore_SOURCES= \
+ 	event.cc \
+ 	EventLoop.cc \
+ 	filemap.cc \
+-	HttpHdrCc.cc \
++	HttpHeaderCacheControl.h \
++	HttpHeaderCacheControl.cc \
+ 	HttpHdrContRange.cc \
+ 	HttpHdrRange.cc \
+ 	HttpHdrSc.cc \
+@@ -2504,7 +2514,8 @@ tests_testUfs_SOURCES = \
+ 	MemBuf.cc \
+ 	HttpHdrContRange.cc \
+ 	Packer.cc \
+-	HttpHdrCc.cc \
++	HttpHeaderCacheControl.h \
++	HttpHeaderCacheControl.cc \
+ 	HttpHdrSc.cc \
+ 	HttpHdrScTarget.cc \
+ 	url.cc \
+@@ -2634,7 +2645,8 @@ tests_testCoss_SOURCES = \
+ 	MemBuf.cc \
+ 	HttpHdrContRange.cc \
+ 	Packer.cc \
+-	HttpHdrCc.cc \
++	HttpHeaderCacheControl.h \
++	HttpHeaderCacheControl.cc \
+ 	HttpHdrSc.cc \
+ 	HttpHdrScTarget.cc \
+ 	url.cc \
+@@ -2758,7 +2770,8 @@ tests_testNull_SOURCES = \
+ 	MemBuf.cc \
+ 	HttpHdrContRange.cc \
+ 	Packer.cc \
+-	HttpHdrCc.cc \
++	HttpHeaderCacheControl.h \
++	HttpHeaderCacheControl.cc \
+ 	HttpHdrSc.cc \
+ 	HttpHdrScTarget.cc \
+ 	url.cc \
+@@ -2860,7 +2873,8 @@ tests_testURL_SOURCES = \
+ 	$(HTCPSOURCE) \
+ 	http.cc \
+ 	HttpBody.cc \
+-	HttpHdrCc.cc \
++	HttpHeaderCacheControl.h \
++	HttpHeaderCacheControl.cc \
+ 	HttpHdrContRange.cc \
+ 	HttpHdrRange.cc \
+ 	HttpHdrSc.cc \
+@@ -181,6 +181,8 @@ class String
+ 
+ _SQUID_INLINE_ std::ostream & operator<<(std::ostream& os, String const &aString);
+ 
++_SQUID_INLINE_ bool operator<(const String &a, const String &b);
++
+ #if _USE_INLINE_
+ #include "String.cci"
  #endif
-     nas_ipaddr = ntohl(salocal.sin_addr.s_addr);
-     while (fgets(buf, HELPER_INPUT_BUFFER, stdin) != NULL) {
+@@ -200,3 +200,9 @@ operator<<(std::ostream& os, String const &aString)
+     os.write(aString.rawBuf(),aString.size());
+     return os;
+ }
++
++bool
++operator<(const String &a, const String &b)
++{
++    return a.cmp(b)<0;
++}
+@@ -67,6 +67,7 @@
+ #include "compat/inet_pton.h"
+ #include "fde.h"
+ #include "format/Tokens.h"
++#include "HttpHeaderCacheControl.h"
+ #include "HttpReply.h"
+ #include "HttpRequest.h"
+ #include "ip/QosConfig.h"
+@@ -696,21 +696,6 @@ class HttpHdrExtField
+     String value;		/* field-value from HTTP/1.1 */
+ };
+ 
+-/* http cache control header field */
+-
+-class HttpHdrCc
+-{
+-
+-public:
+-    int mask;
+-    int max_age;
+-    int s_maxage;
+-    int max_stale;
+-    int stale_if_error;
+-    int min_fresh;
+-    String other;
+-};
+-
+ /* per field statistics */
+ 
+ class HttpHeaderFieldStat

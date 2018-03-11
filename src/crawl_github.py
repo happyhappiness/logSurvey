@@ -31,15 +31,17 @@ def store_patch_file(patch, counter, record, writer):
     
     return counter
 
-def analyze_commit(gh, sha, counter, writer):
+def analyze_commit(gh, sha, total_counter, counter, writer):
     """
-    @ param gh, sha, counter and writer\n
-    @ return new counter\n
+    @ param gh, sha, total_counter, counter and writer\n
+    @ return total_counter, new counter\n
     @ involve retrive record info of commit [url, date, title, changes, file_name]\n
     """
     # retrieve info of commit with given sha
     commit = gh.repos.commits.get(sha=sha)
-
+    title = commit.commit.message
+    if title.startswith('Merge'):
+        return total_counter, counter
     # save commit patch according to files
     patch = []
     for changed_file in commit.files:
@@ -53,9 +55,9 @@ def analyze_commit(gh, sha, counter, writer):
     changes = commit.stats.total
     url = commit.html_url
     date = commit.commit.committer.date.strftime('%d %b %Y')
-    title = commit.commit.message
 
-    return store_patch_file(patch, counter, [url, date, title, changes], writer)
+    total_counter += 1
+    return total_counter, store_patch_file(patch, counter, [url, date, title, changes], writer)
 
 def analyze_commit_list(start_commit, writer, total_counter=0, counter=0):
     """
@@ -70,8 +72,7 @@ def analyze_commit_list(start_commit, writer, total_counter=0, counter=0):
     commits = gh.repos.commits.list(sha=start_commit)
     for commit in commits.iterator():
         # invoke the deal_commit function
-        total_counter += 1
-        counter = analyze_commit(gh, commit.sha, counter, writer)
+        total_counter, counter = analyze_commit(gh, commit.sha, total_counter, counter, writer)
         if total_counter % 5 == 0:
             print 'now have cawled %d commit, find %d log commit' %(total_counter, counter)
 
@@ -81,13 +82,13 @@ main function
 """
 if __name__ == "__main__":
     # several configuration constant: user, repos
-    commit_sha = '25f983407b3c3df95d9f81edf1bd917316f2dfda'
+    commit_sha = 'eaa778413fd9619207139ed45af1abcd4f2c2c44'
 
     record_file = file('data/analyze/' + REPOS_NAME + '_log_commit.csv', 'ab')
     writer = csv.writer(record_file)
     # writer.writerow(['url', 'date', 'title', 'changes', 'file_name'])
 
     # analyze commit list of given repos with start commit
-    analyze_commit_list(commit_sha, writer, 6375, 735)
+    analyze_commit_list(commit_sha, writer, 17485, 1993)
     record_file.close()
 

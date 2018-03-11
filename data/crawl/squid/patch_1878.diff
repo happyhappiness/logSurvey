@@ -1,0 +1,502 @@
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: event.cc,v 1.4 1997/01/07 21:49:51 wessels Exp $
++ * $Id: event.cc,v 1.5 1997/02/27 06:29:11 wessels Exp $
+  *
+  * DEBUG: section 41    Event Processing
+  * AUTHOR: Henrik Nordstrom
+@@ -61,6 +61,23 @@ eventAdd(const char *name, EVH func, void *arg, time_t when)
+     *E = event;
+ }
+ 
++void
++eventDelete(EVH func, void *arg)
++{
++    struct ev_entry **E;
++    struct ev_entry *event;
++    for (E = &tasks; (event = *E); E = &(*E)->next) {
++	if (event->func != func)
++	    continue;
++	if (event->arg != arg)
++	    continue;
++	*E = event->next;
++	xfree(event);
++	return;
++    }
++    debug_trap("eventDelete: event not found");
++}
++
+ void
+ eventRun(void)
+ {
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: main.cc,v 1.136 1997/02/26 20:49:10 wessels Exp $
++ * $Id: main.cc,v 1.137 1997/02/27 06:29:14 wessels Exp $
+  *
+  * DEBUG: section 1     Startup and Main Loop
+  * AUTHOR: Harvest Derived
+@@ -182,7 +182,7 @@ usage(void)
+ 	"       -R        Do not set REUSEADDR on port.\n"
+ 	"       -U        Unlink expired objects on reload.\n"
+ 	"       -V        Virtual host httpd-accelerator.\n"
+-	"       -Y        Only return UDP_HIT or UDP_RELOADING during fast reload.\n",
++	"       -Y        Only return UDP_HIT or UDP_MISSNOFETCH during fast reload.\n",
+ 	appname, CACHE_HTTP_PORT, DefaultConfigFile, CACHE_ICP_PORT);
+     exit(1);
+ }
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: neighbors.cc,v 1.126 1997/02/27 02:57:12 wessels Exp $
++ * $Id: neighbors.cc,v 1.127 1997/02/27 06:29:15 wessels Exp $
+  *
+  * DEBUG: section 15    Neighbor Routines
+  * AUTHOR: Harvest Derived
+@@ -143,7 +143,7 @@ const char *hier_strings[] =
+     "SINGLE_PARENT",
+     "FIRST_UP_PARENT",
+     "NO_PARENT_DIRECT",
+-    "FIRST_PARENT_MISS",
++    "BEST_PARENT_MISS",
+     "NO_DIRECT_FAIL",
+     "SOURCE_FASTEST",
+     "SIBLING_UDP_HIT_OBJ",
+@@ -433,7 +433,7 @@ neighbors_open(int fd)
+ }
+ 
+ int
+-neighborsUdpPing(request_t * request, StoreEntry * entry)
++neighborsUdpPing(request_t * request, StoreEntry * entry, int *exprep)
+ {
+     char *host = request->host;
+     char *url = entry->url;
+@@ -460,12 +460,6 @@ neighborsUdpPing(request_t * request, StoreEntry * entry)
+     if (entry->swap_status != NO_SWAP)
+ 	fatal_dump("neighborsUdpPing: bad swap_status");
+ 
+-    mem->e_pings_n_pings = 0;
+-    mem->e_pings_n_acks = 0;
+-    mem->e_pings_first_miss = NULL;
+-    mem->w_rtt = 0;
+-    mem->start_ping = current_time;
+-
+     for (i = 0, e = Peers.first_ping; i++ < Peers.n; e = e->next) {
+ 	if (e == NULL)
+ 	    e = Peers.peers_head;
+@@ -516,7 +510,7 @@ neighborsUdpPing(request_t * request, StoreEntry * entry)
+ 	    ICP_mcasts_sent++;
+ 	} else if (neighborUp(e)) {
+ 	    /* its alive, expect a reply from it */
+-	    mem->e_pings_n_pings++;
++	    *exprep++;
+ 	} else {
+ 	    /* Neighbor is dead; ping it anyway, but don't expect a reply */
+ 	    /* log it once at the threshold */
+@@ -560,7 +554,7 @@ neighborsUdpPing(request_t * request, StoreEntry * entry)
+     if ((ICP_queries_sent))
+ 	NObjectsQueried++;
+     if ((ICP_mcasts_sent))
+-	mem->e_pings_n_pings += MulticastFudgeFactor;
++	*exprep += MulticastFudgeFactor;
+     return peers_pinged;
+ }
+ 
+@@ -597,12 +591,6 @@ neighborCountIgnored(peer * e, icp_opcode op_unused)
+     NLateReplies++;
+ }
+ 
+-/* I should attach these records to the entry.  We take the first
+- * hit we get our wait until everyone misses.  The timeout handler
+- * call needs to nip this shopping list or call one of the misses.
+- * 
+- * If a hit process is already started, then sobeit
+- */
+ void
+ neighborsUdpAck(int fd, const char *url, icp_common_t * header, const struct sockaddr_in *from, StoreEntry * entry, char *data, int data_sz)
+ {
+@@ -649,68 +637,23 @@ neighborsUdpAck(int fd, const char *url, icp_common_t * header, const struct soc
+     }
+     debug(15, 3, "neighborsUdpAck: %s for '%s' from %s \n",
+ 	opcode_d, url, e ? e->host : "source");
+-    mem->e_pings_n_acks++;
+     if (e)
+ 	ntype = neighborType(e, mem->request);
+-    if (opcode == ICP_OP_SECHO) {
+-	/* Received source-ping reply */
+-	if (e) {
+-	    debug(15, 1, "Ignoring SECHO from neighbor %s\n", e->host);
+-	    neighborCountIgnored(e, opcode);
+-	} else {
+-	    /* if we reach here, source-ping reply is the first 'parent',
+-	     * so fetch directly from the source */
+-	    debug(15, 6, "Source is the first to respond.\n");
+-	    hierarchyNote(entry->mem_obj->request,
+-		HIER_SOURCE_FASTEST,
+-		0,
+-		fqdnFromAddr(from->sin_addr));
+-	    entry->ping_status = PING_DONE;
+-	    protoStart(0, entry, NULL, entry->mem_obj->request);
+-	    return;
+-	}
+-    } else if (opcode == ICP_OP_HIT_OBJ) {
++    if (opcode == ICP_OP_MISS) {
+ 	if (e == NULL) {
+-	    debug(15, 0, "Ignoring ICP_OP_HIT_OBJ from non-peer %s\n",
++	    debug(15, 1, "Ignoring MISS from non-peer %s\n",
+ 		inet_ntoa(from->sin_addr));
+-	} else if (entry->object_len != 0) {
+-	    debug(15, 1, "Too late UDP_HIT_OBJ '%s'?\n", entry->url);
+-	} else if (!opt_udp_hit_obj) {
+-	    /* HIT_OBJ poses a security risk since we take the object 
+-	     * data from the ICP message */
+-	    debug(15, 0, "WARNING: Received ICP_OP_HIT_OBJ from '%s' with HIT_OBJ disabled!\n");
+-	    debug(15, 0, "--> URL '%s'\n", entry->url);
++	} else if (ntype != PEER_PARENT) {
++	    (void) 0;		/* ignore MISS from non-parent */
+ 	} else {
+-	    if (e->options & NEIGHBOR_PROXY_ONLY)
+-		storeReleaseRequest(entry);
+-	    protoCancelTimeout(0, entry);
+-	    entry->ping_status = PING_DONE;
+-	    httpState = xcalloc(1, sizeof(HttpStateData));
+-	    httpState->entry = entry;
+-	    httpProcessReplyHeader(httpState, data, data_sz);
+-	    storeAppend(entry, data, data_sz);
+-	    hierarchyNote(entry->mem_obj->request,
+-		ntype == PEER_PARENT ? HIER_PARENT_UDP_HIT_OBJ : HIER_SIBLING_UDP_HIT_OBJ,
+-		0,
+-		e->host);
+-	    storeComplete(entry);	/* This might release entry! */
+-	    if (httpState->reply_hdr)
+-		put_free_8k_page(httpState->reply_hdr);
+-	    safe_free(httpState);
+-	    return;
++	    mem->icp_reply_callback(e, ntype, opcode, mem->cb_data);
+ 	}
+-    } else if (opcode == ICP_OP_HIT) {
++    } else if (opcode == ICP_OP_HIT || opcode == ICP_OP_HIT_OBJ) {
+ 	if (e == NULL) {
+ 	    debug(15, 1, "Ignoring HIT from non-peer %s\n",
+ 		inet_ntoa(from->sin_addr));
+ 	} else {
+-	    hierarchyNote(entry->mem_obj->request,
+-		ntype == PEER_PARENT ? HIER_PARENT_HIT : HIER_SIBLING_HIT,
+-		0,
+-		e->host);
+-	    entry->ping_status = PING_DONE;
+-	    protoStart(0, entry, e, entry->mem_obj->request);
+-	    return;
++	    mem->icp_reply_callback(e, ntype, ICP_OP_HIT, mem->cb_data);
+ 	}
+     } else if (opcode == ICP_OP_DECHO) {
+ 	if (e == NULL) {
+@@ -720,24 +663,14 @@ neighborsUdpAck(int fd, const char *url, icp_common_t * header, const struct soc
+ 	    debug_trap("neighborsUdpAck: Found non-ICP cache as SIBLING\n");
+ 	    debug_trap("neighborsUdpAck: non-ICP neighbors must be a PARENT\n");
+ 	} else {
+-	    w_rtt = tvSubMsec(mem->start_ping, current_time) / e->weight;
+-	    if (mem->w_rtt == 0 || w_rtt < mem->w_rtt) {
+-		mem->e_pings_first_miss = e;
+-		mem->w_rtt = w_rtt;
+-	    }
++	    mem->icp_reply_callback(e, ntype, opcode, mem->cb_data);
+ 	}
+-    } else if (opcode == ICP_OP_MISS) {
+-	if (e == NULL) {
+-	    debug(15, 1, "Ignoring MISS from non-peer %s\n",
+-		inet_ntoa(from->sin_addr));
+-	} else if (ntype != PEER_PARENT) {
+-	    (void) 0;		/* ignore MISS from non-parent */
++    } else if (opcode == ICP_OP_SECHO) {
++	if (e) {
++	    debug(15, 1, "Ignoring SECHO from neighbor %s\n", e->host);
++	    neighborCountIgnored(e, opcode);
+ 	} else {
+-	    w_rtt = tvSubMsec(mem->start_ping, current_time) / e->weight;
+-	    if (mem->w_rtt == 0 || w_rtt < mem->w_rtt) {
+-		mem->e_pings_first_miss = e;
+-		mem->w_rtt = w_rtt;
+-	    }
++	    mem->icp_reply_callback(NULL, ntype, opcode, mem->cb_data);
+ 	}
+     } else if (opcode == ICP_OP_DENIED) {
+ 	if (e == NULL) {
+@@ -753,19 +686,11 @@ neighborsUdpAck(int fd, const char *url, icp_common_t * header, const struct soc
+ 		neighborCountIgnored(e, opcode);
+ 	    }
+ 	}
+-    } else if (opcode == ICP_OP_RELOADING) {
+-	if (e)
+-	    debug(15, 3, "neighborsUdpAck: %s is RELOADING\n", e->host);
++    } else if (opcode == ICP_OP_MISSNOFETCH) {
++	mem->icp_reply_callback(e, ntype, opcode, mem->cb_data);
+     } else {
+ 	debug(15, 0, "neighborsUdpAck: Unexpected ICP reply: %s\n", opcode_d);
+     }
+-    if (mem->e_pings_n_acks == mem->e_pings_n_pings) {
+-	entry->ping_status = PING_DONE;
+-	debug(15, 6, "neighborsUdpAck: All replies received.\n");
+-	/* pass in fd=0 here so protoStart() looks up the real FD
+-	 * and resets the timeout handler */
+-	peerSelectStart(0, entry->mem_obj->request, entry);
+-    }
+ }
+ 
+ void
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: peer_select.cc,v 1.4 1997/02/27 02:57:13 wessels Exp $
++ * $Id: peer_select.cc,v 1.5 1997/02/27 06:29:16 wessels Exp $
+  *
+  * DEBUG: section 44    Peer Selection Algorithm
+  * AUTHOR: Duane Wessels
+@@ -34,21 +34,35 @@ static struct {
+     int timeouts;
+ } PeerStats;
+ 
+-typedef struct _peer_ctrl_t {
+-    int fd;
++typedef struct {
+     request_t *request;
+     StoreEntry *entry;
+     int always_direct;
+     int never_direct;
+-    int timeout;
+-} peer_ctrl_t;
++    PSC callback;
++    PSC fail_callback;
++    void *callback_data;
++    struct {
++	struct timeval start;
++	int n_sent;
++	int n_recv;
++	int n_replies_expected;
++	int timeout;
++	peer *best_parent;
++    } ping;
++} psctrl_t;
+ 
+ 
+-static void peerSelect _PARAMS((peer_ctrl_t *));
++static void peerSelectFoo _PARAMS((psctrl_t *));
++static void peerPingTimeout _PARAMS((void *data));
++void peerPingComplete _PARAMS((void *data));
++static void peerSelectCallbackFail _PARAMS((psctrl_t * ctrl));
+ 
+ int
+ peerSelectIcpPing(request_t * request, int direct, StoreEntry * entry)
+ {
++    if (entry == NULL)
++	return 0;
+     if (entry->ping_status != PING_NONE)
+ 	return 0;
+     if (direct == DIRECT_YES)
+@@ -99,41 +113,70 @@ peerGetSomeParent(request_t * request, hier_code * code)
+ }
+ 
+ void
+-peerSelectStart(int fd, request_t * request, StoreEntry * entry)
++peerSelect(request_t * request,
++	StoreEntry *entry,
++	PSC callback,
++	PSC fail_callback,
++	void *callback_data)
+ {
+-    peer_ctrl_t *ctrl = xcalloc(1, sizeof(peer_ctrl_t));
+-    ctrl->request = request;
++    psctrl_t *ctrl = xcalloc(1, sizeof(psctrl_t));
++    ctrl->request = requestLink(request);
+     ctrl->entry = entry;
+-    ctrl->fd = fd;
+-    peerSelect(ctrl);
++    ctrl->callback = callback;
++    ctrl->fail_callback = fail_callback;
++    ctrl->callback_data = callback_data;
++    peerSelectFoo(ctrl);
+ }
+ 
+ static void
+ peerCheckNeverDirectDone(int answer, void *data)
+ {
+-    peer_ctrl_t *ctrl = data;
++    psctrl_t *ctrl = data;
+     debug(44, 3, "peerCheckNeverDirectDone: %d\n", answer);
+     ctrl->never_direct = answer ? 1 : -1;
+-    peerSelect(ctrl);
++    peerSelectFoo(ctrl);
+ }
+ 
+ static void
+ peerCheckAlwaysDirectDone(int answer, void *data)
+ {
+-    peer_ctrl_t *ctrl = data;
++    psctrl_t *ctrl = data;
+     debug(44, 3, "peerCheckAlwaysDirectDone: %d\n", answer);
+     ctrl->always_direct = answer ? 1 : -1;
+-    peerSelect(ctrl);
++    peerSelectFoo(ctrl);
+ }
+ 
+-void
+-peerSelect(peer_ctrl_t * ctrl)
++static void
++peerSelectCallback(psctrl_t * ctrl, peer * p)
++{
++    if (!ctrl->ping.timeout)
++	eventDelete(peerPingTimeout, ctrl);
++    ctrl->callback(p, ctrl->callback_data);
++    requestUnlink(ctrl->request);
++    xfree(ctrl);
++}
++
++static void
++peerSelectCallbackFail(psctrl_t * ctrl)
++{
++    request_t *request = ctrl->request;
++    char *url = ctrl->entry ? ctrl->entry->url : urlCanonical(request, NULL);
++    debug(44, 1, "Failed to select source for '%s'\n", url);
++    debug(44, 1, "  always_direct = %d\n", ctrl->always_direct);
++    debug(44, 1, "   never_direct = %d\n", ctrl->never_direct);
++    debug(44, 1, "        timeout = %d\n", ctrl->ping.timeout);
++    ctrl->fail_callback(NULL, ctrl->callback_data);
++    requestUnlink(ctrl->request);
++    xfree(ctrl);
++}
++
++static void
++peerSelectFoo(psctrl_t * ctrl)
+ {
+     peer *p;
+     hier_code code;
+     StoreEntry *entry = ctrl->entry;
+     request_t *request = ctrl->request;
+-    int fd = ctrl->fd;
+     int direct;
+     debug(44, 3, "peerSelect: '%s'\n", entry->url);
+     if (ctrl->never_direct == 0) {
+@@ -164,45 +207,108 @@ peerSelect(peer_ctrl_t * ctrl)
+     debug(44, 3, "peerSelect: direct = %d\n", direct);
+     if (direct == DIRECT_YES) {
+ 	debug(44, 3, "peerSelect: HIER_DIRECT\n");
+-	hierarchyNote(request, HIER_DIRECT, 0, request->host);
+-	protoStart(fd, entry, NULL, request);
++	hierarchyNote(request, HIER_DIRECT, ctrl->ping.timeout, request->host);
++	peerSelectCallback(ctrl, NULL);
+ 	return;
+     }
+     if (peerSelectIcpPing(request, direct, entry)) {
++	if (entry->ping_status != PING_NONE)
++		fatal_dump("peerSelectFoo: bad ping_status");
+ 	debug(44, 3, "peerSelect: Doing ICP pings\n");
+-	/* call neighborUdpPing and start timeout routine */
+-	if (neighborsUdpPing(request, entry)) {
++	ctrl->ping.n_sent = neighborsUdpPing(request,
++		entry,
++		&ctrl->ping.n_replies_expected);
++	if (ctrl->ping.n_sent > 0) {
+ 	    entry->ping_status = PING_WAITING;
+-	    commSetSelect(fd,
+-		COMM_SELECT_TIMEOUT,
++	    eventAdd("peerPingTimeout",
+ 		peerPingTimeout,
+-		(void *) ctrl,
++		ctrl,
+ 		Config.neighborTimeout);
++	    ctrl->ping.start = current_time;
+ 	    return;
+ 	}
+ 	debug_trap("peerSelect: neighborsUdpPing returned 0");
+     }
+-    if ((p = peerGetSomeParent(request, &code))) {
+-	debug(44, 3, "peerSelect: Got some parent %s/%s\n",
+-	    hier_strings[code], p->host);
+-	hierarchyNote(request, code, 0, p->host);
+-	protoStart(fd, entry, p, request);
++    if ((p = ctrl->ping.best_parent)) {
++	code = HIER_BEST_PARENT_MISS;
++	debug(44, 3, "peerSelect: %s/%s\n", hier_strings[code], p->host);
++	hierarchyNote(request, code, ctrl->ping.timeout, p->host);
++	peerSelectCallback(ctrl, p);
++    } else if (direct != DIRECT_NO) {
++	code = HIER_DIRECT;
++	debug(44, 3, "peerSelect: %s/%s\n", hier_strings[code], request->host);
++	hierarchyNote(request, code, ctrl->ping.timeout, request->host);
++	peerSelectCallback(ctrl, NULL);
++    } else if ((p = peerGetSomeParent(request, &code))) {
++	debug(44, 3, "peerSelect: %s/%s\n", hier_strings[code], p->host);
++	hierarchyNote(request, code, ctrl->ping.timeout, p->host);
++	peerSelectCallback(ctrl, p);
++    } else {
++	code = HIER_NO_DIRECT_FAIL;
++	hierarchyNote(request, code, ctrl->ping.timeout, NULL);
++	peerSelectCallbackFail(ctrl);
+     }
+ }
+ 
+ void
+-peerPingTimeout(int fd, void *data)
++peerPingTimeout(void *data)
+ {
+-    peer_ctrl_t *ctrl = data;
++    psctrl_t *ctrl = data;
+     StoreEntry *entry = ctrl->entry;
+     debug(44, 3, "peerPingTimeout: '%s'\n", entry->url);
++    entry->ping_status = PING_TIMEOUT;
+     PeerStats.timeouts++;
+-    ctrl->timeout = 1;
+-    peerSelect(ctrl);
++    ctrl->ping.timeout = 1;
++    peerSelectFoo(ctrl);
++}
++
++void
++peerPingComplete(void *data)
++{
++    psctrl_t *ctrl = data;
++    StoreEntry *entry = ctrl->entry;
++    debug(44, 3, "peerPingComplete: '%s'\n", entry->url);
++    entry->ping_status = PING_DONE;
++    peerSelectFoo(ctrl);
+ }
+ 
+ void
+ peerSelectInit(void)
+ {
+     memset(&PeerStats, '\0', sizeof(PeerStats));
+ }
++
++
++void
++peerHandleIcpReply(peer * p, neighbor_t type, icp_opcode_t op, void *data)
++{
++    psctrl_t *ctrl = data;
++    int w_rtt;
++    request_t *reqeust = ctrl->request;
++    ctrl->pings->n_recv++;
++    if (op == ICP_OP_MISS || op == ICP_OP_DECHO) {
++	if (type == PEER_PARENT) {
++	    w_rtt = tvSubMsec(ctrl->ping.start, current_time) / e->weight;
++	    if (ctrl->ping.w_rtt == 0 || w_rtt < ctrl->ping.w_rtt) {
++		ctrl->ping.best_parent = e;
++		ctrl->ping.w_rtt = w_rtt;
++	    }
++	}
++    } else if (op == ICP_OP_HIT || op == ICP_OP_HIT_OBJ) {
++	hierarchyNote(request,
++	    type == PEER_PARENT ? HIER_PARENT_HIT : HIER_SIBLING_HIT,
++	    0,
++	    p->host);
++	peerSelectCallback(ctrl, p);
++	return;
++    } else if (op == ICP_OP_SECHO) {
++	hierarchyNote(request,
++	    HIER_SOURCE_FASTEST,
++	    0,
++	    request->host
++	peerSelectCallback(ctrl, p);
++	return;
++    }
++    if (ctrl->ping.n_recv < ping.n_replies_expected)
++	return;
++}

@@ -1,0 +1,1694 @@
+@@ -1,7 +1,7 @@
+ #
+ #  Makefile for the Squid Object Cache server
+ #
+-#  $Id: Makefile.in,v 1.115 1998/01/12 04:29:54 wessels Exp $
++#  $Id: Makefile.in,v 1.116 1998/01/31 05:31:52 wessels Exp $
+ #
+ #  Uncomment and customize the following to suit your needs:
+ #
+@@ -93,6 +93,7 @@ OBJS	 	= \
+ 		icp_v2.o \
+ 		icp_v3.o \
+ 		ident.o \
++		ipc.o \
+ 		ipcache.o \
+ 		main.o \
+ 		mem.o \
+@@ -1,7 +1,7 @@
+ 
+ 
+ /*
+- * $Id: access_log.cc,v 1.16 1998/01/05 21:18:12 wessels Exp $
++ * $Id: access_log.cc,v 1.17 1998/01/31 05:31:53 wessels Exp $
+  *
+  * DEBUG: section 46    Access Log
+  * AUTHOR: Duane Wessels
+@@ -33,6 +33,11 @@
+ 
+ #include "squid.h"
+ 
++static void accessLogOpen(const char *fname);
++static char *log_quote(const char *header);
++static int accessLogSquid(AccessLogEntry * al);
++static int accessLogCommon(AccessLogEntry * al);
++
+ const char *log_tags[] =
+ {
+     "NONE",
+@@ -49,7 +54,6 @@ const char *log_tags[] =
+     "TCP_MEM_HIT",
+     "TCP_DENIED",
+     "UDP_HIT",
+-    "UDP_HIT_OBJ",
+     "UDP_MISS",
+     "UDP_DENIED",
+     "UDP_INVALID",
+@@ -181,6 +185,19 @@ accessLogCommon(AccessLogEntry * al)
+ 	hier_strings[al->hier.code]);
+ }
+ 
++static void
++accessLogOpen(const char *fname)
++{
++    assert(fname);
++    xstrncpy(LogfileName, fname, SQUID_MAXPATHLEN);
++    LogfileFD = file_open(LogfileName, O_WRONLY | O_CREAT, NULL, NULL);
++    if (LogfileFD == DISK_ERROR) {
++	debug(50, 0) ("%s: %s\n", LogfileName, xstrerror());
++	fatal("Cannot open logfile.");
++    }
++    LogfileStatus = LOG_ENABLE;
++}
++
+ #define SKIP_BASIC_SZ 6
+ void
+ accessLogLog(AccessLogEntry * al)
+@@ -283,19 +300,6 @@ accessLogClose(void)
+     file_close(LogfileFD);
+ }
+ 
+-void
+-accessLogOpen(const char *fname)
+-{
+-    assert(fname);
+-    xstrncpy(LogfileName, fname, SQUID_MAXPATHLEN);
+-    LogfileFD = file_open(LogfileName, O_WRONLY | O_CREAT, NULL, NULL);
+-    if (LogfileFD == DISK_ERROR) {
+-	debug(50, 0) ("%s: %s\n", LogfileName, xstrerror());
+-	fatal("Cannot open logfile.");
+-    }
+-    LogfileStatus = LOG_ENABLE;
+-}
+-
+ void
+ hierarchyNote(HierarchyLogEntry * hl,
+     hier_code code,
+@@ -314,4 +318,5 @@ void
+ accessLogInit(void)
+ {
+     assert(sizeof(log_tags) == (LOG_TYPE_MAX + 1) * sizeof(char *));
++    accessLogOpen(Config.Log.access);
+ }
+@@ -1566,38 +1566,6 @@ DOC_START
+ 	for that ACL then Squid returns a redirect to the given URL.
+ DOC_END
+ 
+-
+-NAME: udp_hit_obj
+-COMMENT: on|off
+-TYPE: onoff
+-DEFAULT: off
+-LOC: opt_udp_hit_obj
+-DOC_START
+-	If set, Squid will request UDP_HIT_OBJ replies from its
+-	neighbors.  UDP_HIT_OBJ is nice because it saves bandwidth, but
+-	it can cause some other problems.  For one it complicates
+-	calculating hit rates.  Also, problems arise because the ICP
+-	query does not contain any HTTP request headers which may
+-	affect the reply.
+-
+-udp_hit_obj off
+-DOC_END
+-
+-
+-NAME: udp_hit_obj_size
+-COMMENT: (bytes)
+-TYPE: b_size_t
+-LOC: Config.udpMaxHitObjsz
+-DEFAULT: 0 bytes
+-DOC_START
+-	If set, Squid will limit UDP_HIT_OBJ size to be less than
+-	this value.  Setting this value to more than SQUID_UDP_SO_SNDBUF
+-	will not work as expected.  Set to zero to select the size
+-	permited by the socket.
+-udp_hit_obj_size     0 bytes
+-DOC_END
+-
+-
+ NAME: memory_pools
+ COMMENT: on|off
+ TYPE: onoff
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: client_side.cc,v 1.198 1998/01/12 04:29:58 wessels Exp $
++ * $Id: client_side.cc,v 1.199 1998/01/31 05:31:54 wessels Exp $
+  *
+  * DEBUG: section 33    Client-side Routines
+  * AUTHOR: Duane Wessels
+@@ -67,6 +67,7 @@ static void clientProcessExpired(void *data);
+ static char *clientConstructProxyAuthReply(clientHttpRequest * http);
+ static int clientCachable(clientHttpRequest * http);
+ static int clientHierarchical(clientHttpRequest * http);
++static int isTcpHit(log_type code);
+ 
+ static int
+ checkAccelOnly(clientHttpRequest * http)
+@@ -496,6 +497,20 @@ checkNegativeHit(StoreEntry * e)
+     return 1;
+ }
+ 
++void
++clientUpdateCounters(clientHttpRequest *http)
++{
++	Counter.client_http.requests++;
++	kb_incr(&Counter.client_http.kbytes_in, http->req_sz);
++	kb_incr(&Counter.client_http.kbytes_out, http->out.size);
++        if (isTcpHit(http->log_type)) {
++	    Counter.client_http.hits++;
++	    kb_incr(&Counter.client_http.hit_kbytes_out, http->out.size);
++	}
++	if (http->request->err_type != ERR_NONE)
++	    Counter.client_http.errors++;
++}
++
+ static void
+ httpRequestFree(void *data)
+ {
+@@ -536,9 +551,7 @@ httpRequestFree(void *data)
+ 	    http->al.hier = request->hier;
+ 	}
+ 	accessLogLog(&http->al);
+-	HTTPCacheInfo->proto_count(HTTPCacheInfo,
+-	    request ? request->protocol : PROTO_NONE,
+-	    http->log_type);
++	clientUpdateCounters(http);
+ 	clientdbUpdate(conn->peer.sin_addr, http->log_type, PROTO_HTTP);
+     }
+     if (http->redirect_state == REDIRECT_PENDING)
+@@ -734,7 +747,7 @@ clientHierarchical(clientHttpRequest * http)
+     return 1;
+ }
+ 
+-int
++static int
+ isTcpHit(log_type code)
+ {
+     /* this should be a bitmap for better optimization */
+@@ -966,22 +979,12 @@ clientWriteComplete(int fd, char *bufnotused, size_t size, int errflag, void *da
+ 	fd, size, errflag, http->out.offset, entry->object_len);
+     if (errflag) {
+ 	CheckQuickAbort(http);
+-	/* Log the number of bytes that we managed to read */
+-	HTTPCacheInfo->proto_touchobject(HTTPCacheInfo,
+-	    urlParseProtocol(storeUrl(entry)),
+-	    http->out.size);
+ 	comm_close(fd);
+     } else if (entry->store_status == STORE_ABORTED) {
+-	HTTPCacheInfo->proto_touchobject(HTTPCacheInfo,
+-	    urlParseProtocol(storeUrl(entry)),
+-	    http->out.size);
+ 	comm_close(fd);
+     } else if ((done = clientCheckTransferDone(http)) || size == 0) {
+ 	debug(12, 5) ("clientWriteComplete: FD %d transfer is DONE\n", fd);
+ 	/* We're finished case */
+-	HTTPCacheInfo->proto_touchobject(HTTPCacheInfo,
+-	    http->request->protocol,
+-	    http->out.size);
+ 	if (http->entry->mem_obj->reply->content_length < 0 || !done ||
+ 	    EBIT_TEST(entry->flag, ENTRY_BAD_LENGTH)) {
+ 	    /* 
+@@ -1114,9 +1117,6 @@ clientHandleIMSComplete(int fd, char *bufnotused, size_t size, int flag, void *d
+     clientHttpRequest *http = data;
+     StoreEntry *entry = http->entry;
+     debug(12, 5) ("clientHandleIMSComplete: Not Modified sent '%s'\n", storeUrl(entry));
+-    HTTPCacheInfo->proto_touchobject(HTTPCacheInfo,
+-	http->request->protocol,
+-	size);
+     /* Set up everything for the logging */
+     storeUnregister(entry, http);
+     storeUnlockObject(entry);
+@@ -1619,7 +1619,6 @@ clientReadRequest(int fd, void *data)
+ 	    for (H = &conn->chr; *H; H = &(*H)->next);
+ 	    *H = http;
+ 	    conn->nrequests++;
+-	    Counter.client_http.requests++;
+ 	    commSetTimeout(fd, Config.Timeout.lifetime, NULL, NULL);
+ 	    if (parser_return_code < 0) {
+ 		debug(12, 1) ("clientReadRequest: FD %d Invalid Request\n", fd);
+@@ -177,3 +177,8 @@
+ #define META_OK     0x03
+ #define META_DIRTY  0x04
+ #define META_BAD    0x05
++
++#define IPC_NONE 0
++#define IPC_TCP_SOCKET 1
++#define IPC_UDP_SOCKET 2
++#define IPC_FIFO 3
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: dns.cc,v 1.51 1998/01/12 04:30:36 wessels Exp $
++ * $Id: dns.cc,v 1.52 1998/01/31 05:31:55 wessels Exp $
+  *
+  * DEBUG: section 34    Dnsserver interface
+  * AUTHOR: Harvest Derived
+@@ -111,108 +111,9 @@ struct dnsQueueData {
+     void *data;
+ };
+ 
+-static int dnsOpenServer(const char *command);
+ static PF dnsShutdownRead;
+ static dnsserver_t **dns_child_table = NULL;
+ 
+-static int
+-dnsOpenServer(const char *command)
+-{
+-    pid_t pid;
+-    struct sockaddr_in S;
+-    int cfd;
+-    int sfd;
+-    int fd;
+-    int len;
+-    LOCAL_ARRAY(char, buf, 128);
+-
+-    cfd = comm_open(SOCK_STREAM,
+-	0,
+-	local_addr,
+-	0,
+-	COMM_NOCLOEXEC,
+-	"dnsserver listen socket");
+-    if (cfd < 0) {
+-	debug(34, 0) ("dnsOpenServer: Failed to create dnsserver\n");
+-	return -1;
+-    }
+-    len = sizeof(S);
+-    memset(&S, '\0', len);
+-    if (getsockname(cfd, (struct sockaddr *) &S, &len) < 0) {
+-	debug(50, 0) ("dnsOpenServer: getsockname: %s\n", xstrerror());
+-	comm_close(cfd);
+-	return -1;
+-    }
+-    listen(cfd, 1);
+-    /* flush or else we get dup data if unbuffered_logs is set */
+-    logsFlush();
+-    if ((pid = fork()) < 0) {
+-	debug(50, 0) ("dnsOpenServer: fork: %s\n", xstrerror());
+-	comm_close(cfd);
+-	return -1;
+-    }
+-    if (pid > 0) {		/* parent */
+-	comm_close(cfd);	/* close shared socket with child */
+-	/* open new socket for parent process */
+-	sfd = comm_open(SOCK_STREAM,
+-	    0,			/* protocol */
+-	    local_addr,
+-	    0,			/* port */
+-	    0,			/* flags */
+-	    "squid <-> dnsserver");
+-	if (sfd == COMM_ERROR)
+-	    return -1;
+-	if (comm_connect_addr(sfd, &S) == COMM_ERROR) {
+-	    comm_close(sfd);
+-	    return -1;
+-	}
+-	if (write(sfd, "$hello\n", 7) < 0) {
+-	    debug(34, 0) ("dnsOpenServer: $hello write test failed\n");
+-	    comm_close(sfd);
+-	    return -1;
+-	}
+-	memset(buf, '\0', 128);
+-	if (read(sfd, buf, 127) < 0) {
+-	    debug(50, 0) ("dnsOpenServer: $hello read test failed\n");
+-	    debug(50, 0) ("--> read: %s\n", xstrerror());
+-	    comm_close(sfd);
+-	    return -1;
+-	} else if (strcmp(buf, "$alive\n$end\n")) {
+-	    debug(50, 0) ("dnsOpenServer: $hello read test failed\n");
+-	    debug(50, 0) ("--> got '%s'\n", rfc1738_escape(buf));
+-	    comm_close(sfd);
+-	    return -1;
+-	}
+-	commSetTimeout(sfd, -1, NULL, NULL);
+-	return sfd;
+-    }
+-    /* child */
+-    no_suid();			/* give up extra priviliges */
+-    if ((fd = accept(cfd, NULL, NULL)) < 0) {
+-	debug(50, 0) ("dnsOpenServer: FD %d accept: %s\n", cfd, xstrerror());
+-	_exit(1);
+-    }
+-    dup2(fd, 0);
+-    dup2(fd, 1);
+-    dup2(fileno(debug_log), 2);
+-    fclose(debug_log);
+-    /*
+-     * Solaris pthreads seems to close FD 0 upon fork(), so don't close
+-     * this FD if its 0, 1, or 2.
+-     * -- Michael O'Reilly <michael@metal.iinet.net.au>
+-     */
+-    if (fd > 2)
+-	close(fd);
+-    close(cfd);
+-    if (Config.onoff.res_defnames)
+-	execlp(command, "(dnsserver)", "-D", NULL);
+-    else
+-	execlp(command, "(dnsserver)", NULL);
+-    debug(50, 0) ("dnsOpenServer: %s: %s\n", command, xstrerror());
+-    _exit(1);
+-    return 0;
+-}
+-
+ dnsserver_t *
+ dnsGetFirstAvailable(void)
+ {
+@@ -250,29 +151,43 @@ dnsOpenServers(void)
+     int N = Config.dnsChildren;
+     char *prg = Config.Program.dnsserver;
+     int k;
+-    int dnssocket;
++    int x;
++    int rfd;
++    int wfd;
+     LOCAL_ARRAY(char, fd_note_buf, FD_DESC_SZ);
+     char *s;
++    char *args[3];
+ 
+     dnsFreeMemory();
+     dns_child_table = xcalloc(N, sizeof(dnsserver_t *));
+     NDnsServersAlloc = 0;
++    args[0] = "(dnsserver)";
++    args[1] = NULL;
++    args[2] = NULL;
++    if (Config.onoff.res_defnames)
++	args[1] = "-D";
+     for (k = 0; k < N; k++) {
+ 	dns_child_table[k] = xcalloc(1, sizeof(dnsserver_t));
+ 	cbdataAdd(dns_child_table[k], MEM_NONE);
+-	if ((dnssocket = dnsOpenServer(prg)) < 0) {
++        x = ipcCreate(IPC_TCP_SOCKET,
++		prg,
++		args,
++		"dnsserver",
++		&rfd,
++		&wfd);
++	if (x < 0) {
+ 	    debug(34, 1) ("dnsOpenServers: WARNING: Failed to start 'dnsserver' #%d.\n", k + 1);
+ 	    EBIT_CLR(dns_child_table[k]->flags, HELPER_ALIVE);
+ 	    dns_child_table[k]->id = k + 1;
+ 	    dns_child_table[k]->inpipe = -1;
+ 	    dns_child_table[k]->outpipe = -1;
+ 	} else {
+ 	    debug(34, 4) ("dnsOpenServers: FD %d connected to %s #%d.\n",
+-		dnssocket, prg, k + 1);
++		wfd, prg, k + 1);
+ 	    EBIT_SET(dns_child_table[k]->flags, HELPER_ALIVE);
+ 	    dns_child_table[k]->id = k + 1;
+-	    dns_child_table[k]->inpipe = dnssocket;
+-	    dns_child_table[k]->outpipe = dnssocket;
++	    dns_child_table[k]->inpipe = rfd;
++	    dns_child_table[k]->outpipe = wfd;
+ 	    dns_child_table[k]->answer = squid_curtime;
+ 	    dns_child_table[k]->dispatch_time = current_time;
+ 	    dns_child_table[k]->size = DNS_INBUF_SZ - 1;
+@@ -284,7 +199,7 @@ dnsOpenServers(void)
+ 	    snprintf(fd_note_buf, FD_DESC_SZ, "%s #%d", s, dns_child_table[k]->id);
+ 	    fd_note(dns_child_table[k]->inpipe, fd_note_buf);
+ 	    commSetNonBlocking(dns_child_table[k]->inpipe);
+-	    debug(34, 3) ("dnsOpenServers: 'dns_server' %d started\n", k);
++	    debug(34, 3) ("dnsOpenServers: 'dns_server' %d started\n", k+1);
+ 	    NDnsServersAlloc++;
+ 	}
+     }
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: dnsserver.cc,v 1.39 1997/10/29 05:19:06 wessels Exp $
++ * $Id: dnsserver.cc,v 1.40 1998/01/31 05:31:56 wessels Exp $
+  *
+  * DEBUG: section 0     DNS Resolver
+  * AUTHOR: Harvest Derived
+@@ -312,8 +312,10 @@ main(int argc, char *argv[])
+ 	memset(request, '\0', REQ_SZ);
+ 
+ 	/* read from ipcache */
+-	if (fgets(request, REQ_SZ, stdin) == NULL)
++	if (fgets(request, REQ_SZ, stdin) == NULL) {
++fprintf(stderr, "dnsserver %d got EOF\n", (int) getpid());
+ 	    exit(1);
++        }
+ 	t = strrchr(request, '\n');
+ 	if (t == NULL)		/* Ignore if no newline */
+ 	    continue;
+@@ -15,7 +15,6 @@ typedef enum {
+     LOG_TCP_MEM_HIT,
+     LOG_TCP_DENIED,
+     LOG_UDP_HIT,
+-    LOG_UDP_HIT_OBJ,
+     LOG_UDP_MISS,
+     LOG_UDP_DENIED,
+     LOG_UDP_INVALID,
+@@ -152,6 +151,7 @@ typedef enum {
+     MGR_CBDATA,
+     MGR_PCONN,
+     MGR_5MIN,
++    MGR_60MIN,
+     MGR_MEM,
+     MGR_MAX
+ } objcache_op;
+@@ -170,8 +170,6 @@ typedef enum {
+     CLOSEST_DIRECT,
+     NO_DIRECT_FAIL,
+     SOURCE_FASTEST,
+-    SIBLING_UDP_HIT_OBJ,
+-    PARENT_UDP_HIT_OBJ,
+     ROUNDROBIN_PARENT,
+     HIER_MAX
+ } hier_code;
+@@ -431,9 +429,7 @@ typedef enum {
+     MEM_PINGERECHODATA,
+     MEM_PINGERREPLYDATA,
+     MEM_ICP_COMMON_T,
+-    MEM_PROTO_STAT,
+     MEM_META_DATA,
+-    MEM_CACHEINFO,
+     MEM_IOSTATS,
+     MEM_MEM_NODE,
+     MEM_MEM_HDR,
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: fd.cc,v 1.16 1997/12/02 00:17:34 wessels Exp $
++ * $Id: fd.cc,v 1.17 1998/01/31 05:31:57 wessels Exp $
+  *
+  * DEBUG: section 51    Filedescriptor Functions
+  * AUTHOR: Duane Wessels
+@@ -70,6 +70,7 @@ fd_open(int fd, unsigned int type, const char *desc)
+     fde *F = &fd_table[fd];
+     assert(fd >= 0);
+     assert(F->open == 0);
++    debug(51, 3) ("fd_open FD %d %s\n", fd, desc);
+     F->type = type;
+     fdUpdateBiggest(fd, F->open = FD_OPEN);
+     if (desc)
+@@ -1,15 +1,13 @@
+ 
+ /*
+- * $Id: globals.h,v 1.27 1998/01/12 04:30:39 wessels Exp $
++ * $Id: globals.h,v 1.28 1998/01/31 05:31:57 wessels Exp $
+  */
+ 
+ extern FILE *debug_log;		/* NULL */
+ extern FILE *cache_useragent_log;	/* NULL */
+ extern Meta_data meta_data;
+ extern SquidConfig Config;
+ extern SquidConfig2 Config2;
+-extern cacheinfo *HTTPCacheInfo;
+-extern cacheinfo *ICPCacheInfo;
+ extern char *ConfigFile;	/* NULL */
+ extern char *IcpOpcodeStr[];
+ extern char *dns_error_message;	/* NULL */
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: icmp.cc,v 1.53 1998/01/12 04:30:03 wessels Exp $
++ * $Id: icmp.cc,v 1.54 1998/01/31 05:31:58 wessels Exp $
+  *
+  * DEBUG: section 37    ICMP Routines
+  * AUTHOR: Duane Wessels
+@@ -226,61 +226,22 @@ void
+ icmpOpen(void)
+ {
+ #if USE_ICMP
+-    struct sockaddr_in S;
+-    int namelen = sizeof(struct sockaddr_in);
+-    pid_t pid;
+-    int child_sock;
+-    icmp_sock = comm_open(SOCK_DGRAM,
+-	0,
+-	local_addr,
+-	0,
+-	COMM_NONBLOCKING,
+-	"Pinger Socket");
+-    if (icmp_sock < 0) {
+-	debug(50, 0) ("icmpOpen: icmp_sock: %s\n", xstrerror());
+-	return;
+-    }
+-    child_sock = comm_open(SOCK_DGRAM,
+-	0,
+-	local_addr,
+-	0,
+-	0,
+-	"ICMP Socket");
+-    if (child_sock < 0) {
+-	debug(50, 0) ("icmpOpen: child_sock: %s\n", xstrerror());
+-	return;
+-    }
+-    getsockname(icmp_sock, (struct sockaddr *) &S, &namelen);
+-    if (comm_connect_addr(child_sock, &S) != COMM_OK)
+-	fatal(xstrerror());
+-    getsockname(child_sock, (struct sockaddr *) &S, &namelen);
+-    if (comm_connect_addr(icmp_sock, &S) != COMM_OK)
+-	fatal(xstrerror());
+-    /* flush or else we get dup data if unbuffered_logs is set */
+-    logsFlush();
+-    if ((pid = fork()) < 0) {
+-	debug(50, 0) ("icmpOpen: fork: %s\n", xstrerror());
+-	comm_close(icmp_sock);
+-	comm_close(child_sock);
++    char *args[2];
++    int x;
++    int rfd;
++    int wfd;
++    args[0] = "(pinger)";
++    args[1] = NULL;
++    x = ipcCreate(IPC_UDP_SOCKET,
++	Config.Program.pinger,
++	args,
++	"Pinger Socket",
++	&rfd,
++	&wfd);
++    if (x < 0)
+ 	return;
+-    }
+-    if (pid == 0) {		/* child */
+-	int tmp_s;
+-	char *x = xcalloc((tmp_s = strlen(Config.debugOptions) + 32), 1);
+-	snprintf(x, tmp_s, "SQUID_DEBUG=%s", Config.debugOptions);
+-	putenv(x);
+-	comm_close(icmp_sock);
+-	dup2(child_sock, 0);
+-	dup2(child_sock, 1);
+-	comm_close(child_sock);
+-	dup2(fileno(debug_log), 2);
+-	fclose(debug_log);
+-	enter_suid();
+-	execlp(Config.Program.pinger, "(pinger)", NULL);
+-	debug(50, 0) ("icmpOpen: %s: %s\n", Config.Program.pinger, xstrerror());
+-	_exit(1);
+-    }
+-    comm_close(child_sock);
++    assert(rfd == wfd);
++    icmp_sock = rfd;
+     commSetSelect(icmp_sock, COMM_SELECT_READ, icmpRecv, NULL, 0);
+     commSetTimeout(icmp_sock, -1, NULL, NULL);
+     debug(29, 0) ("Pinger socket opened on FD %d\n", icmp_sock);
+@@ -9,12 +9,6 @@ icpLogIcp(icpUdpData * queue)
+     icp_common_t *header = (icp_common_t *) (void *) queue->msg;
+     char *url = (char *) header + sizeof(icp_common_t);
+     AccessLogEntry al;
+-    ICPCacheInfo->proto_touchobject(ICPCacheInfo,
+-	queue->proto,
+-	queue->len);
+-    ICPCacheInfo->proto_count(ICPCacheInfo,
+-	queue->proto,
+-	queue->logcode);
+     clientdbUpdate(queue->address.sin_addr, queue->logcode, PROTO_ICP);
+     if (!Config.onoff.log_udp)
+ 	return;
+@@ -42,6 +36,8 @@ icpUdpReply(int fd, void *data)
+ 	    inet_ntoa(queue->address.sin_addr),
+ 	    ntohs(queue->address.sin_port));
+ 	Counter.icp.pkts_sent++;
++	if (queue->logcode == LOG_UDP_HIT)
++	    Counter.icp.hits_sent++;
+ 	x = comm_udp_sendto(fd,
+ 	    &queue->address,
+ 	    sizeof(struct sockaddr_in),
+@@ -51,7 +47,7 @@ icpUdpReply(int fd, void *data)
+ 	    if (ignoreErrno(errno))
+ 		break;		/* don't de-queue */
+ 	} else {
+-	    Counter.icp.bytes_sent += x;
++	    kb_incr(&Counter.icp.kbytes_sent, (size_t) x);
+ 	}
+ 	UdpQueueHead = queue->next;
+ 	if (queue->logcode)
+@@ -110,7 +106,7 @@ icpUdpSend(int fd,
+     data->address = *to;
+     data->msg = msg;
+     data->len = (int) ntohs(msg->length);
+-    data->start = current_time;	/* wrong for HIT_OBJ */
++    data->start = current_time;
+     data->logcode = logcode;
+     data->proto = proto;
+     AppendUdp(data);
+@@ -141,9 +137,6 @@ icpHandleIcpV2(int fd, struct sockaddr_in from, char *buf, int len)
+     const cache_key *key;
+     request_t *icp_request = NULL;
+     int allow = 0;
+-    char *data = NULL;
+-    u_short data_sz = 0;
+-    u_short u;
+     int pkt_len;
+     aclCheck_t checklist;
+     icp_common_t *reply;
+@@ -208,8 +201,8 @@ icpHandleIcpV2(int fd, struct sockaddr_in from, char *buf, int len)
+ 	}
+ 	break;
+ 
+-    case ICP_HIT_OBJ:
+     case ICP_HIT:
++	Counter.icp.hits_recv++;
+     case ICP_SECHO:
+     case ICP_DECHO:
+     case ICP_MISS:
+@@ -222,16 +215,6 @@ icpHandleIcpV2(int fd, struct sockaddr_in from, char *buf, int len)
+ 	    neighbors_do_private_keys = 0;
+ 	}
+ 	url = buf + sizeof(header);
+-	if (header.opcode == ICP_HIT_OBJ) {
+-	    data = url + strlen(url) + 1;
+-	    xmemcpy((char *) &u, data, sizeof(u_short));
+-	    data += sizeof(u_short);
+-	    data_sz = ntohs(u);
+-	    if ((int) data_sz > (len - (data - buf))) {
+-		debug(12, 0) ("icpHandleIcpV2: ICP_HIT_OBJ object too small\n");
+-		break;
+-	    }
+-	}
+ 	debug(12, 3) ("icpHandleIcpV2: %s from %s for '%s'\n",
+ 	    icp_opcode_str[header.opcode],
+ 	    inet_ntoa(from.sin_addr),
+@@ -315,7 +298,7 @@ icpHandleUdp(int sock, void *datanotused)
+ 	return;
+     }
+     Counter.icp.pkts_recv++;
+-    Counter.icp.bytes_recv += len;
++    kb_incr(&Counter.icp.kbytes_recv, (size_t) len);
+     buf[len] = '\0';
+     debug(12, 4) ("icpHandleUdp: FD %d: received %d bytes from %s.\n",
+ 	sock,
+@@ -12,9 +12,6 @@ icpHandleIcpV3(int fd, struct sockaddr_in from, char *buf, int len)
+     const cache_key *key;
+     request_t *icp_request = NULL;
+     int allow = 0;
+-    char *data = NULL;
+-    u_short data_sz = 0;
+-    u_short u;
+     aclCheck_t checklist;
+ 
+     header.opcode = headerp->opcode;
+@@ -68,7 +65,6 @@ icpHandleIcpV3(int fd, struct sockaddr_in from, char *buf, int len)
+ 	}
+ 	break;
+ 
+-    case ICP_HIT_OBJ:
+     case ICP_HIT:
+     case ICP_SECHO:
+     case ICP_DECHO:
+@@ -82,16 +78,6 @@ icpHandleIcpV3(int fd, struct sockaddr_in from, char *buf, int len)
+ 	    neighbors_do_private_keys = 0;
+ 	}
+ 	url = buf + sizeof(header);
+-	if (header.opcode == ICP_HIT_OBJ) {
+-	    data = url + strlen(url) + 1;
+-	    xmemcpy((char *) &u, data, sizeof(u_short));
+-	    data += sizeof(u_short);
+-	    data_sz = ntohs(u);
+-	    if ((int) data_sz > (len - (data - buf))) {
+-		debug(12, 0) ("icpHandleIcpV3: ICP_HIT_OBJ object too small\n");
+-		break;
+-	    }
+-	}
+ 	debug(12, 3) ("icpHandleIcpV3: %s from %s for '%s'\n",
+ 	    icp_opcode_str[header.opcode],
+ 	    inet_ntoa(from.sin_addr),
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: main.cc,v 1.208 1998/01/12 04:30:40 wessels Exp $
++ * $Id: main.cc,v 1.209 1998/01/31 05:31:59 wessels Exp $
+  *
+  * DEBUG: section 1     Startup and Main Loop
+  * AUTHOR: Harvest Derived
+@@ -448,9 +448,8 @@ mainInitialize(void)
+ 	unlinkdInit();
+ 	/* module initialization */
+ 	urlInitialize();
+-	stat_init(&HTTPCacheInfo, Config.Log.access);
+-	stat_init(&ICPCacheInfo, NULL);
+ 	objcacheInit();
++	statInit();
+ 	storeInit();
+ 	asnAclInitialize(Config.aclList);
+ 	if (Config.effectiveUser) {
+@@ -492,7 +491,6 @@ mainInitialize(void)
+ 	if (Config.onoff.announce)
+ 	    eventAdd("start_announce", start_announce, NULL, 3600);
+ 	eventAdd("ipcache_purgelru", ipcache_purgelru, NULL, 10);
+-	statAvgInit();
+     }
+     configured_once = 1;
+ #ifdef SQUID_SNMP
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: mem.cc,v 1.1 1998/01/12 04:57:23 wessels Exp $
++ * $Id: mem.cc,v 1.2 1998/01/31 05:32:00 wessels Exp $
+  *
+  * DEBUG: section 19    Memory Primitives
+  * AUTHOR: Harvest Derived
+@@ -154,7 +154,6 @@ memInit(void)
+     memDataInit(MEM_ACL_NAME_LIST, "acl_name_list", sizeof(acl_name_list), 0);
+     memDataInit(MEM_ACL_TIME_DATA, "acl_time_data", sizeof(acl_time_data), 0);
+     memDataInit(MEM_AIO_RESULT_T, "aio_result_t", sizeof(aio_result_t), 0);
+-    memDataInit(MEM_CACHEINFO, "cacheinfo", sizeof(cacheinfo), 0);
+     memDataInit(MEM_CACHEMGR_PASSWD, "cachemgr_passwd",
+ 	sizeof(cachemgr_passwd), 0);
+     memDataInit(MEM_CLIENTHTTPREQUEST, "clientHttpRequest",
+@@ -202,7 +201,6 @@ memInit(void)
+ 	sizeof(pingerEchoData), 0);
+     memDataInit(MEM_PINGERREPLYDATA, "pingerReplyData",
+ 	sizeof(pingerReplyData), 0);
+-    memDataInit(MEM_PROTO_STAT, "proto_stat", sizeof(proto_stat), 0);
+     memDataInit(MEM_PS_STATE, "ps_state", sizeof(ps_state), 0);
+     memDataInit(MEM_REFRESH_T, "refresh_t", sizeof(refresh_t), 0);
+     memDataInit(MEM_RELIST, "relist", sizeof(relist), 0);
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: neighbors.cc,v 1.171 1998/01/05 00:45:47 wessels Exp $
++ * $Id: neighbors.cc,v 1.172 1998/01/31 05:32:01 wessels Exp $
+  *
+  * DEBUG: section 15    Neighbor Routines
+  * AUTHOR: Harvest Derived
+@@ -445,11 +445,6 @@ neighborsUdpPing(request_t * request,
+ 		PROTO_NONE);
+ 	} else {
+ 	    flags = 0;
+-	    /* check if we should set ICP_FLAG_HIT_OBJ */
+-	    if (opt_udp_hit_obj)
+-		if (!EBIT_TEST(request->flags, REQ_NOCACHE))
+-		    if (p->icp_version == ICP_VERSION_2)
+-			flags |= ICP_FLAG_HIT_OBJ;
+ 	    if (Config.onoff.query_icmp)
+ 		if (p->icp_version == ICP_VERSION_2)
+ 		    flags |= ICP_FLAG_SRC_RTT;
+@@ -674,7 +669,7 @@ neighborsUdpAck(const char *url, icp_common_t * header, const struct sockaddr_in
+ 	} else {
+ 	    mem->icp_reply_callback(p, ntype, header, mem->ircb_data);
+ 	}
+-    } else if (opcode == ICP_HIT || opcode == ICP_HIT_OBJ) {
++    } else if (opcode == ICP_HIT) {
+ 	if (p == NULL) {
+ 	    neighborIgnoreNonPeer(from, opcode);
+ 	} else {
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: peer_select.cc,v 1.35 1998/01/12 04:30:08 wessels Exp $
++ * $Id: peer_select.cc,v 1.36 1998/01/31 05:32:03 wessels Exp $
+  *
+  * DEBUG: section 44    Peer Selection Algorithm
+  * AUTHOR: Duane Wessels
+@@ -46,8 +46,6 @@ const char *hier_strings[] =
+     "CLOSEST_DIRECT",
+     "NO_DIRECT_FAIL",
+     "SOURCE_FASTEST",
+-    "SIBLING_UDP_HIT_OBJ",
+-    "PARENT_UDP_HIT_OBJ",
+     "ROUNDROBIN_PARENT",
+     "INVALID CODE"
+ };
+@@ -419,7 +417,7 @@ peerHandleIcpReply(peer * p, peer_t type, icp_common_t * header, void *data)
+     if (op == ICP_MISS || op == ICP_DECHO) {
+ 	if (type == PEER_PARENT)
+ 	    peerIcpParentMiss(p, header, psstate);
+-    } else if (op == ICP_HIT || op == ICP_HIT_OBJ) {
++    } else if (op == ICP_HIT) {
+ 	hierarchyNote(&request->hier,
+ 	    type == PEER_PARENT ? PARENT_HIT : SIBLING_HIT,
+ 	    &psstate->icp,
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: pinger.cc,v 1.28 1997/10/31 05:15:08 wessels Exp $
++ * $Id: pinger.cc,v 1.29 1998/01/31 05:32:03 wessels Exp $
+  *
+  * DEBUG: section 42    ICMP Pinger program
+  * AUTHOR: Duane Wessels
+@@ -117,7 +117,7 @@ pingerOpen(void)
+ 	exit(1);
+     }
+     icmp_ident = getpid() & 0xffff;
+-    debug(42, 0) ("ICMP socket opened\n", icmp_sock);
++    debug(42, 0) ("pinger: ICMP socket opened\n");
+ }
+ 
+ void
+@@ -335,17 +335,17 @@ main(int argc, char *argv[])
+ 	x = select(icmp_sock + 1, &R, NULL, NULL, &tv);
+ 	getCurrentTime();
+ 	if (x < 0)
+-	    return 1;
++	    exit(1);
+ 	if (FD_ISSET(0, &R))
+ 	    if (pingerReadRequest() < 0) {
+ 		debug(42, 0) ("Pinger exiting.\n");
+-		return 1;
++		exit(1);
+ 	    }
+ 	if (FD_ISSET(icmp_sock, &R))
+ 	    pingerRecv();
+ 	if (10 + last_check_time < squid_curtime) {
+ 	    if (send(1, (char *) &tv, 0, 0) < 0)
+-		return 1;
++		exit(1);
+ 	    last_check_time = squid_curtime;
+ 	}
+     }
+@@ -3,7 +3,6 @@
+ extern void accessLogLog(AccessLogEntry *);
+ extern void accessLogRotate(void);
+ extern void accessLogClose(void);
+-extern void accessLogOpen(const char *);
+ extern void accessLogInit(void);
+ extern void hierarchyNote(HierarchyLogEntry *, hier_code, icp_ping_data *, const char *);
+ 
+@@ -376,9 +375,8 @@ extern void storeDirClean(void *unused);
+ extern void passStart(int, const char *, request_t *, size_t *);
+ extern void identStart(int, ConnStateData *, IDCB * callback);
+ 
+-extern void stat_init(cacheinfo **, const char *);
++extern void statInit(void);
+ extern void pconnHistCount(int, int);
+-extern void statAvgInit(void);
+ extern int statMemoryAccounted(void);
+ 
+ extern void memInit(void);
+@@ -504,7 +502,7 @@ extern void setMaxFD(void);
+ extern time_t getCurrentTime(void);
+ extern void normal_shutdown(void);
+ extern int percent(int, int);
+-extern int dpercent(double, double);
++extern double dpercent(double, double);
+ extern void squid_signal(int sig, SIGHDLR *, int flags);
+ extern pid_t readPidFile(void);
+ extern struct in_addr inaddrFromHostent(const struct hostent *hp);
+@@ -561,7 +559,8 @@ extern OBJH dump_config;
+ extern OBJH storeDirStats;
+ extern OBJH pconnHistDump;
+ extern void dump_peers(StoreEntry *, peer *);
+-extern OBJH statAvgDump;
++extern OBJH statAvg5min;
++extern OBJH statAvg60min;
+ 
+ extern void pconnPush(int, const char *host, u_short port);
+ extern int pconnPop(const char *host, u_short port);
+@@ -574,6 +573,7 @@ extern void asnInit(void);
+ extern void asnFreeMemory(void);
+ extern void dlinkAdd(void *data, dlink_node *, dlink_list *);
+ extern void dlinkDelete(dlink_node * m, dlink_list * list);
++extern void kb_incr (kb_t *, size_t);
+ 
+ /*
+  * prototypes for system functions missing from system includes
+@@ -585,5 +585,12 @@ int getpagesize(void);
+ int gethostname(char *, int);
+ #endif
+ 
++extern int ipcCreate(int type,
++	const char *prog,
++	char *const args[],
++	const char *name,
++	int *rfd,
++	int *wfd);
++
+ extern int handleConnectionHeader(int, char * , char * );
+ 
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: redirect.cc,v 1.52 1998/01/12 04:30:10 wessels Exp $
++ * $Id: redirect.cc,v 1.53 1998/01/31 05:32:04 wessels Exp $
+  *
+  * DEBUG: section 29    Redirector
+  * AUTHOR: Duane Wessels
+@@ -68,7 +68,6 @@ struct redirectQueueData {
+ };
+ 
+ static redirector_t *GetFirstAvailable(void);
+-static int redirectCreateRedirector(const char *command);
+ static PF redirectHandleRead;
+ static redirectStateData *Dequeue(void);
+ static void Enqueue(redirectStateData *);
+@@ -81,84 +80,6 @@ static int NRedirectorsOpen = 0;
+ static struct redirectQueueData *redirectQueueHead = NULL;
+ static struct redirectQueueData **redirectQueueTailP = &redirectQueueHead;
+ 
+-static int
+-redirectCreateRedirector(const char *command)
+-{
+-    pid_t pid;
+-    struct sockaddr_in S;
+-    static int n_redirector = 0;
+-    int cfd;
+-    int sfd;
+-    int len;
+-    int fd;
+-    struct timeval slp;
+-    cfd = comm_open(SOCK_STREAM,
+-	0,
+-	local_addr,
+-	0,
+-	COMM_NOCLOEXEC,
+-	"socket to redirector");
+-    if (cfd == COMM_ERROR) {
+-	debug(29, 0) ("redirect_create_redirector: Failed to create redirector\n");
+-	return -1;
+-    }
+-    len = sizeof(S);
+-    memset(&S, '\0', len);
+-    if (getsockname(cfd, (struct sockaddr *) &S, &len) < 0) {
+-	debug(50, 0) ("redirect_create_redirector: getsockname: %s\n", xstrerror());
+-	comm_close(cfd);
+-	return -1;
+-    }
+-    listen(cfd, 1);
+-    /* flush or else we get dup data if unbuffered_logs is set */
+-    logsFlush();
+-    if ((pid = fork()) < 0) {
+-	debug(50, 0) ("redirect_create_redirector: fork: %s\n", xstrerror());
+-	comm_close(cfd);
+-	return -1;
+-    }
+-    if (pid > 0) {		/* parent */
+-	comm_close(cfd);	/* close shared socket with child */
+-	/* open new socket for parent process */
+-	sfd = comm_open(SOCK_STREAM,
+-	    0,
+-	    local_addr,
+-	    0,
+-	    0,
+-	    NULL);		/* blocking! */
+-	if (sfd == COMM_ERROR)
+-	    return -1;
+-	if (comm_connect_addr(sfd, &S) == COMM_ERROR) {
+-	    comm_close(sfd);
+-	    return -1;
+-	}
+-	commSetTimeout(sfd, -1, NULL, NULL);
+-	debug(29, 4) ("redirect_create_redirector: FD %d connected to %s #%d.\n",
+-	    sfd, command, ++n_redirector);
+-	slp.tv_sec = 0;
+-	slp.tv_usec = 250000;
+-	select(0, NULL, NULL, NULL, &slp);
+-	return sfd;
+-    }
+-    /* child */
+-    no_suid();			/* give up extra priviliges */
+-    if ((fd = accept(cfd, NULL, NULL)) < 0) {
+-	debug(50, 0) ("redirect_create_redirector: FD %d accept: %s\n",
+-	    cfd, xstrerror());
+-	_exit(1);
+-    }
+-    dup2(fd, 0);
+-    dup2(fd, 1);
+-    dup2(fileno(debug_log), 2);
+-    fclose(debug_log);
+-    close(fd);
+-    close(cfd);
+-    execlp(command, "(redirector)", NULL);
+-    debug(50, 0) ("redirect_create_redirector: %s: %s\n", command, xstrerror());
+-    _exit(1);
+-    return 0;
+-}
+-
+ static void
+ redirectHandleRead(int fd, void *data)
+ {
+@@ -381,6 +302,8 @@ redirectOpenServers(void)
+     LOCAL_ARRAY(char, fd_note_buf, FD_DESC_SZ);
+     static int first_time = 0;
+     char *s;
++    char *args[2];
++    int x;
+ 
+     redirectFreeMemory();
+     if (Config.Program.redirect == NULL)
+@@ -391,7 +314,15 @@ redirectOpenServers(void)
+ 	NRedirectors, prg);
+     for (k = 0; k < NRedirectors; k++) {
+ 	redirect_child_table[k] = xcalloc(1, sizeof(redirector_t));
+-	if ((redirectsocket = redirectCreateRedirector(prg)) < 0) {
++        args[0] = "(redirector)";
++        args[1] = NULL;
++        x = ipcCreate(IPC_TCP_SOCKET,
++		prg,
++		args,
++		"redirector",
++		&redirectsocket,
++		&redirectsocket);
++	if (x < 0) {
+ 	    debug(29, 1) ("WARNING: Cannot run '%s' process.\n", prg);
+ 	    EBIT_CLR(redirect_child_table[k]->flags, HELPER_ALIVE);
+ 	} else {
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: stat.cc,v 1.185 1998/01/12 04:30:11 wessels Exp $
++ * $Id: stat.cc,v 1.186 1998/01/31 05:32:06 wessels Exp $
+  *
+  * DEBUG: section 18    Cache Manager Statistics
+  * AUTHOR: Harvest Derived
+@@ -111,11 +111,9 @@
+ static const char *describeStatuses(const StoreEntry *);
+ static const char *describeFlags(const StoreEntry *);
+ static const char *describeTimestamps(const StoreEntry *);
+-static void proto_count(cacheinfo *, protocol_t, log_type);
+-static void proto_newobject(cacheinfo *, protocol_t, int, int);
+-static void proto_purgeobject(cacheinfo *, protocol_t, int);
+-static void proto_touchobject(cacheinfo *, protocol_t, int);
+ static void statAvgTick(void *notused);
++static void statAvgDump(StoreEntry *, int minutes);
++static void statCountersDump(StoreEntry * sentry);
+ 
+ #ifdef XMALLOC_STATISTICS
+ static void info_get_mallstat(int, int, StoreEntry *);
+@@ -125,71 +123,17 @@ static void info_get_mallstat(int, int, StoreEntry *);
+ int client_pconn_hist[PCONN_HIST_SZ];
+ int server_pconn_hist[PCONN_HIST_SZ];
+ 
+-#define N_COUNT_HIST 5
++/*
++ * An hour's worth, plus the 'current' counter
++ */
++#define N_COUNT_HIST 61
+ static StatCounters CountHist[N_COUNT_HIST];
+ static int NCountHist = 0;
+ 
+-/* process utilization information */
+-static void
+-statUtilization(cacheinfo * obj, StoreEntry * sentry, const char *desc)
+-{
+-    protocol_t proto_id;
+-    proto_stat *p = &obj->proto_stat_data[PROTO_MAX];
+-    proto_stat *q = NULL;
+-    int secs = 0;
+-    secs = (int) (squid_curtime - squid_start.tv_sec);
+-    storeAppendPrintf(sentry, "{ %s\n", desc);	/* } */
+-    strcpy(p->protoname, "TOTAL");
+-    p->object_count = 0;
+-    p->kb.max = 0;
+-    p->kb.min = 0;
+-    p->kb.avg = 0;
+-    p->kb.now = 0;
+-    p->hit = 0;
+-    p->miss = 0;
+-    p->refcount = 0;
+-    p->transferbyte = 0;
+-    /* find the total */
+-    for (proto_id = PROTO_NONE; proto_id < PROTO_MAX; ++proto_id) {
+-	q = &obj->proto_stat_data[proto_id];
+-	p->object_count += q->object_count;
+-	p->kb.max += q->kb.max;
+-	p->kb.min += q->kb.min;
+-	p->kb.avg += q->kb.avg;
+-	p->kb.now += q->kb.now;
+-	p->hit += q->hit;
+-	p->miss += q->miss;
+-	p->refcount += q->refcount;
+-	p->transferbyte += q->transferbyte;
+-    }
+-    /* dump it */
+-    for (proto_id = PROTO_NONE; proto_id <= PROTO_MAX; ++proto_id) {
+-	p = &obj->proto_stat_data[proto_id];
+-	if (p->hit != 0) {
+-	    p->hitratio =
+-		(float) p->hit /
+-		((float) p->hit +
+-		(float) p->miss);
+-	}
+-	storeAppendPrintf(sentry, "{%8.8s %d %d %d %d %4.2f %d %d %d}\n",
+-	    p->protoname,
+-	    p->object_count,
+-	    p->kb.max,
+-	    p->kb.now,
+-	    p->kb.min,
+-	    p->hitratio,
+-	    (secs ? p->transferbyte / secs : 0),
+-	    p->refcount,
+-	    p->transferbyte);
+-    }
+-    storeAppendPrintf(sentry, close_bracket);
+-}
+-
+ void
+ stat_utilization_get(StoreEntry * e)
+ {
+-    statUtilization(HTTPCacheInfo, e, "HTTP");
+-    statUtilization(ICPCacheInfo, e, "ICP");
++	/* MAKE SOMETHING UP */
+ }
+ 
+ void
+@@ -572,7 +516,7 @@ info_get(StoreEntry * sentry)
+     storeAppendPrintf(sentry, "{Resource usage for %s:}\n", appname);
+     storeAppendPrintf(sentry, "{\tUP Time:\t%.3f seconds}\n", runtime);
+     storeAppendPrintf(sentry, "{\tCPU Time:\t%.3f seconds}\n", cputime);
+-    storeAppendPrintf(sentry, "{\tCPU Usage:\t%d%%}\n",
++    storeAppendPrintf(sentry, "{\tCPU Usage:\t%.2f%%}\n",
+ 	dpercent(cputime, runtime));
+     storeAppendPrintf(sentry, "{\tMaximum Resident Size: %ld KB}\n",
+ 	rusage_maxrss(&rusage));
+@@ -708,119 +652,102 @@ info_get(StoreEntry * sentry)
+ }
+ 
+ static void
+-proto_newobject(cacheinfo * obj, protocol_t proto_id, int size, int restart)
+-{
+-    proto_stat *p = &obj->proto_stat_data[proto_id];
+-
+-    p->object_count++;
+-
+-    /* Account for 1KB granularity */
+-    p->kb.now += ((size + 1023) >> 10);
+-
+-    if (p->kb.now > p->kb.max)
+-	p->kb.max = p->kb.now;
+-    if (restart)
+-	p->kb.min = p->kb.now;
+-}
+-
+-
+-static void
+-proto_purgeobject(cacheinfo * obj, protocol_t proto_id, int size)
++statCountersDump(StoreEntry * sentry)
+ {
+-    proto_stat *p = &obj->proto_stat_data[proto_id];
+-
+-    p->object_count--;
+-
+-    /* Scale down to KB */
+-    p->kb.now -= ((size + 1023) >> 10);
+-
+-    if (p->kb.now < p->kb.min)
+-	p->kb.min = p->kb.now;
+-}
+-
+-/* update stat for each particular protocol when an object is fetched */
+-static void
+-proto_touchobject(cacheinfo * obj, protocol_t proto_id, int size)
+-{
+-    obj->proto_stat_data[proto_id].refcount++;
+-    obj->proto_stat_data[proto_id].transferbyte += (1023 + size) >> 10;
++    StatCounters *f = &Counter;
++    struct rusage rusage;
++    squid_getrusage(&rusage);
++    f->page_faults = rusage_pagefaults(&rusage);
++    f->cputime = rusage_cputime(&rusage);
++    storeAppendPrintf(sentry, "client_http.requests = %d\n",
++	f->client_http.requests);
++    storeAppendPrintf(sentry, "client_http.hits = %d\n",
++	f->client_http.hits);
++    storeAppendPrintf(sentry, "client_http.errors = %d\n",
++	f->client_http.errors);
++    storeAppendPrintf(sentry, "client_http.kbytes_in = %d\n",
++	(int) f->client_http.kbytes_in.kb);
++    storeAppendPrintf(sentry, "client_http.kbytes_out = %d\n",
++	(int) f->client_http.kbytes_out.kb);
++    storeAppendPrintf(sentry, "icp.pkts_sent = %d\n",
++	f->icp.pkts_sent);
++    storeAppendPrintf(sentry, "icp.pkts_recv = %d\n",
++	f->icp.pkts_recv);
++    storeAppendPrintf(sentry, "icp.kbytes_sent = %d\n",
++	(int) f->icp.kbytes_sent.kb);
++    storeAppendPrintf(sentry, "icp.kbytes_recv = %d\n",
++	(int) f->icp.kbytes_recv.kb);
++    storeAppendPrintf(sentry, "unlink.requests = %d\n",
++	f->unlink.requests);
++    storeAppendPrintf(sentry, "page_faults = %d\n",
++	f->page_faults);
++    storeAppendPrintf(sentry, "select_loops = %d\n",
++	f->select_loops);
++    storeAppendPrintf(sentry, "cpu_time = %f\n",
++	f->cputime);
++    storeAppendPrintf(sentry, "wall_time = %f\n",
++        tvSubDsec(f->timestamp, current_time));
+ }
+ 
++#define XAVG(X) (dt ? (double) (f->X - l->X) / dt : 0.0)
+ static void
+-proto_count(cacheinfo * obj, protocol_t proto_id, log_type type)
++statAvgDump(StoreEntry * sentry, int minutes)
+ {
+-    switch (type) {
+-    case LOG_TCP_HIT:
+-    case LOG_TCP_IMS_HIT:
+-    case LOG_TCP_REFRESH_HIT:
+-    case LOG_TCP_REFRESH_FAIL_HIT:
+-    case LOG_UDP_HIT:
+-    case LOG_UDP_HIT_OBJ:
+-	obj->proto_stat_data[proto_id].hit++;
+-	break;
+-    default:
+-	obj->proto_stat_data[proto_id].miss++;
+-	break;
+-    }
++    StatCounters *f;
++    StatCounters *l;
++    double dt;
++    double ct;
++    assert(N_COUNT_HIST > 1);
++    assert(minutes > 0);
++    f = &CountHist[0];
++    if (minutes > N_COUNT_HIST-1)
++	minutes = N_COUNT_HIST-1;
++    l = &CountHist[minutes];
++    dt = tvSubDsec(l->timestamp, f->timestamp);
++    ct = f->cputime - l->cputime;
++    storeAppendPrintf(sentry, "client_http.requests = %f/sec\n",
++	XAVG(client_http.requests));
++    storeAppendPrintf(sentry, "client_http.hits = %f/sec\n",
++	XAVG(client_http.hits));
++    storeAppendPrintf(sentry, "client_http.errors = %f/sec\n",
++	XAVG(client_http.errors));
++    storeAppendPrintf(sentry, "client_http.kbytes_in = %f/sec\n",
++	XAVG(client_http.kbytes_in.kb));
++    storeAppendPrintf(sentry, "client_http.kbytes_out = %f/sec\n",
++	XAVG(client_http.kbytes_out.kb));
++    storeAppendPrintf(sentry, "icp.pkts_sent = %f/sec\n",
++	XAVG(icp.pkts_sent));
++    storeAppendPrintf(sentry, "icp.pkts_recv = %f/sec\n",
++	XAVG(icp.pkts_recv));
++    storeAppendPrintf(sentry, "icp.kbytes_sent = %f/sec\n",
++	XAVG(icp.kbytes_sent.kb));
++    storeAppendPrintf(sentry, "icp.kbytes_recv = %f/sec\n",
++	XAVG(icp.kbytes_recv.kb));
++    storeAppendPrintf(sentry, "unlink.requests = %f/sec\n",
++	XAVG(unlink.requests));
++    storeAppendPrintf(sentry, "page_faults = %f/sec\n",
++	XAVG(page_faults));
++    storeAppendPrintf(sentry, "select_loops = %f/sec\n",
++	XAVG(select_loops));
++    storeAppendPrintf(sentry, "cpu_time = %f seconds\n", ct);
++    storeAppendPrintf(sentry, "wall_time = %f seconds\n", dt);
++    storeAppendPrintf(sentry, "cpu_usage = %f%%\n",dpercent(ct,dt));
+ }
+ 
+-
+ void
+-stat_init(cacheinfo ** object, const char *logfilename)
++statInit(void)
+ {
+-    cacheinfo *obj = NULL;
+     int i;
+-    debug(18, 5) ("stat_init: Initializing...\n");
+-    obj = xcalloc(1, sizeof(cacheinfo));
+-    if (logfilename)
+-	accessLogOpen(logfilename);
+-    obj->proto_id = urlParseProtocol;
+-    obj->proto_newobject = proto_newobject;
+-    obj->proto_purgeobject = proto_purgeobject;
+-    obj->proto_touchobject = proto_touchobject;
+-    obj->proto_count = proto_count;
+-    for (i = PROTO_NONE; i <= PROTO_MAX; i++) {
+-	switch (i) {
+-	case PROTO_HTTP:
+-	    strcpy(obj->proto_stat_data[i].protoname, "HTTP");
+-	    break;
+-	case PROTO_GOPHER:
+-	    strcpy(obj->proto_stat_data[i].protoname, "GOPHER");
+-	    break;
+-	case PROTO_FTP:
+-	    strcpy(obj->proto_stat_data[i].protoname, "FTP");
+-	    break;
+-	case PROTO_WAIS:
+-	    strcpy(obj->proto_stat_data[i].protoname, "WAIS");
+-	    break;
+-	case PROTO_CACHEOBJ:
+-	    strcpy(obj->proto_stat_data[i].protoname, "CACHE_OBJ");
+-	    break;
+-	case PROTO_MAX:
+-	    strcpy(obj->proto_stat_data[i].protoname, "TOTAL");
+-	    break;
+-	case PROTO_NONE:
+-	default:
+-	    strcpy(obj->proto_stat_data[i].protoname, "OTHER");
+-	    break;
+-	}
+-	obj->proto_stat_data[i].object_count = 0;
+-	obj->proto_stat_data[i].hit = 0;
+-	obj->proto_stat_data[i].miss = 0;
+-	obj->proto_stat_data[i].hitratio = 0.0;
+-	obj->proto_stat_data[i].transferrate = 0;
+-	obj->proto_stat_data[i].refcount = 0;
+-	obj->proto_stat_data[i].transferbyte = 0;
+-	obj->proto_stat_data[i].kb.max = 0;
+-	obj->proto_stat_data[i].kb.min = 0;
+-	obj->proto_stat_data[i].kb.avg = 0;
+-	obj->proto_stat_data[i].kb.now = 0;
+-    }
+-    *object = obj;
++    debug(18, 5) ("statInit: Initializing...\n");
+     for (i = 0; i < PCONN_HIST_SZ; i++) {
+ 	client_pconn_hist[i] = 0;
+ 	server_pconn_hist[i] = 0;
+     }
++    memset(CountHist, '\0', N_COUNT_HIST * sizeof(StatCounters));
++    for (i=0; i<N_COUNT_HIST; i++)
++	CountHist[i].timestamp = current_time;
++    Counter.timestamp = current_time;
++    eventAdd("statAvgTick", statAvgTick, NULL, 60);
+ }
+ 
+ void
+@@ -866,16 +793,6 @@ pconnHistDump(StoreEntry * e)
+     }
+ }
+ 
+-void
+-statAvgInit(void)
+-{
+-    int i;
+-    memset(CountHist, '\0', N_COUNT_HIST * sizeof(StatCounters));
+-    for (i=0; i<N_COUNT_HIST; i++)
+-	CountHist[i].timestamp = current_time;
+-    eventAdd("statAvgTick", statAvgTick, NULL, 60);
+-}
+-
+ static void
+ statAvgTick(void *notused)
+ {
+@@ -893,45 +810,22 @@ statAvgTick(void *notused)
+     NCountHist++;
+ }
+ 
+-#define XAVG(X) (double) (f->X - l->X) / dt
+ void
+-statAvgDump(StoreEntry * sentry)
++statAvg5min(StoreEntry *e)
+ {
+-    StatCounters *f = &CountHist[0];
+-    StatCounters *l = &CountHist[N_COUNT_HIST - 1];
+-    double dt;
+-    double ct;
+-    eventDelete(statAvgTick, NULL);
+-    statAvgTick(NULL);
+-    dt = tvSubDsec(l->timestamp, f->timestamp);
+-    ct = f->cputime - l->cputime;
+-    storeBuffer(sentry);
+-    storeAppendPrintf(sentry, "client_http.requests = %f/sec\n",
+-	XAVG(client_http.requests));
+-    storeAppendPrintf(sentry, "client_http.hits = %f/sec\n",
+-	XAVG(client_http.hits));
+-    storeAppendPrintf(sentry, "client_http.errors = %f/sec\n",
+-	XAVG(client_http.errors));
+-    storeAppendPrintf(sentry, "client_http.bytes_in = %f/sec\n",
+-	XAVG(client_http.bytes_in));
+-    storeAppendPrintf(sentry, "client_http.bytes_out = %f/sec\n",
+-	XAVG(client_http.bytes_out));
+-    storeAppendPrintf(sentry, "icp.pkts_sent = %f/sec\n",
+-	XAVG(icp.pkts_sent));
+-    storeAppendPrintf(sentry, "icp.pkts_recv = %f/sec\n",
+-	XAVG(icp.pkts_recv));
+-    storeAppendPrintf(sentry, "icp.bytes_sent = %f/sec\n",
+-	XAVG(icp.bytes_sent));
+-    storeAppendPrintf(sentry, "icp.bytes_recv = %f/sec\n",
+-	XAVG(icp.bytes_recv));
+-    storeAppendPrintf(sentry, "unlink.requests = %f/sec\n",
+-	XAVG(unlink.requests));
+-    storeAppendPrintf(sentry, "page_faults = %f/sec\n",
+-	XAVG(page_faults));
+-    storeAppendPrintf(sentry, "select_loops = %f/sec\n",
+-	XAVG(select_loops));
+-    storeAppendPrintf(sentry, "cpu_time = %f seconds\n", ct);
+-    storeAppendPrintf(sentry, "wall_time = %f seconds\n", dt);
+-    storeAppendPrintf(sentry, "cpu_usage = %f%%\n", 100.0*ct/dt);
+-    storeBufferFlush(sentry);
++#if NOT_YET
++	statCountersDump(e);
++	storeAppendPrintf(e, "\n");
++#endif
++	statAvgDump(e, 5);
++}
++
++void
++statAvg60min(StoreEntry *e)
++{
++#if NOT_YET
++	statCountersDump(e);
++	storeAppendPrintf(e, "\n");
++#endif
++	statAvgDump(e, 60);
+ }
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: store.cc,v 1.366 1998/01/12 04:30:13 wessels Exp $
++ * $Id: store.cc,v 1.367 1998/01/31 05:32:07 wessels Exp $
+  *
+  * DEBUG: section 20    Storeage Manager
+  * AUTHOR: Harvest Derived
+@@ -831,10 +831,6 @@ storeSwapOutHandle(int fdnotused, int flag, size_t len, void *data)
+ 	mem->url, storeSwapFullPath(e->swap_file_number, NULL));
+     e->swap_status = SWAPOUT_DONE;
+     storeDirUpdateSwapSize(e->swap_file_number, e->object_len, 1);
+-    HTTPCacheInfo->proto_newobject(HTTPCacheInfo,
+-	mem->request->protocol,
+-	e->object_len,
+-	FALSE);
+     if (storeCheckCachable(e)) {
+ 	storeLog(STORE_LOG_SWAPOUT, e);
+ #if 0
+@@ -1483,10 +1479,6 @@ storeAbort(StoreEntry * e, int cbflag)
+     storeSetMemStatus(e, NOT_IN_MEMORY);
+     /* No DISK swap for negative cached object */
+     e->swap_status = SWAPOUT_NONE;
+-    /* Count bytes faulted through cache but not moved to disk */
+-    HTTPCacheInfo->proto_touchobject(HTTPCacheInfo,
+-	mem->request ? mem->request->protocol : PROTO_NONE,
+-	mem->inmem_hi);
+     /* We assign an object length here--The only other place we assign the
+      * object length is in storeComplete() */
+     e->object_len = mem->inmem_hi;
+@@ -743,23 +743,6 @@ struct _Stack {
+     int stack_size;
+ };
+ 
+-struct _proto_stat {
+-    char protoname[25];
+-    int object_count;
+-    struct _usage {
+-	int max;
+-	int avg;
+-	int min;
+-	int now;
+-    } kb;
+-    unsigned int hit;
+-    unsigned int miss;
+-    float hitratio;
+-    unsigned int transferrate;
+-    unsigned int refcount;
+-    unsigned int transferbyte;
+-};
+-
+ struct _Meta_data {
+     int hot_vm;
+     int ipcache_count;
+@@ -772,16 +755,6 @@ struct _Meta_data {
+     int store_keys;
+ };
+ 
+-struct _cacheinfo {
+-    protocol_t(*proto_id) (const char *url);
+-    void (*proto_newobject) (struct _cacheinfo * c, protocol_t proto_id, int len, int flag);
+-    void (*proto_purgeobject) (struct _cacheinfo * c, protocol_t proto_id, int len);
+-    void (*proto_touchobject) (struct _cacheinfo * c, protocol_t proto_id, int len);
+-    void (*proto_count) (struct _cacheinfo * obj, protocol_t proto_id,
+-	log_type);
+-    proto_stat proto_stat_data[PROTO_MAX + 1];
+-};
+-
+ struct _iostats {
+     struct {
+ 	int reads;
+@@ -957,14 +930,17 @@ struct _StatCounters {
+ 	int requests;
+ 	int hits;
+ 	int errors;
+-	int bytes_in;
+-	int bytes_out;
++	kb_t kbytes_in;
++	kb_t kbytes_out;
++	kb_t hit_kbytes_out;
+     } client_http;
+     struct {
+ 	int pkts_sent;
+ 	int pkts_recv;
+-	int bytes_sent;
+-	int bytes_recv;
++	int hits_sent;
++	int hits_recv;
++	kb_t kbytes_sent;
++	kb_t kbytes_recv;
+     } icp;
+     struct {
+ 	int requests;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: tools.cc,v 1.141 1998/01/04 05:43:48 wessels Exp $
++ * $Id: tools.cc,v 1.142 1998/01/31 05:32:09 wessels Exp $
+  *
+  * DEBUG: section 21    Misc Functions
+  * AUTHOR: Harvest Derived
+@@ -753,7 +753,7 @@ percent(int a, int b)
+     return b ? ((int) (100.0 * a / b + 0.5)) : 0;
+ }
+ 
+-int
++double
+ dpercent(double a, double b)
+ {
+     return b ? (100.0 * a / b) : 0.0;
+@@ -838,3 +838,10 @@ dlinkDelete(dlink_node * m, dlink_list * list)
+     if (m == list->tail)
+ 	list->tail = m->prev;
+ }
++
++void kb_incr(kb_t *k, size_t v)
++{
++	k->bytes += v;
++	k->kb += (k->bytes >> 10);
++	k->bytes &= 0x3FF;
++}
+@@ -4,6 +4,11 @@ typedef unsigned int mem_status_t;
+ typedef unsigned int ping_status_t;
+ typedef unsigned int swap_status_t;
+ 
++typedef struct {
++	size_t bytes;
++	size_t kb;
++} kb_t;
++
+ /*
+  * grep '^struct' structs.h \
+  * | perl -ne '($a,$b)=split;$c=$b;$c=~s/^_//; print "typedef struct $b $c;\n";'
+@@ -54,9 +59,7 @@ typedef struct _HierarchyLogEntry HierarchyLogEntry;
+ typedef struct _pingerEchoData pingerEchoData;
+ typedef struct _pingerReplyData pingerReplyData;
+ typedef struct _icp_common_t icp_common_t;
+-typedef struct _proto_stat proto_stat;
+ typedef struct _Meta_data Meta_data;
+-typedef struct _cacheinfo cacheinfo;
+ typedef struct _iostats iostats;
+ typedef struct _mem_node mem_node;
+ typedef struct _mem_hdr mem_hdr;
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: unlinkd.cc,v 1.12 1998/01/01 05:57:17 wessels Exp $
++ * $Id: unlinkd.cc,v 1.13 1998/01/31 05:32:10 wessels Exp $
+  *
+  * DEBUG: section 43    Unlink Daemon
+  * AUTHOR: Duane Wessels
+@@ -28,8 +28,6 @@
+  *  
+  */
+ 
+-static char hello_string[] = "hi there\n";
+-
+ #ifdef UNLINK_DAEMON
+ 
+ /* This is the external unlinkd process */
+@@ -62,7 +60,6 @@ main(int argc, char *argv[])
+     char buf[UNLINK_BUF_LEN];
+     char *t;
+     setbuf(stdin, NULL);
+-    write(1, hello_string, sizeof(hello_string));
+     while (fgets(buf, UNLINK_BUF_LEN, stdin)) {
+ 	if ((t = strchr(buf, '\n')))
+ 	    *t = '\0';
+@@ -81,80 +78,33 @@ static int unlinkd_fd = -1;
+ 
+ static int unlinkdCreate(void);
+ 
+-#define HELLO_BUFSIZ 128
+ static int
+ unlinkdCreate(void)
+ {
+-    pid_t pid;
+-    int rfd1, rfd2, wfd1, wfd2;
+-    int squid_to_unlinkd[2] =
+-    {-1, -1};
+-    int unlinkd_to_squid[2] =
+-    {-1, -1};
+-    int n;
+-    char buf[HELLO_BUFSIZ];
+-    struct timeval slp;
+-    if (pipe(squid_to_unlinkd) < 0) {
+-	debug(50, 0) ("unlinkdCreate: pipe: %s\n", xstrerror());
+-	return -1;
+-    }
+-    if (pipe(unlinkd_to_squid) < 0) {
+-	debug(50, 0) ("unlinkdCreate: pipe: %s\n", xstrerror());
+-	return -1;
+-    }
+-    rfd1 = squid_to_unlinkd[0];
+-    wfd1 = squid_to_unlinkd[1];
+-    rfd2 = unlinkd_to_squid[0];
+-    wfd2 = unlinkd_to_squid[1];
+-    /* flush or else we get dup data if unbuffered_logs is set */
+-    logsFlush();
+-    if ((pid = fork()) < 0) {
+-	debug(50, 0) ("unlinkdCreate: fork: %s\n", xstrerror());
+-	close(rfd1);
+-	close(wfd1);
+-	close(rfd2);
+-	close(wfd2);
+-	return -1;
+-    }
+-    if (pid > 0) {		/* parent process */
+-	close(rfd1);
+-	close(wfd2);
+-	memset(buf, '\0', HELLO_BUFSIZ);
+-	n = read(rfd2, buf, HELLO_BUFSIZ - 1);
+-	fd_bytes(rfd2, n, FD_READ);
+-	close(rfd2);
+-	if (n <= 0) {
+-	    debug(50, 0) ("unlinkdCreate: handshake failed\n");
+-	    close(wfd1);
+-	    return -1;
+-	} else if (strcmp(buf, hello_string)) {
+-	    debug(50, 0) ("unlinkdCreate: handshake failed\n");
+-	    debug(50, 0) ("--> got '%s'\n", rfc1738_escape(buf));
+-	    close(wfd1);
+-	    return -1;
+-	}
++	int x;
++	int rfd;
++	int wfd;
++	char *args[2];
++	struct timeval slp;
++	args[0] = "(unlinkd)";
++	args[1] = NULL;
++	x = ipcCreate(IPC_FIFO,
++		Config.Program.unlinkd,
++		args,
++		"unlinkd",
++		&rfd,
++		&wfd);
++	if (x < 0)
++		return -1;
+ 	slp.tv_sec = 0;
+ 	slp.tv_usec = 250000;
+ 	select(0, NULL, NULL, NULL, &slp);
+-	fd_open(wfd1, FD_PIPE, "squid -> unlinkd");
+-	commSetTimeout(wfd1, -1, NULL, NULL);
+-	commSetNonBlocking(wfd1);
+-	return wfd1;
+-    }
+-    /* child */
+-    no_suid();			/* give up extra priviliges */
+-    close(wfd1);
+-    close(rfd2);
+-    dup2(rfd1, 0);
+-    dup2(wfd2, 1);
+-    close(rfd1);		/* close FD since we dup'd it */
+-    close(wfd2);		/* close parent's FD */
+-    commSetCloseOnExec(fileno(debug_log));
+-    execlp(Config.Program.unlinkd, "(unlinkd)", NULL);
+-    debug(50, 0) ("unlinkdCreate: %s: %s\n",
+-	Config.Program.unlinkd, xstrerror());
+-    _exit(1);
+-    return 0;
++	fd_note(wfd, "squid -> unlinkd");
++	fd_note(rfd, "unlinkd -> squid");
++	commSetTimeout(rfd, -1, NULL, NULL);
++	commSetTimeout(wfd, -1, NULL, NULL);
++	commSetNonBlocking(wfd);
++	return wfd;
+ }
+ 
+ void

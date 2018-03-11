@@ -1,18 +1,840 @@
-@@ -69,14 +69,14 @@ main(int argc, char **argv)
-         } else if (strcmp(nispasswd, (char *) crypt(passwd, nispasswd)) == 0) {
-             /* All ok !, thanks... */
-             printf("OK\n");
-+        } else {
-+            /* Password incorrect */
-+            printf("ERR Wrong password\n");
- #else
-         } else {
-             /* Password incorrect */
-             printf("BH message=\"Missing crypto capability\"\n");
+@@ -35,6 +35,8 @@ class ClientRequestContext : public RefCountable
+     void clientAccessCheckDone(const allow_t &answer);
+     void clientRedirectStart();
+     void clientRedirectDone(const HelperReply &reply);
++    void clientStoreIdStart();
++    void clientStoreIdDone(const HelperReply &reply);
+     void checkNoCache();
+     void checkNoCacheDone(const allow_t &answer);
+ #if USE_ADAPTATION
+@@ -55,6 +57,7 @@ class ClientRequestContext : public RefCountable
+     ClientHttpRequest *http;
+     ACLChecklist *acl_checklist;        /* need ptr back so we can unreg if needed */
+     int redirect_state;
++    int store_id_state;
+ 
+     /**
+      * URL-rewrite/redirect helper may return BH for internal errors.
+@@ -63,6 +66,7 @@ class ClientRequestContext : public RefCountable
+      * This tracks the number of previous failures for the current context.
+      */
+     uint8_t redirect_fail_count;
++    uint8_t store_id_fail_count;
+ 
+     bool host_header_verify_done;
+     bool http_access_done;
+@@ -71,6 +75,7 @@ class ClientRequestContext : public RefCountable
+     bool adaptation_acl_check_done;
  #endif
--        } else {
--            /* Password incorrect */
--            printf("ERR Wrong password\n");
+     bool redirect_done;
++    bool store_id_done;
+     bool no_cache_done;
+     bool interpreted_req_hdrs;
+     bool tosToClientDone;
+@@ -688,3 +688,16 @@ HttpRequest::pinnedConnection()
+         return clientConnectionManager.get();
+     return NULL;
+ }
++
++const char *
++HttpRequest::storeId()
++{
++    if (store_id.size() != 0) {
++        debugs(73, 3, "sent back store_id:" << store_id);
++
++        return store_id.termedBuf();
++    }
++    debugs(73, 3, "sent back canonicalUrl:" << urlCanonical(this) );
++
++    return urlCanonical(this);
++}
+@@ -165,6 +165,14 @@ class HttpRequest: public HttpMsg
+ 
+     char *canonical;
+ 
++    /**
++     * If defined, store_id_program mapped the request URL to this ID.
++     * Store uses this ID (and not the URL) to find and store entries,
++     * avoiding caching duplicate entries when different URLs point to
++     * "essentially the same" cachable resource.
++     */
++    String store_id;
++
+     RequestFlags flags;
+ 
+     HttpHdrRange *range;
+@@ -241,6 +249,14 @@ class HttpRequest: public HttpMsg
+ 
+     ConnStateData *pinnedConnection();
+ 
++    /**
++     * Returns the current StoreID for the request as a nul-terminated char*.
++     * Always returns the current id for the request
++     * (either the request canonical url or modified ID by the helper).
++     * Does not return NULL.
++     */
++    const char *storeId();
++
+     /**
+      * The client connection manager, if known;
+      * Used for any response actions needed directly to the client.
+@@ -203,6 +203,7 @@ class SquidConfig
+ #endif
+ 
+         wordlist *redirect;
++        wordlist *store_id;
+ #if USE_UNLINKD
+ 
+         char *unlinkd;
+@@ -220,6 +221,7 @@ class SquidConfig
+ #endif
+ 
+     HelperChildConfig redirectChildren;
++    HelperChildConfig storeIdChildren;
+     time_t authenticateGCInterval;
+     time_t authenticateTTL;
+     time_t authenticateIpTTL;
+@@ -318,6 +320,7 @@ class SquidConfig
+         int nonhierarchical_direct;
+         int strip_query_terms;
+         int redirector_bypass;
++        int store_id_bypass;
+         int ignore_unknown_nameservers;
+         int client_pconns;
+         int server_pconns;
+@@ -381,6 +384,7 @@ class SquidConfig
+         acl_access *brokenPosts;
+ #endif
+         acl_access *redirector;
++        acl_access *store_id;
+         acl_access *reply;
+         AclAddress *outgoing_address;
+ #if USE_HTCP
+@@ -701,6 +701,13 @@ configDoConfigure(void)
          }
      }
-     exit(0);
+ 
++    if (Config.Program.store_id) {
++        if (Config.storeIdChildren.n_max < 1) {
++            Config.storeIdChildren.n_max = 0;
++            wordlistDestroy(&Config.Program.store_id);
++        }
++    }
++
+     if (Config.appendDomain)
+         if (*Config.appendDomain != '.')
+             fatal("append_domain must begin with a '.'");
+@@ -763,6 +770,9 @@ configDoConfigure(void)
+     if (Config.Program.redirect)
+         requirePathnameExists("redirect_program", Config.Program.redirect->key);
+ 
++    if (Config.Program.store_id)
++        requirePathnameExists("store_id_program", Config.Program.store_id->key);
++
+     requirePathnameExists("Icon Directory", Config.icons.directory);
+ 
+     if (Config.errorDirectory)
+@@ -4353,6 +4353,128 @@ DOC_START
+ 	be allowed to request.
+ DOC_END
+ 
++COMMENT_START
++ OPTIONS FOR STORE ID
++ -----------------------------------------------------------------------------
++COMMENT_END
++
++NAME: store_id_program storeurl_rewrite_program
++TYPE: wordlist
++LOC: Config.Program.store_id
++DEFAULT: none
++DOC_START
++	Specify the location of the executable StoreID helper to use.
++	Since they can perform almost any function there isn't one included.
++
++	For each requested URL, the helper will receive one line with the format
++
++	  [channel-ID <SP>] URL <SP> client_ip "/" fqdn <SP> user <SP> method [<SP> kv-pairs]<NL>
++
++
++	After processing the request the helper must reply using the following format:
++
++	  [channel-ID <SP>] result [<SP> kv-pairs]
++
++	The result code can be:
++
++	  OK store-id="..."
++		Use the StoreID supplied in 'store-id='.
++
++	  ERR
++		The default is to use HTTP request URL as the store ID.
++
++	  BH
++		An internal error occured in the helper, preventing
++		a result being identified.
++
++
++	Helper programs should be prepared to receive and possibly ignore additional
++	kv-pairs with keys they do not support.
++
++	When using the concurrency= option the protocol is changed by
++	introducing a query channel tag in front of the request/response.
++	The query channel tag is a number between 0 and concurrency-1.
++	This value must be echoed back unchanged to Squid as the first part
++	of the response relating to its request.
++
++	NOTE: when using StoreID refresh_pattern will apply to the StoreID
++	      returned from the helper and not the URL.
++
++	WARNING: Wrong StoreID value returned by a careless helper may result
++	         in the wrong cached response returned to the user.
++
++	By default, a StoreID helper is not used.
++DOC_END
++
++NAME: store_id_children storeurl_rewrite_children
++TYPE: HelperChildConfig
++DEFAULT: 20 startup=0 idle=1 concurrency=0
++LOC: Config.storeIdChildren
++DOC_START
++	The maximum number of StoreID helper processes to spawn. If you limit
++	it too few Squid will have to wait for them to process a backlog of
++	requests, slowing it down. If you allow too many they will use RAM
++	and other system resources noticably.
++	
++	The startup= and idle= options allow some measure of skew in your
++	tuning.
++	
++		startup=
++	
++	Sets a minimum of how many processes are to be spawned when Squid
++	starts or reconfigures. When set to zero the first request will
++	cause spawning of the first child process to handle it.
++	
++	Starting too few will cause an initial slowdown in traffic as Squid
++	attempts to simultaneously spawn enough processes to cope.
++	
++		idle=
++	
++	Sets a minimum of how many processes Squid is to try and keep available
++	at all times. When traffic begins to rise above what the existing
++	processes can handle this many more will be spawned up to the maximum
++	configured. A minimum setting of 1 is required.
++
++		concurrency=
++
++	The number of requests each storeID helper can handle in
++	parallel. Defaults to 0 which indicates the helper
++	is a old-style single threaded program.
++
++	When this directive is set to a value >= 1 then the protocol
++	used to communicate with the helper is modified to include
++	an ID in front of the request/response. The ID from the request
++	must be echoed back with the response to that request.
++DOC_END
++
++NAME: store_id_access storeurl_rewrite_access
++TYPE: acl_access
++DEFAULT: none
++LOC: Config.accessList.store_id
++DOC_START
++	If defined, this access list specifies which requests are
++	sent to the StoreID processes.  By default all requests
++	are sent.
++
++	This clause supports both fast and slow acl types.
++	See http://wiki.squid-cache.org/SquidFaq/SquidAcl for details.
++DOC_END
++
++NAME: store_id_bypass storeurl_rewrite_bypass
++TYPE: onoff
++LOC: Config.onoff.store_id_bypass
++DEFAULT: on
++DOC_START
++	When this is 'on', a request will not go through the
++	helper if all helpers are busy.  If this is 'off'
++	and the helper queue grows too large, Squid will exit
++	with a FATAL error and ask you to increase the number of
++	helpers.  You should only enable this if the helperss
++	are not critical to your caching system.  If you use
++	helpers for critical caching components, and you enable this 
++	option,	users may not get objects from cache.
++DOC_END
++
+ COMMENT_START
+  OPTIONS FOR TUNING THE CACHE
+  -----------------------------------------------------------------------------
+@@ -258,7 +258,7 @@ clientReplyContext::triggerInitialStoreRead()
+ void
+ clientReplyContext::processExpired()
+ {
+-    char *url = http->uri;
++    const char *url = storeId();
+     StoreEntry *entry = NULL;
+     debugs(88, 3, "clientReplyContext::processExpired: '" << http->uri << "'");
+     assert(http->storeEntry()->lastmod >= 0);
+@@ -497,8 +497,8 @@ clientReplyContext::cacheHit(StoreIOBuffer result)
+      */
+     assert(http->logType == LOG_TCP_HIT);
+ 
+-    if (strcmp(e->mem_obj->url, urlCanonical(r)) != 0) {
+-        debugs(33, DBG_IMPORTANT, "clientProcessHit: URL mismatch, '" << e->mem_obj->url << "' != '" << urlCanonical(r) << "'");
++    if (strcmp(e->mem_obj->url, http->request->storeId()) != 0) {
++        debugs(33, DBG_IMPORTANT, "clientProcessHit: URL mismatch, '" << e->mem_obj->url << "' != '" << http->request->storeId() << "'");
+         processMiss();
+         return;
+     }
+@@ -880,7 +880,7 @@ clientReplyContext::purgeFoundObject(StoreEntry *entry)
+     http->storeEntry(entry);
+ 
+     http->storeEntry()->lock();
+-    http->storeEntry()->createMemObject(http->uri, http->log_uri);
++    http->storeEntry()->createMemObject(storeId(), http->log_uri);
+ 
+     http->storeEntry()->mem_obj->method = http->request->method;
+ 
+@@ -1744,8 +1744,13 @@ clientReplyContext::doGetMoreData()
+              * is a cache hit for a GET response, we want to keep
+              * the method as GET.
+              */
+-            http->storeEntry()->createMemObject(http->uri, http->log_uri);
++            http->storeEntry()->createMemObject(storeId(), http->log_uri);
+             http->storeEntry()->mem_obj->method = http->request->method;
++            /**
++             * Here we can see if the object was
++             * created using URL or alternative StoreID from helper.
++             */
++            debugs(88, 3, "mem_obj->url: " << http->storeEntry()->mem_obj->url);
+         }
+ 
+         sc = storeClientListAdd(http->storeEntry(), this);
+@@ -2176,7 +2181,7 @@ clientReplyContext::createStoreEntry(const HttpRequestMethod& m, RequestFlags re
+     if (http->request == NULL)
+         http->request = HTTPMSGLOCK(new HttpRequest(m, AnyP::PROTO_NONE, null_string));
+ 
+-    StoreEntry *e = storeCreateEntry(http->uri, http->log_uri, reqFlags, m);
++    StoreEntry *e = storeCreateEntry(storeId(), http->log_uri, reqFlags, m);
+ 
+     sc = storeClientListAdd(e, this);
+ 
+@@ -91,6 +91,7 @@ class clientReplyContext : public RefCountable, public StoreClient
+     clientStream_status_t replyStatus();
+     void processMiss();
+     void traceReply(clientStreamNode * node);
++    const char *storeId() const { return (http->store_id.size() > 0 ? http->store_id.termedBuf() : http->uri); }
+ 
+     http_status purgeStatus;
+ 
+@@ -132,6 +132,7 @@ static void sslBumpAccessCheckDoneWrapper(allow_t, void *);
+ static int clientHierarchical(ClientHttpRequest * http);
+ static void clientInterpretRequestHeaders(ClientHttpRequest * http);
+ static HLPCB clientRedirectDoneWrapper;
++static HLPCB clientStoreIdDoneWrapper;
+ static void checkNoCacheDoneWrapper(allow_t, void *);
+ SQUIDCEXTERN CSR clientGetMoreData;
+ SQUIDCEXTERN CSS clientReplyStatus;
+@@ -152,11 +153,13 @@ ClientRequestContext::~ClientRequestContext()
+     debugs(85,3, HERE << this << " ClientRequestContext destructed");
+ }
+ 
+-ClientRequestContext::ClientRequestContext(ClientHttpRequest *anHttp) : http(cbdataReference(anHttp)), acl_checklist (NULL), redirect_state (REDIRECT_NONE), error(NULL), readNextRequest(false)
++ClientRequestContext::ClientRequestContext(ClientHttpRequest *anHttp) : http(cbdataReference(anHttp)), acl_checklist (NULL), redirect_state (REDIRECT_NONE), store_id_state(REDIRECT_NONE),error(NULL), readNextRequest(false)
+ {
+     http_access_done = false;
+     redirect_done = false;
+     redirect_fail_count = 0;
++    store_id_done = false;
++    store_id_fail_count = 0;
+     no_cache_done = false;
+     interpreted_req_hdrs = false;
+ #if USE_SSL
+@@ -920,6 +923,44 @@ ClientRequestContext::clientRedirectStart()
+         redirectStart(http, clientRedirectDoneWrapper, this);
+ }
+ 
++/**
++ * This methods handles Access checks result of StoreId access list.
++ * Will handle as "ERR" (no change) in a case Access is not allowed.
++ */
++static void
++clientStoreIdAccessCheckDone(allow_t answer, void *data)
++{
++    ClientRequestContext *context = static_cast<ClientRequestContext *>(data);
++    ClientHttpRequest *http = context->http;
++    context->acl_checklist = NULL;
++
++    if (answer == ACCESS_ALLOWED)
++        storeIdStart(http, clientStoreIdDoneWrapper, context);
++    else {
++        debugs(85, 3, "access denied expected ERR reply handling: " << answer);
++        HelperReply nilReply;
++        nilReply.result = HelperReply::Error;
++        context->clientStoreIdDone(nilReply);
++    }
++}
++
++/**
++ * Start locating an alternative storeage ID string (if any) from admin
++ * configured helper program. This is an asynchronous operation terminating in
++ * ClientRequestContext::clientStoreIdDone() when completed.
++ */
++void
++ClientRequestContext::clientStoreIdStart()
++{
++    debugs(33, 5,"'" << http->uri << "'");
++
++    if (Config.accessList.store_id) {
++        acl_checklist = clientAclChecklistCreate(Config.accessList.store_id, http);
++        acl_checklist->nonBlockingCheck(clientStoreIdAccessCheckDone, this);
++    } else
++        storeIdStart(http, clientStoreIdDoneWrapper, this);
++}
++
+ static int
+ clientHierarchical(ClientHttpRequest * http)
+ {
+@@ -1196,6 +1237,17 @@ clientRedirectDoneWrapper(void *data, const HelperReply &result)
+     calloutContext->clientRedirectDone(result);
+ }
+ 
++void
++clientStoreIdDoneWrapper(void *data, const HelperReply &result)
++{
++    ClientRequestContext *calloutContext = (ClientRequestContext *)data;
++
++    if (!calloutContext->httpStateIsValid())
++        return;
++
++    calloutContext->clientStoreIdDone(result);
++}
++
+ void
+ ClientRequestContext::clientRedirectDone(const HelperReply &reply)
+ {
+@@ -1313,6 +1365,62 @@ ClientRequestContext::clientRedirectDone(const HelperReply &reply)
+     http->doCallouts();
+ }
+ 
++/**
++ * This method handles the different replies from StoreID helper.
++ */
++void
++ClientRequestContext::clientStoreIdDone(const HelperReply &reply)
++{
++    HttpRequest *old_request = http->request;
++    debugs(85, 5, "'" << http->uri << "' result=" << reply);
++    assert(store_id_state == REDIRECT_PENDING);
++    store_id_state = REDIRECT_DONE;
++
++    // copy the helper response Notes to the HTTP request for logging
++    // do it early to ensure that no matter what the outcome the notes are present.
++    // TODO put them straight into the transaction state record (ALE?) eventually
++    if (!old_request->helperNotes)
++        old_request->helperNotes = new Notes;
++    old_request->helperNotes->add(reply.notes);
++
++    switch (reply.result) {
++    case HelperReply::Unknown:
++    case HelperReply::TT:
++        // Handler in redirect.cc should have already mapped Unknown
++        // IF it contained valid entry for the old helper protocol
++        debugs(85, DBG_IMPORTANT, "ERROR: storeID helper returned invalid result code. Wrong helper? " << reply);
++        break;
++
++    case HelperReply::BrokenHelper:
++        debugs(85, DBG_IMPORTANT, "ERROR: storeID helper: " << reply << ", attempt #" << (store_id_fail_count+1) << " of 2");
++        if (store_id_fail_count < 2) { // XXX: make this configurable ?
++            ++store_id_fail_count;
++            // reset state flag to try StoreID again from scratch.
++            store_id_done = false;
++        }
++        break;
++
++    case HelperReply::Error:
++        // no change to be done.
++        break;
++
++    case HelperReply::Okay: {
++        Note::Pointer urlNote = reply.notes.find("store-id");
++
++        // prevent broken helpers causing too much damage. If old URL == new URL skip the re-write.
++        if (urlNote != NULL && strcmp(urlNote->firstValue(), http->uri) ) {
++            // Debug section required for some very specific cases.
++            debugs(85, 9, "Setting storeID with: " << urlNote->firstValue() );
++            http->request->store_id = urlNote->firstValue();
++            http->store_id = urlNote->firstValue();
++        }
++    }
++    break;
++    }
++
++    http->doCallouts();
++}
++
+ /** Test cache allow/deny configuration
+  *  Sets flags.cachable=1 if caching is not denied.
+  */
+@@ -1643,6 +1751,18 @@ ClientHttpRequest::doCallouts()
+             return;
+         }
+ 
++        if (!calloutContext->store_id_done) {
++            calloutContext->store_id_done = true;
++            assert(calloutContext->store_id_state == REDIRECT_NONE);
++
++            if (Config.Program.store_id) {
++                debugs(83, 3,"Doing calloutContext->clientStoreIdStart()");
++                calloutContext->store_id_state = REDIRECT_PENDING;
++                calloutContext->clientStoreIdStart();
++                return;
++            }
++        }
++
+         if (!calloutContext->interpreted_req_hdrs) {
+             debugs(83, 3, HERE << "Doing clientInterpretRequestHeaders()");
+             calloutContext->interpreted_req_hdrs = 1;
+@@ -1696,8 +1816,8 @@ ClientHttpRequest::doCallouts()
+ #endif
+ 
+     if (calloutContext->error) {
+-        const char *url = urlCanonical(request);
+-        StoreEntry *e= storeCreateEntry(url, url, request->flags, request->method);
++        const char *storeUri = request->storeId();
++        StoreEntry *e= storeCreateEntry(storeUri, storeUri, request->flags, request->method);
+ #if USE_SSL
+         if (sslBumpNeeded()) {
+             // set final error but delay sending until we bump
+@@ -98,6 +98,7 @@ class ClientHttpRequest
+     HttpRequest *request;		/* Parsed URL ... */
+     char *uri;
+     char *log_uri;
++    String store_id; /* StoreID for transactions where the request member is nil */
+ 
+     struct {
+         int64_t offset;
+@@ -66,10 +66,14 @@ typedef struct {
+ } redirectStateData;
+ 
+ static HLPCB redirectHandleReply;
++static HLPCB storeIdHandleReply;
+ static void redirectStateFree(redirectStateData * r);
+ static helper *redirectors = NULL;
++static helper *storeIds = NULL;
+ static OBJH redirectStats;
+-static int n_bypassed = 0;
++static OBJH storeIdStats;
++static int redirectorBypassed = 0;
++static int storeIdBypassed = 0;
+ CBDATA_TYPE(redirectStateData);
+ 
+ static void
+@@ -155,6 +159,22 @@ redirectHandleReply(void *data, const HelperReply &reply)
+     redirectStateFree(r);
+ }
+ 
++static void
++storeIdHandleReply(void *data, const HelperReply &reply)
++{
++    redirectStateData *r = static_cast<redirectStateData *>(data);
++    debugs(61, 5,"StoreId helper: reply=" << reply);
++
++    // XXX: This function is now kept only to check for and display the garbage use-case
++    // and to map the old helper response format(s) into new format result code and key=value pairs
++    // it can be removed when the helpers are all updated to the normalized "OK/ERR kv-pairs" format
++    void *cbdata;
++    if (cbdataReferenceValidDone(r->data, &cbdata))
++        r->handler(cbdata, reply);
++
++    redirectStateFree(r);
++}
++
+ static void
+ redirectStateFree(redirectStateData * r)
+ {
+@@ -174,37 +194,39 @@ redirectStats(StoreEntry * sentry)
+ 
+     if (Config.onoff.redirector_bypass)
+         storeAppendPrintf(sentry, "\nNumber of requests bypassed "
+-                          "because all redirectors were busy: %d\n", n_bypassed);
++                          "because all redirectors were busy: %d\n", redirectorBypassed);
+ }
+ 
+-/**** PUBLIC FUNCTIONS ****/
++static void
++storeIdStats(StoreEntry * sentry)
++{
++    if (storeIds == NULL) {
++        storeAppendPrintf(sentry, "No StoreId helpers defined\n");
++        return;
++    }
+ 
+-void
+-redirectStart(ClientHttpRequest * http, HLPCB * handler, void *data)
++    helperStats(sentry, storeIds, "StoreId helper Statistics");
++
++    if (Config.onoff.store_id_bypass)
++        storeAppendPrintf(sentry, "\nNumber of requests bypassed "
++                          "because all StoreId helpers were busy: %d\n", storeIdBypassed);
++}
++
++static void
++constructHelperQuery(const char *name, struct helper *hlp, HLPCB *replyHandler, ClientHttpRequest * http, HLPCB *handler, void *data)
+ {
+     ConnStateData * conn = http->getConn();
+-    redirectStateData *r = NULL;
+     const char *fqdn;
+     char buf[MAX_REDIRECTOR_REQUEST_STRLEN];
+     int sz;
+     http_status status;
+     char claddr[MAX_IPSTRLEN];
+     char myaddr[MAX_IPSTRLEN];
+-    assert(http);
+-    assert(handler);
+-    debugs(61, 5, "redirectStart: '" << http->uri << "'");
+ 
+-    if (Config.onoff.redirector_bypass && redirectors->stats.queue_size) {
+-        /* Skip redirector if there is one request queued */
+-        ++n_bypassed;
+-        HelperReply bypassReply;
+-        bypassReply.result = HelperReply::Okay;
+-        bypassReply.notes.add("message","URL rewrite/redirect queue too long. Bypassed.");
+-        handler(data, bypassReply);
+-        return;
+-    }
+-
+-    r = cbdataAlloc(redirectStateData);
++    /** TODO: create a standalone method to initialize
++     * the cbdata\redirectStateData for all the helpers.
++     */
++    redirectStateData *r = cbdataAlloc(redirectStateData);
+     r->orig_url = xstrdup(http->uri);
+     if (conn != NULL)
+         r->client_addr = conn->log_addr;
+@@ -261,10 +283,10 @@ redirectStart(ClientHttpRequest * http, HLPCB * handler, void *data)
+     if ((sz<=0) || (sz>=MAX_REDIRECTOR_REQUEST_STRLEN)) {
+         if (sz<=0) {
+             status = HTTP_INTERNAL_SERVER_ERROR;
+-            debugs(61, DBG_CRITICAL, "ERROR: Gateway Failure. Can not build request to be passed to redirector. Request ABORTED.");
++            debugs(61, DBG_CRITICAL, "ERROR: Gateway Failure. Can not build request to be passed to " << name << ". Request ABORTED.");
+         } else {
+             status = HTTP_REQUEST_URI_TOO_LARGE;
+-            debugs(61, DBG_CRITICAL, "ERROR: Gateway Failure. Request passed to redirector exceeds MAX_REDIRECTOR_REQUEST_STRLEN (" << MAX_REDIRECTOR_REQUEST_STRLEN << "). Request ABORTED.");
++            debugs(61, DBG_CRITICAL, "ERROR: Gateway Failure. Request passed to " << name << " exceeds MAX_REDIRECTOR_REQUEST_STRLEN (" << MAX_REDIRECTOR_REQUEST_STRLEN << "). Request ABORTED.");
+         }
+ 
+         clientStreamNode *node = (clientStreamNode *)http->client_stream.tail->prev->data;
+@@ -290,14 +312,63 @@ redirectStart(ClientHttpRequest * http, HLPCB * handler, void *data)
+         return;
+     }
+ 
+-    debugs(61,6, HERE << "sending '" << buf << "' to the helper");
+-    helperSubmit(redirectors, buf, redirectHandleReply, r);
++    debugs(61,6, HERE << "sending '" << buf << "' to the " << name << " helper");
++    helperSubmit(hlp, buf, replyHandler, r);
++}
++
++/**** PUBLIC FUNCTIONS ****/
++
++void
++redirectStart(ClientHttpRequest * http, HLPCB * handler, void *data)
++{
++    assert(http);
++    assert(handler);
++    debugs(61, 5, "redirectStart: '" << http->uri << "'");
++
++    if (Config.onoff.redirector_bypass && redirectors->stats.queue_size) {
++        /* Skip redirector if there is one request queued */
++        ++redirectorBypassed;
++        HelperReply bypassReply;
++        bypassReply.result = HelperReply::Okay;
++        bypassReply.notes.add("message","URL rewrite/redirect queue too long. Bypassed.");
++        handler(data, bypassReply);
++        return;
++    }
++
++    constructHelperQuery("redirector", redirectors, redirectHandleReply, http, handler, data);
++}
++
++/**
++ * Handles the StoreID feature helper starting.
++ * For now it cannot be done using the redirectStart method.
++ */
++void
++storeIdStart(ClientHttpRequest * http, HLPCB * handler, void *data)
++{
++    assert(http);
++    assert(handler);
++    debugs(61, 5, "storeIdStart: '" << http->uri << "'");
++
++    if (Config.onoff.store_id_bypass && storeIds->stats.queue_size) {
++        /* Skip StoreID Helper if there is one request queued */
++        ++storeIdBypassed;
++        HelperReply bypassReply;
++
++        bypassReply.result = HelperReply::Okay;
++
++        bypassReply.notes.add("message","StoreId helper queue too long. Bypassed.");
++        handler(data, bypassReply);
++        return;
++    }
++
++    constructHelperQuery("storeId helper", storeIds, storeIdHandleReply, http, handler, data);
+ }
+ 
+ static void
+ redirectRegisterWithCacheManager(void)
+ {
+     Mgr::RegisterAction("redirector", "URL Redirector Stats", redirectStats, 0, 1);
++    Mgr::RegisterAction("store_id", "StoreId helper Stats", storeIdStats, 0, 1); /* registering the new StoreID statistics in Mgr*/
+ }
+ 
+ void
+@@ -307,19 +378,40 @@ redirectInit(void)
+ 
+     redirectRegisterWithCacheManager();
+ 
+-    if (!Config.Program.redirect)
++    /** FIXME: Temporary unified helpers startup
++     * When and if needed for more helpers a separated startup
++     * method will be added for each of them.
++     */
++    if (!Config.Program.redirect && !Config.Program.store_id)
+         return;
+ 
+-    if (redirectors == NULL)
+-        redirectors = new helper("redirector");
++    if (Config.Program.redirect) {
+ 
+-    redirectors->cmdline = Config.Program.redirect;
++        if (redirectors == NULL)
++            redirectors = new helper("redirector");
+ 
+-    redirectors->childs.updateLimits(Config.redirectChildren);
++        redirectors->cmdline = Config.Program.redirect;
+ 
+-    redirectors->ipc_type = IPC_STREAM;
++        redirectors->childs.updateLimits(Config.redirectChildren);
+ 
+-    helperOpenServers(redirectors);
++        redirectors->ipc_type = IPC_STREAM;
++
++        helperOpenServers(redirectors);
++    }
++
++    if (Config.Program.store_id) {
++
++        if (storeIds == NULL)
++            storeIds = new helper("store_id");
++
++        storeIds->cmdline = Config.Program.store_id;
++
++        storeIds->childs.updateLimits(Config.storeIdChildren);
++
++        storeIds->ipc_type = IPC_STREAM;
++
++        helperOpenServers(storeIds);
++    }
+ 
+     if (!init) {
+         init = 1;
+@@ -330,14 +422,26 @@ redirectInit(void)
+ void
+ redirectShutdown(void)
+ {
+-    if (!redirectors)
++    /** FIXME: Temporary unified helpers Shutdown
++     * When and if needed for more helpers a separated shutdown
++     * method will be added for each of them.
++     */
++    if (!storeIds && !redirectors)
+         return;
+ 
+-    helperShutdown(redirectors);
++    if (redirectors)
++        helperShutdown(redirectors);
++
++    if (storeIds)
++        helperShutdown(storeIds);
+ 
+     if (!shutting_down)
+         return;
+ 
+     delete redirectors;
+     redirectors = NULL;
++
++    delete storeIds;
++    storeIds = NULL;
++
+ }
+@@ -40,5 +40,6 @@ class ClientHttpRequest;
+ void redirectInit(void);
+ void redirectShutdown(void);
+ void redirectStart(ClientHttpRequest *, HLPCB *, void *);
++void storeIdStart(ClientHttpRequest *, HLPCB *, void *);
+ 
+ #endif /* SQUID_REDIRECT_H_ */
+@@ -1694,6 +1694,8 @@ StoreEntry::url() const
+ void
+ StoreEntry::createMemObject(const char *aUrl, const char *aLogUrl)
+ {
++    debugs(20, 3, "A mem_obj create attempted using : " << aUrl);
++
+     if (mem_obj)
+         return;
+ 
+@@ -106,7 +106,7 @@ storeKeyPrivate(const char *url, const HttpRequestMethod& method, int id)
+     static cache_key digest[SQUID_MD5_DIGEST_LENGTH];
+     SquidMD5_CTX M;
+     assert(id > 0);
+-    debugs(20, 3, "storeKeyPrivate: " << RequestMethodStr(method) << " " << url);
++    debugs(20, 3, "storeKeyPrivate: " << method << " " << url);
+     SquidMD5Init(&M);
+     SquidMD5Update(&M, (unsigned char *) &id, sizeof(id));
+     SquidMD5Update(&M, (unsigned char *) &method, sizeof(method));
+@@ -125,6 +125,7 @@ storeKeyPublic(const char *url, const HttpRequestMethod& method)
+     SquidMD5Update(&M, &m, sizeof(m));
+     SquidMD5Update(&M, (unsigned char *) url, strlen(url));
+     SquidMD5Final(digest, &M);
++    debugs(20, 3, "created public key: " << digest << " for: " << method << ' ' << url);
+     return digest;
+ }
+ 
+@@ -139,16 +140,18 @@ storeKeyPublicByRequestMethod(HttpRequest * request, const HttpRequestMethod& me
+ {
+     static cache_key digest[SQUID_MD5_DIGEST_LENGTH];
+     unsigned char m = (unsigned char) method.id();
+-    const char *url = urlCanonical(request);
++    const char *url = request->storeId(); /* storeId returns the right storeID\canonical URL for the md5 calc */
+     SquidMD5_CTX M;
+     SquidMD5Init(&M);
+     SquidMD5Update(&M, &m, sizeof(m));
+     SquidMD5Update(&M, (unsigned char *) url, strlen(url));
+ 
+-    if (request->vary_headers)
++    if (request->vary_headers) {
+         SquidMD5Update(&M, (unsigned char *) request->vary_headers, strlen(request->vary_headers));
+-
++        debugs(20, 3, "updating public key by vary headers: " << request->vary_headers << " for: " << url);
++    }
+     SquidMD5Final(digest, &M);
++    debugs(20, 3, "created public key: " << digest << " for: " << method << ' ' << url);
+ 
+     return digest;
+ }
+@@ -67,8 +67,15 @@ storeSwapMetaBuild(StoreEntry * e)
+     assert(e->mem_obj != NULL);
+     const int64_t objsize = e->mem_obj->expectedReplySize();
+     assert(e->swap_status == SWAPOUT_WRITING);
+-    url = e->url();
+-    debugs(20, 3, "storeSwapMetaBuild: " << url  );
++
++    // e->mem_obj->request may be nil in this context
++    if (e->mem_obj->request)
++        url = e->mem_obj->request->storeId();
++    else
++        url = e->url();
++
++    debugs(20, 3, "storeSwapMetaBuild URL: " << url);
++
+     tlv *t = StoreMeta::Factory (STORE_META_KEY,SQUID_MD5_DIGEST_LENGTH, e->key);
+ 
+     if (!t) {

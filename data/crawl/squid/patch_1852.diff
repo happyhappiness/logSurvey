@@ -1,0 +1,694 @@
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: client_side.cc,v 1.103 1997/05/15 06:55:44 wessels Exp $
++ * $Id: client_side.cc,v 1.104 1997/05/22 15:51:50 wessels Exp $
+  *
+  * DEBUG: section 33    Client-side Routines
+  * AUTHOR: Duane Wessels
+@@ -353,7 +353,12 @@ icpProcessExpired(int fd, void *data)
+     http->out.offset = 0;
+     protoDispatch(fd, http->entry, http->request);
+     /* Register with storage manager to receive updates when data comes in. */
+-    storeRegister(entry, icpHandleIMSReply, http, http->out.offset);
++    storeClientCopy(entry,
++	http->out.offset,
++	4096,
++	get_free_4k_page(),
++	icpHandleIMSReply,
++	http);
+ }
+ 
+ static int
+@@ -384,13 +389,12 @@ clientGetsOldEntry(StoreEntry * new_entry, StoreEntry * old_entry, request_t * r
+ 
+ 
+ static void
+-icpHandleIMSReply(void *data)
++icpHandleIMSReply(void *data, char *buf, size_t size)
+ {
+     clientHttpRequest *http = data;
+     int fd = http->conn->fd;
+     StoreEntry *entry = http->entry;
+     MemObject *mem = entry->mem_obj;
+-    char *hbuf;
+     int len;
+     int unlink_request = 0;
+     StoreEntry *oldentry;
+@@ -409,39 +413,29 @@ icpHandleIMSReply(void *data)
+     } else if (mem->reply->code == 0) {
+ 	debug(33, 3, "icpHandleIMSReply: Incomplete headers for '%s'\n",
+ 	    entry->url);
+-	storeRegister(entry, icpHandleIMSReply, http, http->out.offset);
++	storeClientCopy(entry,
++	    http->out.offset,
++	    4096,
++	    get_free_4k_page(),
++	    icpHandleIMSReply,
++	    http);
+ 	return;
+     } else if (clientGetsOldEntry(entry, http->old_entry, http->request)) {
+ 	/* We initiated the IMS request, the client is not expecting
+ 	 * 304, so put the good one back.  First, make sure the old entry
+ 	 * headers have been loaded from disk. */
+ 	oldentry = http->old_entry;
+-	if (oldentry->mem_obj->e_current_len == 0) {
+-	    storeRegister(entry, icpHandleIMSReply, http, http->out.offset);
+-	    return;
+-	}
+ 	http->log_type = LOG_TCP_REFRESH_HIT;
+-	hbuf = get_free_8k_page();
+-	if (storeClientCopy(oldentry, 0, 8191, hbuf, &len, http) < 0) {
+-	    debug(33, 1, "icpHandleIMSReply: Couldn't copy old entry\n");
+-	} else {
+-	    if (oldentry->mem_obj->request == NULL) {
+-		oldentry->mem_obj->request = requestLink(mem->request);
+-		unlink_request = 1;
+-	    }
++	if (oldentry->mem_obj->request == NULL) {
++	    oldentry->mem_obj->request = requestLink(mem->request);
++	    unlink_request = 1;
+ 	}
++	memcpy(oldentry->mem_obj->reply, entry->mem_obj->reply, sizeof(struct _http_reply));
++	storeTimestampsSet(oldentry);
+ 	storeUnregister(entry, http);
+ 	storeUnlockObject(entry);
+ 	entry = http->entry = oldentry;
+-	if (mime_headers_end(hbuf)) {
+-	    httpParseReplyHeaders(hbuf, entry->mem_obj->reply);
+-	    storeTimestampsSet(entry);
+-	} else {
+-	    debug(33, 1, "icpHandleIMSReply: No end-of-headers, len=%d\n", len);
+-	    debug(33, 1, "  --> '%s'\n", entry->url);
+-	}
+ 	entry->timestamp = squid_curtime;
+-	put_free_8k_page(hbuf);
+ 	if (unlink_request) {
+ 	    requestUnlink(entry->mem_obj->request);
+ 	    entry->mem_obj->request = NULL;
+@@ -456,9 +450,20 @@ icpHandleIMSReply(void *data)
+ 	}
+ 	storeUnregister(http->old_entry, http);
+ 	storeUnlockObject(http->old_entry);
++#if DONT_USE_VM
++	file_close(http->swapin_fd);
++	http->swapin_fd = storeOpenSwapFileRead(entry);
++	if (http->swapin_fd < 0)
++	    fatal_dump("icpHandleIMSReply: storeOpenSwapFileRead() failed\n");
++#endif
+     }
+     http->old_entry = NULL;	/* done with old_entry */
+-    storeRegister(http->entry, icpHandleStore, http, http->out.offset);
++    storeClientCopy(entry,
++	http->out.offset,
++	4096,
++	get_free_4k_page(),
++	icpSendMoreData,
++	http);
+ }
+ 
+ int
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: comm.cc,v 1.153 1997/05/16 07:42:49 wessels Exp $
++ * $Id: comm.cc,v 1.154 1997/05/22 15:51:51 wessels Exp $
+  *
+  * DEBUG: section 5     Socket Functions
+  * AUTHOR: Harvest Derived
+@@ -760,7 +760,6 @@ comm_poll(time_t sec)
+     unsigned long nfds;
+     int num;
+     static time_t last_timeout = 0;
+-    static time_t pending_time;
+     int poll_time;
+     static int incoming_counter = 0;
+     time_t timeout;
+@@ -805,23 +804,6 @@ comm_poll(time_t sec)
+ 	}
+ 	if (shutdown_pending || reconfigure_pending)
+ 	    debug(5, 2, "comm_poll: Still waiting on %d FDs\n", nfds);
+-#ifdef WTFISTHIS
+-	if (pending_time == 0)
+-	    pending_time = squid_curtime;
+-	if ((squid_curtime - pending_time) > (Config.shutdownLifetime + 5)) {
+-	    pending_time = 0;
+-	    for (i = 1; i < maxfd; i++) {
+-		if ((fd = pfds[i].fd) < 0)
+-		    continue;
+-		if (fd_table[fd].type == FD_FILE)
+-		    file_must_close(fd);
+-		else
+-		    comm_close(fd);
+-		pfds[fd].fd = -1;
+-	    }
+-	}
+-#endif
+-	pending_time = 0;
+ 	if (nfds == 0)
+ 	    return COMM_SHUTDOWN;
+ 	poll_time = sec > 0 ? 100 : 0;
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: disk.cc,v 1.69 1997/05/15 23:35:59 wessels Exp $
++ * $Id: disk.cc,v 1.70 1997/05/22 15:51:51 wessels Exp $
+  *
+  * DEBUG: section 6     Disk I/O Routines
+  * AUTHOR: Harvest Derived
+@@ -201,36 +201,6 @@ file_open_complete(void *data, int fd, int errcode)
+     xfree(ctrlp);
+ }
+ 
+-/* must close a disk file */
+-
+-void
+-file_must_close(int fd)
+-{
+-    dwrite_q *q = NULL;
+-    FD_ENTRY *fde = &fd_table[fd];
+-    if (fde->type != FD_FILE)
+-	fatal_dump("file_must_close: type != FD_FILE");
+-    if (!fde->open)
+-	fatal_dump("file_must_close: FD not opened");
+-    BIT_SET(fde->flags, FD_CLOSE_REQUEST);
+-    BIT_RESET(fde->flags, FD_WRITE_DAEMON);
+-    BIT_RESET(fde->flags, FD_WRITE_PENDING);
+-    /* Drain queue */
+-    while (fde->disk.write_q) {
+-	q = fde->disk.write_q;
+-	fde->disk.write_q = q->next;
+-	if (q->free)
+-	    (q->free) (q->buf);
+-	safe_free(q);
+-    }
+-    fde->disk.write_q_tail = NULL;
+-    if (fde->disk.wrt_handle)
+-	fde->disk.wrt_handle(fd, DISK_ERROR, fde->disk.wrt_handle_data);
+-    commSetSelect(fd, COMM_SELECT_READ, NULL, NULL, 0);
+-    commSetSelect(fd, COMM_SELECT_WRITE, NULL, NULL, 0);
+-    file_close(fd);
+-}
+-
+ /* close a disk file. */
+ void
+ file_close(int fd)
+@@ -363,7 +333,7 @@ diskHandleWriteComplete(void *data, int len, int errcode)
+ 	BIT_SET(fde->flags, FD_WRITE_DAEMON);
+     }
+     if (fdd->wrt_handle)
+-	fdd->wrt_handle(fd, status, fdd->wrt_handle_data);
++	fdd->wrt_handle(fd, status, len, fdd->wrt_handle_data);
+     if (BIT_TEST(fde->flags, FD_CLOSE_REQUEST))
+ 	file_close(fd);
+ }
+@@ -376,7 +346,7 @@ int
+ file_write(int fd,
+     char *ptr_to_buf,
+     int len,
+-    FILE_WRITE_HD handle,
++    DWCB handle,
+     void *handle_data,
+     FREE * free_func)
+ {
+@@ -513,7 +483,7 @@ diskHandleReadComplete(void *data, int len, int errcode)
+  * It must have at least req_len space in there. 
+  * call handler when a reading is complete. */
+ int
+-file_read(int fd, char *buf, int req_len, int offset, FILE_READ_HD * handler, void *client_data)
++file_read(int fd, char *buf, int req_len, int offset, DRCB * handler, void *client_data)
+ {
+     dread_ctrl *ctrl_dat;
+     if (fd < 0)
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: ftp.cc,v 1.107 1997/05/15 23:37:58 wessels Exp $
++ * $Id: ftp.cc,v 1.108 1997/05/22 15:51:53 wessels Exp $
+  *
+  * DEBUG: section 9     File Transfer Protocol (FTP)
+  * AUTHOR: Harvest Derived
+@@ -274,9 +274,8 @@ ftpReadReply(int fd, void *data)
+     StoreEntry *entry = NULL;
+ 
+     entry = ftpState->entry;
+-    if (entry->flag & DELETE_BEHIND && !storeClientWaiting(entry)) {
+-	/* we can terminate connection right now */
+-	squid_error_entry(entry, ERR_NO_CLIENTS_BIG_OBJ, NULL);
++    if (protoAbortFetch(entry)) { 
++	squid_error_entry(entry, ERR_CLIENT_ABORT, NULL);
+ 	comm_close(fd);
+ 	return;
+     }
+@@ -349,14 +348,12 @@ ftpReadReply(int fd, void *data)
+ 	    storeNegativeCache(entry);
+ 	    BIT_RESET(entry->flag, ENTRY_CACHABLE);
+ 	    storeReleaseRequest(entry);
+-	} else if (!(entry->flag & DELETE_BEHIND)) {
++	} else {
+ 	    storeTimestampsSet(entry);
+ 	}
+ 	storeComplete(entry);
+ 	comm_close(fd);
+     } else if (entry->flag & CLIENT_ABORT_REQUEST) {
+-	/* append the last bit of info we get */
+-	storeAppend(entry, buf, len);
+ 	squid_error_entry(entry, ERR_CLIENT_ABORT, NULL);
+ 	comm_close(fd);
+     } else {
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: gopher.cc,v 1.80 1997/05/15 23:38:00 wessels Exp $
++ * $Id: gopher.cc,v 1.81 1997/05/22 15:51:54 wessels Exp $
+  *
+  * DEBUG: section 10    Gopher
+  * AUTHOR: Harvest Derived
+@@ -660,9 +660,8 @@ gopherReadReply(int fd, void *data)
+     int bin;
+ 
+     entry = gopherState->entry;
+-    if (entry->flag & DELETE_BEHIND && !storeClientWaiting(entry)) {
+-	/* we can terminate connection right now */
+-	squid_error_entry(entry, ERR_NO_CLIENTS_BIG_OBJ, NULL);
++    if (protoAbortFetch(entry)) {
++	squid_error_entry(entry, ERR_CLIENT_ABORT, NULL);
+ 	comm_close(fd);
+ 	return;
+     }
+@@ -734,18 +733,11 @@ gopherReadReply(int fd, void *data)
+ 	/* flush the rest of data in temp buf if there is one. */
+ 	if (gopherState->conversion != NORMAL)
+ 	    gopherEndHTML(data);
+-	if (!(entry->flag & DELETE_BEHIND))
+-	    storeTimestampsSet(entry);
++	storeTimestampsSet(entry);
+ 	BIT_RESET(entry->flag, DELAY_SENDING);
+ 	storeComplete(entry);
+ 	comm_close(fd);
+     } else if (entry->flag & CLIENT_ABORT_REQUEST) {
+-	/* append the last bit of info we got */
+-	if (gopherState->conversion != NORMAL) {
+-	    gopherToHTML(data, buf, len);
+-	} else {
+-	    storeAppend(entry, buf, len);
+-	}
+ 	squid_error_entry(entry, ERR_CLIENT_ABORT, NULL);
+ 	if (gopherState->conversion != NORMAL)
+ 	    gopherEndHTML(data);
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: http.cc,v 1.161 1997/05/15 23:38:01 wessels Exp $
++ * $Id: http.cc,v 1.162 1997/05/22 15:51:54 wessels Exp $
+  *
+  * DEBUG: section 11    Hypertext Transfer Protocol (HTTP)
+  * AUTHOR: Harvest Derived
+@@ -531,9 +531,8 @@ httpReadReply(int fd, void *data)
+     StoreEntry *entry = NULL;
+ 
+     entry = httpState->entry;
+-    if (entry->flag & DELETE_BEHIND && !storeClientWaiting(entry)) {
+-	/* we can terminate connection right now */
+-	squid_error_entry(entry, ERR_NO_CLIENTS_BIG_OBJ, NULL);
++    if (protoAbortFetch(entry)) {
++	squid_error_entry(entry, ERR_CLIENT_ABORT, NULL);
+ 	comm_close(fd);
+ 	return;
+     }
+@@ -607,8 +606,6 @@ httpReadReply(int fd, void *data)
+ 	storeComplete(entry);	/* deallocates mem_obj->request */
+ 	comm_close(fd);
+     } else if (entry->flag & CLIENT_ABORT_REQUEST) {
+-	/* append the last bit of info we get */
+-	storeAppend(entry, buf, len);
+ 	squid_error_entry(entry, ERR_CLIENT_ABORT, NULL);
+ 	comm_close(fd);
+     } else {
+@@ -847,7 +844,11 @@ proxyhttpStart(request_t * orig_request,
+     debug(11, 10, "proxyhttpStart: HTTP request header:\n%s\n",
+ 	entry->mem_obj->mime_hdr);
+     if (e->options & NEIGHBOR_PROXY_ONLY)
++#if DONT_USE_VM
++	storeReleaseRequest(entry);
++#else
+ 	storeStartDeleteBehind(entry);
++#endif
+     /* Create socket. */
+     fd = comm_open(SOCK_STREAM,
+ 	0,
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: squid.h,v 1.115 1997/05/16 07:43:08 wessels Exp $
++ * $Id: squid.h,v 1.116 1997/05/22 15:51:59 wessels Exp $
+  *
+  * AUTHOR: Duane Wessels
+  *
+@@ -268,7 +268,7 @@ typedef unsigned long u_num32;
+ 
+ typedef void SIH _PARAMS((void *, int));	/* swap in */
+ typedef int QS _PARAMS((const void *, const void *));	/* qsort */
+-typedef void STCB _PARAMS((void *));	/* store callback */
++typedef void STCB _PARAMS((void *, char *, size_t));	/* store callback */
+ 
+ #include "cache_cf.h"
+ #include "fd.h"
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: stmem.cc,v 1.38 1997/02/26 19:46:23 wessels Exp $
++ * $Id: stmem.cc,v 1.39 1997/05/22 15:51:59 wessels Exp $
+  *
+  * DEBUG: section 19    Memory Primitives
+  * AUTHOR: Harvest Derived
+@@ -117,16 +117,11 @@ stmem_stats mem_obj_pool;
+ #define USE_MEMALIGN 0
+ #endif
+ 
+-static int memFreeDataUpto _PARAMS((mem_ptr, int));
+-static int memAppend _PARAMS((mem_ptr, const char *, int));
+-static int memCopy _PARAMS((const mem_ptr, int, char *, int));
+ static void *get_free_thing _PARAMS((stmem_stats *));
+ static void put_free_thing _PARAMS((stmem_stats *, void *));
+ static void stmemFreeThingMemory _PARAMS((stmem_stats *));
+-static void memFree _PARAMS((mem_ptr));
+-static void memFreeData _PARAMS((mem_ptr));
+ 
+-static void
++void
+ memFree(mem_ptr mem)
+ {
+     mem_node lastp, p = mem->head;
+@@ -150,7 +145,7 @@ memFree(mem_ptr mem)
+     safe_free(mem);
+ }
+ 
+-static void
++void
+ memFreeData(mem_ptr mem)
+ {
+     mem_node lastp, p = mem->head;
+@@ -171,7 +166,7 @@ memFreeData(mem_ptr mem)
+     mem->origin_offset = 0;
+ }
+ 
+-static int
++int
+ memFreeDataUpto(mem_ptr mem, int target_offset)
+ {
+     int current_offset = mem->origin_offset;
+@@ -208,7 +203,7 @@ memFreeDataUpto(mem_ptr mem, int target_offset)
+ 
+ 
+ /* Append incoming data. */
+-static int
++int
+ memAppend(mem_ptr mem, const char *data, int len)
+ {
+     mem_node p;
+@@ -252,48 +247,34 @@ memAppend(mem_ptr mem, const char *data, int len)
+     return len;
+ }
+ 
+-static int
+-memCopy(const mem_ptr mem, int offset, char *buf, int size)
++size_t
++memCopy(const mem_ptr mem, off_t offset, char *buf, size_t size)
+ {
+     mem_node p = mem->head;
+-    int t_off = mem->origin_offset;
+-    int bytes_to_go = size;
++    off_t t_off = mem->origin_offset;
++    size_t bytes_to_go = size;
+     char *ptr_to_buf = NULL;
+     int bytes_from_this_packet = 0;
+     int bytes_into_this_packet = 0;
+-
+     debug(19, 6, "memCopy: offset %d: size %d\n", offset, size);
+-
+     if (p == NULL)
+ 	return -1;
+     /*      fatal_dump("memCopy: NULL mem_node"); *//* Can happen on async */
+-
+-    if (size <= 0)
+-	return size;
+-
++    assert (size > 0);
+     /* Seek our way into store */
+     while ((t_off + p->len) < offset) {
+ 	t_off += p->len;
+-	if (p->next)
+-	    p = p->next;
+-	else {
+-	    debug(19, 1, "memCopy: Offset: %d is off limit of current object of %d\n", t_off, offset);
+-	    return 0;
+-	}
++	assert(p->next);
++	p = p->next;
+     }
+-
+     /* Start copying begining with this block until
+      * we're satiated */
+-
+     bytes_into_this_packet = offset - t_off;
+-    bytes_from_this_packet = min(bytes_to_go,
+-	p->len - bytes_into_this_packet);
+-
++    bytes_from_this_packet = min(bytes_to_go, p->len - bytes_into_this_packet);
+     xmemcpy(buf, p->data + bytes_into_this_packet, bytes_from_this_packet);
+     bytes_to_go -= bytes_from_this_packet;
+     ptr_to_buf = buf + bytes_from_this_packet;
+     p = p->next;
+-
+     while (p && bytes_to_go > 0) {
+ 	if (bytes_to_go > p->len) {
+ 	    xmemcpy(ptr_to_buf, p->data, p->len);
+@@ -305,8 +286,7 @@ memCopy(const mem_ptr mem, int offset, char *buf, int size)
+ 	}
+ 	p = p->next;
+     }
+-
+-    return size;
++    return size - bytes_to_go;
+ }
+ 
+ 
+@@ -316,11 +296,6 @@ memInit(void)
+ {
+     mem_ptr new = xcalloc(1, sizeof(Mem_Hdr));
+     new->tail = new->head = NULL;
+-    new->mem_free = memFree;
+-    new->mem_free_data = memFreeData;
+-    new->mem_free_data_upto = memFreeDataUpto;
+-    new->mem_append = memAppend;
+-    new->mem_copy = memCopy;
+     return new;
+ }
+ 
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: store.cc,v 1.236 1997/05/16 07:44:57 wessels Exp $
++ * $Id: store.cc,v 1.237 1997/05/22 15:52:00 wessels Exp $
+  *
+  * DEBUG: section 20    Storeage Manager
+  * AUTHOR: Harvest Derived
+@@ -259,7 +259,7 @@ static int storeEntryValidLength _PARAMS((const StoreEntry *));
+ static void storeGetMemSpace _PARAMS((int));
+ static int storeHashDelete _PARAMS((StoreEntry *));
+ static int storeShouldPurgeMem _PARAMS((const StoreEntry *));
+-static FILE_READ_HD storeSwapInHandle;
++static DRCB storeSwapInHandle;
+ static void storeSwapInValidateComplete _PARAMS((void *, int));
+ static void storeSwapInStartComplete _PARAMS((void *, int));
+ static int swapInError _PARAMS((int, StoreEntry *));
+@@ -284,7 +284,7 @@ static void storeSetMemStatus _PARAMS((StoreEntry *, mem_status_t));
+ static void storeStartRebuildFromDisk _PARAMS((void));
+ static void storeSwapOutStart _PARAMS((StoreEntry * e));
+ static void storeSwapOutStartComplete _PARAMS((void *, int));
+-static FILE_WRITE_HD storeSwapOutHandle;
++static DWCB storeSwapOutHandle;
+ static void storeHashMemInsert _PARAMS((StoreEntry *));
+ static void storeHashMemDelete _PARAMS((StoreEntry *));
+ static void storeSetPrivateKey _PARAMS((StoreEntry *));
+@@ -413,7 +413,7 @@ destroy_MemObjectData(MemObject * mem)
+ 	mem->data, mem->e_current_len);
+     store_mem_size -= ENTRY_INMEM_SIZE(mem);
+     if (mem->data) {
+-	mem->data->mem_free(mem->data);
++	memFreeData(mem->data);
+ 	mem->data = NULL;
+ 	meta_data.mem_data_count--;
+     }
+@@ -839,6 +839,7 @@ storeAddDiskRestore(const char *url, int file_number, int size, time_t expires,
+     return e;
+ }
+ 
++#if OLD_CODE
+ /* Register interest in an object currently being retrieved. */
+ void
+ storeRegister(StoreEntry * e, STCB * callback, void *data, off_t offset)
+@@ -861,6 +862,7 @@ storeRegister(StoreEntry * e, STCB * callback, void *data, off_t offset)
+ 	callback(data);
+     }
+ }
++#endif
+ 
+ int
+ storeUnregister(StoreEntry * e, void *data)
+@@ -907,7 +909,7 @@ storeDeleteBehind(StoreEntry * e)
+     int target_offset = storeGetLowestReaderOffset(e);
+     if (target_offset == 0)
+ 	return;
+-    new_lowest_offset = (int) mem->data->mem_free_data_upto(mem->data,
++    new_lowest_offset = (int) memFreeDataUpto(mem->data,
+ 	target_offset);
+     store_mem_size -= new_lowest_offset - old_lowest_offset;
+     mem->e_lowest_offset = new_lowest_offset;
+@@ -919,24 +921,27 @@ InvokeHandlers(StoreEntry * e)
+ {
+     int i;
+     MemObject *mem = e->mem_obj;
+-    STCB *handler = NULL;
+-    void *data = NULL;
++    STCB *callback = NULL;
+     struct _store_client *sc;
++    size_t size;
+     if (mem->clients == NULL && mem->nclients) {
+ 	debug_trap("InvokeHandlers: NULL mem->clients");
+ 	return;
+     }
+-    /* walk the entire list looking for valid handlers */
++    /* walk the entire list looking for valid callbacks */
+     for (i = 0; i < mem->nclients; i++) {
+ 	sc = &mem->clients[i];
+ 	if (sc->callback_data == NULL)
+ 	    continue;
+-	if ((handler = sc->callback) == NULL)
++	if ((callback = sc->callback) == NULL)
+ 	    continue;
+-	data = sc->callback_data;
+ 	sc->callback = NULL;
+ 	/* Don't NULL the callback_data, its used to identify the client */
+-	handler(data);
++	size = memCopy(mem->data,
++	    sc->offset,
++	    sc->copy_buf,
++	    sc->copy_size);
++	callback(sc->callback_data, sc->copy_buf, size);
+     }
+ }
+ 
+@@ -989,7 +994,7 @@ storeAppend(StoreEntry * e, const char *data, int len)
+ 		storeStartDeleteBehind(e);
+ 	}
+ 	store_mem_size += len;
+-	(void) mem->data->mem_append(mem->data, data, len);
++	(void) memAppend(mem->data, data, len);
+ 	mem->e_current_len += len;
+     }
+     if (e->store_status != STORE_ABORTED && !BIT_TEST(e->flag, DELAY_SENDING))
+@@ -1166,7 +1171,7 @@ storeSwapInStartComplete(void *data, int fd)
+ }
+ 
+ static void
+-storeSwapOutHandle(int fd, int flag, void *data)
++storeSwapOutHandle(int fd, int flag, size_t len, void *data)
+ {
+     StoreEntry *e = data;
+     MemObject *mem = e->mem_obj;
+@@ -1512,7 +1517,7 @@ storeCleanup(void *data)
+ 	debug(20, 1, "  %7d Entries Validated so far.\n", validnum);
+     if (!BIT_TEST(e->flag, ENTRY_VALIDATED)) {
+ 	storeValidate(e, storeCleanupComplete, e);
+-        validnum++;
++	validnum++;
+     }
+     xfree(curr->key);
+     xfree(curr);
+@@ -2136,21 +2141,10 @@ storeEntryLocked(const StoreEntry * e)
+ static int
+ storeCopy(const StoreEntry * e, int stateoffset, int maxSize, char *buf, int *size)
+ {
+-    int available;
+     MemObject *mem = e->mem_obj;
+-    int s;
+-    if (stateoffset < mem->e_lowest_offset) {
+-	debug_trap("storeCopy: requested offset < e_lowest_offset");
+-	return *size = 0;
+-    }
+-    s = available = mem->e_current_len - stateoffset;
+-    if (s < 0)
+-	fatal_dump("storeCopy: offset > e_current_len");
+-    if (s > maxSize)
+-	s = maxSize;
+-    debug(20, 6, "storeCopy: copying %d bytes at offset %d\n", s, stateoffset);
+-    if (s > 0)
+-	(void) mem->data->mem_copy(mem->data, stateoffset, buf, s);
++    size_t s;
++    assert(stateoffset >= mem->e_lowest_offset);
++    s = memCopy(mem->data, stateoffset, buf, maxSize);
+     return *size = s;
+ }
+ 
+@@ -2221,43 +2215,39 @@ storeClientListAdd(StoreEntry * e, void *data, int offset)
+ 
+ /* same to storeCopy but also register client fd and last requested offset
+  * for each client */
+-int
++void
+ storeClientCopy(StoreEntry * e,
+-    int stateoffset,
+-    int maxSize,
++    off_t offset,
++    size_t size,
+     char *buf,
+-    int *size,
++    STCB * callback,
+     void *data)
+ {
+     int ci;
+-    int sz;
++    size_t sz;
+     MemObject *mem = e->mem_obj;
+-    int available_to_write = mem->e_current_len - stateoffset;
+-    if (stateoffset < mem->e_lowest_offset) {
++    if (offset < mem->e_lowest_offset) {
+ 	debug_trap("storeClientCopy: requested offset < lowest offset");
+ 	debug(20, 0, " --> %d < %d\n",
+-	    stateoffset, mem->e_lowest_offset);
++	    offset, mem->e_lowest_offset);
+ 	debug(20, 0, "--> '%s'\n", e->url);
+-	*size = 0;
+-	return 0;
++	return;
+     }
+-    if ((ci = storeClientListSearch(mem, data)) < 0) {
+-	debug_trap("storeClientCopy: Unregistered client");
+-	debug(20, 0, "--> '%s'\n", e->url);
+-	*size = 0;
+-	return 0;
++    if ((ci = storeClientListSearch(mem, data)) < 0)
++	fatal_dump("storeClientCopy: Unregistered client");
++    mem->clients[ci].offset = offset;
++    if (offset >= mem->e_current_len) {
++	mem->clients[ci].callback = callback;
++	mem->clients[ci].copy_buf = buf;
++	mem->clients[ci].copy_size = size;
++	return;
+     }
+-    sz = (available_to_write >= maxSize) ? maxSize : available_to_write;
+-    /* update the lowest requested offset */
+-    mem->clients[ci].offset = stateoffset + sz;
+-    if (sz > 0)
+-	if (mem->data->mem_copy(mem->data, stateoffset, buf, sz) < 0)
+-	    return -1;
++    sz = memCopy(mem->data, offset, buf, size);
++debug(0,0,"storeClientCopy: size=%d\n", sz);
++    callback(data, buf, sz);
+     /* see if we can get rid of some data if we are in "delete behind" mode . */
+     if (BIT_TEST(e->flag, DELETE_BEHIND))
+ 	storeDeleteBehind(e);
+-    *size = sz;
+-    return sz;
+ }
+ 
+ static int

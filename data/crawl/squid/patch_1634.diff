@@ -1,0 +1,598 @@
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: dnsserver.cc,v 1.46 1998/02/18 00:34:37 wessels Exp $
++ * $Id: dnsserver.cc,v 1.47 1998/04/03 06:27:04 wessels Exp $
+  *
+  * DEBUG: section 0     DNS Resolver
+  * AUTHOR: Harvest Derived
+@@ -228,7 +228,6 @@ struct hostent *_res_gethostbyname(char *name);
+ #define gethostbyname _res_gethostbyname
+ #endif /* _SQUID_NEXT_ */
+ 
+-static int do_debug = 0;
+ static struct in_addr no_addr;
+ 
+ /* error messages from gethostbyname() */
+@@ -249,20 +248,83 @@ my_h_msgs(int x)
+ 
+ #define REQ_SZ 512
+ 
++static void
++lookup(const char *buf)
++{
++    const struct hostent *result = NULL;
++    int reverse = 0;
++    int ttl = 0;
++    int retry = 0;
++    int i;
++    struct in_addr addr;
++    if (0 == strcmp(buf, "$shutdown"))
++	exit(0);
++    if (0 == strcmp(buf, "$hello")) {
++	printf("$alive\n");
++	return;
++    }
++    /* check if it's already an IP address in text form. */
++    for (;;) {
++	if (safe_inet_addr(buf, &addr)) {
++	    reverse = 1;
++	    result = gethostbyaddr((char *) &addr.s_addr, 4, AF_INET);
++	} else {
++	    result = gethostbyname(buf);
++	}
++	if (NULL != result)
++	    break;
++	if (h_errno != TRY_AGAIN)
++	    break;
++	if (++retry == 3)
++	    break;
++	sleep(1);
++    }
++    if (NULL == result) {
++	if (h_errno == TRY_AGAIN) {
++	    printf("$fail Name Server for domain '%s' is unavailable.\n", buf);
++	} else {
++	    printf("$fail DNS Domain '%s' is invalid: %s.\n",
++		buf, my_h_msgs(h_errno));
++	}
++	return;
++    }
++#if LIBRESOLV_DNS_TTL_HACK
++    /* DNS TTL handling - bne@CareNet.hu
++     * for first try it's a dirty hack, by hacking getanswer
++     * to place the ttl in a global variable */
++    if (_dns_ttl_ > -1)
++	ttl = _dns_ttl_;
++#endif
++    if (reverse) {
++	printf("$name %d %s\n", ttl, result->h_name);
++	return;
++    }
++    printf("$addr %d", ttl);
++    for (i = 0; NULL != result->h_addr_list[i]; i++) {
++	if (32 == i)
++	    break;
++	xmemcpy(&addr, result->h_addr_list[i], sizeof(addr));
++	printf(" %s", inet_ntoa(addr));
++    }
++    printf("\n");
++}
++
++static void
++usage(void)
++{
++    fprintf(stderr, "usage: dnsserver -Dhv -s nameserver\n"
++	"\t-D             Enable resolver RES_DEFNAMES and RES_DNSRCH options\n"
++	"\t-h             Help\n"
++	"\t-v             Version\n"
++	"\t-s nameserver  Specify alternate name server(s).  'nameserver'\n"
++	"\t               must be an IP address, -s option may be repeated\n");
++}
++
+ int
+ main(int argc, char *argv[])
+ {
+     char request[512];
+-    char msg[1024];
+-    const struct hostent *result = NULL;
+-    FILE *logfile = NULL;
+-    long start;
+-    long stop;
+     char *t = NULL;
+-    char buf[256];
+-    int addr_count = 0;
+-    int alias_count = 0;
+-    int i;
+     int c;
+     int opt_s = 0;
+     extern char *optarg;
+@@ -282,7 +344,7 @@ main(int argc, char *argv[])
+ #endif
+ #endif
+ 
+-    while ((c = getopt(argc, argv, "Ddhs:v")) != -1) {
++    while ((c = getopt(argc, argv, "Dhs:v")) != -1) {
+ 	switch (c) {
+ 	case 'D':
+ #ifdef RES_DEFNAMES
+@@ -292,17 +354,6 @@ main(int argc, char *argv[])
+ 	    _res.options |= RES_DNSRCH;
+ #endif
+ 	    break;
+-	case 'd':
+-	    snprintf(buf, 256, "dnsserver.%d.log", (int) getpid());
+-	    logfile = fopen(buf, "a");
+-	    do_debug++;
+-	    if (!logfile)
+-		fprintf(stderr, "Could not open dnsserver's log file\n");
+-	    break;
+-	case 'h':
+-	    fprintf(stderr, "usage: dnsserver -hvd\n");
+-	    exit(1);
+-	    break;
+ 	case 's':
+ 	    if (opt_s == 0) {
+ 		_res.nscount = 0;
+@@ -315,129 +366,26 @@ main(int argc, char *argv[])
+ 	    printf("dnsserver version %s\n", SQUID_VERSION);
+ 	    exit(0);
+ 	    break;
++	case 'h':
+ 	default:
+-	    fprintf(stderr, "usage: dnsserver -hvd\n");
++	    usage();
+ 	    exit(1);
+ 	    break;
+ 	}
+     }
+ 
+     for (;;) {
+-	int retry_count = 0;
+-	struct in_addr ip;
+ 	memset(request, '\0', REQ_SZ);
+-
+-	/* read from ipcache */
+-	if (fgets(request, REQ_SZ, stdin) == NULL) {
++	if (fgets(request, REQ_SZ, stdin) == NULL)
+ 	    exit(1);
+-	}
+ 	t = strrchr(request, '\n');
+ 	if (t == NULL)		/* Ignore if no newline */
+ 	    continue;
+ 	*t = '\0';		/* strip NL */
+ 	if ((t = strrchr(request, '\r')) != NULL)
+ 	    *t = '\0';		/* strip CR */
+-	if (strcmp(request, "$shutdown") == 0) {
+-	    exit(0);
+-	}
+-	if (strcmp(request, "$hello") == 0) {
+-	    printf("$alive\n");
+-	    printf("$end\n");
+-	    fflush(stdout);
+-	    continue;
+-	}
+-	result = NULL;
+-	start = time(NULL);
+-	/* check if it's already an IP address in text form. */
+-	if (safe_inet_addr(request, &ip)) {
+-#if NO_REVERSE_LOOKUP
+-	    printf("$name %s\n", request);
+-	    printf("$h_name %s\n", request);
+-	    printf("$h_len %d\n", 4);
+-	    printf("$ipcount %d\n", 1);
+-	    printf("%s\n", request);
+-	    printf("$aliascount %d\n", 0);
+-	    printf("$end\n");
+-	    fflush(stdout);
+-	    continue;
+-#endif
+-	    for (;;) {
+-		result = gethostbyaddr((char *) &ip.s_addr, 4, AF_INET);
+-		if (result || h_errno != TRY_AGAIN)
+-		    break;
+-		if (++retry_count == 2)
+-		    break;
+-		sleep(2);
+-	    }
+-	} else {
+-	    for (;;) {
+-		result = gethostbyname(request);
+-		if (result || h_errno != TRY_AGAIN)
+-		    break;
+-		if (++retry_count == 2)
+-		    break;
+-		sleep(2);
+-	    }
+-	}
+-	stop = time(NULL);
+-
+-	msg[0] = '\0';
+-	if (!result) {
+-	    if (h_errno == TRY_AGAIN) {
+-		snprintf(msg, 1024, "Name Server for domain '%s' is unavailable.\n",
+-		    request);
+-	    } else {
+-		snprintf(msg, 1024, "DNS Domain '%s' is invalid: %s.\n",
+-		    request, my_h_msgs(h_errno));
+-	    }
+-	}
+-	if (!result || (strlen(result->h_name) == 0)) {
+-	    if (logfile) {
+-		fprintf(logfile, "%s %d\n", request, (int) (stop - start));
+-		fflush(logfile);
+-	    }
+-	    printf("$fail %s\n", request);
+-	    printf("$message %s", msg[0] ? msg : "Unknown Error\n");
+-	    printf("$end\n");
+-	    fflush(stdout);
+-	    continue;
+-	} else {
+-
+-	    printf("$name %s\n", request);
+-	    printf("$h_name %s\n", result->h_name);
+-	    printf("$h_len %d\n", result->h_length);
+-
+-	    addr_count = alias_count = 0;
+-	    while (result->h_addr_list[addr_count] && addr_count < 255)
+-		++addr_count;
+-	    printf("$ipcount %d\n", addr_count);
+-	    for (i = 0; i < addr_count; i++) {
+-		struct in_addr addr;
+-		xmemcpy((char *) &addr, result->h_addr_list[i], result->h_length);
+-		printf("%s\n", inet_ntoa(addr));
+-	    }
+-
+-#ifdef SEND_ALIASES
+-	    while ((alias_count < 255) && result->h_aliases[alias_count])
+-		++alias_count;
+-#endif
+-	    printf("$aliascount %d\n", alias_count);
+-	    for (i = 0; i < alias_count; i++) {
+-		printf("%s\n", result->h_aliases[i]);
+-	    }
+-
+-#if LIBRESOLV_DNS_TTL_HACK
+-	    /* DNS TTL handling - bne@CareNet.hu
+-	     * for first try it's a dirty hack, by hacking getanswer
+-	     * to place th e ttl in a global variable */
+-	    if (_dns_ttl_ > -1)
+-		printf("$ttl %d\n", _dns_ttl_);
+-#endif
+-
+-	    printf("$end\n");
+-	    fflush(stdout);
+-	    continue;
+-	}
++	lookup(request);
++	fflush(stdout);
+     }
+     /* NOTREACHED */
+     return 0;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: fqdncache.cc,v 1.97 1998/04/02 22:58:14 wessels Exp $
++ * $Id: fqdncache.cc,v 1.98 1998/04/03 06:27:06 wessels Exp $
+  *
+  * DEBUG: section 35    FQDN Cache
+  * AUTHOR: Harvest Derived
+@@ -131,7 +131,7 @@ static struct {
+ static dlink_list lru_list;
+ 
+ static void fqdncache_dnsHandleRead(int, void *);
+-static fqdncache_entry *fqdncache_parsebuffer(const char *buf, dnsserver_t *);
++static fqdncache_entry *fqdncacheParse(const char *buf, dnsserver_t *);
+ static void fqdncache_release(fqdncache_entry *);
+ static fqdncache_entry *fqdncache_create(const char *name);
+ static void fqdncache_call_pending(fqdncache_entry *);
+@@ -339,70 +339,51 @@ fqdncache_call_pending(fqdncache_entry * f)
+     fqdncacheUnlockEntry(f);
+ }
+ 
++
+ static fqdncache_entry *
+-fqdncache_parsebuffer(const char *inbuf, dnsserver_t * dnsData)
++fqdncacheParse(const char *inbuf, dnsserver_t * dnsData)
+ {
+-    char *buf = xstrdup(inbuf);
++    LOCAL_ARRAY(char, buf, DNS_INBUF_SZ);
+     char *token;
+     static fqdncache_entry f;
+-    int k;
+-    int ipcount;
+-    int aliascount;
+-    debug(35, 5) ("fqdncache_parsebuffer: parsing:\n%s", inbuf);
+-    memset(&f, '\0', sizeof(fqdncache_entry));
+-    f.expires = squid_curtime + Config.positiveDnsTtl;
+-    f.status = FQDN_DISPATCHED;
+-    for (token = strtok(buf, w_space); token; token = strtok(NULL, w_space)) {
+-	if (!strcmp(token, "$end")) {
+-	    break;
+-	} else if (!strcmp(token, "$alive")) {
+-	    dnsData->answer = squid_curtime;
+-	} else if (!strcmp(token, "$fail")) {
+-	    if ((token = strtok(NULL, "\n")) == NULL)
+-		fatal_dump("Invalid $fail");
+-	    f.expires = squid_curtime + Config.negativeDnsTtl;
+-	    f.status = FQDN_NEGATIVE_CACHED;
+-	} else if (!strcmp(token, "$message")) {
+-	    if ((token = strtok(NULL, "\n")) == NULL)
+-		fatal_dump("Invalid $message");
+-	    f.error_message = xstrdup(token);
+-	} else if (!strcmp(token, "$name")) {
+-	    if ((token = strtok(NULL, w_space)) == NULL)
+-		fatal_dump("Invalid $name");
+-	    f.status = FQDN_CACHED;
+-	} else if (!strcmp(token, "$h_name")) {
+-	    if ((token = strtok(NULL, w_space)) == NULL)
+-		fatal_dump("Invalid $h_name");
+-	    f.names[0] = xstrdup(token);
+-	    f.name_count = 1;
+-	} else if (!strcmp(token, "$h_len")) {
+-	    if ((token = strtok(NULL, w_space)) == NULL)
+-		fatal_dump("Invalid $h_len");
+-	} else if (!strcmp(token, "$ipcount")) {
+-	    if ((token = strtok(NULL, w_space)) == NULL)
+-		fatal_dump("Invalid $ipcount");
+-	    ipcount = atoi(token);
+-	    for (k = 0; k < ipcount; k++) {
+-		if ((token = strtok(NULL, w_space)) == NULL)
+-		    fatal_dump("Invalid FQDN address");
+-	    }
+-	} else if (!strcmp(token, "$aliascount")) {
+-	    if ((token = strtok(NULL, w_space)) == NULL)
+-		fatal_dump("Invalid $aliascount");
+-	    aliascount = atoi(token);
+-	    for (k = 0; k < aliascount; k++) {
+-		if ((token = strtok(NULL, w_space)) == NULL)
+-		    fatal_dump("Invalid alias");
+-	    }
+-	} else if (!strcmp(token, "$ttl")) {
+-	    if ((token = strtok(NULL, w_space)) == NULL)
+-		fatal_dump("Invalid $ttl");
+-	    f.expires = squid_curtime + atoi(token);
+-	} else {
+-	    fatal_dump("Invalid dnsserver output");
+-	}
++    int ttl;
++    xstrncpy(buf, inbuf, DNS_INBUF_SZ);
++    debug(14, 5) ("fqdncacheParse: parsing:\n%s", buf);
++    memset(&f, '\0', sizeof(f));
++    f.expires = squid_curtime;
++    f.status = FQDN_NEGATIVE_CACHED;
++    token = strtok(buf, w_space);
++    if (NULL == token) {
++	debug(14, 1) ("fqdncacheParse: Got <NULL>, expecting '$name'\n");
++	return &f;
++    }
++    if (0 == strcmp(token, "$fail")) {
++	f.expires = squid_curtime + Config.negativeDnsTtl;
++	token = strtok(NULL, "\n");
++	assert(NULL != token);
++	f.error_message = xstrdup(token);
++	return &f;
++    }
++    if (0 != strcmp(token, "$name")) {
++	debug(14, 1) ("fqdncacheParse: Got '%s', expecting '$name'\n", token);
++	return &f;
++    }
++    token = strtok(NULL, w_space);
++    if (NULL == token) {
++	debug(14, 1) ("fqdncacheParse: Got <NULL>, expecting TTL\n");
++	return &f;
++    }
++    f.status = FQDN_CACHED;
++    ttl = atoi(token);
++    if (ttl > 0)
++	f.expires = squid_curtime + ttl;
++    else
++	f.expires = squid_curtime + Config.positiveDnsTtl;
++    token = strtok(NULL, w_space);
++    if (NULL != token) {
++	f.names[0] = xstrdup(token);
++	f.name_count = 1;
+     }
+-    xfree(buf);
+     return &f;
+ }
+ 
+@@ -456,13 +437,13 @@ fqdncache_dnsHandleRead(int fd, void *data)
+     f = dnsData->data;
+     if (f->status != FQDN_DISPATCHED)
+ 	fatal_dump("fqdncache_dnsHandleRead: bad status");
+-    if (strstr(dnsData->ip_inbuf, "$end\n")) {
++    if (strchr(dnsData->ip_inbuf, '\n')) {
+ 	/* end of record found */
+ 	DnsStats.replies++;
+ 	statHistCount(&Counter.dns.svc_time,
+ 	    tvSubMsec(dnsData->dispatch_time, current_time));
+-	if ((x = fqdncache_parsebuffer(dnsData->ip_inbuf, dnsData)) == NULL) {
+-	    debug(35, 0) ("fqdncache_dnsHandleRead: fqdncache_parsebuffer failed?!\n");
++	if ((x = fqdncacheParse(dnsData->ip_inbuf, dnsData)) == NULL) {
++	    debug(35, 0) ("fqdncache_dnsHandleRead: fqdncacheParse failed?!\n");
+ 	} else {
+ 	    dnsData->offset = 0;
+ 	    dnsData->ip_inbuf[0] = '\0';
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: ipcache.cc,v 1.175 1998/04/01 05:38:57 wessels Exp $
++ * $Id: ipcache.cc,v 1.176 1998/04/03 06:27:05 wessels Exp $
+  *
+  * DEBUG: section 14    IP Cache
+  * AUTHOR: Harvest Derived
+@@ -127,7 +127,7 @@ static dlink_list lru_list;
+ 
+ static int ipcache_testname(void);
+ static PF ipcache_dnsHandleRead;
+-static ipcache_entry *ipcache_parsebuffer(const char *buf, dnsserver_t *);
++static ipcache_entry *ipcacheParse(const char *buf, dnsserver_t *);
+ static void ipcache_release(ipcache_entry *);
+ static ipcache_entry *ipcache_create(const char *name);
+ static void ipcache_call_pending(ipcache_entry *);
+@@ -384,79 +384,67 @@ ipcache_call_pending(ipcache_entry * i)
+ 
+ 
+ static ipcache_entry *
+-ipcache_parsebuffer(const char *inbuf, dnsserver_t * dnsData)
++ipcacheParse(const char *inbuf, dnsserver_t * dnsData)
+ {
+-    char *buf = xstrdup(inbuf);
++    LOCAL_ARRAY(char, buf, DNS_INBUF_SZ);
+     char *token;
+     static ipcache_entry i;
++    int j;
+     int k;
+-    int ipcount;
+-    int aliascount;
+-    debug(14, 5) ("ipcache_parsebuffer: parsing:\n%s", inbuf);
+-    memset(&i, '\0', sizeof(ipcache_entry));
+-    i.expires = squid_curtime + Config.positiveDnsTtl;
+-    for (token = strtok(buf, w_space); token; token = strtok(NULL, w_space)) {
+-	if (!strcmp(token, "$end")) {
++    int ipcount = 0;
++    int ttl;
++    char A[32][16];
++    xstrncpy(buf, inbuf, DNS_INBUF_SZ);
++    debug(14, 5) ("ipcacheParse: parsing:\n%s", buf);
++    memset(&i, '\0', sizeof(i));
++    i.expires = squid_curtime;
++    i.status = IP_NEGATIVE_CACHED;
++    token = strtok(buf, w_space);
++    if (NULL == token) {
++	debug(14, 1) ("ipcacheParse: Got <NULL>, expecting '$addr'\n");
++	return &i;
++    }
++    if (0 == strcmp(token, "$fail")) {
++	i.expires = squid_curtime + Config.negativeDnsTtl;
++	token = strtok(NULL, "\n");
++	assert(NULL != token);
++	i.error_message = xstrdup(token);
++	return &i;
++    }
++    if (0 != strcmp(token, "$addr")) {
++	debug(14, 1) ("ipcacheParse: Got '%s', expecting '$addr'\n", token);
++	return &i;
++    }
++    token = strtok(NULL, w_space);
++    if (NULL == token) {
++	debug(14, 1) ("ipcacheParse: Got <NULL>, expecting TTL\n");
++	return &i;
++    }
++    i.status = IP_CACHED;
++    ttl = atoi(token);
++    if (ttl > 0)
++	i.expires = squid_curtime + ttl;
++    else
++	i.expires = squid_curtime + Config.positiveDnsTtl;
++    while (NULL != (token = strtok(NULL, w_space))) {
++	xstrncpy(A[ipcount], token, 16);
++	if (++ipcount == 32)
+ 	    break;
+-	} else if (!strcmp(token, "$alive")) {
+-	    dnsData->answer = squid_curtime;
+-	} else if (!strcmp(token, "$fail")) {
+-	    if ((token = strtok(NULL, "\n")) == NULL)
+-		fatal_dump("Invalid $fail");
+-	    i.expires = squid_curtime + Config.negativeDnsTtl;
+-	    i.status = IP_NEGATIVE_CACHED;
+-	} else if (!strcmp(token, "$message")) {
+-	    if ((token = strtok(NULL, "\n")) == NULL)
+-		fatal_dump("Invalid $message");
+-	    i.error_message = xstrdup(token);
+-	} else if (!strcmp(token, "$name")) {
+-	    if ((token = strtok(NULL, w_space)) == NULL)
+-		fatal_dump("Invalid $name");
+-	    i.status = IP_CACHED;
+-	} else if (!strcmp(token, "$h_name")) {
+-	    if ((token = strtok(NULL, w_space)) == NULL)
+-		fatal_dump("Invalid $h_name");
+-	    /* ignore $h_name */
+-	} else if (!strcmp(token, "$h_len")) {
+-	    if ((token = strtok(NULL, w_space)) == NULL)
+-		fatal_dump("Invalid $h_len");
+-	    /* ignore $h_length */
+-	} else if (!strcmp(token, "$ipcount")) {
+-	    if ((token = strtok(NULL, w_space)) == NULL)
+-		fatal_dump("Invalid $ipcount");
+-	    ipcount = atoi(token);
+-	    i.addrs.count = (unsigned char) ipcount;
+-	    if (ipcount == 0) {
+-		i.addrs.in_addrs = NULL;
+-		i.addrs.bad_mask = NULL;
+-	    } else {
+-		i.addrs.in_addrs = xcalloc(ipcount, sizeof(struct in_addr));
+-		i.addrs.bad_mask = xcalloc(ipcount, sizeof(unsigned char));
+-	    }
+-	    for (k = 0; k < ipcount; k++) {
+-		if ((token = strtok(NULL, w_space)) == NULL)
+-		    fatal_dump("Invalid IP address");
+-		if (!safe_inet_addr(token, &i.addrs.in_addrs[k]))
+-		    fatal_dump("Invalid IP address");
+-	    }
+-	} else if (!strcmp(token, "$aliascount")) {
+-	    if ((token = strtok(NULL, w_space)) == NULL)
+-		fatal_dump("Invalid $aliascount");
+-	    aliascount = atoi(token);
+-	    for (k = 0; k < aliascount; k++) {
+-		if ((token = strtok(NULL, w_space)) == NULL)
+-		    fatal_dump("Invalid alias");
+-	    }
+-	} else if (!strcmp(token, "$ttl")) {
+-	    if ((token = strtok(NULL, w_space)) == NULL)
+-		fatal_dump("Invalid $ttl");
+-	    i.expires = squid_curtime + atoi(token);
+-	} else {
+-	    debug(14, 0) ("--> %s <--\n", inbuf);
+-	    debug_trap("Invalid dnsserver output");
+-	}
+     }
+-    xfree(buf);
++    if (0 == ipcount) {
++	i.addrs.in_addrs = NULL;
++	i.addrs.bad_mask = NULL;
++    } else {
++	i.addrs.in_addrs = xcalloc(ipcount, sizeof(struct in_addr));
++	i.addrs.bad_mask = xcalloc(ipcount, sizeof(unsigned char));
++    }
++    for (j = 0, k = 0; k < ipcount; k++) {
++	if (safe_inet_addr(A[k], &i.addrs.in_addrs[j]))
++	    j++;
++	else
++	    debug(14, 1) ("ipcacheParse: Invalid IP address '%s'\n", A[k]);
++    }
++    i.addrs.count = (unsigned char) j;
+     return &i;
+ }
+ 
+@@ -502,24 +490,24 @@ ipcache_dnsHandleRead(int fd, void *data)
+ 	return;
+     }
+     n = ++IpcacheStats.replies;
+-    DnsStats.replies++;
+     dnsData->offset += len;
+     dnsData->ip_inbuf[dnsData->offset] = '\0';
+     i = dnsData->data;
+     assert(i != NULL);
+     assert(i->status == IP_DISPATCHED);
+-    if (strstr(dnsData->ip_inbuf, "$end\n")) {
++    if (strchr(dnsData->ip_inbuf, '\n')) {
+ 	/* end of record found */
++	DnsStats.replies++;
+ 	statHistCount(&Counter.dns.svc_time,
+ 	    tvSubMsec(i->request_time, current_time));
+-	if ((x = ipcache_parsebuffer(dnsData->ip_inbuf, dnsData)) == NULL) {
+-	    debug(14, 0) ("ipcache_dnsHandleRead: ipcache_parsebuffer failed?!\n");
++	if ((x = ipcacheParse(dnsData->ip_inbuf, dnsData)) == NULL) {
++	    debug(14, 0) ("ipcache_dnsHandleRead: ipcacheParse failed?!\n");
+ 	} else {
+ 	    dnsData->offset = 0;
+ 	    dnsData->ip_inbuf[0] = '\0';
++	    i->status = x->status;
+ 	    i->addrs = x->addrs;
+ 	    i->error_message = x->error_message;
+-	    i->status = x->status;
+ 	    i->expires = x->expires;
+ 	    ipcache_call_pending(i);
+ 	}

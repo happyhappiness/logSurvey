@@ -1,0 +1,780 @@
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: EventLoop.cc,v 1.2 2006/08/12 01:43:10 robertc Exp $
++ * $Id: EventLoop.cc,v 1.3 2006/08/19 12:31:21 robertc Exp $
+  *
+  * DEBUG: section 1     Main Loop
+  * AUTHOR: Harvest Derived
+@@ -35,9 +35,44 @@
+ 
+ #include "EventLoop.h"
+ 
+-EventLoop::EventLoop() : errcount(0), last_loop(false), timeService(NULL)
++EventLoop::EventLoop() : errcount(0), last_loop(false), timeService(NULL),
++        primaryEngine(NULL)
+ {}
+ 
++void
++EventLoop::checkEngine(AsyncEngine * engine, bool const primary)
++{
++    int requested_delay;
++
++    if (!primary)
++        requested_delay = engine->checkEvents(0);
++    else
++        requested_delay = engine->checkEvents(loop_delay);
++
++    if (requested_delay < 0)
++        switch (requested_delay) {
++
++        case AsyncEngine::EVENT_IDLE:
++            debugs(1, 9, "Engine " << engine << " is idle.");
++            break;
++
++        case AsyncEngine::EVENT_ERROR:
++            runOnceResult = false;
++            error = true;
++            break;
++
++        default:
++            fatal_dump("unknown AsyncEngine result");
++        }
++    else {
++        /* not idle or error */
++        runOnceResult = false;
++
++        if (requested_delay < loop_delay)
++            loop_delay = requested_delay;
++    }
++}
++
+ void
+ EventLoop::prepareToRun()
+ {
+@@ -70,48 +105,31 @@ EventLoop::run()
+ bool
+ EventLoop::runOnce()
+ {
+-    bool result = true;
+-    bool error = false;
+-    int loop_delay = 10; /* 10 ms default delay */
++    runOnceResult = true;
++    error = false;
++    loop_delay = 10; /* 10 ms default delay */
+ 
+     for (engine_vector::iterator i = engines.begin();
+             i != engines.end(); ++i) {
+-        int requested_delay;
+-        /* special case the last engine */
+-
+-        if (i - engines.end() != -1)
+-            requested_delay = (*i)->checkEvents(0);
+-        else /* last engine gets the delay */
+-            requested_delay = (*i)->checkEvents(loop_delay);
+-
+-        if (requested_delay < 0)
+-            switch (requested_delay) {
+-
+-            case AsyncEngine::EVENT_IDLE:
+-                debugs(1, 9, "Engine " << *i << " is idle.");
+-                break;
+-
+-            case AsyncEngine::EVENT_ERROR:
+-                result = false;
+-                error = true;
+-                break;
+-
+-            default:
+-                fatal_dump("unknown AsyncEngine result");
+-            }
+-        else if (requested_delay < loop_delay) {
+-            loop_delay = requested_delay;
+-            result = false;
+-        }
++        /* check the primary outside the loop */
++
++        if (*i == primaryEngine)
++            continue;
++
++        /* special case the last engine to be primary */
++        checkEngine(*i, primaryEngine == NULL && (i - engines.end() == -1));
+     }
+ 
++    if (primaryEngine != NULL)
++        checkEngine(primaryEngine, true);
++
+     if (timeService != NULL)
+         timeService->tick();
+ 
+     for (dispatcher_vector::iterator i = dispatchers.begin();
+             i != dispatchers.end(); ++i)
+         if ((*i)->dispatch())
+-            result = false;
++            runOnceResult = false;
+ 
+     if (error) {
+         ++errcount;
+@@ -125,7 +143,20 @@ EventLoop::runOnce()
+     if (last_loop)
+         return true;
+ 
+-    return result;
++    return runOnceResult;
++}
++
++void
++EventLoop::setPrimaryEngine(AsyncEngine * engine)
++{
++    for (engine_vector::iterator i = engines.begin();
++            i != engines.end(); ++i)
++        if (*i == engine) {
++            primaryEngine = engine;
++            return;
++        }
++
++    fatal("EventLoop::setPrimaryEngine: No such engine!.");
+ }
+ 
+ void
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: EventLoop.h,v 1.2 2006/08/12 01:43:10 robertc Exp $
++ * $Id: EventLoop.h,v 1.3 2006/08/19 12:31:21 robertc Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -69,6 +69,14 @@ class EventLoop
+      * TIMEOUT?
+      */
+     bool runOnce();
++    /* set the primary async engine. The primary async engine recieves the
++     * lowest requested timeout gathered from the other engines each loop.
++     * (There is a default of 10ms if all engines are idle or request higher
++     * delays).
++     * If no primary has been nominated, the last async engine added is 
++     * implicitly the default.
++     */
++    void setPrimaryEngine(AsyncEngine * engine);
+     /* set the time service. There can be only one time service set at any
+      * time. The time service is invoked on each loop 
+      */
+@@ -83,12 +91,18 @@ class EventLoop
+ private:
+     /* setup state variables prior to running */
+     void prepareToRun();
++    /* check an individual engine */
++    void checkEngine(AsyncEngine * engine, bool const primary);
+     bool last_loop;
+     typedef Vector<CompletionDispatcher *> dispatcher_vector;
+     dispatcher_vector dispatchers;
+     typedef Vector<AsyncEngine *> engine_vector;
+     engine_vector engines;
+     TimeEngine * timeService;
++    AsyncEngine * primaryEngine;
++    int loop_delay; /* the delay to be given to the primary engine */
++    bool error; /* has an error occured in this loop */
++    bool runOnceResult; /* the result from runOnce */
+ };
+ 
+ 
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: SwapDir.h,v 1.9 2006/05/23 00:21:47 wessels Exp $
++ * $Id: SwapDir.h,v 1.10 2006/08/19 12:31:21 robertc Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -79,6 +79,9 @@ class StoreController : public Store
+ 
+     virtual void updateSize(size_t size, int sign);
+ 
++    /* the number of store dirs being rebuilt. */
++    static int store_dirs_rebuilding;
++
+ private:
+     void createOneStore(Store &aStore);
+ 
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: store_dir_coss.cc,v 1.65 2006/08/07 02:28:25 robertc Exp $
++ * $Id: store_dir_coss.cc,v 1.66 2006/08/19 12:31:21 robertc Exp $
+  * vim: set et : 
+  *
+  * DEBUG: section 47    Store COSS Directory Routines
+@@ -387,7 +387,7 @@ storeCossRebuildComplete(void *data)
+     RebuildState *rb = (RebuildState *)data;
+     CossSwapDir *sd = rb->sd;
+     sd->startMembuf();
+-    store_dirs_rebuilding--;
++    StoreController::store_dirs_rebuilding--;
+     storeCossDirCloseTmpSwapLog(rb->sd);
+     storeRebuildComplete(&rb->counts);
+     cbdataFree(rb);
+@@ -577,7 +577,7 @@ storeCossDirRebuild(CossSwapDir * sd)
+     debug(47, 1) ("Rebuilding COSS storage in %s (%s)\n",
+                   sd->path, clean ? "CLEAN" : "DIRTY");
+     rb->log = fp;
+-    store_dirs_rebuilding++;
++    StoreController::store_dirs_rebuilding++;
+ 
+     if (!clean || fp == NULL) {
+         /* COSS cannot yet rebuild from a dirty state. If the log
+@@ -860,7 +860,7 @@ CossSwapDir::writeCleanDone()
+     }
+ 
+     /* touch a timestamp file if we're not still validating */
+-    if (store_dirs_rebuilding)
++    if (StoreController::store_dirs_rebuilding)
+         (void) 0;
+     else if (anfd < 0)
+         (void) 0;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: store_null.cc,v 1.10 2006/08/07 02:28:25 robertc Exp $
++ * $Id: store_null.cc,v 1.11 2006/08/19 12:31:21 robertc Exp $
+  *
+  * DEBUG: section 47    Store Directory Routines
+  * AUTHOR: Duane Wessels
+@@ -56,7 +56,7 @@ NullSwapDir::reconfigure(int index, char *path)
+ void
+ NullSwapDir::init()
+ {
+-    store_dirs_rebuilding++;
++    StoreController::store_dirs_rebuilding++;
+     eventAdd("storeNullDirRebuildComplete", storeNullDirRebuildComplete,
+              NULL, 0.0, 1);
+ }
+@@ -81,7 +81,7 @@ storeNullDirRebuildComplete(void *unused)
+ 
+     struct _store_rebuild_data counts;
+     memset(&counts, '\0', sizeof(counts));
+-    store_dirs_rebuilding--;
++    StoreController::store_dirs_rebuilding--;
+     storeRebuildComplete(&counts);
+ }
+ 
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: store_dir_ufs.cc,v 1.74 2006/05/23 00:21:48 wessels Exp $
++ * $Id: store_dir_ufs.cc,v 1.75 2006/08/19 12:31:24 robertc Exp $
+  *
+  * DEBUG: section 47    Store Directory Routines
+  * AUTHOR: Duane Wessels
+@@ -352,7 +352,9 @@ UFSSwapDir::maintain()
+ {
+     /* We can't delete objects while rebuilding swap */
+ 
+-    if (store_dirs_rebuilding)
++    /* XXX FIXME each store should start maintaining as it comes online. */
++
++    if (StoreController::store_dirs_rebuilding)
+         return;
+ 
+     StoreEntry *e = NULL;
+@@ -745,7 +747,7 @@ UFSSwapDir::addDiskRestore(const cache_key * key,
+ void
+ UFSSwapDir::rebuild()
+ {
+-    store_dirs_rebuilding++;
++    ++StoreController::store_dirs_rebuilding;
+     eventAdd("storeRebuild", RebuildState::RebuildStep, new RebuildState(this), 0.0, 1);
+ }
+ 
+@@ -1005,7 +1007,7 @@ UFSSwapDir::writeCleanDone()
+     }
+ 
+     /* touch a timestamp file if we're not still validating */
+-    if (store_dirs_rebuilding)
++    if (StoreController::store_dirs_rebuilding)
+         (void) 0;
+     else if (fd < 0)
+         (void) 0;
+@@ -1071,7 +1073,7 @@ rev_int_sort(const void *A, const void *B)
+ int
+ UFSSwapDir::DirClean(int swap_index)
+ {
+-    DIR *dp = NULL;
++    DIR *dir_pointer = NULL;
+ 
+     struct dirent *de = NULL;
+     LOCAL_ARRAY(char, p1, MAXPATHLEN + 1);
+@@ -1100,9 +1102,9 @@ UFSSwapDir::DirClean(int swap_index)
+     snprintf(p1, SQUID_MAXPATHLEN, "%s/%02X/%02X",
+              SD->path, D1, D2);
+     debug(36, 3) ("storeDirClean: Cleaning directory %s\n", p1);
+-    dp = opendir(p1);
++    dir_pointer = opendir(p1);
+ 
+-    if (dp == NULL) {
++    if (dir_pointer == NULL) {
+         if (errno == ENOENT) {
+             debug(36, 0) ("storeDirClean: WARNING: Creating %s\n", p1);
+ #ifdef _SQUID_MSWIN_
+@@ -1121,7 +1123,7 @@ UFSSwapDir::DirClean(int swap_index)
+         return 0;
+     }
+ 
+-    while ((de = readdir(dp)) != NULL && k < 20) {
++    while ((de = readdir(dir_pointer)) != NULL && k < 20) {
+         if (sscanf(de->d_name, "%X", &swapfileno) != 1)
+             continue;
+ 
+@@ -1143,7 +1145,7 @@ UFSSwapDir::DirClean(int swap_index)
+         files[k++] = swapfileno;
+     }
+ 
+-    closedir(dp);
++    closedir(dir_pointer);
+ 
+     if (k == 0)
+         return 0;
+@@ -1217,7 +1219,8 @@ UFSSwapDir::CleanEvent(void *unused)
+         swap_index = (int) (squid_random() % j);
+     }
+ 
+-    if (0 == store_dirs_rebuilding) {
++    /* if the rebuild is finished, start cleaning directories. */
++    if (0 == StoreController::store_dirs_rebuilding) {
+         n = DirClean(swap_index);
+         swap_index++;
+     }
+@@ -1270,6 +1273,7 @@ UFSSwapDir::FilenoBelongsHere(int fn, int F0, int F1, int F2)
+     return 1;
+ }
+ 
++
+ int
+ UFSSwapDir::validFileno(sfileno filn, int flag) const
+ {
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: ufscommon.cc,v 1.5 2006/05/19 20:22:57 wessels Exp $
++ * $Id: ufscommon.cc,v 1.6 2006/08/19 12:31:24 robertc Exp $
+  * vim: set et : 
+  *
+  * DEBUG: section 47    Store Directory Routines
+@@ -91,7 +91,7 @@ RebuildState::RebuildStep(void *data)
+     if (!rb->isDone())
+         eventAdd("storeRebuild", RebuildStep, rb, 0.0, 1);
+     else {
+-        store_dirs_rebuilding--;
++        StoreController::store_dirs_rebuilding--;
+         storeRebuildComplete(&rb->counts);
+         delete rb;
+     }
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: globals.h,v 1.136 2006/06/18 10:05:53 serassio Exp $
++ * $Id: globals.h,v 1.137 2006/08/19 12:31:21 robertc Exp $
+  *
+  *
+  * SQUID Web Proxy Cache          http://www.squid-cache.org/
+@@ -127,7 +127,6 @@ extern "C"
+     extern struct timeval squid_start;
+     extern int shutting_down;	/* 0 */
+     extern int reconfiguring;	/* 0 */
+-    extern int store_dirs_rebuilding;	/* 1 */
+     extern unsigned long store_swap_size;	/* 0 */
+     extern time_t hit_only_mode_until;	/* 0 */
+     extern StatCounters statCounter;
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: icp_v2.cc,v 1.93 2006/05/08 23:38:33 robertc Exp $
++ * $Id: icp_v2.cc,v 1.94 2006/08/19 12:31:21 robertc Exp $
+  *
+  * DEBUG: section 12    Internet Cache Protocol
+  * AUTHOR: Duane Wessels
+@@ -43,6 +43,7 @@
+ #include "AccessLogEntry.h"
+ #include "wordlist.h"
+ #include "SquidTime.h"
++#include "SwapDir.h"
+ 
+ static void icpLogIcp(struct IN_ADDR, log_type, int, const char *, int);
+ 
+@@ -327,13 +328,16 @@ icpCheckUdpHit(StoreEntry * e, HttpRequest * request)
+     return 1;
+ }
+ 
+-/* ICP_ERR means no opcode selected here */
++/* ICP_ERR means no opcode selected here
++ *
++ * This routine selects an ICP opcode for ICP misses.
++ */
+ icp_opcode
+ icpGetCommonOpcode()
+ {
+-    /* if store is rebuilding, return a UDP_HIT, but not a MISS */
++    /* if store is rebuilding, return a UDP_MISS_NOFETCH */
+ 
+-    if (store_dirs_rebuilding && opt_reload_hit_only ||
++    if (StoreController::store_dirs_rebuilding && opt_reload_hit_only ||
+             hit_only_mode_until > squid_curtime) {
+         return ICP_MISS_NOFETCH;
+     }
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: main.cc,v 1.429 2006/08/12 01:43:11 robertc Exp $
++ * $Id: main.cc,v 1.430 2006/08/19 12:31:21 robertc Exp $
+  *
+  * DEBUG: section 1     Startup and Main Loop
+  * AUTHOR: Harvest Derived
+@@ -1331,11 +1331,10 @@ main(int argc, char **argv)
+ 
+     CommSelectEngine comm_engine;
+ 
+-    /* must be last - its the only engine that implements timeouts properly
+-     * at the moment.
+-     */
+     mainLoop.registerEngine(&comm_engine);
+ 
++    mainLoop.setPrimaryEngine(&comm_engine);
++
+     /* use the standard time service */
+     TimeEngine time_engine;
+ 
+@@ -1742,3 +1741,4 @@ SquidShutdown()
+ 
+     exit(shutdown_status);
+ }
++
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: store.cc,v 1.597 2006/08/07 02:28:22 robertc Exp $
++ * $Id: store.cc,v 1.598 2006/08/19 12:31:21 robertc Exp $
+  *
+  * DEBUG: section 20    Storage Manager
+  * AUTHOR: Harvest Derived
+@@ -1276,7 +1276,7 @@ StoreEntry::release()
+         return;
+     }
+ 
+-    if (store_dirs_rebuilding && swap_filen > -1) {
++    if (StoreController::store_dirs_rebuilding && swap_filen > -1) {
+         storeSetPrivateKey(this);
+ 
+         if (mem_obj)
+@@ -1329,7 +1329,7 @@ storeLateRelease(void *unused)
+     int i;
+     static int n = 0;
+ 
+-    if (store_dirs_rebuilding) {
++    if (StoreController::store_dirs_rebuilding) {
+         eventAdd("storeLateRelease", storeLateRelease, NULL, 1.0, 1);
+         return;
+     }
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: store_dir.cc,v 1.154 2006/05/24 02:13:27 hno Exp $
++ * $Id: store_dir.cc,v 1.155 2006/08/19 12:31:21 robertc Exp $
+  *
+  * DEBUG: section 47    Store Directory Routines
+  * AUTHOR: Duane Wessels
+@@ -61,6 +61,8 @@
+ static STDIRSELECT storeDirSelectSwapDirRoundRobin;
+ static STDIRSELECT storeDirSelectSwapDirLeastLoad;
+ 
++int StoreController::store_dirs_rebuilding = 0;
++
+ StoreController::StoreController() : swapDir (new StoreHashIndex())
+ {}
+ 
+@@ -421,7 +423,7 @@ storeDirWriteCleanLogs(int reopen)
+     int dirn;
+     int notdone = 1;
+ 
+-    if (store_dirs_rebuilding) {
++    if (StoreController::store_dirs_rebuilding) {
+         debug(20, 1) ("Not currently OK to rewrite swap log.\n");
+         debug(20, 1) ("storeDirWriteCleanLogs: Operation aborted.\n");
+         return 0;
+@@ -796,7 +798,16 @@ StoreHashIndex::init()
+         /* this starts a search of the store dirs, loading their
+          * index. under the new Store api this should be
+          * driven by the StoreHashIndex, not by each store.
++        *
++        * That is, the HashIndex should perform a search of each dir it is
++        * indexing to do the hash insertions. The search is then able to 
++        * decide 'from-memory', or 'from-clean-log' or 'from-dirty-log' or
++        * 'from-no-log'.
++        *
+          * Step 1: make the store rebuilds use a search internally
++        * Step 2: change the search logic to use the four modes described
++        *         above
++        * Step 3: have the hash index walk the searches itself.
+          */
+         store(i)->init();
+ 
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: store_rebuild.cc,v 1.85 2006/08/07 02:28:22 robertc Exp $
++ * $Id: store_rebuild.cc,v 1.86 2006/08/19 12:31:21 robertc Exp $
+  *
+  * DEBUG: section 20    Store Rebuild Routines
+  * AUTHOR: Duane Wessels
+@@ -113,8 +113,7 @@ storeCleanup(void *datanotused)
+         debugs(20, 1, "  Completed Validation Procedure");
+         debugs(20, 1, "  Validated " << validated << " Entries");
+         debugs(20, 1, "  store_swap_size = " << store_swap_size);
+-        store_dirs_rebuilding--;
+-        assert(0 == store_dirs_rebuilding);
++        assert(0 == StoreController::store_dirs_rebuilding);
+ 
+         if (opt_store_doublecheck)
+             assert(store_errors == 0);
+@@ -144,12 +143,12 @@ storeRebuildComplete(struct _store_rebuild_data *dc)
+     counts.bad_log_op += dc->bad_log_op;
+     counts.zero_object_sz += dc->zero_object_sz;
+     /*
+-     * When store_dirs_rebuilding == 1, it means we are done reading
++     * When store_dirs_rebuilding == 0, it means we are done reading
+      * or scanning all cache_dirs.  Now report the stats and start
+      * the validation (storeCleanup()) thread.
+      */
+ 
+-    if (store_dirs_rebuilding > 1)
++    if (StoreController::store_dirs_rebuilding)
+         return;
+ 
+     dt = tvSubDsec(rebuild_start, current_time);
+@@ -195,10 +194,15 @@ storeRebuildStart(void)
+     memset(&counts, '\0', sizeof(counts));
+     rebuild_start = current_time;
+     /*
+-     * Note: store_dirs_rebuilding is initialized to 1 in globals.c.
++     * Note: store_dirs_rebuilding is initialized to 0.
++     *  
++     * When we parse the configuration and construct each swap dir, 
++     * the construction of that raises the rebuild count.
++     *
+      * This prevents us from trying to write clean logs until we
+-     * finished rebuilding for sure.  The corresponding decrement
+-     * occurs in storeCleanup(), when it is finished.
++     * finished rebuilding - including after a reconfiguration that opens an
++     * existing swapdir.  The corresponding decrement * occurs in
++     * storeCleanup(), when it is finished.
+      */
+     RebuildProgress = (store_rebuild_progress *)xcalloc(Config.cacheSwap.n_configured,
+                       sizeof(store_rebuild_progress));
+@@ -175,12 +175,18 @@ testCoss::testCossSearch()
+     /* rebuild is a scheduled event */
+     StockEventLoop loop;
+ 
+-    loop.run();
++    /* our swapdir must be scheduled to rebuild */
++    CPPUNIT_ASSERT_EQUAL(1, StoreController::store_dirs_rebuilding);
+ 
+-    /* nothing to rebuild */
+-    CPPUNIT_ASSERT(store_dirs_rebuilding == 1);
++    while (StoreController::store_dirs_rebuilding)
++        loop.runOnce();
+ 
+-    --store_dirs_rebuilding;
++    /* cannot use loop.run(); as the loop will never idle: the store-dir
++     * clean() scheduled event prevents it 
++     */
++
++    /* nothing left to rebuild */
++    CPPUNIT_ASSERT_EQUAL(0, StoreController::store_dirs_rebuilding);
+ 
+     /* add an entry */
+     {
+@@ -57,11 +57,6 @@ class RecordDispatcher : public CompletionDispatcher
+     RecordDispatcher(): calls(0)
+     {}
+ 
+-    void dispatch()
+-    {
+-        ++calls;
+-    }
+-
+     bool dispatch()
+     {
+         ++calls;
+@@ -123,12 +118,6 @@ class ShutdownDispatcher : public CompletionDispatcher
+     ShutdownDispatcher(EventLoop & theLoop):theLoop(theLoop), calls(0)
+     {}
+ 
+-    void dispatch()
+-    {
+-        if (++calls == 2)
+-            theLoop.stop();
+-    }
+-
+     bool dispatch()
+     {
+         if (++calls == 2)
+@@ -225,6 +214,14 @@ testEventLoop::testStopOnIdle()
+     theLoop.run();
+     /* run resets the error count ... */
+     CPPUNIT_ASSERT_EQUAL(11, failing_engine.calls);
++
++    /* an engine that asks for a timeout should not be detected as idle:
++     * use runOnce which should return false
++     */
++    theLoop = EventLoop();
++    RecordingEngine non_idle_engine(1000);
++    theLoop.registerEngine(&non_idle_engine);
++    CPPUNIT_ASSERT_EQUAL(false, theLoop.runOnce());
+ }
+ 
+ /* An event loop has a time service which is like an async engine but never
+@@ -260,3 +257,29 @@ testEventLoop::testSetTimeService()
+     theLoop.runOnce();
+     CPPUNIT_ASSERT_EQUAL(2, myTime.calls);
+ }
++
++/* one async engine is the primary engine - the engine that is allowed to block.
++ * this defaults to the last added one, but can be explicitly nominated
++ */
++void
++testEventLoop::testSetPrimaryEngine()
++{
++    EventLoop theLoop;
++    RecordingEngine first_engine(10);
++    RecordingEngine second_engine(10);
++    /* one engine - gets a timeout */
++    theLoop.registerEngine(&first_engine);
++    theLoop.runOnce();
++    CPPUNIT_ASSERT_EQUAL(10, first_engine.lasttimeout);
++    /* two engines - the second gets the timeout */
++    theLoop.registerEngine(&second_engine);
++    theLoop.runOnce();
++    CPPUNIT_ASSERT_EQUAL(0, first_engine.lasttimeout);
++    CPPUNIT_ASSERT_EQUAL(10, second_engine.lasttimeout);
++    /* set the first engine to be primary explicitly  and now gets the timeout */
++    theLoop.setPrimaryEngine(&first_engine);
++    theLoop.runOnce();
++    CPPUNIT_ASSERT_EQUAL(10, first_engine.lasttimeout);
++    CPPUNIT_ASSERT_EQUAL(0, second_engine.lasttimeout);
++
++}
+@@ -17,6 +17,7 @@ class testEventLoop : public CPPUNIT_NS::TestFixture
+     CPPUNIT_TEST( testRegisterEngine );
+     CPPUNIT_TEST( testEngineTimeout );
+     CPPUNIT_TEST( testSetTimeService );
++    CPPUNIT_TEST( testSetPrimaryEngine );
+     CPPUNIT_TEST( testStopOnIdle );
+     CPPUNIT_TEST_SUITE_END();
+ 
+@@ -29,6 +30,7 @@ class testEventLoop : public CPPUNIT_NS::TestFixture
+     void testRegisterDispatcher();
+     void testRegisterEngine();
+     void testSetTimeService();
++    void testSetPrimaryEngine();
+     void testStopOnIdle();
+     /* TODO:
+      * test that engine which errors a couple of times, then returns 0, then
+@@ -142,12 +142,21 @@ testNull::testNullSearch()
+ 
+     /* rebuild is a scheduled event */
+     StockEventLoop loop;
+-    loop.run();
+ 
+-    /* nothing to rebuild */
+-    CPPUNIT_ASSERT(store_dirs_rebuilding == 1);
++    /* our swapdir must be scheduled to rebuild - though it does not
++     * make sense to rebuild Null stores at all.
++     */
++    CPPUNIT_ASSERT_EQUAL(1, StoreController::store_dirs_rebuilding);
++
++    while (StoreController::store_dirs_rebuilding)
++        loop.runOnce();
++
++    /* cannot use loop.run(); as the loop will never idle: the store-dir
++     * clean() scheduled event prevents it 
++     */
+ 
+-    --store_dirs_rebuilding;
++    /* nothing left to rebuild */
++    CPPUNIT_ASSERT_EQUAL(0, StoreController::store_dirs_rebuilding);
+ 
+     /* add an entry */
+     {
+@@ -106,15 +106,21 @@ testUfs::testUfsSearch()
+     /* ok, ready to use - inits store & hash too */
+     Store::Root().init();
+ 
++    /* our swapdir must be scheduled to rebuild */
++    CPPUNIT_ASSERT_EQUAL(1, StoreController::store_dirs_rebuilding);
++
+     /* rebuild is a scheduled event */
+     StockEventLoop loop;
+ 
+-    loop.run();
++    while (StoreController::store_dirs_rebuilding)
++        loop.runOnce();
+ 
+-    /* nothing to rebuild */
+-    CPPUNIT_ASSERT(store_dirs_rebuilding == 1);
++    /* cannot use loop.run(); as the loop will never idle: the store-dir
++     * clean() scheduled event prevents it 
++     */
+ 
+-    --store_dirs_rebuilding;
++    /* nothing left to rebuild */
++    CPPUNIT_ASSERT_EQUAL(0, StoreController::store_dirs_rebuilding);
+ 
+     /* add an entry */
+     {
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: tools.cc,v 1.268 2006/05/08 23:38:33 robertc Exp $
++ * $Id: tools.cc,v 1.269 2006/08/19 12:31:21 robertc Exp $
+  *
+  * DEBUG: section 21    Misc Functions
+  * AUTHOR: Harvest Derived
+@@ -458,7 +458,12 @@ fatal(const char *message)
+      * used in early initialization phases, long before we ever
+      * get to the store log. */
+ 
+-    if (0 == store_dirs_rebuilding)
++    /* XXX: this should be turned into a callback-on-fatal, or
++     * a mandatory-shutdown-event or something like that.
++     * - RBC 20060819
++     */
++
++    if (0 == StoreController::store_dirs_rebuilding)
+         storeDirWriteCleanLogs(0);
+ 
+     fatal_common(message);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: wccp2.cc,v 1.4 2006/08/07 02:28:22 robertc Exp $
++ * $Id: wccp2.cc,v 1.5 2006/08/19 12:31:21 robertc Exp $
+  *
+  * DEBUG: section 80    WCCP Support
+  * AUTHOR: Steven WIlton
+@@ -37,6 +37,7 @@
+ #include "event.h"
+ #include "Parsing.h"
+ #include "Store.h"
++#include "SwapDir.h"
+ 
+ #if USE_WCCPv2
+ #include <netdb.h>
+@@ -1346,8 +1347,8 @@ wccp2HereIam(void *voidnotused)
+         return;
+     }
+ 
+-    /* Wait 10 seconds if store dirs are rebuilding */
+-    if (store_dirs_rebuilding && Config.Wccp2.rebuildwait) {
++    /* Wait if store dirs are rebuilding */
++    if (StoreController::store_dirs_rebuilding && Config.Wccp2.rebuildwait) {
+         eventAdd("wccp2HereIam", wccp2HereIam, NULL, 1.0, 1);
+         return;
+     }

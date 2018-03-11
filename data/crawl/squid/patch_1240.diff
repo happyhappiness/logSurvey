@@ -1,0 +1,1997 @@
+@@ -0,0 +1,535 @@
++/*
++ * $Id: ACLARP.cc,v 1.1 2003/02/25 12:16:55 robertc Exp $
++ *
++ * DEBUG: section 28    Access Control
++ * AUTHOR: Duane Wessels
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sources; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ *
++ * Copyright (c) 2003, Robert Collins <robertc@squid-cache.org>
++ */
++
++#include "squid.h"
++#include "ACLARP.h"
++
++#if !USE_ARP_ACL
++#error USE_ARP_ACL Not defined
++#endif
++static void aclParseArpList(SplayNode<acl_arp_data *> **curlist);
++static int decode_eth(const char *asc, char *eth);
++static int aclMatchArp(SplayNode<acl_arp_data *> **dataptr, struct in_addr c);
++static SplayNode<acl_arp_data *>::SPLAYCMP aclArpCompare;
++static SplayNode<acl_arp_data *>::SPLAYWALKEE aclDumpArpListWalkee;
++
++ACL::Prototype ACLARP::RegistryProtoype(&ACLARP::RegistryEntry_, "arp");
++
++ACLARP ACLARP::RegistryEntry_("arp");
++
++ACL *
++ACLARP::clone() const
++{
++    return new ACLARP(*this);
++}
++
++ACLARP::ACLARP (char const *theClass) : data (NULL), class_ (theClass)
++{}
++
++ACLARP::ACLARP (ACLARP const & old) : data (NULL), class_ (old.class_)
++{
++    /* we don't have copy constructors for the data yet */
++    assert (!old.data);
++}
++
++MemPool *ACLARP::Pool(NULL);
++void *
++ACLARP::operator new (size_t byteCount)
++{
++    /* derived classes with different sizes must implement their own new */
++    assert (byteCount == sizeof (ACLARP));
++
++    if (!Pool)
++        Pool = memPoolCreate("ACLARP", sizeof (ACLARP));
++
++    return memPoolAlloc(Pool);
++}
++
++void
++ACLARP::operator delete (void *address)
++{
++    memPoolFree (Pool, address);
++}
++
++void
++ACLARP::deleteSelf() const
++{
++    delete this;
++}
++
++ACLARP::~ACLARP()
++{
++    if (data)
++        data->destroy(SplayNode<acl_arp_data*>::DefaultFree);
++}
++
++char const *
++ACLARP::typeString() const
++{
++    return class_;
++}
++
++bool
++ACLARP::valid () const
++{
++    return data != NULL;
++}
++
++/* ==== BEGIN ARP ACL SUPPORT ============================================= */
++
++/*
++ * From:    dale@server.ctam.bitmcnit.bryansk.su (Dale)
++ * To:      wessels@nlanr.net
++ * Subject: Another Squid patch... :)
++ * Date:    Thu, 04 Dec 1997 19:55:01 +0300
++ * ============================================================================
++ * 
++ * Working on setting up a proper firewall for a network containing some
++ * Win'95 computers at our Univ, I've discovered that some smart students
++ * avoid the restrictions easily just changing their IP addresses in Win'95
++ * Contol Panel... It has been getting boring, so I took Squid-1.1.18
++ * sources and added a new acl type for hard-wired access control:
++ * 
++ * acl <name> arp <Ethernet address> ...
++ * 
++ * For example,
++ * 
++ * acl students arp 00:00:21:55:ed:22 00:00:21:ff:55:38
++ *
++ * NOTE: Linux code by David Luyer <luyer@ucs.uwa.edu.au>.
++ *       Original (BSD-specific) code no longer works.
++ *       Solaris code by R. Gancarz <radekg@solaris.elektrownia-lagisza.com.pl>
++ */
++
++#ifdef _SQUID_SOLARIS_
++#include <sys/sockio.h>
++#else
++#include <sys/sysctl.h>
++#endif
++#ifdef _SQUID_LINUX_
++#include <net/if_arp.h>
++#include <sys/ioctl.h>
++#else
++#include <net/if_dl.h>
++#endif
++#include <net/route.h>
++#include <net/if.h>
++#if HAVE_NETINET_IF_ETHER_H
++#include <netinet/if_ether.h>
++#endif
++
++/*
++ * Decode an ascii representation (asc) of an ethernet adress, and place
++ * it in eth[6].
++ */
++static int
++decode_eth(const char *asc, char *eth)
++{
++    int a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0;
++
++    if (sscanf(asc, "%x:%x:%x:%x:%x:%x", &a1, &a2, &a3, &a4, &a5, &a6) != 6) {
++        debug(28, 0) ("decode_eth: Invalid ethernet address '%s'\n", asc);
++        return 0;		/* This is not valid address */
++    }
++
++    eth[0] = (u_char) a1;
++    eth[1] = (u_char) a2;
++    eth[2] = (u_char) a3;
++    eth[3] = (u_char) a4;
++    eth[4] = (u_char) a5;
++    eth[5] = (u_char) a6;
++    return 1;
++}
++
++acl_arp_data *
++aclParseArpData(const char *t)
++{
++    LOCAL_ARRAY(char, eth, 256);
++    acl_arp_data *q = new acl_arp_data;
++    debug(28, 5) ("aclParseArpData: %s\n", t);
++
++    if (sscanf(t, "%[0-9a-fA-F:]", eth) != 1) {
++        debug(28, 0) ("aclParseArpData: Bad ethernet address: '%s'\n", t);
++        safe_free(q);
++        return NULL;
++    }
++
++    if (!decode_eth(eth, q->eth)) {
++        debug(28, 0) ("%s line %d: %s\n",
++                      cfg_filename, config_lineno, config_input_line);
++        debug(28, 0) ("aclParseArpData: Ignoring invalid ARP acl entry: can't parse '%s'\n", eth);
++        safe_free(q);
++        return NULL;
++    }
++
++    return q;
++}
++
++
++/*******************/
++/* aclParseArpList */
++/*******************/
++void
++ACLARP::parse()
++{
++    aclParseArpList (&data);
++}
++
++void
++aclParseArpList(SplayNode<acl_arp_data *> **curlist)
++{
++    char *t = NULL;
++    SplayNode<acl_arp_data *> **Top = curlist;
++    acl_arp_data *q = NULL;
++
++    while ((t = strtokFile())) {
++        if ((q = aclParseArpData(t)) == NULL)
++            continue;
++
++        *Top = (*Top)->insert(q, aclArpCompare);
++    }
++}
++
++int
++ACLARP::match(ACLChecklist *checklist)
++{
++    return aclMatchArp(&data, checklist->src_addr);
++}
++
++/***************/
++/* aclMatchArp */
++/***************/
++int
++aclMatchArp(SplayNode<acl_arp_data *> **dataptr, struct in_addr c)
++{
++#if defined(_SQUID_LINUX_)
++
++    struct arpreq arpReq;
++
++    struct sockaddr_in ipAddr;
++
++    unsigned char ifbuffer[sizeof(struct ifreq) * 64];
++
++    struct ifconf ifc;
++
++    struct ifreq *ifr;
++    int offset;
++    SplayNode<acl_arp_data*> **Top = dataptr;
++    /*
++     * The linux kernel 2.2 maintains per interface ARP caches and
++     * thus requires an interface name when doing ARP queries.
++     * 
++     * The older 2.0 kernels appear to use a unified ARP cache,
++     * and require an empty interface name
++     * 
++     * To support both, we attempt the lookup with a blank interface
++     * name first. If that does not succeed, the try each interface
++     * in turn
++     */
++    /*
++     * Set up structures for ARP lookup with blank interface name
++     */
++    ipAddr.sin_family = AF_INET;
++    ipAddr.sin_port = 0;
++    ipAddr.sin_addr = c;
++    memset(&arpReq, '\0', sizeof(arpReq));
++
++    xmemcpy(&arpReq.arp_pa, &ipAddr, sizeof(struct sockaddr_in));
++    /* Query ARP table */
++
++    if (ioctl(HttpSockets[0], SIOCGARP, &arpReq) != -1) {
++        /* Skip non-ethernet interfaces */
++
++        if (arpReq.arp_ha.sa_family != ARPHRD_ETHER) {
++            return 0;
++        }
++
++        debug(28, 4) ("Got address %02x:%02x:%02x:%02x:%02x:%02x\n",
++                      arpReq.arp_ha.sa_data[0] & 0xff, arpReq.arp_ha.sa_data[1] & 0xff,
++                      arpReq.arp_ha.sa_data[2] & 0xff, arpReq.arp_ha.sa_data[3] & 0xff,
++                      arpReq.arp_ha.sa_data[4] & 0xff, arpReq.arp_ha.sa_data[5] & 0xff);
++        /* Do lookup */
++        acl_arp_data X;
++        memcpy (X.eth, arpReq.arp_ha.sa_data, 6);
++        *Top = (*Top)->splay(&X, aclArpCompare);
++        debug(28, 3) ("aclMatchArp: '%s' %s\n",
++                      inet_ntoa(c), splayLastResult ? "NOT found" : "found");
++        return (0 == splayLastResult);
++    }
++
++    /* lookup list of interface names */
++    ifc.ifc_len = sizeof(ifbuffer);
++
++    ifc.ifc_buf = (char *)ifbuffer;
++
++    if (ioctl(HttpSockets[0], SIOCGIFCONF, &ifc) < 0) {
++        debug(28, 1) ("Attempt to retrieve interface list failed: %s\n",
++                      xstrerror());
++        return 0;
++    }
++
++    if (ifc.ifc_len > (int)sizeof(ifbuffer)) {
++        debug(28, 1) ("Interface list too long - %d\n", ifc.ifc_len);
++        return 0;
++    }
++
++    /* Attempt ARP lookup on each interface */
++    offset = 0;
++
++    while (offset < ifc.ifc_len) {
++
++        ifr = (struct ifreq *) (ifbuffer + offset);
++        offset += sizeof(*ifr);
++        /* Skip loopback and aliased interfaces */
++
++        if (0 == strncmp(ifr->ifr_name, "lo", 2))
++            continue;
++
++        if (NULL != strchr(ifr->ifr_name, ':'))
++            continue;
++
++        debug(28, 4) ("Looking up ARP address for %s on %s\n", inet_ntoa(c),
++                      ifr->ifr_name);
++
++        /* Set up structures for ARP lookup */
++        ipAddr.sin_family = AF_INET;
++
++        ipAddr.sin_port = 0;
++
++        ipAddr.sin_addr = c;
++
++        memset(&arpReq, '\0', sizeof(arpReq));
++
++        xmemcpy(&arpReq.arp_pa, &ipAddr, sizeof(struct sockaddr_in));
++
++        strncpy(arpReq.arp_dev, ifr->ifr_name, sizeof(arpReq.arp_dev) - 1);
++
++        arpReq.arp_dev[sizeof(arpReq.arp_dev) - 1] = '\0';
++
++        /* Query ARP table */
++        if (-1 == ioctl(HttpSockets[0], SIOCGARP, &arpReq)) {
++            /*
++             * Query failed.  Do not log failed lookups or "device
++             * not supported"
++             */
++
++            if (ENXIO == errno)
++                (void) 0;
++            else if (ENODEV == errno)
++                (void) 0;
++            else
++                debug(28, 1) ("ARP query failed: %s: %s\n",
++                              ifr->ifr_name, xstrerror());
++
++            continue;
++        }
++
++        /* Skip non-ethernet interfaces */
++        if (arpReq.arp_ha.sa_family != ARPHRD_ETHER)
++            continue;
++
++        debug(28, 4) ("Got address %02x:%02x:%02x:%02x:%02x:%02x on %s\n",
++                      arpReq.arp_ha.sa_data[0] & 0xff,
++                      arpReq.arp_ha.sa_data[1] & 0xff,
++                      arpReq.arp_ha.sa_data[2] & 0xff,
++                      arpReq.arp_ha.sa_data[3] & 0xff,
++                      arpReq.arp_ha.sa_data[4] & 0xff,
++                      arpReq.arp_ha.sa_data[5] & 0xff, ifr->ifr_name);
++
++        /* Do lookup */
++        acl_arp_data X;
++
++        memcpy (X.eth, arpReq.arp_ha.sa_data, 6);
++
++        *Top = (*Top)->splay(&X, aclArpCompare);
++
++        /* Return if match, otherwise continue to other interfaces */
++        if (0 == splayLastResult) {
++            debug(28, 3) ("aclMatchArp: %s found on %s\n",
++                          inet_ntoa(c), ifr->ifr_name);
++            return 1;
++        }
++
++        /*
++         * Should we stop looking here? Can the same IP address
++         * exist on multiple interfaces?
++         */
++    }
++
++#elif defined(_SQUID_SOLARIS_)
++
++    struct arpreq arpReq;
++
++    struct sockaddr_in ipAddr;
++
++    unsigned char ifbuffer[sizeof(struct ifreq) * 64];
++
++    struct ifconf ifc;
++
++    struct ifreq *ifr;
++
++    int offset;
++
++    SplayNode<acl_arp_data *> **Top = dataptr;
++
++    /*
++    * Set up structures for ARP lookup with blank interface name
++    */
++    ipAddr.sin_family = AF_INET;
++
++    ipAddr.sin_port = 0;
++
++    ipAddr.sin_addr = c;
++
++    memset(&arpReq, '\0', sizeof(arpReq));
++
++    xmemcpy(&arpReq.arp_pa, &ipAddr, sizeof(struct sockaddr_in));
++
++    /* Query ARP table */
++    if (ioctl(HttpSockets[0], SIOCGARP, &arpReq) != -1) {
++        /*
++        *  Solaris (at least 2.6/x86) does not use arp_ha.sa_family -
++        * it returns 00:00:00:00:00:00 for non-ethernet media
++        */
++
++        if (arpReq.arp_ha.sa_data[0] == 0 &&
++                arpReq.arp_ha.sa_data[1] == 0 &&
++                arpReq.arp_ha.sa_data[2] == 0 &&
++                arpReq.arp_ha.sa_data[3] == 0 &&
++                arpReq.arp_ha.sa_data[4] == 0 && arpReq.arp_ha.sa_data[5] == 0)
++            return 0;
++
++        debug(28, 4) ("Got address %02x:%02x:%02x:%02x:%02x:%02x\n",
++                      arpReq.arp_ha.sa_data[0] & 0xff, arpReq.arp_ha.sa_data[1] & 0xff,
++                      arpReq.arp_ha.sa_data[2] & 0xff, arpReq.arp_ha.sa_data[3] & 0xff,
++                      arpReq.arp_ha.sa_data[4] & 0xff, arpReq.arp_ha.sa_data[5] & 0xff);
++
++        /* Do lookup */
++        *Top = (*Top)->splay(&arpReq.arp_ha.sa_data, aclArpCompare);
++
++        debug(28, 3) ("aclMatchArp: '%s' %s\n",
++                      inet_ntoa(c), splayLastResult ? "NOT found" : "found");
++
++        return (0 == splayLastResult);
++    }
++
++#else
++    WRITE ME;
++
++#endif
++    /*
++     * Address was not found on any interface
++     */
++    debug(28, 3) ("aclMatchArp: %s NOT found\n", inet_ntoa(c));
++
++    return 0;
++}
++
++static int
++aclArpCompare(acl_arp_data * const &a, acl_arp_data * const &b)
++{
++    return memcmp(a->eth, b->eth, 6);
++}
++
++#if UNUSED_CODE
++/**********************************************************************
++* This is from the pre-splay-tree code for BSD
++* I suspect the Linux approach will work on most O/S and be much
++* better - <luyer@ucs.uwa.edu.au>
++***********************************************************************
++static int
++checkARP(u_long ip, char *eth)
++{
++    int mib[6] =
++    {CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_FLAGS, RTF_LLINFO};
++    size_t needed;
++    char *buf, *next, *lim;
++    struct rt_msghdr *rtm;
++    struct sockaddr_inarp *sin;
++    struct sockaddr_dl *sdl;
++    if (sysctl(mib, 6, NULL, &needed, NULL, 0) < 0) {
++	debug(28, 0) ("Can't estimate ARP table size!\n");
++	return 0;
++    }
++    if ((buf = xmalloc(needed)) == NULL) {
++	debug(28, 0) ("Can't allocate temporary ARP table!\n");
++	return 0;
++    }
++    if (sysctl(mib, 6, buf, &needed, NULL, 0) < 0) {
++	debug(28, 0) ("Can't retrieve ARP table!\n");
++	xfree(buf);
++	return 0;
++    }
++    lim = buf + needed;
++    for (next = buf; next < lim; next += rtm->rtm_msglen) {
++	rtm = (struct rt_msghdr *) next;
++	sin = (struct sockaddr_inarp *) (rtm + 1);
++	sdl = (struct sockaddr_dl *) (sin + 1);
++	if (sin->sin_addr.s_addr == ip) {
++	    if (sdl->sdl_alen)
++		if (!memcmp(LLADDR(sdl), eth, 6)) {
++		    xfree(buf);
++		    return 1;
++		}
++	    break;
++	}
++    }
++    xfree(buf);
++    return 0;
++}
++**********************************************************************/
++#endif
++
++static void
++aclDumpArpListWalkee(acl_arp_data * const &node, void *state)
++{
++    acl_arp_data *arp = node;
++    static char buf[24];
++    snprintf(buf, sizeof(buf), "%02x:%02x:%02x:%02x:%02x:%02x",
++             arp->eth[0], arp->eth[1], arp->eth[2], arp->eth[3],
++             arp->eth[4], arp->eth[5]);
++    wordlistAdd((wordlist **)state, buf);
++}
++
++wordlist *
++ACLARP::dump() const
++{
++    wordlist *w = NULL;
++    data->walk(aclDumpArpListWalkee, &w);
++    return w;
++}
++
++/* ==== END ARP ACL SUPPORT =============================================== */
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: ACLASN.cc,v 1.1 2003/02/16 02:23:18 robertc Exp $
++ * $Id: ACLASN.cc,v 1.2 2003/02/25 12:16:55 robertc Exp $
+  *
+  * DEBUG: section 28    Access Control
+  * AUTHOR: Robert Collins
+@@ -37,29 +37,3 @@
+ #include "ACLASN.h"
+ #include "ACLChecklist.h"
+ 
+-ASNLookup ASNLookup::instance_;
+-
+-ASNLookup *
+-ASNLookup::Instance()
+-{
+-    return &instance_;
+-}
+-
+-void
+-ASNLookup::checkForAsync(ACLChecklist *checklist)const
+-{
+-    checklist->asyncInProgress(true);
+-    checklist->state[ACL_DST_ASN] = ACL_LOOKUP_PENDING;
+-    ipcache_nbgethostbyname(checklist->request->host, LookupDone, checklist);
+-}
+-
+-void
+-ASNLookup::LookupDone(const ipcache_addrs * ia, void *data)
+-{
+-    ACLChecklist *checklist = (ACLChecklist *)data;
+-    assert (checklist->asyncState() == ASNLookup::Instance());
+-    checklist->request->flags.destinationIPLookupCompleted();
+-    checklist->asyncInProgress(false);
+-    checklist->changeState (ACLChecklist::NullState::Instance());
+-    checklist->check();
+-}
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: ACLCertificateData.cc,v 1.3 2003/02/21 22:50:04 robertc Exp $
++ * $Id: ACLCertificateData.cc,v 1.4 2003/02/25 12:16:55 robertc Exp $
+  *
+  * DEBUG: section 28    Access Control
+  * AUTHOR: Duane Wessels
+@@ -65,13 +65,11 @@ ACLCertificateData::deleteSelf() const
+ }
+ 
+ 
+-ACLCertificateData::ACLCertificateData(SSLGETATTRIBUTE *sslStrategy) : attribute (NULL), values (NULL), sslAttributeCall (sslStrategy)
++ACLCertificateData::ACLCertificateData(SSLGETATTRIBUTE *sslStrategy) : attribute (NULL), values (), sslAttributeCall (sslStrategy)
+ {}
+ 
+-ACLCertificateData::ACLCertificateData(ACLCertificateData const &old) : attribute (NULL), values (NULL), sslAttributeCall (old.sslAttributeCall)
++ACLCertificateData::ACLCertificateData(ACLCertificateData const &old) : attribute (NULL), values (old.values), sslAttributeCall (old.sslAttributeCall)
+ {
+-    assert (!old.values);
+-
+     if (old.attribute)
+         attribute = xstrdup (old.attribute);
+ }
+@@ -86,16 +84,6 @@ xRefFree(T &thing)
+ ACLCertificateData::~ACLCertificateData()
+ {
+     safe_free (attribute);
+-
+-    if (values)
+-        values->destroy(xRefFree);
+-}
+-
+-template<class T>
+-inline int
+-splaystrcasecmp (T&l, T&r)
+-{
+-    return strcasecmp ((char *)l,(char *)r);
+ }
+ 
+ template<class T>
+@@ -116,14 +104,7 @@ ACLCertificateData::match(SSL *ssl)
+     if (value == NULL)
+         return 0;
+ 
+-    debug(28, 3) ("aclMatchCertificateList: checking '%s'\n", value);
+-
+-    values = values->splay((char *)value, splaystrcmp);
+-
+-    debug(28, 3) ("aclMatchCertificateList: '%s' %s\n",
+-                  value, splayLastResult ? "NOT found" : "found");
+-
+-    return !splayLastResult;
++    return values.match(value);
+ }
+ 
+ static void
+@@ -142,7 +123,8 @@ ACLCertificateData::dump()
+      * a wordlist this way costs Sum(1,N) iterations. For instance
+      * a 1000-elements list will be filled in 499500 iterations.
+      */
+-    values->walk(aclDumpAttributeListWalkee, &wl);
++    /* XXX FIXME: don't break abstraction */
++    values.values->walk(aclDumpAttributeListWalkee, &wl);
+     return wl;
+ }
+ 
+@@ -161,18 +143,13 @@ ACLCertificateData::parse()
+     } else
+         attribute = xstrdup(newAttribute);
+ 
+-    char *t;
+-
+-    while ((t = strtokFile())) {
+-        values = values->insert(xstrdup(t), splaystrcmp);
+-    }
++    values.parse();
+ }
+ 
+ 
+ ACLData<SSL *> *
+ ACLCertificateData::clone() const
+ {
+     /* Splay trees don't clone yet. */
+-    assert (!values);
+     return new ACLCertificateData(*this);
+ }
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: ACLChecklist.cc,v 1.8 2003/02/22 14:59:33 hno Exp $
++ * $Id: ACLChecklist.cc,v 1.9 2003/02/25 12:16:55 robertc Exp $
+  *
+  * DEBUG: section 28    Access Control
+  * AUTHOR: Duane Wessels
+@@ -197,12 +197,7 @@ ACLChecklist::checkAccessList()
+     /* what is our result on a match? */
+     currentAnswer(accessList->allow);
+     /* does the current AND clause match */
+-    bool match = matchAclList(accessList->aclList);
+-
+-    if (match)
+-        markFinished();
+-    else
+-        checkForAsync();
++    matchAclList(accessList->aclList);
+ }
+ 
+ void
+@@ -239,7 +234,7 @@ ACLChecklist::checkCallback(allow_t answer)
+     delete this;
+ }
+ 
+-bool
++void
+ ACLChecklist::matchAclList(const acl_list * head, bool const fast)
+ {
+     PROF_start(aclMatchAclList);
+@@ -253,16 +248,17 @@ ACLChecklist::matchAclList(const acl_list * head, bool const fast)
+ 
+         if (!nodeMatched || state_ != NullState::Instance()) {
+             debug(28, 3) ("aclmatchAclList: %p returning false (AND list entry failed to match)\n", this);
++            checkForAsync();
+             PROF_stop(aclMatchAclList);
+-            return false;
++            return;
+         }
+ 
+         node = node->next;
+     }
+ 
+     debug(28, 3) ("aclmatchAclList: %p returning true (AND list satisfied)\n", this);
++    markFinished();
+     PROF_stop(aclMatchAclList);
+-    return true;
+ }
+ 
+ CBDATA_CLASS_INIT(ACLChecklist);
+@@ -318,7 +314,6 @@ ACLChecklist::ACLChecklist() : accessList (NULL), my_port (0), request (NULL),
+ 
+     memset (&my_addr, '\0', sizeof (struct in_addr));
+     rfc931[0] = '\0';
+-    memset (&state, '\0', sizeof (state));
+ }
+ 
+ ACLChecklist::~ACLChecklist()
+@@ -0,0 +1,141 @@
++/*
++ * $Id: ACLIntRange.cc,v 1.1 2003/02/25 12:16:55 robertc Exp $
++ *
++ * DEBUG: section 28    Access Control
++ * AUTHOR: Robert Collins
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sources; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ *
++ * Copyright (c) 2003, Robert Collins <robertc@squid-cache.org>
++ */
++
++#include "squid.h"
++#include "ACLIntRange.h"
++
++void
++ACLIntRange::parse()
++{
++    RangeType **Tail;
++    RangeType *q = NULL;
++    char *t = NULL;
++
++    for (Tail = &ranges; *Tail; Tail = &((*Tail)->next))
++
++        ;
++    while ((t = strtokFile())) {
++        Range<int> temp (0,0);
++        temp.start = atoi(t);
++        t = strchr(t, '-');
++
++        if (t && *(++t))
++            temp.end = atoi(t) + 1;
++        else
++            temp.end = temp.start+1;
++
++        q = new RangeType (temp);
++
++        *(Tail) = q;
++
++        Tail = &q->next;
++    }
++}
++
++bool
++ACLIntRange::match(int i)
++{
++    Range<int> const toFind (i, i+1);
++    RangeType *prev;
++    RangeType *data = ranges;
++    prev = NULL;
++
++    while (data) {
++        Range<int> result = data->element.intersection (toFind);
++
++        if (result.size()) {
++            /* matched */
++
++            if (prev != NULL) {
++                /* shift the element just found to the second position
++                 * in the list */
++                prev->next = data->next;
++                data->next = ranges->next;
++                ranges->next = data;
++            }
++
++            return true;
++        }
++
++        prev = data;
++        data = data->next;
++    }
++
++    return false;
++}
++
++void
++ACLIntRange::deleteSelf() const
++{
++    delete this;
++}
++
++ACLData<int> *
++ACLIntRange::clone() const
++{
++    if (ranges)
++        fatal("ACLIntRange::clone: attempt to clone used ACL");
++
++    return new ACLIntRange (*this);
++}
++
++ACLIntRange::~ACLIntRange ()
++{
++    if (ranges)
++        ranges->deleteSelf();
++}
++
++wordlist *
++ACLIntRange::dump ()
++{
++    wordlist *W = NULL;
++    char buf[32];
++    RangeType *data = ranges;
++
++    while (data != NULL) {
++        if (data->element.size() == 1)
++            snprintf(buf, sizeof(buf), "%d", data->element.start);
++        else
++            snprintf(buf, sizeof(buf), "%d-%d", data->element.start, data->element.end);
++
++        wordlistAdd(&W, buf);
++
++        data = data->next;
++    }
++
++    return W;
++}
++
+@@ -0,0 +1,138 @@
++/*
++ * $Id: ACLMaxConnection.cc,v 1.1 2003/02/25 12:16:55 robertc Exp $
++ *
++ * DEBUG: section 28    Access Control
++ * AUTHOR: Duane Wessels
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sources; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ *
++ * Copyright (c) 2003, Robert Collins <robertc@squid-cache.org>
++ */
++
++#include "squid.h"
++#include "ACLMaxConnection.h"
++
++ACL::Prototype ACLMaxConnection::RegistryProtoype(&ACLMaxConnection::RegistryEntry_, "maxconn");
++
++ACLMaxConnection ACLMaxConnection::RegistryEntry_("maxconn");
++
++ACL *
++ACLMaxConnection::clone() const
++{
++    return new ACLMaxConnection(*this);
++}
++
++ACLMaxConnection::ACLMaxConnection (char const *theClass) : class_ (theClass), limit(0)
++{}
++
++ACLMaxConnection::ACLMaxConnection (ACLMaxConnection const & old) :class_ (old.class_), limit (old.limit)
++{}
++
++MemPool *ACLMaxConnection::Pool(NULL);
++void *
++ACLMaxConnection::operator new (size_t byteCount)
++{
++    /* derived classes with different sizes must implement their own new */
++    assert (byteCount == sizeof (ACLMaxConnection));
++
++    if (!Pool)
++        Pool = memPoolCreate("ACLMaxConnection", sizeof (ACLMaxConnection));
++
++    return memPoolAlloc(Pool);
++}
++
++void
++ACLMaxConnection::operator delete (void *address)
++{
++    memPoolFree (Pool, address);
++}
++
++void
++ACLMaxConnection::deleteSelf() const
++{
++    delete this;
++}
++
++ACLMaxConnection::~ACLMaxConnection()
++{}
++
++char const *
++ACLMaxConnection::typeString() const
++{
++    return class_;
++}
++
++bool
++ACLMaxConnection::valid () const
++{
++    return limit != 0;
++}
++
++void
++ACLMaxConnection::parse()
++{
++    char *t = strtokFile();
++    limit = (atoi (t));
++    /* suck out file contents */
++
++    while ((t = strtokFile()))
++
++        ;
++}
++
++int
++ACLMaxConnection::match(ACLChecklist *checklist)
++{
++    return (clientdbEstablished(checklist->src_addr, 0) > limit ? 1 : 0);
++}
++
++wordlist *
++ACLMaxConnection::dump() const
++{
++    if (!limit)
++        return NULL;
++
++    wordlist *W = NULL;
++
++    char buf[32];
++
++    snprintf(buf, sizeof(buf), "%d", limit);
++
++    wordlistAdd(&W, buf);
++
++    return W;
++}
++
++void
++ACLMaxConnection::prepareForUse()
++{
++    if (0 != Config.onoff.client_db)
++        return;
++
++    debug(22, 0) ("WARNING: 'maxconn' ACL (%s) won't work with client_db disabled\n", name);
++}
+@@ -0,0 +1,203 @@
++/*
++ * $Id: ACLMaxUserIP.cc,v 1.1 2003/02/25 12:16:55 robertc Exp $
++ *
++ * DEBUG: section 28    Access Control
++ * AUTHOR: Duane Wessels
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sources; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ *
++ * Copyright (c) 2003, Robert Collins <robertc@squid-cache.org>
++ */
++
++#include "squid.h"
++#include "ACLMaxUserIP.h"
++#include "authenticate.h"
++
++ACL::Prototype ACLMaxUserIP::RegistryProtoype(&ACLMaxUserIP::RegistryEntry_, "max_user_ip");
++
++ACLMaxUserIP ACLMaxUserIP::RegistryEntry_("max_user_ip");
++
++ACL *
++ACLMaxUserIP::clone() const
++{
++    return new ACLMaxUserIP(*this);
++}
++
++ACLMaxUserIP::ACLMaxUserIP (char const *theClass) : class_ (theClass), max(0)
++{}
++
++ACLMaxUserIP::ACLMaxUserIP (ACLMaxUserIP const & old) :class_ (old.class_), max (old.max), flags (old.flags)
++{}
++
++MemPool *ACLMaxUserIP::Pool(NULL);
++void *
++ACLMaxUserIP::operator new (size_t byteCount)
++{
++    /* derived classes with different sizes must implement their own new */
++    assert (byteCount == sizeof (ACLMaxUserIP));
++
++    if (!Pool)
++        Pool = memPoolCreate("ACLMaxUserIP", sizeof (ACLMaxUserIP));
++
++    return memPoolAlloc(Pool);
++}
++
++void
++ACLMaxUserIP::operator delete (void *address)
++{
++    memPoolFree (Pool, address);
++}
++
++void
++ACLMaxUserIP::deleteSelf() const
++{
++    delete this;
++}
++
++ACLMaxUserIP::~ACLMaxUserIP()
++{}
++
++char const *
++ACLMaxUserIP::typeString() const
++{
++    return class_;
++}
++
++bool
++ACLMaxUserIP::valid () const
++{
++    return max != 0;
++}
++
++void
++ACLMaxUserIP::parse()
++{
++    if (max) {
++        debug(28, 1) ("Attempting to alter already set User max IP acl\n");
++        return;
++    }
++
++    char *t = strtokFile();
++
++    if (!t)
++        fatal("aclParseUserMaxIP: Malformed ACL\n");
++
++    debug(28, 5) ("aclParseUserMaxIP: First token is %s\n", t);
++
++    if (strcmp("-s", t) == 0) {
++        debug(28, 5) ("aclParseUserMaxIP: Going strict\n");
++        flags.strict = 1;
++        t = strtokFile();
++    }
++
++    if (!t)
++        fatal("aclParseUserMaxIP: Malformed ACL\n");
++
++    max = atoi(t);
++
++    debug(28, 5) ("aclParseUserMaxIP: Max IP address's %d\n", (int) max);
++
++    return;
++}
++
++/*
++ * aclMatchUserMaxIP - check for users logging in from multiple IP's 
++ * 0 : No match
++ * 1 : Match 
++ */
++int
++ACLMaxUserIP::match(auth_user_request_t * auth_user_request,
++
++                    struct in_addr const &src_addr)
++{
++    /*
++     * the logic for flush the ip list when the limit is hit vs keep
++     * it sorted in most recent access order and just drop the oldest
++     * one off is currently undecided (RBC)
++     */
++
++    if (authenticateAuthUserRequestIPCount(auth_user_request) <= max)
++        return 0;
++
++    /* this is a match */
++    if (flags.strict)
++    {
++        /*
++         * simply deny access - the user name is already associated with
++         * the request 
++         */
++        /* remove _this_ ip, as it is the culprit for going over the limit */
++        authenticateAuthUserRequestRemoveIp(auth_user_request, src_addr);
++        debug(28, 4) ("aclMatchUserMaxIP: Denying access in strict mode\n");
++    } else
++    {
++        /*
++         * non-strict - remove some/all of the cached entries 
++         * ie to allow the user to move machines easily
++         */
++        authenticateAuthUserRequestClearIp(auth_user_request);
++        debug(28, 4) ("aclMatchUserMaxIP: Denying access in non-strict mode - flushing the user ip cache\n");
++    }
++
++    return 1;
++}
++
++int
++ACLMaxUserIP::match(ACLChecklist *checklist)
++{
++    int ti;
++
++    if ((ti = checklist->authenticated()) != 1)
++        return ti;
++
++    ti = match(checklist->auth_user_request, checklist->src_addr);
++
++    checklist->auth_user_request = NULL;
++
++    return ti;
++}
++
++wordlist *
++ACLMaxUserIP::dump() const
++{
++    if (!max)
++        return NULL;
++
++    wordlist *W = NULL;
++
++    if (flags.strict)
++        wordlistAdd(&W, "-s");
++
++    char buf[128];
++
++    snprintf(buf, sizeof(buf), "%lu", (unsigned long int) max);
++
++    wordlistAdd(&W, buf);
++
++    return W;
++}
+@@ -0,0 +1,56 @@
++
++/*
++ * $Id: ACLMethod.cc,v 1.1 2003/02/25 12:16:55 robertc Exp $
++ *
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sources; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ *
++ * Copyright (c) 2003, Robert Collins <robertc@squid-cache.org>
++ */
++
++#include "squid.h"
++#include "ACLMethod.h"
++#include "ACLMethodData.h"
++#include "ACLChecklist.h"
++
++ACL::Prototype ACLMethod::RegistryProtoype(&ACLMethod::RegistryEntry_, "method");
++ACLStrategised<method_t> ACLMethod::RegistryEntry_(new ACLMethodData, ACLMethodStrategy::Instance(), "method");
++
++int
++ACLMethodStrategy::match (ACLData<MatchType> * &data, ACLChecklist *checklist)
++{
++    return data->match (checklist->request->method);
++}
++
++ACLMethodStrategy *
++ACLMethodStrategy::Instance()
++{
++    return &Instance_;
++}
++
++ACLMethodStrategy ACLMethodStrategy::Instance_;
+@@ -0,0 +1,122 @@
++/*
++ * $Id: ACLMethodData.cc,v 1.1 2003/02/25 12:16:55 robertc Exp $
++ *
++ * DEBUG: section 28    Access Control
++ * AUTHOR: Duane Wessels
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sources; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ *
++ * Copyright (c) 2003, Robert Collins <robertc@squid-cache.org>
++ */
++
++#include "squid.h"
++#include "ACLMethodData.h"
++#include "ACLChecklist.h"
++
++MemPool *ACLMethodData::Pool(NULL);
++void *
++ACLMethodData::operator new (size_t byteCount)
++{
++    /* derived classes with different sizes must implement their own new */
++    assert (byteCount == sizeof (ACLMethodData));
++
++    if (!Pool)
++        Pool = memPoolCreate("ACLMethodData", sizeof (ACLMethodData));
++
++    return memPoolAlloc(Pool);
++}
++
++void
++ACLMethodData::operator delete (void *address)
++{
++    memPoolFree (Pool, address);
++}
++
++void
++ACLMethodData::deleteSelf() const
++{
++    delete this;
++}
++
++
++ACLMethodData::ACLMethodData() : values (NULL)
++{}
++
++ACLMethodData::ACLMethodData(ACLMethodData const &old) : values (NULL)
++{
++    assert (!old.values);
++}
++
++ACLMethodData::~ACLMethodData()
++{
++    if (values)
++        values->deleteSelf();
++}
++
++bool
++ACLMethodData::match(method_t toFind)
++{
++    return values->findAndTune (toFind);
++}
++
++wordlist *
++ACLMethodData::dump()
++{
++    wordlist *W = NULL;
++    List<method_t> *data = values;
++
++    while (data != NULL) {
++        wordlistAdd(&W, RequestMethodStr[data->element]);
++        data = data->next;
++    }
++
++    return W;
++}
++
++void
++ACLMethodData::parse()
++{
++    List<method_t> **Tail;
++    char *t = NULL;
++
++    for (Tail = &values; *Tail; Tail = &((*Tail)->next))
++
++        ;
++    while ((t = strtokFile())) {
++        List<method_t> *q = new List<method_t> (urlParseMethod(t));
++        *(Tail) = q;
++        Tail = &q->next;
++    }
++}
++
++ACLData<method_t> *
++ACLMethodData::clone() const
++{
++    assert (!values);
++    return new ACLMethodData(*this);
++}
+@@ -0,0 +1,56 @@
++
++/*
++ * $Id: ACLMyPort.cc,v 1.1 2003/02/25 12:16:55 robertc Exp $
++ *
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sources; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ *
++ * Copyright (c) 2003, Robert Collins <robertc@squid-cache.org>
++ */
++
++#include "squid.h"
++#include "ACLMyPort.h"
++#include "ACLIntRange.h"
++#include "ACLChecklist.h"
++
++ACL::Prototype ACLMyPort::RegistryProtoype(&ACLMyPort::RegistryEntry_, "myport");
++ACLStrategised<int> ACLMyPort::RegistryEntry_(new ACLIntRange, ACLMyPortStrategy::Instance(), "myport");
++
++int
++ACLMyPortStrategy::match (ACLData<MatchType> * &data, ACLChecklist *checklist)
++{
++    return data->match (checklist->my_port);
++}
++
++ACLMyPortStrategy *
++ACLMyPortStrategy::Instance()
++{
++    return &Instance_;
++}
++
++ACLMyPortStrategy ACLMyPortStrategy::Instance_;
+@@ -0,0 +1,57 @@
++
++/*
++ * $Id: ACLProtocol.cc,v 1.1 2003/02/25 12:16:55 robertc Exp $
++ *
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sources; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ *
++ * Copyright (c) 2003, Robert Collins <robertc@squid-cache.org>
++ */
++
++#include "squid.h"
++#include "ACLProtocol.h"
++#include "ACLProtocolData.h"
++#include "ACLChecklist.h"
++
++ACL::Prototype ACLProtocol::RegistryProtoype(&ACLProtocol::RegistryEntry_, "proto");
++ACLStrategised<protocol_t> ACLProtocol::RegistryEntry_(new ACLProtocolData, ACLProtocolStrategy::Instance(), "proto");
++
++int
++ACLProtocolStrategy::match (ACLData<MatchType> * &data, ACLChecklist *checklist)
++{
++    return data->match (checklist->request->protocol);
++    ;
++}
++
++ACLProtocolStrategy *
++ACLProtocolStrategy::Instance()
++{
++    return &Instance_;
++}
++
++ACLProtocolStrategy ACLProtocolStrategy::Instance_;
+@@ -0,0 +1,123 @@
++/*
++ * $Id: ACLProtocolData.cc,v 1.1 2003/02/25 12:16:55 robertc Exp $
++ *
++ * DEBUG: section 28    Access Control
++ * AUTHOR: Duane Wessels
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sources; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ *
++ * Copyright (c) 2003, Robert Collins <robertc@squid-cache.org>
++ */
++
++#include "squid.h"
++#include "ACLProtocolData.h"
++#include "ACLChecklist.h"
++
++MemPool *ACLProtocolData::Pool(NULL);
++void *
++ACLProtocolData::operator new (size_t byteCount)
++{
++    /* derived classes with different sizes must implement their own new */
++    assert (byteCount == sizeof (ACLProtocolData));
++
++    if (!Pool)
++        Pool = memPoolCreate("ACLProtocolData", sizeof (ACLProtocolData));
++
++    return memPoolAlloc(Pool);
++}
++
++void
++ACLProtocolData::operator delete (void *address)
++{
++    memPoolFree (Pool, address);
++}
++
++void
++ACLProtocolData::deleteSelf() const
++{
++    delete this;
++}
++
++
++ACLProtocolData::ACLProtocolData() : values (NULL)
++{}
++
++ACLProtocolData::ACLProtocolData(ACLProtocolData const &old) : values (NULL)
++{
++    assert (!old.values);
++}
++
++ACLProtocolData::~ACLProtocolData()
++{
++    if (values)
++        values->deleteSelf();
++}
++
++bool
++ACLProtocolData::match(protocol_t toFind)
++{
++    return values->findAndTune (toFind);
++}
++
++wordlist *
++ACLProtocolData::dump()
++{
++    wordlist *W = NULL;
++    List<protocol_t> *data = values;
++
++    while (data != NULL) {
++        wordlistAdd(&W, ProtocolStr[data->element]);
++        data = data->next;
++    }
++
++    return W;
++}
++
++void
++ACLProtocolData::parse()
++{
++    List<protocol_t> **Tail;
++    char *t = NULL;
++
++    for (Tail = &values; *Tail; Tail = &((*Tail)->next))
++
++        ;
++    while ((t = strtokFile())) {
++        List<protocol_t> *q = new List<protocol_t> (urlParseProtocol(t));
++        *(Tail) = q;
++        Tail = &q->next;
++    }
++}
++
++ACLData<protocol_t> *
++ACLProtocolData::clone() const
++{
++    /* Splay trees don't clone yet. */
++    assert (!values);
++    return new ACLProtocolData(*this);
++}
+@@ -1,5 +1,5 @@
+ /*
+- * $Id: ACLRegexData.cc,v 1.3 2003/02/21 22:50:04 robertc Exp $
++ * $Id: ACLRegexData.cc,v 1.4 2003/02/25 12:16:55 robertc Exp $
+  *
+  * DEBUG: section 28    Access Control
+  * AUTHOR: Duane Wessels
+@@ -65,21 +65,118 @@ ACLRegexData::deleteSelf() const
+     delete this;
+ }
+ 
++static void aclDestroyRegexList(relist * data);
++void
++aclDestroyRegexList(relist * data)
++{
++    relist *next = NULL;
++
++    for (; data; data = next) {
++        next = data->next;
++        regfree(&data->regex);
++        safe_free(data->pattern);
++        memFree(data, MEM_RELIST);
++    }
++}
++
+ ACLRegexData::~ACLRegexData()
+ {
+     aclDestroyRegexList(data);
+ }
+ 
+ bool
+-ACLRegexData::match(char const *user)
++ACLRegexData::match(char const *word)
+ {
+-    return aclMatchRegex(data, user);
++    if (word == NULL)
++        return 0;
++
++    debug(28, 3) ("aclRegexData::match: checking '%s'\n", word);
++
++    relist *first, *prev;
++
++    first = data;
++
++    prev = NULL;
++
++    relist *current = first;
++
++    while (current) {
++        debug(28, 3) ("aclRegexData::match: looking for '%s'\n", current->pattern);
++
++        if (regexec(&current->regex, word, 0, 0, 0) == 0) {
++            if (prev != NULL) {
++                /* shift the element just found to the second position
++                 * in the list */
++                prev->next = current->next;
++                current->next = first->next;
++                first->next = current;
++            }
++
++            return 1;
++        }
++
++        prev = current;
++        current = current->next;
++    }
++
++    return 0;
+ }
+ 
+ wordlist *
+ ACLRegexData::dump()
+ {
+-    return aclDumpRegexList(data);
++    wordlist *W = NULL;
++    relist *temp = data;
++
++    while (temp != NULL) {
++        wordlistAdd(&W, temp->pattern);
++        temp = temp->next;
++    }
++
++    return W;
++}
++
++static void aclParseRegexList(relist **curlist);
++void
++aclParseRegexList(relist **curlist)
++{
++    relist **Tail;
++    relist *q = NULL;
++    char *t = NULL;
++    regex_t comp;
++    int errcode;
++    int flags = REG_EXTENDED | REG_NOSUB;
++
++    for (Tail = (relist **)curlist; *Tail; Tail = &((*Tail)->next))
++
++        ;
++    while ((t = strtokFile())) {
++        if (strcmp(t, "-i") == 0) {
++            flags |= REG_ICASE;
++            continue;
++        }
++
++        if (strcmp(t, "+i") == 0) {
++            flags &= ~REG_ICASE;
++            continue;
++        }
++
++        if ((errcode = regcomp(&comp, t, flags)) != 0) {
++            char errbuf[256];
++            regerror(errcode, &comp, errbuf, sizeof errbuf);
++            debug(28, 0) ("%s line %d: %s\n",
++                          cfg_filename, config_lineno, config_input_line);
++            debug(28, 0) ("aclParseRegexList: Invalid regular expression '%s': %s\n",
++                          t, errbuf);
++            continue;
++        }
++
++        q = (relist *)memAllocate(MEM_RELIST);
++        q->pattern = xstrdup(t);
++        q->regex = comp;
++        *(Tail) = q;
++        Tail = &q->next;
++    }
+ }
+ 
+ void
+@@ -0,0 +1,43 @@
++/*
++ * $Id: ACLReplyMIMEType.cc,v 1.1 2003/02/25 12:16:55 robertc Exp $
++ *
++ * DEBUG: section 28    Access Control
++ * AUTHOR: Duane Wessels
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sources; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ *
++ * Copyright (c) 2003, Robert Collins <robertc@squid-cache.org>
++ */
++
++#include "squid.h"
++#include "ACLReplyMIMEType.h"
++#include "ACLChecklist.h"
++#include "ACLRegexData.h"
++
++ACL::Prototype ACLReplyMIMEType::RegistryProtoype(&ACLReplyMIMEType::RegistryEntry_, "rep_mime_type");
++ACLStrategised<char const *> ACLReplyMIMEType::RegistryEntry_(new ACLRegexData, ACLReplyHeaderStrategy<HDR_CONTENT_TYPE>::Instance(), "rep_mime_type");
+@@ -0,0 +1,145 @@
++/*
++ * $Id: ACLStringData.cc,v 1.1 2003/02/25 12:16:55 robertc Exp $
++ *
++ * DEBUG: section 28    Access Control
++ * AUTHOR: Duane Wessels
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sources; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ *
++ * Copyright (c) 2003, Robert Collins <robertc@squid-cache.org>
++ */
++
++#include "squid.h"
++#include "ACLStringData.h"
++#include "ACLChecklist.h"
++
++MemPool *ACLStringData::Pool(NULL);
++void *
++ACLStringData::operator new (size_t byteCount)
++{
++    /* derived classes with different sizes must implement their own new */
++    assert (byteCount == sizeof (ACLStringData));
++
++    if (!Pool)
++        Pool = memPoolCreate("ACLStringData", sizeof (ACLStringData));
++
++    return memPoolAlloc(Pool);
++}
++
++void
++ACLStringData::operator delete (void *address)
++{
++    memPoolFree (Pool, address);
++}
++
++void
++ACLStringData::deleteSelf() const
++{
++    delete this;
++}
++
++
++ACLStringData::ACLStringData() : values (NULL)
++{}
++
++ACLStringData::ACLStringData(ACLStringData const &old) : values (NULL)
++{
++    assert (!old.values);
++}
++
++template<class T>
++inline void
++xRefFree(T &thing)
++{
++    xfree (thing);
++}
++
++ACLStringData::~ACLStringData()
++{
++    if (values)
++        values->destroy(xRefFree);
++}
++
++template<class T>
++inline int
++splaystrcmp (T&l, T&r)
++{
++    return strcmp ((char *)l,(char *)r);
++}
++
++bool
++ACLStringData::match(char const *toFind)
++{
++    if (!values || !toFind)
++        return 0;
++
++    debug(28, 3) ("aclMatchStringList: checking '%s'\n", toFind);
++
++    values = values->splay((char *)toFind, splaystrcmp);
++
++    debug(28, 3) ("aclMatchStringList: '%s' %s\n",
++                  toFind, splayLastResult ? "NOT found" : "found");
++
++    return !splayLastResult;
++}
++
++static void
++aclDumpStringWalkee(char * const & node_data, void *outlist)
++{
++    /* outlist is really a wordlist ** */
++    wordlistAdd((wordlist **)outlist, node_data);
++}
++
++wordlist *
++ACLStringData::dump()
++{
++    wordlist *wl = NULL;
++    /* damn this is VERY inefficient for long ACL lists... filling
++     * a wordlist this way costs Sum(1,N) iterations. For instance
++     * a 1000-elements list will be filled in 499500 iterations.
++     */
++    values->walk(aclDumpStringWalkee, &wl);
++    return wl;
++}
++
++void
++ACLStringData::parse()
++{
++    char *t;
++
++    while ((t = strtokFile()))
++        values = values->insert(xstrdup(t), splaystrcmp);
++}
++
++ACLData<char const *> *
++ACLStringData::clone() const
++{
++    /* Splay trees don't clone yet. */
++    assert (!values);
++    return new ACLStringData(*this);
++}
+@@ -0,0 +1,56 @@
++
++/*
++ * $Id: ACLUrlPort.cc,v 1.1 2003/02/25 12:16:55 robertc Exp $
++ *
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sources; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ *
++ * Copyright (c) 2003, Robert Collins <robertc@squid-cache.org>
++ */
++
++#include "squid.h"
++#include "ACLUrlPort.h"
++#include "ACLIntRange.h"
++#include "ACLChecklist.h"
++
++ACL::Prototype ACLUrlPort::RegistryProtoype(&ACLUrlPort::RegistryEntry_, "port");
++ACLStrategised<int> ACLUrlPort::RegistryEntry_(new ACLIntRange, ACLUrlPortStrategy::Instance(), "port");
++
++int
++ACLUrlPortStrategy::match (ACLData<MatchType> * &data, ACLChecklist *checklist)
++{
++    return data->match (checklist->request->port);
++}
++
++ACLUrlPortStrategy *
++ACLUrlPortStrategy::Instance()
++{
++    return &Instance_;
++}
++
++ACLUrlPortStrategy ACLUrlPortStrategy::Instance_;

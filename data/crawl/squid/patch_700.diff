@@ -1,17 +1,1037 @@
-@@ -624,9 +624,13 @@ Rock::SwapDir::statfs(StoreEntry &e) const
-     storeAppendPrintf(&e, "Current Size: %"PRIu64" KB %.2f%%\n", cur_size,
-                       100.0 * cur_size / max_size);
+@@ -208,8 +208,9 @@ int
+ ACLProxyAuth::matchProxyAuth(ACLChecklist *cl)
+ {
+     ACLFilledChecklist *checklist = Filled(cl);
+-    if (!authenticateUserAuthenticated(Filled(checklist)->auth_user_request))
++    if (!authenticateUserAuthenticated(Filled(checklist)->auth_user_request)) {
+         return 0;
++    }
+     /* check to see if we have matched the user-acl before */
+     int result = cacheMatchAcl(&checklist->auth_user_request->user()->proxy_match_cache, checklist);
+     checklist->auth_user_request = NULL;
+@@ -3,14 +3,6 @@
  
--    storeAppendPrintf(&e, "Maximum entries: %9d\n", map->entryLimit());
--    storeAppendPrintf(&e, "Current entries: %9d %.2f%%\n",
--        map->entryCount(), (100.0 * map->entryCount() / map->entryLimit()));
-+    if (map) {
-+        const int limit = map->entryLimit();
-+        storeAppendPrintf(&e, "Maximum entries: %9d\n", limit);
-+        if (limit > 0)
-+            storeAppendPrintf(&e, "Current entries: %9d %.2f%%\n",
-+                map->entryCount(), (100.0 * map->entryCount() / limit));
-+    }    
+ #include "auth/UserRequest.h"
  
-     storeAppendPrintf(&e, "Pending operations: %d out of %d\n",
-         store_open_disk_fd, Config.max_open_disk_fds);
+-typedef enum {
+-    AUTHENTICATE_STATE_NONE,
+-    AUTHENTICATE_STATE_INITIAL,
+-    AUTHENTICATE_STATE_IN_PROGRESS,
+-    AUTHENTICATE_STATE_DONE,
+-    AUTHENTICATE_STATE_FAILED
+-} auth_state_t;                 /* connection level auth state */
+-
+ /**
+  * CBDATA state for NTLM, Negotiate, and Digest stateful authentication.
+  */
+@@ -53,11 +53,15 @@ CBDATA_TYPE(AuthUserIP);
+ 
+ time_t AuthUser::last_discard = 0;
+ 
++char *CredentialsState_str[] = { "Unchecked", "Ok", "Pending", "Handshake", "Failed" };
++
++
+ AuthUser::AuthUser(AuthConfig *aConfig) :
+         auth_type(AUTH_UNKNOWN),
+         config(aConfig),
+         ipcount(0),
+         expiretime(0),
++	credentials_state(Unchecked),
+         username_(NULL)
+ {
+     proxy_auth_list.head = proxy_auth_list.tail = NULL;
+@@ -66,6 +70,19 @@ AuthUser::AuthUser(AuthConfig *aConfig) :
+     debugs(29, 5, "AuthUser::AuthUser: Initialised auth_user '" << this << "'.");
+ }
+ 
++AuthUser::CredentialsState
++AuthUser::credentials() const
++{
++    return credentials_state;
++}
++
++void
++AuthUser::credentials(CredentialsState newCreds)
++{
++    credentials_state = newCreds;
++}
++
++
+ /**
+  * Combine two user structs. ONLY to be called from within a scheme
+  * module. The scheme module is responsible for ensuring that the
+@@ -355,19 +372,21 @@ AuthUser::UsernameCacheStats(StoreEntry *output)
+     storeAppendPrintf(output, "Next Garbage Collection in %d seconds.\n", static_cast<int32_t>(last_discard + Config.authenticateGCInterval - squid_curtime));
+ 
+     /* cache dump column titles */
+-    storeAppendPrintf(output, "\n%-15s %-9s %-9s %s\n",
++    storeAppendPrintf(output, "\n%-15s %-9s %-9s %-9s %s\n",
+                       "Type",
++                      "State",
+                       "Check TTL",
+                       "Cache TTL",
+                       "Username");
+-    storeAppendPrintf(output, "--------------- --------- --------- ------------------------------\n");
++    storeAppendPrintf(output, "--------------- --------- --------- --------- ------------------------------\n");
+ 
+     hash_first(proxy_auth_username_cache);
+     while ((usernamehash = ((AuthUserHashPointer *) hash_next(proxy_auth_username_cache)))) {
+         AuthUser::Pointer auth_user = usernamehash->user();
+ 
+-        storeAppendPrintf(output, "%-15s %-9d %-9d %s\n",
++        storeAppendPrintf(output, "%-15s %-9s %-9d %-9d %s\n",
+                           AuthType_str[auth_user->auth_type],
++                          CredentialsState_str[auth_user->credentials()],
+                           auth_user->ttl(),
+                           static_cast<int32_t>(auth_user->expiretime - squid_curtime + Config.authenticateTTL),
+                           auth_user->username()
+@@ -92,6 +92,21 @@ class AuthUser : public RefCountable
+     void addToNameCache();
+     static void UsernameCacheStats(StoreEntry * output);
+ 
++    enum CredentialsState { Unchecked, Ok, Pending, Handshake, Failed };
++    CredentialsState credentials() const;
++    void credentials(CredentialsState);
++
++private:
++    /**
++     * The current state these credentials are in:
++     *   Unchecked
++     *   Authenticated
++     *   Pending helper result
++     *   Handshake happening in stateful auth.
++     *   Failed auth
++     */
++    CredentialsState credentials_state;
++
+ protected:
+     AuthUser(AuthConfig *);
+ 
+@@ -113,6 +128,8 @@ class AuthUser : public RefCountable
+     dlink_list ip_list;
+ };
+ 
++extern char *CredentialsState_str[];
++
+ #if _USE_INLINE_
+ #include "auth/User.cci"
+ #endif
+@@ -114,8 +114,10 @@ AuthUserRequest::operator delete (void *address)
+     fatal ("AuthUserRequest child failed to override operator delete\n");
+ }
+ 
+-AuthUserRequest::AuthUserRequest():_auth_user(NULL), message(NULL),
+-        lastReply (AUTH_ACL_CANNOT_AUTHENTICATE)
++AuthUserRequest::AuthUserRequest():
++        _auth_user(NULL),
++        message(NULL),
++        lastReply(AUTH_ACL_CANNOT_AUTHENTICATE)
+ {
+     debugs(29, 5, "AuthUserRequest::AuthUserRequest: initialised request " << this);
+ }
+@@ -482,7 +484,7 @@ AuthUserRequest::tryToAuthenticateAndSetAuthUser(AuthUserRequest::Pointer * auth
+ int
+ authenticateDirection(AuthUserRequest::Pointer auth_user_request)
+ {
+-    if (auth_user_request == NULL)
++    if (auth_user_request == NULL || auth_user_request->user() == NULL)
+         return -2;
+ 
+     return auth_user_request->direction();
+@@ -95,7 +95,7 @@ AuthBasicConfig::type() const
+ int32_t
+ BasicUser::ttl() const
+ {
+-    if (flags.credentials_ok != 1)
++    if (credentials() != Ok && credentials() != Pending)
+         return -1; // TTL is obsolete NOW.
+ 
+     int32_t basic_ttl = expiretime - squid_curtime + static_cast<AuthBasicConfig*>(config)->credentialsTTL;
+@@ -107,7 +107,7 @@ BasicUser::ttl() const
+ bool
+ BasicUser::authenticated() const
+ {
+-    if ((flags.credentials_ok == 1) && (expiretime + static_cast<AuthBasicConfig*>(config)->credentialsTTL > squid_curtime))
++    if ((credentials() == Ok) && (expiretime + static_cast<AuthBasicConfig*>(config)->credentialsTTL > squid_curtime))
+         return true;
+ 
+     debugs(29, 4, "User not authenticated or credentials need rechecking.");
+@@ -188,9 +188,9 @@ authenticateBasicHandleReply(void *data, char *reply)
+     assert(basic_auth != NULL);
+ 
+     if (reply && (strncasecmp(reply, "OK", 2) == 0))
+-        basic_auth->flags.credentials_ok = 1;
++        basic_auth->credentials(AuthUser::Ok);
+     else {
+-        basic_auth->flags.credentials_ok = 3;
++        basic_auth->credentials(AuthUser::Failed);
+ 
+         if (t && *t)
+             r->auth_user_request->setDenyMessage(t);
+@@ -305,10 +305,14 @@ BasicUser::deleteSelf() const
+     delete this;
+ }
+ 
+-BasicUser::BasicUser(AuthConfig *aConfig) : AuthUser(aConfig) , passwd (NULL), auth_queue(NULL), cleartext(NULL), currentRequest(NULL), httpAuthHeader(NULL)
+-{
+-    flags.credentials_ok = 0;
+-}
++BasicUser::BasicUser(AuthConfig *aConfig) :
++        AuthUser(aConfig),
++        passwd(NULL),
++        auth_queue(NULL),
++        cleartext(NULL),
++        currentRequest(NULL),
++        httpAuthHeader(NULL)
++{}
+ 
+ bool
+ BasicUser::decodeCleartext()
+@@ -467,15 +471,15 @@ BasicUser::updateCached(BasicUser *from)
+ 
+     if (strcmp(from->passwd, passwd)) {
+         debugs(29, 4, HERE << "new password found. Updating in user master record and resetting auth state to unchecked");
+-        flags.credentials_ok = 0;
++        credentials(Unchecked);
+         xfree(passwd);
+         passwd = from->passwd;
+         from->passwd = NULL;
+     }
+ 
+-    if (flags.credentials_ok == 3) {
++    if (credentials() == Failed) {
+         debugs(29, 4, HERE << "last attempt to authenticate this user failed, resetting auth state to unchecked");
+-        flags.credentials_ok = 0;
++        credentials(Unchecked);
+     }
+ }
+ 
+@@ -592,7 +596,7 @@ void
+ BasicUser::submitRequest(AuthUserRequest::Pointer auth_user_request, RH * handler, void *data)
+ {
+     /* mark the user as having verification in progress */
+-    flags.credentials_ok = 2;
++    credentials(Pending);
+     authenticateStateData *r = NULL;
+     char buf[8192];
+     char user[1024], pass[1024];
+@@ -49,9 +49,6 @@ class BasicUser : public AuthUser
+ 
+     char *passwd;
+ 
+-    struct {
+-        unsigned int credentials_ok:2;	/* 0=unchecked, 1=ok, 2=failed */
+-    } flags;
+     BasicAuthQueueNode *auth_queue;
+ 
+ private:
+@@ -22,25 +22,22 @@ AuthBasicUserRequest::authenticate(HttpRequest * request, ConnStateData * conn,
+ {
+     assert(user() != NULL);
+ 
+-    BasicUser *basic_auth = dynamic_cast<BasicUser *>(user().getRaw());
+-
+     /* if the password is not ok, do an identity */
+-
+-    if (!basic_auth || basic_auth->flags.credentials_ok != 1)
++    if (!user() || user()->credentials() != AuthUser::Ok)
+         return;
+ 
+     /* are we about to recheck the credentials externally? */
+-    if ((basic_auth->expiretime + static_cast<AuthBasicConfig*>(AuthConfig::Find("basic"))->credentialsTTL) <= squid_curtime) {
+-        debugs(29, 4, "authBasicAuthenticate: credentials expired - rechecking");
++    if ((user()->expiretime + static_cast<AuthBasicConfig*>(AuthConfig::Find("basic"))->credentialsTTL) <= squid_curtime) {
++        debugs(29, 4, HERE << "credentials expired - rechecking");
+         return;
+     }
+ 
+     /* we have been through the external helper, and the credentials haven't expired */
+-    debugs(29, 9, "authenticateBasicAuthenticateuser: user '" << basic_auth->username() << "' authenticated");
++    debugs(29, 9, HERE << "user '" << user()->username() << "' authenticated");
+ 
+     /* Decode now takes care of finding the AuthUser struct in the cache */
+     /* after external auth occurs anyway */
+-    basic_auth->expiretime = current_time.tv_sec;
++    user()->expiretime = current_time.tv_sec;
+ 
+     return;
+ }
+@@ -49,29 +46,26 @@ int
+ AuthBasicUserRequest::module_direction()
+ {
+     /* null auth_user is checked for by authenticateDirection */
+-    BasicUser const *basic_auth = dynamic_cast<BasicUser *>(user().getRaw());
+-    assert (basic_auth);
++    if (user()->auth_type != AUTH_BASIC)
++        return -2;
+ 
+-    switch (basic_auth->flags.credentials_ok) {
++    switch (user()->credentials()) {
+ 
+-    case 0:                     /* not checked */
++    case AuthUser::Unchecked:
++    case AuthUser::Pending:
+         return -1;
+ 
+-    case 1:                     /* checked & ok */
+-
+-        if (basic_auth->expiretime + static_cast<AuthBasicConfig*>(AuthConfig::Find("basic"))->credentialsTTL <= squid_curtime)
++    case AuthUser::Ok:
++        if (user()->expiretime + static_cast<AuthBasicConfig*>(AuthConfig::Find("basic"))->credentialsTTL <= squid_curtime)
+             return -1;
+-
+         return 0;
+ 
+-    case 2:                     /* paused while waiting for a username:password check on another request */
+-        return -1;
+-
+-    case 3:                     /* authentication process failed. */
++    case AuthUser::Failed:
+         return 0;
+-    }
+ 
+-    return -2;
++    default:
++        return -2;
++    }
+ }
+ 
+ /* send the initial data to a basic authenticator module */
+@@ -84,12 +78,13 @@ AuthBasicUserRequest::module_start(RH * handler, void *data)
+     debugs(29, 9, HERE << "'" << basic_auth->username() << ":" << basic_auth->passwd << "'");
+ 
+     if (static_cast<AuthBasicConfig*>(AuthConfig::Find("basic"))->authenticate == NULL) {
++        debugs(29, DBG_CRITICAL, "ERROR: No Basic authentication program configured.");
+         handler(data, NULL);
+         return;
+     }
+ 
+     /* check to see if the auth_user already has a request outstanding */
+-    if (basic_auth->flags.credentials_ok == 2) {
++    if (user()->credentials() == AuthUser::Pending) {
+         /* there is a request with the same credentials already being verified */
+         basic_auth->queueRequest(this, handler, data);
+         return;
+@@ -1069,7 +1069,7 @@ AuthDigestConfig::decode(char const *proxy_auth)
+     if (!nonce) {
+         /* we couldn't find a matching nonce! */
+         debugs(29, 2, "authenticateDigestDecode: Unexpected or invalid nonce received");
+-        digest_request->credentials(AuthDigestUserRequest::Failed);
++        digest_request->user()->credentials(AuthUser::Failed);
+         return authDigestLogUsername(username, digest_request);
+     }
+ 
+@@ -16,8 +16,7 @@ AuthDigestUserRequest::AuthDigestUserRequest() :
+         qop(NULL),
+         uri(NULL),
+         response(NULL),
+-        nonce(NULL),
+-        credentials_ok(Unchecked)
++        nonce(NULL)
+ {}
+ 
+ /**
+@@ -42,22 +41,10 @@ AuthDigestUserRequest::~AuthDigestUserRequest()
+         authDigestNonceUnlink(nonce);
+ }
+ 
+-AuthDigestUserRequest::CredentialsState
+-AuthDigestUserRequest::credentials() const
+-{
+-    return credentials_ok;
+-}
+-
+-void
+-AuthDigestUserRequest::credentials(CredentialsState newCreds)
+-{
+-    credentials_ok = newCreds;
+-}
+-
+ int
+ AuthDigestUserRequest::authenticated() const
+ {
+-    if (credentials() == Ok)
++    if (user() != NULL && user()->credentials() == AuthUser::Ok)
+         return 1;
+ 
+     return 0;
+@@ -73,11 +60,10 @@ AuthDigestUserRequest::authenticate(HttpRequest * request, ConnStateData * conn,
+     HASHHEX Response;
+ 
+     /* if the check has corrupted the user, just return */
+-    if (credentials() == Failed) {
++    if (user() == NULL || user()->credentials() == AuthUser::Failed) {
+         return;
+     }
+ 
+-    assert(user() != NULL);
+     AuthUser::Pointer auth_user = user();
+ 
+     DigestUser *digest_user = dynamic_cast<DigestUser*>(auth_user.getRaw());
+@@ -87,13 +73,13 @@ AuthDigestUserRequest::authenticate(HttpRequest * request, ConnStateData * conn,
+ 
+     /* do we have the HA1 */
+     if (!digest_user->HA1created) {
+-        credentials(Pending);
++        auth_user->credentials(AuthUser::Pending);
+         return;
+     }
+ 
+     if (digest_request->nonce == NULL) {
+         /* this isn't a nonce we issued */
+-        credentials(Failed);
++        auth_user->credentials(AuthUser::Failed);
+         return;
+     }
+ 
+@@ -111,7 +97,7 @@ AuthDigestUserRequest::authenticate(HttpRequest * request, ConnStateData * conn,
+         if (!digest_request->flags.helper_queried) {
+             /* Query the helper in case the password has changed */
+             digest_request->flags.helper_queried = 1;
+-            digest_request->credentials_ok = Pending;
++            auth_user->credentials(AuthUser::Pending);
+             return;
+         }
+ 
+@@ -127,7 +113,7 @@ AuthDigestUserRequest::authenticate(HttpRequest * request, ConnStateData * conn,
+                                RequestMethodStr(METHOD_GET), digest_request->uri, HA2, Response);
+ 
+             if (strcasecmp(digest_request->response, Response)) {
+-                credentials(Failed);
++                auth_user->credentials(AuthUser::Failed);
+                 digest_request->flags.invalid_password = 1;
+                 digest_request->setDenyMessage("Incorrect password");
+                 return;
+@@ -152,7 +138,7 @@ AuthDigestUserRequest::authenticate(HttpRequest * request, ConnStateData * conn,
+                 }
+             }
+         } else {
+-            credentials(Failed);
++            auth_user->credentials(AuthUser::Failed);
+             digest_request->flags.invalid_password = 1;
+             digest_request->setDenyMessage("Incorrect password");
+             return;
+@@ -161,13 +147,13 @@ AuthDigestUserRequest::authenticate(HttpRequest * request, ConnStateData * conn,
+         /* check for stale nonce */
+         if (!authDigestNonceIsValid(digest_request->nonce, digest_request->nc)) {
+             debugs(29, 3, "authenticateDigestAuthenticateuser: user '" << auth_user->username() << "' validated OK but nonce stale");
+-            credentials(Failed);
++            auth_user->credentials(AuthUser::Failed);
+             digest_request->setDenyMessage("Stale nonce");
+             return;
+         }
+     }
+ 
+-    credentials(Ok);
++    auth_user->credentials(AuthUser::Ok);
+ 
+     /* password was checked and did match */
+     debugs(29, 4, "authenticateDigestAuthenticateuser: user '" << auth_user->username() << "' validated OK");
+@@ -181,22 +167,25 @@ AuthDigestUserRequest::authenticate(HttpRequest * request, ConnStateData * conn,
+ int
+ AuthDigestUserRequest::module_direction()
+ {
+-    switch (credentials()) {
++    if (user()->auth_type != AUTH_DIGEST)
++        return -2;
+ 
+-    case Unchecked:
+-        return -1;
++    switch (user()->credentials()) {
+ 
+-    case Ok:
++    case AuthUser::Ok:
+         return 0;
+ 
+-    case Pending:
+-        return -1;
+-
+-    case Failed:
++    case AuthUser::Failed:
+         /* send new challenge */
+         return 1;
++
++    case AuthUser::Unchecked:
++    case AuthUser::Pending:
++        return -1;
++
++    default:
++        return -2;
+     }
+-    return -2;
+ }
+ 
+ /* add the [proxy]authorisation header */
+@@ -262,14 +251,10 @@ AuthDigestUserRequest::module_start(RH * handler, void *data)
+     char buf[8192];
+ 
+     assert(user() != NULL && user()->auth_type == AUTH_DIGEST);
+-#if 0
+-    DigestUser *digest_user = dynamic_cast<DigestUser*>(user().getRaw());
+-    assert(digest_user != NULL);
+-#endif
+-
+     debugs(29, 9, "authenticateStart: '\"" << user()->username() << "\":\"" << realm << "\"'");
+ 
+     if (static_cast<AuthDigestConfig*>(AuthConfig::Find("digest"))->authenticate == NULL) {
++        debugs(29, DBG_CRITICAL, "ERROR: No Digest authentication program configured.");
+         handler(data, NULL);
+         return;
+     }
+@@ -313,7 +298,7 @@ AuthDigestUserRequest::HandleReply(void *data, char *reply)
+         AuthDigestUserRequest *digest_request = dynamic_cast<AuthDigestUserRequest *>(auth_user_request.getRaw());
+         assert(digest_request);
+ 
+-        digest_request->credentials(AuthDigestUserRequest::Failed);
++        digest_request->user()->credentials(AuthUser::Failed);
+         digest_request->flags.invalid_password = 1;
+ 
+         if (t && *t)
+@@ -16,7 +16,6 @@ class AuthDigestUserRequest : public AuthUserRequest
+ {
+ 
+ public:
+-    enum CredentialsState {Unchecked, Ok, Pending, Failed};
+     MEMPROXY_CLASS(AuthDigestUserRequest);
+ 
+     AuthDigestUserRequest();
+@@ -33,9 +32,6 @@ class AuthDigestUserRequest : public AuthUserRequest
+ 
+     virtual void module_start(RH *, void *);
+ 
+-    CredentialsState credentials() const;
+-    void credentials(CredentialsState);
+-
+     char *nonceb64;             /* "dcd98b7102dd2f0e8b11d0f600bfb0c093" */
+     char *cnonce;               /* "0a4f113b" */
+     char *realm;                /* = "testrealm@host.com" */
+@@ -55,8 +51,6 @@ class AuthDigestUserRequest : public AuthUserRequest
+     digest_nonce_h *nonce;
+ 
+ private:
+-    CredentialsState credentials_ok;
+-
+     static HLPCB HandleReply;
+ };
+ 
+@@ -252,20 +252,19 @@ AuthNegotiateConfig::fixHeader(AuthUserRequest::Pointer auth_user_request, HttpR
+         negotiate_request = dynamic_cast<AuthNegotiateUserRequest *>(auth_user_request.getRaw());
+         assert(negotiate_request != NULL);
+ 
+-        switch (negotiate_request->auth_state) {
++        switch (negotiate_request->user()->credentials()) {
+ 
+-        case AUTHENTICATE_STATE_FAILED:
++        case AuthUser::Failed:
+             /* here it makes sense to drop the connection, as auth is
+              * tied to it, even if MAYBE the client could handle it - Kinkie */
+             rep->header.delByName("keep-alive");
+             request->flags.proxy_keepalive = 0;
+             /* fall through */
+ 
+-        case AUTHENTICATE_STATE_DONE:
++        case AuthUser::Ok:
+             /* Special case: authentication finished OK but disallowed by ACL.
+              * Need to start over to give the client another chance.
+              */
+-
+             if (negotiate_request->server_blob) {
+                 debugs(29, 9, "authenticateNegotiateFixErrorHeader: Sending type:" << reqType << " header: 'Negotiate " << negotiate_request->server_blob << "'");
+                 httpHeaderPutStrf(&rep->header, reqType, "Negotiate %s", negotiate_request->server_blob);
+@@ -274,26 +273,24 @@ AuthNegotiateConfig::fixHeader(AuthUserRequest::Pointer auth_user_request, HttpR
+                 debugs(29, 9, "authenticateNegotiateFixErrorHeader: Connection authenticated");
+                 httpHeaderPutStrf(&rep->header, reqType, "Negotiate");
+             }
+-
+             break;
+ 
+-        case AUTHENTICATE_STATE_NONE:
++        case AuthUser::Unchecked:
+             /* semantic change: do not drop the connection.
+              * 2.5 implementation used to keep it open - Kinkie */
+             debugs(29, 9, "AuthNegotiateConfig::fixHeader: Sending type:" << reqType << " header: 'Negotiate'");
+             httpHeaderPutStrf(&rep->header, reqType, "Negotiate");
+             break;
+ 
+-        case AUTHENTICATE_STATE_IN_PROGRESS:
++        case AuthUser::Handshake:
+             /* we're waiting for a response from the client. Pass it the blob */
+             debugs(29, 9, "AuthNegotiateConfig::fixHeader: Sending type:" << reqType << " header: 'Negotiate " << negotiate_request->server_blob << "'");
+             httpHeaderPutStrf(&rep->header, reqType, "Negotiate %s", negotiate_request->server_blob);
+             safe_free(negotiate_request->server_blob);
+             break;
+ 
+-
+         default:
+-            debugs(29, 0, "AuthNegotiateConfig::fixHeader: state " << negotiate_request->auth_state << ".");
++            debugs(29, DBG_CRITICAL, "AuthNegotiateConfig::fixHeader: state " << negotiate_request->user()->credentials() << ".");
+             fatal("unexpected state in AuthenticateNegotiateFixErrorHeader.\n");
+         }
+     }
+@@ -307,10 +304,9 @@ NegotiateUser::~NegotiateUser()
+ int32_t
+ NegotiateUser::ttl() const
+ {
+-    return -1; // Negotiate canot be cached.
++    return -1; // Negotiate cannot be cached.
+ }
+ 
+-
+ static void
+ authenticateNegotiateStats(StoreEntry * sentry)
+ {
+@@ -13,8 +13,7 @@
+ // AYJ: must match re-definition in helpers/negotiate_auth/kerberos/negotiate_kerb_auth.cc
+ #define MAX_AUTHTOKEN_LEN   32768
+ 
+-AuthNegotiateUserRequest::AuthNegotiateUserRequest() :
+-        /*conn(NULL),*/ auth_state(AUTHENTICATE_STATE_NONE)
++AuthNegotiateUserRequest::AuthNegotiateUserRequest()
+ {
+     waiting=0;
+     client_blob=0;
+@@ -49,7 +48,7 @@ AuthNegotiateUserRequest::connLastHeader()
+ int
+ AuthNegotiateUserRequest::authenticated() const
+ {
+-    if (auth_state == AUTHENTICATE_STATE_DONE) {
++    if (user() != NULL && user()->credentials() == AuthUser::Ok) {
+         debugs(29, 9, HERE << "user authenticated.");
+         return 1;
+     }
+@@ -67,30 +66,25 @@ AuthNegotiateUserRequest::module_direction()
+     if (waiting || client_blob)
+         return -1; /* need helper response to continue */
+ 
+-    switch (auth_state) {
+-
+-        /* no progress at all. */
+-
+-    case AUTHENTICATE_STATE_NONE:
+-        debugs(29, DBG_CRITICAL, HERE << "called before Negotiate Authenticate for request " << this << "!. Report a bug to the Squid developers!");
+-        return -2; /* error */
++    if (user()->auth_type != AUTH_NEGOTIATE)
++        return -2;
+ 
+-   case AUTHENTICATE_STATE_FAILED:
+-        return -2; /* error */
++    switch (user()->credentials()) {
+ 
+-    case AUTHENTICATE_STATE_IN_PROGRESS:
++    case AuthUser::Handshake:
+         assert(server_blob);
+         return 1; /* send to client */
+ 
+-    case AUTHENTICATE_STATE_DONE:
++    case AuthUser::Ok:
+         return 0; /* do nothing */
+ 
+-    case AUTHENTICATE_STATE_INITIAL:
+-        debugs(29, DBG_IMPORTANT, "WARNING: Negotiate Authentcation in unexpected state AUTHENTICATE_STATE_INITIAL");
++    case AuthUser::Failed:
+         return -2;
+-    }
+ 
+-    return -2;
++    default:
++        debugs(29, DBG_IMPORTANT, "WARNING: Negotiate Authentication in unexpected state: " << user()->credentials());
++        return -2;
++    }
+ }
+ 
+ /* add the [proxy]authorisation header */
+@@ -117,7 +111,6 @@ AuthNegotiateUserRequest::addHeader(HttpReply * rep, int accel)
+ void
+ AuthNegotiateUserRequest::module_start(RH * handler, void *data)
+ {
+-    authenticateStateData *r = NULL;
+     static char buf[MAX_AUTHTOKEN_LEN];
+ 
+     assert(data);
+@@ -126,20 +119,20 @@ AuthNegotiateUserRequest::module_start(RH * handler, void *data)
+     assert(user() != NULL);
+     assert(user()->auth_type == AUTH_NEGOTIATE);
+ 
+-    debugs(29, 8, HERE << "auth state is '" << auth_state << "'");
++    debugs(29, 8, HERE << "auth state is '" << user()->credentials() << "'");
+ 
+-    if (negotiateConfig.authenticate == NULL) {
++    if (static_cast<AuthNegotiateConfig*>(AuthConfig::Find("negotiate"))->authenticate == NULL) {
+         debugs(29, DBG_CRITICAL, "ERROR: No Negotiate authentication program configured.");
+         handler(data, NULL);
+         return;
+     }
+ 
+-    r = cbdataAlloc(authenticateStateData);
++    authenticateStateData *r = cbdataAlloc(authenticateStateData);
+     r->handler = handler;
+     r->data = cbdataReference(data);
+     r->auth_user_request = this;
+ 
+-    if (auth_state == AUTHENTICATE_STATE_INITIAL) {
++    if (user()->credentials() == AuthUser::Pending) {
+         snprintf(buf, MAX_AUTHTOKEN_LEN, "YR %s\n", client_blob); //CHECKME: can ever client_blob be 0 here?
+     } else {
+         snprintf(buf, MAX_AUTHTOKEN_LEN, "KK %s\n", client_blob);
+@@ -194,7 +187,7 @@ AuthNegotiateUserRequest::authenticate(HttpRequest * aRequest, ConnStateData * c
+ 
+     /** Check that we are in the client side, where we can generate auth challenges */
+     if (conn == NULL) {
+-        auth_state = AUTHENTICATE_STATE_FAILED;
++        user()->credentials(AuthUser::Failed);
+         debugs(29, DBG_IMPORTANT, "WARNING: Negotiate Authentication attempt to perform authentication without a connection!");
+         return;
+     }
+@@ -226,12 +219,12 @@ AuthNegotiateUserRequest::authenticate(HttpRequest * aRequest, ConnStateData * c
+             blob++;
+     }
+ 
+-    switch (auth_state) {
++    switch (user()->credentials()) {
+ 
+-    case AUTHENTICATE_STATE_NONE:
++    case AuthUser::Unchecked:
+         /* we've received a negotiate request. pass to a helper */
+         debugs(29, 9, HERE << "auth state negotiate none. Received blob: '" << proxy_auth << "'");
+-        auth_state = AUTHENTICATE_STATE_INITIAL;
++        user()->credentials(AuthUser::Pending);
+         safe_free(client_blob);
+         client_blob=xstrdup(blob);
+         assert(conn->auth_user_request == NULL);
+@@ -240,11 +233,11 @@ AuthNegotiateUserRequest::authenticate(HttpRequest * aRequest, ConnStateData * c
+         HTTPMSGLOCK(request);
+         break;
+ 
+-   case AUTHENTICATE_STATE_INITIAL:
++    case AuthUser::Pending:
+         debugs(29, 1, HERE << "need to ask helper");
+         break;
+ 
+-    case AUTHENTICATE_STATE_IN_PROGRESS:
++    case AuthUser::Handshake:
+         /* we should have received a blob from the client. Hand it off to
+          * some helper */
+         safe_free(client_blob);
+@@ -255,11 +248,11 @@ AuthNegotiateUserRequest::authenticate(HttpRequest * aRequest, ConnStateData * c
+         HTTPMSGLOCK(request);
+         break;
+ 
+-    case AUTHENTICATE_STATE_DONE:
++    case AuthUser::Ok:
+         fatal("AuthNegotiateUserRequest::authenticate: unexpected auth state DONE! Report a bug to the squid developers.\n");
+         break;
+ 
+-    case AUTHENTICATE_STATE_FAILED:
++    case AuthUser::Failed:
+         /* we've failed somewhere in authentication */
+         debugs(29, 9, HERE << "auth state negotiate failed. " << proxy_auth);
+         break;
+@@ -327,11 +320,11 @@ AuthNegotiateUserRequest::HandleReply(void *data, void *lastserver, char *reply)
+         negotiate_request->request->flags.must_keepalive = 1;
+         if (negotiate_request->request->flags.proxy_keepalive) {
+             negotiate_request->server_blob = xstrdup(blob);
+-            negotiate_request->auth_state = AUTHENTICATE_STATE_IN_PROGRESS;
++            auth_user_request->user()->credentials(AuthUser::Handshake);
+             auth_user_request->denyMessage("Authentication in progress");
+             debugs(29, 4, HERE << "Need to challenge the client with a server blob '" << blob << "'");
+         } else {
+-            negotiate_request->auth_state = AUTHENTICATE_STATE_FAILED;
++            auth_user_request->user()->credentials(AuthUser::Failed);
+             auth_user_request->denyMessage("NTLM authentication requires a persistent connection");
+         }
+     } else if (strncasecmp(reply, "AF ", 3) == 0 && arg != NULL) {
+@@ -345,7 +338,7 @@ AuthNegotiateUserRequest::HandleReply(void *data, void *lastserver, char *reply)
+         safe_free(negotiate_request->server_blob);
+         negotiate_request->server_blob = xstrdup(blob);
+         negotiate_request->releaseAuthServer();
+-        negotiate_request->auth_state = AUTHENTICATE_STATE_DONE;
++        auth_user_request->user()->credentials(AuthUser::Ok);
+         debugs(29, 4, HERE << "Successfully validated user via Negotiate. Username '" << blob << "'");
+ 
+         /* connection is authenticated */
+@@ -373,7 +366,7 @@ AuthNegotiateUserRequest::HandleReply(void *data, void *lastserver, char *reply)
+          * existing user or a new user */
+         local_auth_user->expiretime = current_time.tv_sec;
+         negotiate_request->releaseAuthServer();
+-        negotiate_request->auth_state = AUTHENTICATE_STATE_DONE;
++        negotiate_request->user()->credentials(AuthUser::Ok);
+ 
+     } else if (strncasecmp(reply, "NA ", 3) == 0 && arg != NULL) {
+         /* authentication failure (wrong password, etc.) */
+@@ -382,7 +375,7 @@ AuthNegotiateUserRequest::HandleReply(void *data, void *lastserver, char *reply)
+             *arg++ = '\0';
+ 
+         auth_user_request->denyMessage(arg);
+-        negotiate_request->auth_state = AUTHENTICATE_STATE_FAILED;
++        negotiate_request->user()->credentials(AuthUser::Failed);
+         safe_free(negotiate_request->server_blob);
+         negotiate_request->server_blob = xstrdup(blob);
+         negotiate_request->releaseAuthServer();
+@@ -394,7 +387,7 @@ AuthNegotiateUserRequest::HandleReply(void *data, void *lastserver, char *reply)
+          * If after a KK deny the user's request w/ 407 and mark the helper as
+          * Needing YR. */
+         auth_user_request->denyMessage(blob);
+-        negotiate_request->auth_state = AUTHENTICATE_STATE_FAILED;
++        auth_user_request->user()->credentials(AuthUser::Failed);
+         safe_free(negotiate_request->server_blob);
+         negotiate_request->releaseAuthServer();
+         debugs(29, DBG_IMPORTANT, "ERROR: Negotiate Authentication validating user. Error returned '" << reply << "'");
+@@ -1,7 +1,6 @@
+ #ifndef _SQUID_SRC_AUTH_NEGOTIATE_USERREQUEST_H
+ #define _SQUID_SRC_AUTH_NEGOTIATE_USERREQUEST_H
+ 
+-#include "auth/State.h"
+ #include "auth/UserRequest.h"
+ #include "helper.h"
+ #include "MemPool.h"
+@@ -37,9 +36,6 @@ class AuthNegotiateUserRequest : public AuthUserRequest
+     /* what connection is this associated with */
+     /* ConnStateData * conn;*/
+ 
+-    /* how far through the authentication process are we? */
+-    auth_state_t auth_state;
+-
+     /* our current blob to pass to the client */
+     char *server_blob;
+     /* our current blob to pass to the server */
+@@ -235,36 +235,36 @@ AuthNTLMConfig::fixHeader(AuthUserRequest::Pointer auth_user_request, HttpReply
+         AuthNTLMUserRequest *ntlm_request = dynamic_cast<AuthNTLMUserRequest *>(auth_user_request.getRaw());
+         assert(ntlm_request != NULL);
+ 
+-        switch (ntlm_request->auth_state) {
++        switch (ntlm_request->user()->credentials()) {
+ 
+-        case AUTHENTICATE_STATE_FAILED:
++        case AuthUser::Failed:
+             /* here it makes sense to drop the connection, as auth is
+              * tied to it, even if MAYBE the client could handle it - Kinkie */
+             request->flags.proxy_keepalive = 0;
+             /* fall through */
+ 
+-        case AUTHENTICATE_STATE_DONE:
++        case AuthUser::Ok:
+             /* Special case: authentication finished OK but disallowed by ACL.
+              * Need to start over to give the client another chance.
+              */
+             /* fall through */
+ 
+-        case AUTHENTICATE_STATE_NONE:
++        case AuthUser::Unchecked:
+             /* semantic change: do not drop the connection.
+              * 2.5 implementation used to keep it open - Kinkie */
+             debugs(29, 9, "AuthNTLMConfig::fixHeader: Sending type:" << hdrType << " header: 'NTLM'");
+             httpHeaderPutStrf(&rep->header, hdrType, "NTLM");
+             break;
+ 
+-        case AUTHENTICATE_STATE_IN_PROGRESS:
++        case AuthUser::Handshake:
+             /* we're waiting for a response from the client. Pass it the blob */
+             debugs(29, 9, "AuthNTLMConfig::fixHeader: Sending type:" << hdrType << " header: 'NTLM " << ntlm_request->server_blob << "'");
+             httpHeaderPutStrf(&rep->header, hdrType, "NTLM %s", ntlm_request->server_blob);
+             safe_free(ntlm_request->server_blob);
+             break;
+ 
+         default:
+-            debugs(29, 0, "AuthNTLMConfig::fixHeader: state " << ntlm_request->auth_state << ".");
++            debugs(29, DBG_CRITICAL, "AuthNTLMConfig::fixHeader: state " << ntlm_request->user()->credentials() << ".");
+             fatal("unexpected state in AuthenticateNTLMFixErrorHeader.\n");
+         }
+     }
+@@ -1,14 +1,14 @@
+ #include "config.h"
+ #include "auth/ntlm/ntlmUserRequest.h"
+ #include "auth/ntlm/auth_ntlm.h"
++#include "auth/State.h"
+ #include "cbdata.h"
+ #include "HttpRequest.h"
+ #include "SquidTime.h"
+ 
+ /* state wrapper functions */
+ 
+-AuthNTLMUserRequest::AuthNTLMUserRequest() :
+-        /*conn(NULL),*/ auth_state(AUTHENTICATE_STATE_NONE)
++AuthNTLMUserRequest::AuthNTLMUserRequest()
+ {
+     waiting=0;
+     client_blob=0;
+@@ -46,31 +46,25 @@ AuthNTLMUserRequest::module_direction()
+     if (waiting || client_blob)
+         return -1; /* need helper response to continue */
+ 
+-    switch (auth_state) {
+-
+-        /* no progress at all. */
+-
+-    case AUTHENTICATE_STATE_NONE:
+-        debugs(29, 1, "AuthNTLMUserRequest::direction: called before NTLM Authenticate for request " << this << "!. Report a bug to squid-dev.");
+-        return -2; /* error */
+-
+-    case AUTHENTICATE_STATE_FAILED:
+-        return -2; /* error */
++    if (user()->auth_type != AUTH_NTLM)
++        return -2;
+ 
++    switch (user()->credentials()) {
+ 
+-    case AUTHENTICATE_STATE_IN_PROGRESS:
++    case AuthUser::Handshake:
+         assert(server_blob);
+         return 1; /* send to client */
+ 
+-    case AUTHENTICATE_STATE_DONE:
++    case AuthUser::Ok:
+         return 0; /* do nothing */
+ 
+-    case AUTHENTICATE_STATE_INITIAL:
+-        debugs(29, 1, "AuthNTLMUserRequest::direction: Unexpected AUTHENTICATE_STATE_INITIAL");
++    case AuthUser::Failed:
+         return -2;
+-    }
+ 
+-    return -2;
++    default:
++        debugs(29, DBG_IMPORTANT, "WARNING: NTLM Authentication in unexpected state: " << user()->credentials());
++        return -2;
++    }
+ }
+ 
+ /* send the initial data to a stateful ntlm authenticator module */
+@@ -83,10 +77,10 @@ AuthNTLMUserRequest::module_start(RH * handler, void *data)
+     assert(data);
+     assert(handler);
+ 
+-    debugs(29, 8, "AuthNTLMUserRequest::module_start: auth state is '" << auth_state << "'");
++    debugs(29, 8, HERE << "credentials state is '" << user()->credentials() << "'");
+ 
+     if (static_cast<AuthNTLMConfig*>(AuthConfig::Find("ntlm"))->authenticate == NULL) {
+-        debugs(29, 0, "AuthNTLMUserRequest::module_start: no NTLM program specified.");
++        debugs(29, DBG_CRITICAL, "ERROR: NTLM Start: no NTLM program configured.");
+         handler(data, NULL);
+        return;
+     }
+@@ -96,7 +90,7 @@ AuthNTLMUserRequest::module_start(RH * handler, void *data)
+     r->data = cbdataReference(data);
+     r->auth_user_request = this;
+ 
+-    if (auth_state == AUTHENTICATE_STATE_INITIAL) {
++    if (user()->credentials() == AuthUser::Pending) {
+         snprintf(buf, 8192, "YR %s\n", client_blob); //CHECKME: can ever client_blob be 0 here?
+     } else {
+         snprintf(buf, 8192, "KK %s\n", client_blob);
+@@ -147,7 +141,7 @@ AuthNTLMUserRequest::onConnectionClose(ConnStateData *conn)
+ int
+ AuthNTLMUserRequest::authenticated() const
+ {
+-    if (auth_state == AUTHENTICATE_STATE_DONE) {
++    if (user()->credentials() == AuthUser::Ok) {
+         debugs(29, 9, "AuthNTLMUserRequest::authenticated: user authenticated.");
+         return 1;
+     }
+@@ -168,7 +162,7 @@ AuthNTLMUserRequest::authenticate(HttpRequest * aRequest, ConnStateData * conn,
+      * auth challenges */
+ 
+     if (conn == NULL || !cbdataReferenceValid(conn)) {
+-        auth_state = AUTHENTICATE_STATE_FAILED;
++        user()->credentials(AuthUser::Failed);
+         debugs(29, 1, "AuthNTLMUserRequest::authenticate: attempt to perform authentication without a connection!");
+         return;
+     }
+@@ -201,12 +195,12 @@ AuthNTLMUserRequest::authenticate(HttpRequest * aRequest, ConnStateData * conn,
+             blob++;
+     }
+ 
+-    switch (auth_state) {
++    switch (user()->credentials()) {
+ 
+-    case AUTHENTICATE_STATE_NONE:
++    case AuthUser::Unchecked:
+         /* we've received a ntlm request. pass to a helper */
+         debugs(29, 9, "AuthNTLMUserRequest::authenticate: auth state ntlm none. Received blob: '" << proxy_auth << "'");
+-        auth_state = AUTHENTICATE_STATE_INITIAL;
++        user()->credentials(AuthUser::Pending);
+         safe_free(client_blob);
+         client_blob=xstrdup(blob);
+         assert(conn->auth_user_request == NULL);
+@@ -215,11 +209,11 @@ AuthNTLMUserRequest::authenticate(HttpRequest * aRequest, ConnStateData * conn,
+         HTTPMSGLOCK(request);
+         break;
+ 
+-    case AUTHENTICATE_STATE_INITIAL:
++    case AuthUser::Pending:
+         debugs(29, 1, "AuthNTLMUserRequest::authenticate: need to ask helper");
+         break;
+ 
+-    case AUTHENTICATE_STATE_IN_PROGRESS:
++    case AuthUser::Handshake:
+         /* we should have received a blob from the client. Hand it off to
+          * some helper */
+         safe_free(client_blob);
+@@ -231,11 +225,11 @@ AuthNTLMUserRequest::authenticate(HttpRequest * aRequest, ConnStateData * conn,
+         HTTPMSGLOCK(request);
+         break;
+ 
+-    case AUTHENTICATE_STATE_DONE:
++    case AuthUser::Ok:
+         fatal("AuthNTLMUserRequest::authenticate: unexpect auth state DONE! Report a bug to the squid developers.\n");
+         break;
+ 
+-    case AUTHENTICATE_STATE_FAILED:
++    case AuthUser::Failed:
+         /* we've failed somewhere in authentication */
+         debugs(29, 9, "AuthNTLMUserRequest::authenticate: auth state ntlm failed. " << proxy_auth);
+         break;
+@@ -293,11 +287,11 @@ AuthNTLMUserRequest::HandleReply(void *data, void *lastserver, char *reply)
+         ntlm_request->request->flags.must_keepalive = 1;
+         if (ntlm_request->request->flags.proxy_keepalive) {
+             ntlm_request->server_blob = xstrdup(blob);
+-            ntlm_request->auth_state = AUTHENTICATE_STATE_IN_PROGRESS;
++            ntlm_request->user()->credentials(AuthUser::Handshake);
+             auth_user_request->denyMessage("Authentication in progress");
+             debugs(29, 4, "authenticateNTLMHandleReply: Need to challenge the client with a server blob '" << blob << "'");
+         } else {
+-            ntlm_request->auth_state = AUTHENTICATE_STATE_FAILED;
++            ntlm_request->user()->credentials(AuthUser::Failed);
+             auth_user_request->denyMessage("NTLM authentication requires a persistent connection");
+         }
+     } else if (strncasecmp(reply, "AF ", 3) == 0) {
+@@ -330,11 +324,11 @@ AuthNTLMUserRequest::HandleReply(void *data, void *lastserver, char *reply)
+          * existing user or a new user */
+         local_auth_user->expiretime = current_time.tv_sec;
+         ntlm_request->releaseAuthServer();
+-        ntlm_request->auth_state = AUTHENTICATE_STATE_DONE;
++        local_auth_user->credentials(AuthUser::Ok);
+     } else if (strncasecmp(reply, "NA ", 3) == 0) {
+         /* authentication failure (wrong password, etc.) */
+         auth_user_request->denyMessage(blob);
+-        ntlm_request->auth_state = AUTHENTICATE_STATE_FAILED;
++        ntlm_request->user()->credentials(AuthUser::Failed);
+         safe_free(ntlm_request->server_blob);
+         ntlm_request->releaseAuthServer();
+         debugs(29, 4, "authenticateNTLMHandleReply: Failed validating user via NTLM. Error returned '" << blob << "'");
+@@ -345,7 +339,7 @@ AuthNTLMUserRequest::HandleReply(void *data, void *lastserver, char *reply)
+          * If after a KK deny the user's request w/ 407 and mark the helper as
+          * Needing YR. */
+         auth_user_request->denyMessage(blob);
+-        ntlm_request->auth_state = AUTHENTICATE_STATE_FAILED;
++        auth_user_request->user()->credentials(AuthUser::Failed);
+         safe_free(ntlm_request->server_blob);
+         ntlm_request->releaseAuthServer();
+         debugs(29, 1, "authenticateNTLMHandleReply: Error validating user via NTLM. Error returned '" << reply << "'");
+@@ -1,7 +1,6 @@
+ #ifndef _SQUID_SRC_AUTH_NTLM_USERREQUEST_H
+ #define _SQUID_SRC_AUTH_NTLM_USERREQUEST_H
+ 
+-#include "auth/State.h"
+ #include "auth/UserRequest.h"
+ #include "auth/ntlm/auth_ntlm.h"
+ #include "MemPool.h"
+@@ -34,9 +33,6 @@ class AuthNTLMUserRequest : public AuthUserRequest
+     /* what connection is this associated with */
+ //    ConnStateData * conn;
+ 
+-    /* how far through the authentication process are we? */
+-    auth_state_t auth_state;
+-
+     /* our current blob to pass to the client */
+     char *server_blob;
+ 

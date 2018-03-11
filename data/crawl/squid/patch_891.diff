@@ -1,0 +1,561 @@
+@@ -1731,6 +1731,22 @@ parse_peer(peer ** head)
+         } else if (!strcasecmp(token, "htcp-oldsquid")) {
+             p->options.htcp = 1;
+             p->options.htcp_oldsquid = 1;
++        } else if (!strcasecmp(token, "htcp-no-clr")) {
++            if (p->options.htcp_only_clr)
++        	fatalf("parse_peer: can't set htcp-no-clr and htcp-only-clr simultaneously");
++            p->options.htcp = 1;
++            p->options.htcp_no_clr = 1;
++        } else if (!strcasecmp(token, "htcp-no-purge-clr")) {
++            p->options.htcp = 1;
++            p->options.htcp_no_purge_clr = 1;
++        } else if (!strcasecmp(token, "htcp-only-clr")) {
++            if (p->options.htcp_no_clr)
++        	fatalf("parse_peer: can't set htcp-no-clr and htcp-only-clr simultaneously");
++            p->options.htcp = 1;
++            p->options.htcp_only_clr = 1;
++        } else if (!strcasecmp(token, "htcp-forward-clr")) {
++            p->options.htcp = 1;
++            p->options.htcp_forward_clr = 1;
+ #endif
+ 
+         } else if (!strcasecmp(token, "no-netdb-exchange")) {
+@@ -1585,6 +1585,10 @@ DOC_START
+ 		     max-conn=n
+ 		     htcp
+ 		     htcp-oldsquid
++		     htcp-no-clr
++		     htcp-no-purge-clr
++		     htcp-only-clr
++		     htcp-forward-clr
+ 		     originserver
+ 		     name=xxx
+ 		     forceddomain=name
+@@ -1727,6 +1731,20 @@ DOC_START
+ 		     You MUST also set htcp_access expicitly. The default of
+ 		     deny all will prevent peer traffic.		     
+ 
++		     use 'htcp-no-clr' to send HTCP to the neighbor but without
++		     sending any CLR requests.  This cannot be used with
++		     htcp-only-clr.
++		
++		     use 'htcp-no-purge-clr' to send HTCP to the neighbor
++		     including CLRs but only when they do not result from
++		     PURGE requests.
++		
++		     use 'htcp-only-clr' to send HTCP to the neighbor but ONLY
++		     CLR requests.  This cannot be used with htcp-no-clr.
++		
++		     use 'htcp-forward-clr' to forward any HTCP CLR requests
++		     this proxy receives to the peer.
++
+ 		     'originserver' causes this parent peer to be contacted as
+ 		     a origin server. Meant to be used in accelerator setups.
+ 
+@@ -176,6 +176,7 @@ struct _htcpStuff
+     int rr;
+     int f1;
+     int response;
++    int reason;
+     u_int32_t msg_id;
+     htcpSpecifier S;
+     htcpDetail D;
+@@ -248,8 +249,6 @@ static void htcpFreeDetail(htcpDetail * s);
+ 
+ static void htcpHandle(char *buf, int sz, IPAddress &from);
+ 
+-static void htcpHandleData(char *buf, int sz, IPAddress &from);
+-
+ static void htcpHandleMon(htcpDataHeader *, char *buf, int sz, IPAddress &from);
+ 
+ static void htcpHandleNop(htcpDataHeader *, char *buf, int sz, IPAddress &from);
+@@ -438,6 +437,26 @@ htcpBuildTstOpData(char *buf, size_t buflen, htcpStuff * stuff)
+     return 0;
+ }
+ 
++static ssize_t
++htcpBuildClrOpData(char *buf, size_t buflen, htcpStuff * stuff)
++{
++    u_short reason;
++    
++    switch (stuff->rr) {
++    case RR_REQUEST:
++        debugs(31, 3, "htcpBuildClrOpData: RR_REQUEST");
++        reason = htons((u_short)stuff->reason);
++        xmemcpy(buf, &reason, 2);
++        return htcpBuildSpecifier(buf + 2, buflen - 2, stuff) + 2;
++    case RR_RESPONSE:
++        break;
++    default:
++        fatal_dump("htcpBuildClrOpData: bad RR value");
++    }
++    
++    return 0;
++}
++
+ static ssize_t
+ htcpBuildOpData(char *buf, size_t buflen, htcpStuff * stuff)
+ {
+@@ -451,7 +470,7 @@ htcpBuildOpData(char *buf, size_t buflen, htcpStuff * stuff)
+         break;
+ 
+     case HTCP_CLR:
+-        /* nothing to be done */
++        off = htcpBuildClrOpData(buf + off, buflen, stuff);
+         break;
+ 
+     default:
+@@ -1287,25 +1306,89 @@ htcpHandleClr(htcpDataHeader * hdr, char *buf, int sz, IPAddress &from)
+     htcpFreeSpecifier(s);
+ }
+ 
++static void
++htcpForwardClr(char *buf, int sz)
++{
++    peer *p;
++    
++    for (p = Config.peers; p; p->next) {
++        if (!p->options.htcp) {
++            continue;
++        }
++        if (!p->options.htcp_forward_clr) {
++            continue;
++        }
++        
++        htcpSend(buf, sz, p->in_addr);
++    }
++}
++
+ static void
+ 
+ htcpHandleData(char *buf, int sz, IPAddress &from)
+ {
++
++}
++
++static void
++
++htcpHandle(char *buf, int sz, IPAddress &from)
++{
++    htcpHeader htcpHdr;
+     htcpDataHeader hdr;
++    char *hbuf;
++    int hsz;
++    assert (sz >= 0);
+ 
+-    if ((size_t)sz < sizeof(htcpDataHeader))
++    if ((size_t)sz < sizeof(htcpHeader))
++    {
++        debugs(31, 1, "htcpHandle: msg size less than htcpHeader size");
++        return;
++    }
++
++    htcpHexdump("htcpHandle", buf, sz);
++    xmemcpy(&htcpHdr, buf, sizeof(htcpHeader));
++    htcpHdr.length = ntohs(htcpHdr.length);
++
++    if (htcpHdr.minor == 0)
++        old_squid_format = 1;
++    else
++        old_squid_format = 0;
++
++    debugs(31, 3, "htcpHandle: htcpHdr.length = " << htcpHdr.length);
++    debugs(31, 3, "htcpHandle: htcpHdr.major = " << htcpHdr.major);
++    debugs(31, 3, "htcpHandle: htcpHdr.minor = " << htcpHdr.minor);
++
++    if (sz != htcpHdr.length)
++    {
++        debugs(31, 1, "htcpHandle: sz/" << sz << " != htcpHdr.length/" <<
++               htcpHdr.length << " from " << from );
++
++        return;
++    }
++
++    if (htcpHdr.major != 0)
++    {
++        debugs(31, 1, "htcpHandle: Unknown major version " << htcpHdr.major << " from " << from );
++
++        return;
++    }
++
++    hbuf += sizeof(htcpHeader);
++    hsz -= sizeof(htcpHeader);
++
++    if ((size_t)hsz < sizeof(htcpDataHeader))
+     {
+         debugs(31, 1, "htcpHandleData: msg size less than htcpDataHeader size");
+         return;
+     }
+ 
+     if (!old_squid_format)
+     {
+-        xmemcpy(&hdr, buf, sizeof(hdr));
+-    } else
+-    {
++        xmemcpy(&hdr, hbuf, sizeof(hdr));
++    } else {
+         htcpDataHeaderSquid hdrSquid;
+-        xmemcpy(&hdrSquid, buf, sizeof(hdrSquid));
++        xmemcpy(&hdrSquid, hbuf, sizeof(hdrSquid));
+         hdr.length = hdrSquid.length;
+         hdr.opcode = hdrSquid.opcode;
+         hdr.response = hdrSquid.response;
+@@ -1317,11 +1400,10 @@ htcpHandleData(char *buf, int sz, IPAddress &from)
+ 
+     hdr.length = ntohs(hdr.length);
+     hdr.msg_id = ntohl(hdr.msg_id);
+-    debugs(31, 3, "htcpHandleData: sz = " << sz);
++    debugs(31, 3, "htcpHandleData: hsz = " << hsz);
+     debugs(31, 3, "htcpHandleData: length = " << hdr.length);
+ 
+-    if (hdr.opcode >= HTCP_END)
+-    {
++    if (hdr.opcode >= HTCP_END) {
+         debugs(31, 1, "htcpHandleData: client " << from << ", opcode " << hdr.opcode << " out of range");
+         return;
+     }
+@@ -1332,8 +1414,7 @@ htcpHandleData(char *buf, int sz, IPAddress &from)
+     debugs(31, 3, "htcpHandleData: RR = " << hdr.RR);
+     debugs(31, 3, "htcpHandleData: msg_id = " << hdr.msg_id);
+ 
+-    if (sz < hdr.length)
+-    {
++    if (hsz < hdr.length) {
+         debugs(31, 1, "htcpHandleData: sz < hdr.length");
+         return;
+     }
+@@ -1342,88 +1423,33 @@ htcpHandleData(char *buf, int sz, IPAddress &from)
+      * set sz = hdr.length so we ignore any AUTH fields following
+      * the DATA.
+      */
+-    sz = (int) hdr.length;
++    hsz = (int) hdr.length;
++    hbuf += sizeof(htcpDataHeader);
++    hsz -= sizeof(htcpDataHeader);
++    debugs(31, 3, "htcpHandleData: hsz = " << hsz);
+ 
+-    buf += sizeof(htcpDataHeader);
+-
+-    sz -= sizeof(htcpDataHeader);
+-
+-    debugs(31, 3, "htcpHandleData: sz = " << sz);
+-
+-    htcpHexdump("htcpHandleData", buf, sz);
+-
+-    switch (hdr.opcode)
+-    {
++    htcpHexdump("htcpHandleData", hbuf, hsz);
+ 
++    switch (hdr.opcode) {
+     case HTCP_NOP:
+-        htcpHandleNop(&hdr, buf, sz, from);
++        htcpHandleNop(&hdr, hbuf, hsz, from);
+         break;
+-
+     case HTCP_TST:
+-        htcpHandleTst(&hdr, buf, sz, from);
++        htcpHandleTst(&hdr, hbuf, hsz, from);
+         break;
+-
+     case HTCP_MON:
+-        htcpHandleMon(&hdr, buf, sz, from);
++        htcpHandleMon(&hdr, hbuf, hsz, from);
+         break;
+-
+     case HTCP_SET:
+-        htcpHandleSet(&hdr, buf, sz, from);
++        htcpHandleSet(&hdr, hbuf, hsz, from);
+         break;
+-
+     case HTCP_CLR:
+-        htcpHandleClr(&hdr, buf, sz, from);
++        htcpHandleClr(&hdr, hbuf, hsz, from);
++        htcpForwardClr(buf, sz);
+         break;
+-
+     default:
+-        return;
+-    }
+-}
+-
+-static void
+-
+-htcpHandle(char *buf, int sz, IPAddress &from)
+-{
+-    htcpHeader htcpHdr;
+-    assert (sz >= 0);
+-
+-    if ((size_t)sz < sizeof(htcpHeader))
+-    {
+-        debugs(31, 1, "htcpHandle: msg size less than htcpHeader size");
+-        return;
+-    }
+-
+-    htcpHexdump("htcpHandle", buf, sz);
+-    xmemcpy(&htcpHdr, buf, sizeof(htcpHeader));
+-    htcpHdr.length = ntohs(htcpHdr.length);
+-
+-    if (htcpHdr.minor == 0)
+-        old_squid_format = 1;
+-    else
+-        old_squid_format = 0;
+-
+-    debugs(31, 3, "htcpHandle: htcpHdr.length = " << htcpHdr.length);
+-    debugs(31, 3, "htcpHandle: htcpHdr.major = " << htcpHdr.major);
+-    debugs(31, 3, "htcpHandle: htcpHdr.minor = " << htcpHdr.minor);
+-
+-    if (sz != htcpHdr.length)
+-    {
+-        debugs(31, 1, "htcpHandle: sz/" << sz << " != htcpHdr.length/" <<
+-               htcpHdr.length << " from " << from );
+-
+-        return;
+-    }
+-
+-    if (htcpHdr.major != 0)
+-    {
+-        debugs(31, 1, "htcpHandle: Unknown major version " << htcpHdr.major << " from " << from );
+-
+-        return;
++        break;
+     }
+-
+-    buf += sizeof(htcpHeader);
+-    sz -= sizeof(htcpHeader);
+-    htcpHandleData(buf, sz, from);
+ }
+ 
+ static void
+@@ -1523,51 +1549,31 @@ htcpQuery(StoreEntry * e, HttpRequest * req, peer * p)
+         return;
+ 
+     old_squid_format = p->options.htcp_oldsquid;
+-
+     memset(&flags, '\0', sizeof(flags));
+-
+     snprintf(vbuf, sizeof(vbuf), "%d/%d",
+              req->http_ver.major, req->http_ver.minor);
+-
+     stuff.op = HTCP_TST;
+-
+     stuff.rr = RR_REQUEST;
+-
+     stuff.f1 = 1;
+-
+     stuff.response = 0;
+-
+     stuff.msg_id = ++msg_id_counter;
+-
+     stuff.S.method = (char *) RequestMethodStr(req->method);
+-
+     stuff.S.uri = (char *) e->url();
+-
+     stuff.S.version = vbuf;
+-
+     HttpStateData::httpBuildRequestHeader(req, req, e, &hdr, flags);
+-
+     mb.init();
+-
+     packerToMemInit(&pa, &mb);
+-
+     hdr.packInto(&pa);
+-
+     hdr.clean();
+-
+     packerClean(&pa);
+-
+     stuff.S.req_hdrs = mb.buf;
+-
+     pktlen = htcpBuildPacket(pkt, sizeof(pkt), &stuff);
+-
+     mb.clean();
+-
+     if (!pktlen) {
+         debugs(31, 1, "htcpQuery: htcpBuildPacket() failed");
+         return;
+     }
+-
++    
+     htcpSend(pkt, (int) pktlen, p->in_addr);
+ 
+     queried_id[stuff.msg_id % N_QUERIED_KEYS] = stuff.msg_id;
+@@ -1577,6 +1583,72 @@ htcpQuery(StoreEntry * e, HttpRequest * req, peer * p)
+     debugs(31, 3, "htcpQuery: key (" << save_key << ") " << storeKeyText(save_key));
+ }
+ 
++void
++htcpClear(StoreEntry * e, const char *uri, HttpRequest * req, HttpRequestMethod * method, peer * p, htcp_clr_reason reason)
++{
++    static char pkt[8192];
++    ssize_t pktlen;
++    char vbuf[32];
++    htcpStuff stuff;
++    HttpHeader hdr;
++    Packer pa;
++    MemBuf mb;
++    http_state_flags flags;
++
++    if (htcpInSocket < 0)
++    	return;
++
++    old_squid_format = p->options.htcp_oldsquid;
++    memset(&flags, '\0', sizeof(flags));
++    snprintf(vbuf, sizeof(vbuf), "%d/%d",
++	req->http_ver.major, req->http_ver.minor);
++    stuff.op = HTCP_CLR;
++    stuff.rr = RR_REQUEST;
++    stuff.f1 = 0;
++    stuff.response = 0;
++    stuff.msg_id = ++msg_id_counter;
++    switch (reason) {
++    case HTCP_CLR_INVALIDATION:
++    	stuff.reason = 1;
++    	break;
++    default:
++    	stuff.reason = 0;
++    	break;
++    }
++    stuff.S.method = (char *) RequestMethodStr(req->method);
++    if (e == NULL || e->mem_obj == NULL) {
++    	if (uri == NULL) {
++            return;
++    	}
++    	stuff.S.uri = xstrdup(uri);
++    } else {
++    	stuff.S.uri = (char *) e->url();
++    }
++    stuff.S.version = vbuf;
++    if (reason != HTCP_CLR_INVALIDATION) {
++        HttpStateData::httpBuildRequestHeader(req, req, e, &hdr, flags);
++        mb.init();
++        packerToMemInit(&pa, &mb);
++        hdr.packInto(&pa);
++        hdr.clean();
++        packerClean(&pa);
++    	stuff.S.req_hdrs = mb.buf;
++    }
++    pktlen = htcpBuildPacket(pkt, sizeof(pkt), &stuff);
++    if (reason != HTCP_CLR_INVALIDATION) {
++        mb.clean();
++    }
++    if (e == NULL) {
++    	xfree(stuff.S.uri);
++    }
++    if (!pktlen) {
++    	debug(31, 1) ("htcpQuery: htcpBuildPacket() failed\n");
++    	return;
++    }
++    
++    htcpSend(pkt, (int) pktlen, p->in_addr);
++}
++
+ /*
+  * htcpSocketShutdown only closes the 'in' socket if it is
+  * different than the 'out' socket.
+@@ -37,6 +37,11 @@
+ #include "HttpHeader.h"
+ #include "IPAddress.h"
+ 
++typedef enum {
++    HTCP_CLR_PURGE,
++    HTCP_CLR_INVALIDATION,
++} htcp_clr_reason;
++
+ /// \ingroup ServerProtocolHTCP
+ class HtcpReplyData
+ {
+@@ -69,6 +74,9 @@ SQUIDCEXTERN void htcpInit(void);
+ /// \ingroup ServerProtocolHTCP
+ SQUIDCEXTERN void htcpQuery(StoreEntry * e, HttpRequest * req, peer * p);
+ 
++/// \ingroup ServerProtocolHTCP
++SQUIDCEXTERN void htcpClear(StoreEntry * e, const char *uri, HttpRequest * req, HttpRequestMethod * method, peer * p, htcp_clr_reason reason);
++
+ /// \ingroup ServerProtocolHTCP
+ SQUIDCEXTERN void htcpSocketShutdown(void);
+ 
+@@ -672,8 +672,7 @@ neighborsUdpPing(HttpRequest * request,
+         debugs(15, 3, "neighborsUdpPing: reqnum = " << reqnum);
+ 
+ #if USE_HTCP
+-
+-        if (p->options.htcp) {
++        if (p->options.htcp && !p->options.htcp_only_clr) {
+             debugs(15, 3, "neighborsUdpPing: sending HTCP query");
+             htcpQuery(entry, request, p);
+         } else
+@@ -1591,10 +1590,16 @@ dump_peer_options(StoreEntry * sentry, peer * p)
+         storeAppendPrintf(sentry, " closest-only");
+ 
+ #if USE_HTCP
+-
+     if (p->options.htcp)
+         storeAppendPrintf(sentry, " htcp");
+-
++	if (p->options.htcp_oldsquid)
++	    storeAppendPrintf(sentry, " htcp-oldsquid");
++	if (p->options.htcp_no_clr)
++	    storeAppendPrintf(sentry, " htcp-no-clr");
++	if (p->options.htcp_no_purge_clr)
++	    storeAppendPrintf(sentry, " htcp-no-purge-clr");
++	if (p->options.htcp_only_clr)
++	    storeAppendPrintf(sentry, " htcp-only-clr");
+ #endif
+ 
+     if (p->options.no_netdb_exchange)
+@@ -1749,7 +1754,6 @@ dump_peers(StoreEntry * sentry, peer * peers)
+ 
+ #if USE_HTCP
+ void
+-
+ neighborsHtcpReply(const cache_key * key, htcpReplyData * htcp, const IPAddress &from)
+ {
+     StoreEntry *e = Store::Root().get(key);
+@@ -1819,4 +1823,26 @@ neighborsHtcpReply(const cache_key * key, htcpReplyData * htcp, const IPAddress
+     mem->ping_reply_callback(p, ntype, PROTO_HTCP, htcp, mem->ircb_data);
+ }
+ 
++void
++neighborsHtcpClear(StoreEntry * e, const char *uri, HttpRequest * req, HttpRequestMethod * method, htcp_clr_reason reason)
++{
++    peer *p;
++    char buf[128];
++
++    debug(15, 1) ("neighborsHtcpClear: clear reason: %d\n", reason);
++    for (p = Config.peers; p; p = p->next) {
++        if (!p->options.htcp) {
++            continue;
++        }
++        if (p->options.htcp_no_clr) {
++            continue;
++        }
++        if (p->options.htcp_no_purge_clr && reason == HTCP_CLR_PURGE) {
++            continue;
++        }
++        debug(15, 1) ("neighborsHtcpClear: sending CLR to %s\n", p->in_addr->ToURL(buf, 128););
++        htcpClear(e, uri, req, method, p, reason);
++    }
++}
++
+ #endif
+@@ -385,6 +385,8 @@ SQUIDCEXTERN void neighborAddAcl(const char *, const char *);
+ SQUIDCEXTERN void neighborsUdpAck(const cache_key *, icp_common_t *, const IPAddress &);
+ SQUIDCEXTERN void neighborAdd(const char *, const char *, int, int, int, int, int);
+ SQUIDCEXTERN void neighbors_init(void);
++#if USE_HTCP
++SQUIDCEXTERN void neighborsHtcpClear(StoreEntry *, const char *, HttpRequest *, HttpRequestMethod *, htcp_clr_reason);
+ SQUIDCEXTERN peer *peerFindByName(const char *);
+ SQUIDCEXTERN peer *peerFindByNameAndPort(const char *, unsigned short);
+ SQUIDCEXTERN peer *getDefaultParent(HttpRequest * request);
+@@ -925,6 +925,10 @@ struct peer
+ #if USE_HTCP
+         unsigned int htcp:1;
+         unsigned int htcp_oldsquid:1;
++        unsigned int htcp_no_clr:1;
++        unsigned int htcp_no_purge_clr:1;
++        unsigned int htcp_only_clr:1;
++        unsigned int htcp_forward_clr:1;
+ #endif
+         unsigned int no_netdb_exchange:1;
+ #if DELAY_POOLS

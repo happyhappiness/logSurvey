@@ -1,688 +1,163 @@
-@@ -33,6 +33,7 @@
-  */
+@@ -55,12 +55,20 @@ class AccessLogEntry
+     {
  
- #include "squid.h"
-+#include "acl/Gadgets.h"
- #include "base/TextException.h"
- #include "comm/Write.h"
- #include "Server.h"
-@@ -660,10 +661,28 @@ ServerStateData::noteBodyConsumerAborted(BodyPipe::Pointer)
+     public:
+-        HttpDetails() : method(METHOD_NONE), code(0), content_type(NULL) {}
++    HttpDetails() : method(METHOD_NONE), code(0), content_type(NULL),
++	timedout(false), aborted(false) {}
  
- // received adapted response headers (body may follow)
- void
--ServerStateData::noteAdaptationAnswer(HttpMsg *msg)
-+ServerStateData::noteAdaptationAnswer(const Adaptation::Answer &answer)
- {
-     clearAdaptation(adaptedHeadSource); // we do not expect more messages
- 
-+    switch (answer.kind) {
-+    case Adaptation::Answer::akForward:
-+        handleAdaptedHeader(answer.message);
-+        break;
+         HttpRequestMethod method;
+         int code;
+         const char *content_type;
+         HttpVersion version;
++        bool timedout; ///< terminated due to a lifetime or I/O timeout
++        bool aborted; ///< other abnormal termination (e.g., I/O error)
 +
-+    case Adaptation::Answer::akBlock:
-+        handleAdaptationBlocked(answer);
-+        break;
-+
-+    case Adaptation::Answer::akError:
-+        handleAdaptationAborted(!answer.final);
-+        break;
-+    }
-+}
-+
-+void
-+ServerStateData::handleAdaptedHeader(HttpMsg *msg)
-+{
-     if (abortOnBadEntry("entry went bad while waiting for adapted headers"))
-         return;
++        /// compute suffix for the status access.log field
++        const char *statusSfx() const {
++            return timedout ? "_TIMEDOUT" : (aborted ? "_ABORTED" : "");
++        }
+     } http;
  
-@@ -685,14 +704,6 @@ ServerStateData::noteAdaptationAnswer(HttpMsg *msg)
+     class ICPDetails
+@@ -623,6 +623,15 @@ ConnStateData::freeAllContexts()
      }
  }
  
--// will not receive adapted response headers (and, hence, body)
--void
--ServerStateData::noteAdaptationQueryAbort(bool final)
--{
--    clearAdaptation(adaptedHeadSource);
--    handleAdaptationAborted(!final);
--}
--
- // more adapted response body is available
- void
- ServerStateData::handleMoreAdaptedBodyAvailable()
-@@ -778,6 +789,37 @@ ServerStateData::handleAdaptationAborted(bool bypassable)
-     abortTransaction("ICAP failure");
- }
- 
-+// adaptation service wants us to deny HTTP client access to this response
++/// propagates abort event to all contexts
 +void
-+ServerStateData::handleAdaptationBlocked(const Adaptation::Answer &answer)
++ConnStateData::notifyAllContexts(int xerrno)
 +{
-+    debugs(11,5, HERE << "handleAdaptationBlocked: " << answer.ruleId);
-+
-+    if (abortOnBadEntry("entry went bad while ICAP aborted"))
-+        return;
-+
-+    if (!entry->isEmpty()) { // too late to block (should not really happen)
-+       if (request)
-+           request->detailError(ERR_ICAP_FAILURE, ERR_DETAIL_RESPMOD_BLOCK_LATE);
-+       abortTransaction("late adaptation block");
-+       return;
-+    }
-+      
-+    debugs(11,7, HERE << "creating adaptation block response");
-+
-+    err_type page_id =
-+        aclGetDenyInfoPage(&Config.denyInfoList, answer.ruleId.termedBuf(), 1);
-+    if (page_id == ERR_NONE)
-+        page_id = ERR_ACCESS_DENIED;
-+
-+    ErrorState *err = errorCon(page_id, HTTP_FORBIDDEN, request);
-+    err->xerrno = ERR_DETAIL_RESPMOD_BLOCK_EARLY;
-+    fwd->fail(err);
-+    fwd->dontRetry(true);
-+
-+    abortTransaction("timely adaptation block");
++    typedef ClientSocketContext::Pointer CSCP;
++    for (CSCP c = getCurrentContext(); c.getRaw(); c = c->next)
++        c->noteIoError(xerrno);
 +}
++
+ /* This is a handler normally called by comm_close() */
+ void ConnStateData::connStateClosed(const CommCloseCbParams &io)
+ {
+@@ -1622,6 +1631,19 @@ clientWriteComplete(int fd, char *bufnotused, size_t size, comm_err_t errflag, i
+     context->writeComplete (fd, bufnotused, size, errflag);
+ }
+ 
++/// remembers the abnormal connection termination for logging purposes
++void
++ClientSocketContext::noteIoError(const int xerrno)
++{
++    if (http) {
++        if (xerrno == ETIMEDOUT)
++            http->al.http.timedout = true;
++        else // even if xerrno is zero (which means read abort/eof)
++            http->al.http.aborted = true;
++    }
++}
++
 +
  void
- ServerStateData::adaptationAclCheckDone(Adaptation::ServiceGroupPointer group)
+ ClientSocketContext::doClose()
  {
-@@ -90,8 +90,7 @@ class ServerStateData:
-     static void adaptationAclCheckDoneWrapper(Adaptation::ServiceGroupPointer group, void *data);
- 
-     // ICAPInitiator: start an ICAP transaction and receive adapted headers.
--    virtual void noteAdaptationAnswer(HttpMsg *message);
--    virtual void noteAdaptationQueryAbort(bool final);
-+    virtual void noteAdaptationAnswer(const Adaptation::Answer &answer);
- 
-     // BodyProducer: provide virgin response body to ICAP.
-     virtual void noteMoreBodySpaceAvailable(BodyPipe::Pointer );
-@@ -154,7 +153,9 @@ class ServerStateData:
-     void handleAdaptedBodyProductionEnded();
-     void handleAdaptedBodyProducerAborted();
- 
-+    void handleAdaptedHeader(HttpMsg *msg);
-     void handleAdaptationCompleted();
-+    void handleAdaptationBlocked(const Adaptation::Answer &answer);
-     void handleAdaptationAborted(bool bypassable = false);
- #endif
- 
-@@ -8,29 +8,6 @@
- #include "adaptation/Initiate.h"
- #include "base/AsyncJobCalls.h"
- 
--namespace Adaptation
--{
--
--// AdaptInitiator::noteAdaptionAnswer Dialer locks/unlocks the message in transit
--// TODO: replace HTTPMSGLOCK with general RefCounting and delete this class
--class AnswerDialer: public UnaryMemFunT<Initiator, HttpMsg*>
--{
--public:
--    typedef UnaryMemFunT<Initiator, HttpMsg*> Parent;
--
--    AnswerDialer(const Parent::JobPointer &job, Parent::Method meth,
--                 HttpMsg *msg): Parent(job, meth, msg) { HTTPMSGLOCK(arg1); }
--    AnswerDialer(const AnswerDialer &d): Parent(d) { HTTPMSGLOCK(arg1); }
--    virtual ~AnswerDialer() { HTTPMSGUNLOCK(arg1); }
--
--private:
--    AnswerDialer &operator =(const AnswerDialer &); // not implemented
--};
--
--} // namespace Adaptation
--
--
--/* Initiate */
- 
- Adaptation::Initiate::Initiate(const char *aTypeName): AsyncJob(aTypeName)
- {
-@@ -70,20 +47,18 @@ void Adaptation::Initiate::clearInitiator()
-     theInitiator.clear();
- }
- 
--void Adaptation::Initiate::sendAnswer(HttpMsg *msg)
-+void Adaptation::Initiate::sendAnswer(const Answer &answer)
- {
--    assert(msg);
-+    typedef UnaryMemFunT<Initiator, Answer, const Answer &> MyDialer;
-     CallJob(93, 5, __FILE__, __LINE__, "Initiator::noteAdaptationAnswer",
--            AnswerDialer(theInitiator, &Initiator::noteAdaptationAnswer, msg));
-+            MyDialer(theInitiator, &Initiator::noteAdaptationAnswer, answer));
-     clearInitiator();
- }
- 
- 
- void Adaptation::Initiate::tellQueryAborted(bool final)
- {
--    CallJobHere1(93, 5, theInitiator,
--                 Initiator, noteAdaptationQueryAbort, final);
--    clearInitiator();
-+    sendAnswer(Answer::Error(final));
- }
- 
- const char *Adaptation::Initiate::status() const
-@@ -5,8 +5,6 @@
- #include "base/CbcPointer.h"
- #include "adaptation/forward.h"
- 
--class HttpMsg;
--
- namespace Adaptation
- {
- 
-@@ -34,7 +32,7 @@ class Initiate: virtual public AsyncJob
-     virtual void noteInitiatorAborted() = 0;
- 
- protected:
--    void sendAnswer(HttpMsg *msg); // send to the initiator
-+    void sendAnswer(const Answer &answer); // send to the initiator
-     void tellQueryAborted(bool final); // tell initiator
-     void clearInitiator(); // used by noteInitiatorAborted; TODO: make private
- 
-@@ -28,3 +28,46 @@ Adaptation::Initiator::announceInitiatorAbort(CbcPointer<Initiate> &x)
-     CallJobHere(93, 5, x, Initiate, noteInitiatorAborted);
-     clearAdaptation(x);
- }
-+
-+
-+/* Adaptation::Answer */
-+
-+// TODO: Move to src/adaptation/Answer.*
-+
-+Adaptation::Answer
-+Adaptation::Answer::Error(bool final)
-+{
-+    Answer answer(akError);
-+    answer.final = final;
-+    debugs(93, 4, HERE << "error: " << final);
-+    return answer;
-+}
-+
-+Adaptation::Answer
-+Adaptation::Answer::Forward(HttpMsg *aMsg)
-+{
-+    Answer answer(akForward);
-+    answer.message = aMsg;
-+    debugs(93, 4, HERE << "forwarding: " << (void*)aMsg);
-+    return answer;
-+}
-+
-+
-+Adaptation::Answer
-+Adaptation::Answer::Block(const String &aRule)
-+{
-+    Answer answer(akBlock);
-+    answer.ruleId = aRule;
-+    debugs(93, 4, HERE << "blocking rule: " << aRule);
-+    return answer;
-+}
-+
-+std::ostream &
-+Adaptation::Answer::print(std::ostream &os) const
-+{
-+    return os << kind; // TODO: add more details
-+}
-+
-+Adaptation::Answer::Answer(Kind aKind): final(true), kind(aKind)
-+{
-+}
-@@ -4,6 +4,9 @@
- #include "base/AsyncJob.h"
- #include "base/CbcPointer.h"
- #include "adaptation/forward.h"
-+#include "HttpMsg.h"
-+
-+#include <iosfwd>
- 
- /*
-  * The ICAP Initiator is an ICAP vectoring point that initates ICAP
-@@ -14,23 +17,50 @@
-  * or aborting an ICAP transaction.
-  */
- 
--class HttpMsg;
--
- namespace Adaptation
- {
- 
-+/// summarizes adaptation service answer for the noteAdaptationAnswer() API
-+class Answer {
-+public:
-+    /// helps interpret other members without a class hierarchy
-+    typedef enum {
-+        akForward, ///< forward the supplied adapted HTTP message
-+        akBlock, ///< block or deny the master xaction; see authority
-+        akError, ///< no adapted message will come; see bypassable
-+    } Kind;
-+
-+    static Answer Error(bool final); ///< create an akError answer
-+    static Answer Forward(HttpMsg *aMsg); ///< create an akForward answer
-+    static Answer Block(const String &aRule); ///< create an akBlock answer
-+
-+    std::ostream &print(std::ostream &os) const;
-+
-+public:
-+    HttpMsgPointerT<HttpMsg> message; ///< HTTP request or response to forward
-+    String ruleId; ///< ACL (or similar rule) name that blocked forwarding
-+    bool final; ///< whether the error, if any, cannot be bypassed
-+    Kind kind; ///< the type of the answer
-+
-+private:
-+    explicit Answer(Kind aKind); ///< use static creators instead
-+};
-+
-+inline
-+std::ostream &operator <<(std::ostream &os, const Answer &answer)
-+{
-+    return answer.print(os);
-+}
-+
- class Initiator: virtual public AsyncJob
- {
- public:
-     Initiator(): AsyncJob("Initiator") {}
-     virtual ~Initiator() {}
- 
--    // called when ICAP response headers are successfully interpreted
--    virtual void noteAdaptationAnswer(HttpMsg *message) = 0;
--
--    // called when valid ICAP response headers are no longer expected
--    // the final parameter is set to disable bypass or retries
--    virtual void noteAdaptationQueryAbort(bool final) = 0;
-+    /// called with the initial adaptation decision (adapt, block, error);
-+    /// virgin and/or adapted body transmission may continue after this
-+    virtual void noteAdaptationAnswer(const Answer &answer) = 0;
- 
- protected:
-     ///< starts freshly created initiate and returns a safe pointer to it
-@@ -51,7 +51,7 @@ void Adaptation::Iterator::step()
-     Must(!theLauncher);
- 
-     if (thePlan.exhausted()) { // nothing more to do
--        sendAnswer(theMsg);
-+        sendAnswer(Answer::Forward(theMsg));
-         Must(done());
+@@ -2215,6 +2237,7 @@ ConnStateData::connFinishedWithConn(int size)
+         } else if (!Config.onoff.half_closed_clients) {
+             /* admin doesn't want to support half-closed client sockets */
+             debugs(33, 3, "connFinishedWithConn: FD " << fd << " aborted (half_closed_clients disabled)");
++            notifyAllContexts(0); // no specific error implies abort
+             return 1;
+         }
+     }
+@@ -2663,6 +2686,7 @@ ConnStateData::clientReadRequest(const CommIoCbParams &io)
+      * lame half-close detection
+      */
+     if (connReadWasError(io.flag, io.size, io.xerrno)) {
++        notifyAllContexts(io.xerrno);
+         comm_close(fd);
          return;
      }
-@@ -74,7 +74,26 @@ void Adaptation::Iterator::step()
-     Must(!done());
- }
- 
--void Adaptation::Iterator::noteAdaptationAnswer(HttpMsg *aMsg)
-+void
-+Adaptation::Iterator::noteAdaptationAnswer(const Answer &answer)
-+{
-+    switch (answer.kind) {
-+    case Answer::akForward:
-+        handleAdaptedHeader(answer.message);
-+        break;
-+
-+    case Answer::akBlock:
-+        handleAdaptationBlock(answer);
-+        break;
-+
-+    case Answer::akError:
-+        handleAdaptationError(answer.final);
-+        break;
-+    }
-+}
-+
-+void
-+Adaptation::Iterator::handleAdaptedHeader(HttpMsg *aMsg)
+@@ -2937,8 +2961,9 @@ static void
+ clientLifetimeTimeout(int fd, void *data)
  {
-     // set theCause if we switched to request satisfaction mode
-     if (!theCause) { // probably sent a request message
-@@ -106,7 +125,16 @@ void Adaptation::Iterator::noteInitiatorAborted()
-     mustStop("initiator gone");
+     ClientHttpRequest *http = (ClientHttpRequest *)data;
+-    debugs(33, 1, "WARNING: Closing client " << http->getConn()->peer << " connection due to lifetime timeout");
++    debugs(33, 1, "WARNING: Closing client " << " connection due to lifetime timeout");
+     debugs(33, 1, "\t" << http->uri);
++    http->al.http.timedout = true;
+     comm_close(fd);
  }
  
--void Adaptation::Iterator::noteAdaptationQueryAbort(bool final)
-+void Adaptation::Iterator::handleAdaptationBlock(const Answer &answer)
-+{
-+    debugs(93,5, HERE << "blocked by " << answer);
-+    clearAdaptation(theLauncher);
-+    updatePlan(false);
-+    sendAnswer(answer);
-+    mustStop("blocked");
-+}
-+
-+void Adaptation::Iterator::handleAdaptationError(bool final)
- {
-     debugs(93,5, HERE << "final: " << final << " plan: " << thePlan);
-     clearAdaptation(theLauncher);
-@@ -130,7 +158,7 @@ void Adaptation::Iterator::noteAdaptationQueryAbort(bool final)
- 
-     if (canIgnore && srcIntact && adapted) {
-         debugs(85,3, HERE << "responding with older adapted msg");
--        sendAnswer(theMsg);
-+        sendAnswer(Answer::Forward(theMsg));
-         mustStop("sent older adapted msg");
-         return;
-     }
-@@ -29,8 +29,7 @@ class Iterator: public Initiate, public Initiator
-     void noteInitiatorAborted();
- 
-     // Adaptation::Initiator: asynchronous communication with the current launcher
--    virtual void noteAdaptationAnswer(HttpMsg *message);
--    virtual void noteAdaptationQueryAbort(bool final);
-+    virtual void noteAdaptationAnswer(const Answer &answer);
- 
- protected:
-     // Adaptation::Initiate API implementation
-@@ -47,6 +46,10 @@ class Iterator: public Initiate, public Initiator
-     /// creates service filter for the current step
-     ServiceFilter filter() const;
- 
-+    void handleAdaptedHeader(HttpMsg *msg);
-+    void handleAdaptationBlock(const Answer &answer);
-+    void handleAdaptationError(bool final);
-+
-     ServiceGroupPointer theGroup; ///< the service group we are iterating
-     ServicePlan thePlan; ///< which services to use and in what order
-     HttpMsg *theMsg; ///< the message being adapted (virgin for each step)
-@@ -9,6 +9,7 @@
- #include "HttpReply.h"
- #include "SquidTime.h"
- #include "adaptation/ecap/XactionRep.h"
-+#include "adaptation/Initiator.h"
- #include "base/TextException.h"
- 
- CBDATA_NAMESPACED_CLASS_INIT(Adaptation::Ecap::XactionRep, XactionRep);
-@@ -158,14 +159,21 @@ void
- Adaptation::Ecap::XactionRep::dropVirgin(const char *reason)
- {
-     debugs(93,4, HERE << "because " << reason << "; status:" << status());
--    Must(proxyingVb = opOn);
- 
-     BodyPipePointer &p = theVirginRep.raw().body_pipe;
-     Must(p != NULL);
--    Must(p->stillConsuming(this));
--    stopConsumingFrom(p);
-     p->enableAutoConsumption();
--    proxyingVb = opComplete;
-+
-+    if (proxyingVb == opOn) {
-+        Must(p->stillConsuming(this));
-+        stopConsumingFrom(p);
-+        proxyingVb = opComplete;
-+    } else {
-+        Must(!p->stillConsuming(this));
-+        if (proxyingVb == opUndecided)
-+            proxyingVb = opNever;
-+    }
-+
-     canAccessVb = false;
- 
-     // called from adapter handler so does not inform adapter
-@@ -196,7 +204,7 @@ Adaptation::Ecap::XactionRep::useVirgin()
-         proxyingVb = opNever;
-     }
- 
--    sendAnswer(clone);
-+    sendAnswer(Answer::Forward(clone));
-     Must(done());
- }
- 
-@@ -211,7 +219,7 @@ Adaptation::Ecap::XactionRep::useAdapted(const libecap::shared_ptr<libecap::Mess
-     HttpMsg *msg = answer().header;
-     if (!theAnswerRep->body()) { // final, bodyless answer
-         proxyingAb = opNever;
--        sendAnswer(msg);
-+        sendAnswer(Answer::Forward(msg));
-     } else { // got answer headers but need to handle body
-         proxyingAb = opOn;
-         Must(!msg->body_pipe); // only host can set body pipes
-@@ -220,13 +228,26 @@ Adaptation::Ecap::XactionRep::useAdapted(const libecap::shared_ptr<libecap::Mess
-         rep->tieBody(this); // sets us as a producer
-         Must(msg->body_pipe != NULL); // check tieBody
- 
--        sendAnswer(msg);
-+        sendAnswer(Answer::Forward(msg));
- 
-         debugs(93,4, HERE << "adapter will produce body" << status());
-         theMaster->abMake(); // libecap will produce
-     }
- }
- 
-+void
-+Adaptation::Ecap::XactionRep::blockVirgin()
-+{
-+    debugs(93,3, HERE << status());
-+    Must(proxyingAb == opUndecided);
-+    proxyingAb = opNever;
-+
-+    dropVirgin("blockVirgin");
-+
-+    sendAnswer(Answer::Block(service().cfg().key));
-+    Must(done());
-+}
-+
- void
- Adaptation::Ecap::XactionRep::vbDiscard()
- {
-@@ -250,8 +271,7 @@ void
- Adaptation::Ecap::XactionRep::vbStopMaking()
- {
-     // if adapter does not need vb, we do not need to receive it
--    if (proxyingVb == opOn)
--        dropVirgin("vbStopMaking");
-+    dropVirgin("vbStopMaking");
-     Must(proxyingVb == opComplete);
- }
- 
-@@ -40,6 +40,7 @@ class XactionRep : public Adaptation::Initiate, public libecap::host::Xaction,
-     virtual libecap::Message &adapted();
-     virtual void useVirgin();
-     virtual void useAdapted(const libecap::shared_ptr<libecap::Message> &msg);
-+    virtual void blockVirgin();
-     virtual void adaptationDelayed(const libecap::Delay &);
-     virtual void adaptationAborted();
-     virtual void vbDiscard();
-@@ -25,6 +25,7 @@ class ServiceGroup;
- class ServicePlan;
- class ServiceFilter;
- class Message;
-+class Answer;
- 
- typedef RefCount<Service> ServicePointer;
- typedef RefCount<ServiceGroup> ServiceGroupPointer;
-@@ -50,12 +50,16 @@ void Adaptation::Icap::Launcher::launchXaction(const char *xkind)
-     Must(initiated(theXaction));
- }
- 
--void Adaptation::Icap::Launcher::noteAdaptationAnswer(HttpMsg *message)
-+void Adaptation::Icap::Launcher::noteAdaptationAnswer(const Answer &answer)
- {
--    sendAnswer(message);
-+    debugs(93,5, HERE << "launches: " << theLaunches << " answer: " << answer);
-+
-+    // XXX: akError is unused by ICAPXaction in favor of noteXactAbort()
-+    Must(answer.kind != Answer::akError);
-+
-+    sendAnswer(answer);
-     clearAdaptation(theXaction);
-     Must(done());
--    debugs(93,3, HERE << "Adaptation::Icap::Launcher::noteAdaptationAnswer exiting ");
- }
- 
- void Adaptation::Icap::Launcher::noteInitiatorAborted()
-@@ -67,15 +71,6 @@ void Adaptation::Icap::Launcher::noteInitiatorAborted()
- 
- }
- 
--// XXX: this call is unused by ICAPXaction in favor of ICAPLauncher::noteXactAbort
--void Adaptation::Icap::Launcher::noteAdaptationQueryAbort(bool final)
--{
--    debugs(93,5, HERE << "launches: " << theLaunches << "; final: " << final);
--    clearAdaptation(theXaction);
--
--    Must(done()); // swanSong will notify the initiator
--}
--
- void Adaptation::Icap::Launcher::noteXactAbort(XactAbortInfo info)
- {
-     debugs(93,5, HERE << "theXaction:" << theXaction << " launches: " << theLaunches);
-@@ -80,13 +80,12 @@ class Launcher: public Adaptation::Initiate, public Adaptation::Initiator
-     void noteInitiatorAborted();
- 
-     // Adaptation::Initiator: asynchronous communication with the current transaction
--    virtual void noteAdaptationAnswer(HttpMsg *message);
-+    virtual void noteAdaptationAnswer(const Answer &answer);
-     virtual void noteXactAbort(XactAbortInfo info);
+@@ -114,6 +114,7 @@ class ClientSocketContext : public RefCountable
+     void deferRecipientForLater(clientStreamNode * node, HttpReply * rep, StoreIOBuffer receivedData);
+     bool multipartRangeRequest() const;
+     void registerWithConn();
++    void noteIoError(const int xerrno); ///< update state to reflect I/O error
  
  private:
-     bool canRetry(XactAbortInfo &info) const; //< true if can retry in the case of persistent connection failures
-     bool canRepeat(XactAbortInfo &info) const; //< true if can repeat in the case of no or unsatisfactory response
--    virtual void noteAdaptationQueryAbort(bool final);
+     CBDATA_CLASS(ClientSocketContext);
+@@ -142,6 +143,7 @@ class ConnStateData : public BodyProducer/*, public RefCountable*/
+     int getAvailableBufferLength() const;
+     bool areAllContextsForThisConnection() const;
+     void freeAllContexts();
++    void notifyAllContexts(const int xerrno); ///< tell everybody about the err
+     void readNextRequest();
+     void makeSpaceAvailable();
+     ClientSocketContext::Pointer getCurrentContext() const;
+@@ -1047,7 +1047,13 @@ accessLogCustom(AccessLogEntry * al, customlog * log)
+              */
  
- protected:
-     // Adaptation::Initiate API implementation
-@@ -714,7 +714,7 @@ void Adaptation::Icap::ModXact::startSending()
- {
-     disableRepeats("sent headers");
-     disableBypass("sent headers", true);
--    sendAnswer(adapted.header);
-+    sendAnswer(Answer::Forward(adapted.header));
+         case LFT_SQUID_STATUS:
+-            out = log_tags[al->cache.code];
++            if (al->http.timedout || al->http.aborted) {
++                snprintf(tmp, sizeof(tmp), "%s%s", log_tags[al->cache.code],
++                    al->http.statusSfx());
++                out = tmp;
++            } else {
++                out = log_tags[al->cache.code];
++            }
  
-     if (state.sending == State::sendingVirgin)
-         echoMore();
-@@ -79,7 +79,7 @@ void Adaptation::Icap::OptXact::handleCommRead(size_t)
-         debugs(93, 7, HERE << "readAll=" << readAll);
-         icap_tio_finish = current_time;
-         setOutcome(xoOpt);
--        sendAnswer(icapReply);
-+        sendAnswer(Answer::Forward(icapReply));
-         Must(done()); // there should be nothing else to do
-         return;
-     }
-@@ -304,11 +304,19 @@ void Adaptation::Icap::ServiceRep::announceStatusChange(const char *downPhrase,
- }
+             break;
  
- // we are receiving ICAP OPTIONS response headers here or NULL on failures
--void Adaptation::Icap::ServiceRep::noteAdaptationAnswer(HttpMsg *msg)
-+void Adaptation::Icap::ServiceRep::noteAdaptationAnswer(const Answer &answer)
- {
-     Must(initiated(theOptionsFetcher));
-     clearAdaptation(theOptionsFetcher);
+@@ -1725,12 +1731,13 @@ accessLogSquid(AccessLogEntry * al, Logfile * logfile)
+         safe_free(user);
  
-+    if (answer.kind == Answer::akError) {
-+        debugs(93,3, HERE << "failed to fetch options " << status());
-+        handleNewOptions(0);
-+        return;
-+    }
-+
-+    Must(answer.kind == Answer::akForward); // no akBlock for OPTIONS requests
-+    HttpMsg *msg = answer.message;
-     Must(msg);
+     if (!Config.onoff.log_mime_hdrs) {
+-        logfilePrintf(logfile, "%9ld.%03d %6d %s %s/%03d %"PRId64" %s %s %s %s%s/%s %s\n",
++        logfilePrintf(logfile, "%9ld.%03d %6d %s %s%s/%03d %"PRId64" %s %s %s %s%s/%s %s\n",
+                       (long int) current_time.tv_sec,
+                       (int) current_time.tv_usec / 1000,
+                       al->cache.msec,
+                       client,
+                       log_tags[al->cache.code],
++                      al->http.statusSfx(),
+                       al->http.code,
+                       al->cache.replySize,
+                       al->_private.method_str,
+@@ -1743,12 +1750,13 @@ accessLogSquid(AccessLogEntry * al, Logfile * logfile)
+     } else {
+         char *ereq = log_quote(al->headers.request);
+         char *erep = log_quote(al->headers.reply);
+-        logfilePrintf(logfile, "%9ld.%03d %6d %s %s/%03d %"PRId64" %s %s %s %s%s/%s %s [%s] [%s]\n",
++        logfilePrintf(logfile, "%9ld.%03d %6d %s %s%s/%03d %"PRId64" %s %s %s %s%s/%s %s [%s] [%s]\n",
+                       (long int) current_time.tv_sec,
+                       (int) current_time.tv_usec / 1000,
+                       al->cache.msec,
+                       client,
+                       log_tags[al->cache.code],
++                      al->http.statusSfx(),
+                       al->http.code,
+                       al->cache.replySize,
+                       al->_private.method_str,
+@@ -1785,7 +1793,7 @@ accessLogCommon(AccessLogEntry * al, Logfile * logfile)
  
-     debugs(93,5, HERE << "is interpreting new options " << status());
-@@ -324,15 +332,6 @@ void Adaptation::Icap::ServiceRep::noteAdaptationAnswer(HttpMsg *msg)
-     handleNewOptions(newOptions);
- }
+     user2 = accessLogFormatName(al->cache.rfc931);
  
--void Adaptation::Icap::ServiceRep::noteAdaptationQueryAbort(bool)
--{
--    Must(initiated(theOptionsFetcher));
--    clearAdaptation(theOptionsFetcher);
--
--    debugs(93,3, HERE << "failed to fetch options " << status());
--    handleNewOptions(0);
--}
--
- // we (a) must keep trying to get OPTIONS and (b) are RefCounted so we
- // must keep our job alive (XXX: until nobody needs us)
- void Adaptation::Icap::ServiceRep::callException(const std::exception &e)
-@@ -119,8 +119,7 @@ class ServiceRep : public RefCountable, public Adaptation::Service,
-     void noteTimeToNotify();
+-    logfilePrintf(logfile, "%s %s %s [%s] \"%s %s HTTP/%d.%d\" %d %"PRId64" %s:%s",
++    logfilePrintf(logfile, "%s %s %s [%s] \"%s %s HTTP/%d.%d\" %d %"PRId64" %s%s:%s",
+                   client,
+                   user2 ? user2 : dash_str,
+                   user1 ? user1 : dash_str,
+@@ -1796,6 +1804,7 @@ accessLogCommon(AccessLogEntry * al, Logfile * logfile)
+                   al->http.code,
+                   al->cache.replySize,
+                   log_tags[al->cache.code],
++                  al->http.statusSfx(),
+                   hier_code_str[al->hier.code]);
  
-     // receive either an ICAP OPTIONS response header or an abort message
--    virtual void noteAdaptationAnswer(HttpMsg *msg);
--    virtual void noteAdaptationQueryAbort(bool);
-+    virtual void noteAdaptationAnswer(const Answer &answer);
- 
- private:
-     // stores Prepare() callback info
-@@ -5917,6 +5917,8 @@ DOC_START
- 	  the first authentication related acl encountered
- 	- When none of the http_access lines matches. It's then the last
- 	  acl processed on the last http_access line.
-+	- When the decision to deny access was made by an adaptation service,
-+	  the acl name is the corresponding eCAP or ICAP service_name.
- 
- 	NP: If providing your own custom error pages with error_directory
- 	    you may also specify them by your custom file name:
-@@ -1407,9 +1407,30 @@ ClientHttpRequest::startAdaptation(const Adaptation::ServiceGroupPointer &g)
- }
- 
- void
--ClientHttpRequest::noteAdaptationAnswer(HttpMsg *msg)
-+ClientHttpRequest::noteAdaptationAnswer(const Adaptation::Answer &answer)
- {
-     assert(cbdataReferenceValid(this));		// indicates bug
-+    clearAdaptation(virginHeadSource);
-+    assert(!adaptedBodySource);
-+
-+    switch (answer.kind) {
-+    case Adaptation::Answer::akForward:
-+        handleAdaptedHeader(answer.message);
-+        break;
-+
-+    case Adaptation::Answer::akBlock:
-+        handleAdaptationBlock(answer);
-+        break;
-+
-+    case Adaptation::Answer::akError:
-+        handleAdaptationFailure(ERR_DETAIL_CLT_REQMOD_ABORT, !answer.final);
-+        break;
-+    }
-+}
-+
-+void
-+ClientHttpRequest::handleAdaptedHeader(HttpMsg *msg)    
-+{
-     assert(msg);
- 
-     if (HttpRequest *new_req = dynamic_cast<HttpRequest*>(msg)) {
-@@ -1458,11 +1479,13 @@ ClientHttpRequest::noteAdaptationAnswer(HttpMsg *msg)
- }
- 
- void
--ClientHttpRequest::noteAdaptationQueryAbort(bool final)
-+ClientHttpRequest::handleAdaptationBlock(const Adaptation::Answer &answer)
- {
--    clearAdaptation(virginHeadSource);
--    assert(!adaptedBodySource);
--    handleAdaptationFailure(ERR_DETAIL_CLT_REQMOD_ABORT, !final);
-+    request->detailError(ERR_ACCESS_DENIED, ERR_DETAIL_REQMOD_BLOCK);
-+    AclMatchedName = answer.ruleId.termedBuf();
-+    assert(calloutContext);
-+    calloutContext->clientAccessCheckDone(ACCESS_DENIED);
-+    AclMatchedName = NULL;
- }
- 
- void
-@@ -166,8 +166,9 @@ class ClientHttpRequest
- 
- private:
-     // Adaptation::Initiator API
--    virtual void noteAdaptationAnswer(HttpMsg *message);
--    virtual void noteAdaptationQueryAbort(bool final);
-+    virtual void noteAdaptationAnswer(const Adaptation::Answer &answer);
-+    void handleAdaptedHeader(HttpMsg *msg);
-+    void handleAdaptationBlock(const Adaptation::Answer &answer);
- 
-     // BodyConsumer API, called by BodyPipe
-     virtual void noteMoreBodyDataAvailable(BodyPipe::Pointer);
-@@ -9,6 +9,9 @@ typedef enum {
-     ERR_DETAIL_CLT_REQMOD_RESP_BODY, // client-side detected REQMOD satisfaction reply body failure
-     ERR_DETAIL_ICAP_RESPMOD_EARLY, // RESPMOD failed w/o store entry
-     ERR_DETAIL_ICAP_RESPMOD_LATE,  // RESPMOD failed with a store entry
-+    ERR_DETAIL_REQMOD_BLOCK, // REQMOD denied client access
-+    ERR_DETAIL_RESPMOD_BLOCK_EARLY, // RESPMOD denied client access to HTTP response, before any part of the response was sent
-+    ERR_DETAIL_RESPMOD_BLOCK_LATE, // RESPMOD denied client access to HTTP response, after [a part of] the response was sent
-     ERR_DETAIL_ICAP_XACT_START, // transaction start failure
-     ERR_DETAIL_ICAP_XACT_BODY_CONSUMER_ABORT, // transaction body consumer gone
-     ERR_DETAIL_ICAP_INIT_GONE, // initiator gone
+     safe_free(user1);

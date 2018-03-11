@@ -1,17 +1,121 @@
-@@ -173,6 +173,16 @@ Http::One::Server::buildHttpRequest(Http::Stream *context)
-         return false;
-     }
+@@ -72,6 +72,7 @@ class SquidConfig
+     } Swap;
  
-+    // when absolute-URI is provided Host header should be ignored. However
-+    // some code still uses Host directly so normalize it using the previously
-+    // sanitized URL authority value.
-+    // For now preserve the case where Host is completely absent. That matters.
-+    if (const auto x = request->header.delById(Http::HOST)) {
-+        debugs(33, 5, "normalize " << x << " Host header using " << request->url.authority());
-+        SBuf tmp(request->url.authority());
-+        request->header.putStr(Http::HOST, tmp.c_str());
+     YesNoNone memShared; ///< whether the memory cache is shared among workers
++    YesNoNone shmLocking; ///< shared_memory_locking
+     size_t memMaxSize;
+ 
+     struct {
+@@ -419,6 +419,39 @@ DOC_START
+ 	See also: workers
+ DOC_END
+ 
++NAME: shared_memory_locking
++TYPE: YesNoNone
++COMMENT: on|off
++LOC: Config.shmLocking
++DEFAULT: off
++DOC_START
++	Whether to ensure that all required shared memory is available by
++	"locking" that shared memory into RAM when Squid starts. The
++	alternative is faster startup time followed by slightly slower
++	performance and, if not enough RAM is actually available during
++	runtime, mysterious crashes.
++
++	SMP Squid uses many shared memory segments. These segments are
++	brought into Squid memory space using an mmap(2) system call. During
++	Squid startup, the mmap() call often succeeds regardless of whether
++	the system has enough RAM. In general, Squid cannot tell whether the
++	kernel applies this "optimistic" memory allocation policy (but
++	popular modern kernels usually use it).
++
++	Later, if Squid attempts to actually access the mapped memory
++	regions beyond what the kernel is willing to allocate, the
++	"optimistic" kernel simply kills Squid kid with a SIGBUS signal.
++	Some of the memory limits enforced by the kernel are currently
++	poorly understood: We do not know how to detect and check them. This
++	option ensures that the mapped memory will be available. 
++
++	This option may have a positive performance side-effect: Locking
++	memory at start avoids runtime paging I/O. Paging slows Squid down.
++
++	Locking memory may require a large enough RLIMIT_MEMLOCK OS limit,
++	CAP_IPC_LOCK capability, or equivalent.
++DOC_END
++
+ COMMENT_START
+  OPTIONS FOR AUTHENTICATION
+  -----------------------------------------------------------------------------
+@@ -15,6 +15,7 @@
+ #include "fatal.h"
+ #include "ipc/mem/Segment.h"
+ #include "sbuf/SBuf.h"
++#include "SquidConfig.h"
+ #include "tools.h"
+ 
+ #if HAVE_FCNTL_H
+@@ -174,6 +175,8 @@ Ipc::Mem::Segment::attach()
+                theName.termedBuf(), xstrerror());
+     }
+     theMem = p;
++
++    lock();
+ }
+ 
+ /// Unmap the shared memory segment from the process memory space.
+@@ -191,6 +194,39 @@ Ipc::Mem::Segment::detach()
+     theMem = 0;
+ }
+ 
++/// Lock the segment into RAM, ensuring that the OS has enough RAM for it [now]
++/// and preventing segment bytes from being swapped out to disk later by the OS.
++void
++Ipc::Mem::Segment::lock()
++{
++    if (!Config.shmLocking) {
++        debugs(54, 5, "mlock(2)-ing disabled");
++        return;
 +    }
 +
-     http->request = request.getRaw();
-     HTTPMSGLOCK(http->request);
++#if defined(_POSIX_MEMLOCK_RANGE)
++    debugs(54, 7, "mlock(" << theName << ',' << theSize << ") starts");
++    if (mlock(theMem, theSize) != 0) {
++        const int savedError = errno;
++        fatalf("shared_memory_locking on but failed to mlock(%s, %" PRId64 "): %s\n",
++               theName.termedBuf(), theSize, xstrerr(savedError));
++    }
++    // TODO: Warn if it took too long.
++    debugs(54, 7, "mlock(" << theName << ',' << theSize << ") OK");
++#else
++    debugs(54, 5, "insufficient mlock(2) support");
++    if (Config.shmLocking.configured()) { // set explicitly
++        static bool warnedOnce = false;
++        if (!warnedOnce) {
++            debugs(54, DBG_IMPORTANT, "ERROR: insufficient mlock(2) support prevents " <<
++                   "honoring `shared_memory_locking on`. " <<
++                   "If you lack RAM, kernel will kill Squid later.");
++            warnedOnce = true;
++        }
++    }
++#endif
++}
++
+ void
+ Ipc::Mem::Segment::unlink()
+ {
+@@ -56,6 +56,7 @@ class Segment
+     bool createFresh();
+     void attach();
+     void detach();
++    void lock();
+     void unlink(); ///< unlink the segment
+     off_t statSize(const char *context) const;
  
+@@ -58,6 +58,7 @@ testRock::setUp()
+         throw std::runtime_error("Failed to clean test work directory");
+ 
+     Config.memShared.defaultTo(false);
++    Config.shmLocking.defaultTo(false);
+ 
+     // use current directory for shared segments (on path-based OSes)
+     Ipc::Mem::Segment::BasePath = getcwd(cwd,MAXPATHLEN);

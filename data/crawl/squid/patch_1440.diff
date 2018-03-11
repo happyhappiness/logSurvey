@@ -1,0 +1,488 @@
+@@ -1,7 +1,7 @@
+ 
+ 
+ /*
+- * $Id: access_log.cc,v 1.54 2000/03/06 16:23:28 wessels Exp $
++ * $Id: access_log.cc,v 1.55 2000/03/14 23:07:51 wessels Exp $
+  *
+  * DEBUG: section 46    Access Log
+  * AUTHOR: Duane Wessels
+@@ -37,10 +37,10 @@
+ 
+ #include "squid.h"
+ 
+-static void accessLogOpen(const char *fname);
+ static char *log_quote(const char *header);
+-static void accessLogSquid(AccessLogEntry * al, MemBuf * mb);
+-static void accessLogCommon(AccessLogEntry * al, MemBuf * mb);
++static void accessLogSquid(AccessLogEntry * al);
++static void accessLogCommon(AccessLogEntry * al);
++static Logfile *logfile = NULL;
+ 
+ #if MULTICAST_MISS_STREAM
+ static int mcast_miss_fd = -1;
+@@ -93,8 +93,6 @@ static void fvdbClear(void);
+ #endif
+ 
+ static int LogfileStatus = LOG_DISABLE;
+-static int LogfileFD = -1;
+-static char LogfileName[SQUID_MAXPATHLEN];
+ #define LOG_BUF_SZ (MAX_URL<<2)
+ 
+ static const char c2x[] =
+@@ -185,14 +183,14 @@ log_quote(const char *header)
+ }
+ 
+ static void
+-accessLogSquid(AccessLogEntry * al, MemBuf * mb)
++accessLogSquid(AccessLogEntry * al)
+ {
+     const char *client = NULL;
+     if (Config.onoff.log_fqdn)
+ 	client = fqdncache_gethostbyaddr(al->cache.caddr, FQDN_LOOKUP_IF_MISS);
+     if (client == NULL)
+ 	client = inet_ntoa(al->cache.caddr);
+-    memBufPrintf(mb, "%9d.%03d %6d %s %s/%03d %d %s %s %s %s%s/%s %s",
++    logfilePrintf(logfile, "%9d.%03d %6d %s %s/%03d %d %s %s %s %s%s/%s %s",
+ 	(int) current_time.tv_sec,
+ 	(int) current_time.tv_usec / 1000,
+ 	al->cache.msec,
+@@ -210,14 +208,14 @@ accessLogSquid(AccessLogEntry * al, MemBuf * mb)
+ }
+ 
+ static void
+-accessLogCommon(AccessLogEntry * al, MemBuf * mb)
++accessLogCommon(AccessLogEntry * al)
+ {
+     const char *client = NULL;
+     if (Config.onoff.log_fqdn)
+ 	client = fqdncache_gethostbyaddr(al->cache.caddr, 0);
+     if (client == NULL)
+ 	client = inet_ntoa(al->cache.caddr);
+-    memBufPrintf(mb, "%s %s - [%s] \"%s %s HTTP/%.1f\" %d %d %s:%s",
++    logfilePrintf(logfile, "%s %s - [%s] \"%s %s HTTP/%.1f\" %d %d %s:%s",
+ 	client,
+ 	al->cache.ident,
+ 	mkhttpdlogtime(&squid_curtime),
+@@ -230,37 +228,9 @@ accessLogCommon(AccessLogEntry * al, MemBuf * mb)
+ 	hier_strings[al->hier.code]);
+ }
+ 
+-static void
+-accessLogOpen(const char *fname)
+-{
+-    assert(fname);
+-    xstrncpy(LogfileName, fname, SQUID_MAXPATHLEN);
+-    LogfileFD = file_open(LogfileName, O_WRONLY | O_CREAT);
+-    if (LogfileFD == DISK_ERROR) {
+-	if (ENOENT == errno) {
+-	    fatalf("%s cannot be created, since the\n"
+-		"\tdirectory it is to reside in does not exist."
+-		"\t(%s)\n", LogfileName, xstrerror());
+-	} else if (EACCES == errno) {
+-	    fatalf("cannot create %s:\n"
+-		"\t%s.\n"
+-		"\tThe directory access.log is to reside in needs to be\n"
+-		"\twriteable by the user %s, the cache_effective_user\n"
+-		"\tset in squid.conf.",
+-		LogfileName, xstrerror(), Config.effectiveUser);
+-	} else {
+-	    debug(50, 0) ("%s: %s\n", LogfileName, xstrerror());
+-	    fatalf("Cannot open %s: %s", LogfileName, xstrerror());
+-	}
+-    }
+-    LogfileStatus = LOG_ENABLE;
+-}
+-
+ void
+ accessLogLog(AccessLogEntry * al)
+ {
+-    MemBuf mb;
+-    char *xbuf = NULL;
+     LOCAL_ARRAY(char, ident_buf, USER_IDENT_SZ);
+ 
+     if (LogfileStatus != LOG_ENABLE)
+@@ -282,23 +252,20 @@ accessLogLog(AccessLogEntry * al)
+     if (al->hier.host[0] == '\0')
+ 	xstrncpy(al->hier.host, dash_str, SQUIDHOSTNAMELEN);
+ 
+-    memBufDefInit(&mb);
+-
+     if (Config.onoff.common_log)
+-	accessLogCommon(al, &mb);
++	accessLogCommon(al);
+     else
+-	accessLogSquid(al, &mb);
++	accessLogSquid(al);
+     if (Config.onoff.log_mime_hdrs) {
+ 	char *ereq = log_quote(al->headers.request);
+ 	char *erep = log_quote(al->headers.reply);
+-	memBufPrintf(&mb, " [%s] [%s]\n", ereq, erep);
++	logfilePrintf(logfile, " [%s] [%s]\n", ereq, erep);
+ 	safe_free(ereq);
+ 	safe_free(erep);
+     } else {
+-	memBufPrintf(&mb, "\n");
++	logfilePrintf(logfile, "\n");
+     }
+-    file_write_mbuf(LogfileFD, -1, mb, NULL, NULL);
+-    safe_free(xbuf);
++    logfileFlush(logfile);
+ #if MULTICAST_MISS_STREAM
+     if (al->cache.code != LOG_TCP_MISS)
+ 	(void) 0;
+@@ -325,48 +292,19 @@ accessLogLog(AccessLogEntry * al)
+ void
+ accessLogRotate(void)
+ {
+-    int i;
+-    LOCAL_ARRAY(char, from, MAXPATHLEN);
+-    LOCAL_ARRAY(char, to, MAXPATHLEN);
+-    char *fname = NULL;
+-    struct stat sb;
+ #if FORW_VIA_DB
+     fvdbClear();
+ #endif
+-    if ((fname = LogfileName) == NULL)
++    if (NULL == logfile)
+ 	return;
+-#ifdef S_ISREG
+-    if (stat(fname, &sb) == 0)
+-	if (S_ISREG(sb.st_mode) == 0)
+-	    return;
+-#endif
+-    debug(46, 1) ("accessLogRotate: Rotating\n");
+-    /* Rotate numbers 0 through N up one */
+-    for (i = Config.Log.rotateNumber; i > 1;) {
+-	i--;
+-	snprintf(from, MAXPATHLEN, "%s.%d", fname, i - 1);
+-	snprintf(to, MAXPATHLEN, "%s.%d", fname, i);
+-	xrename(from, to);
+-    }
+-    /* Rotate the current log to .0 */
+-    file_close(LogfileFD);	/* always close */
+-    if (Config.Log.rotateNumber > 0) {
+-	snprintf(to, MAXPATHLEN, "%s.%d", fname, 0);
+-	xrename(fname, to);
+-    }
+-    /* Reopen the log.  It may have been renamed "manually" */
+-    LogfileFD = file_open(fname, O_WRONLY | O_CREAT);
+-    if (LogfileFD == DISK_ERROR) {
+-	debug(46, 0) ("accessLogRotate: Cannot open logfile: %s\n", fname);
+-	LogfileStatus = LOG_DISABLE;
+-	fatalf("Cannot open %s: %s", fname, xstrerror());
+-    }
++    logfileRotate(logfile);
+ }
+ 
+ void
+ accessLogClose(void)
+ {
+-    file_close(LogfileFD);
++    logfileClose(logfile);
++    logfile = NULL;
+ }
+ 
+ void
+@@ -383,7 +321,8 @@ void
+ accessLogInit(void)
+ {
+     assert(sizeof(log_tags) == (LOG_TYPE_MAX + 1) * sizeof(char *));
+-    accessLogOpen(Config.Log.access);
++    logfile = logfileOpen(Config.Log.access, MAX_URL << 1);
++    LogfileStatus = LOG_ENABLE;
+ #if FORW_VIA_DB
+     fvdbInit();
+ #endif
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: protos.h,v 1.355 2000/03/06 16:23:33 wessels Exp $
++ * $Id: protos.h,v 1.356 2000/03/14 23:07:51 wessels Exp $
+  *
+  *
+  * SQUID Internet Object Cache  http://squid.nlanr.net/Squid/
+@@ -1229,6 +1229,18 @@ extern void *leakTouchFL(void *, const char *, int);
+ extern void *leakFreeFL(void *, const char *, int);
+ #endif
+ 
++/* logfile.c */
++extern Logfile *logfileOpen(const char *path, size_t bufsz);
++extern void logfileClose(Logfile * lf);
++extern void logfileRotate(Logfile * lf);
++extern void logfileWrite(Logfile * lf, void *buf, size_t len);
++extern void logfileFlush(Logfile * lf);
++#if STDC_HEADERS
++extern void logfilePrintf(Logfile * lf, const char *fmt,...);
++#else
++extern void logfilePrintf(va_alist);
++#endif
++
+ /*
+  * prototypes for system functions missing from system includes
+  */
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: store_log.cc,v 1.10 2000/03/06 16:23:35 wessels Exp $
++ * $Id: store_log.cc,v 1.11 2000/03/14 23:07:51 wessels Exp $
+  *
+  * DEBUG: section 20    Storage Manager Logging Functions
+  * AUTHOR: Duane Wessels
+@@ -43,15 +43,14 @@ static char *storeLogTags[] =
+     "RELEASE"
+ };
+ 
+-static int storelog_fd = -1;
++static Logfile *storelog = NULL;
+ 
+ void
+ storeLog(int tag, const StoreEntry * e)
+ {
+-    MemBuf mb;
+     MemObject *mem = e->mem_obj;
+     HttpReply *reply;
+-    if (storelog_fd < 0)
++    if (NULL == storelog)
+ 	return;
+     if (mem == NULL)
+ 	return;
+@@ -62,9 +61,8 @@ storeLog(int tag, const StoreEntry * e)
+ 	storeMemObjectDump(mem);
+ 	mem->log_url = xstrdup(mem->url);
+     }
+-    memBufDefInit(&mb);
+     reply = mem->reply;
+-    memBufPrintf(&mb, "%9d.%03d %-7s %08X %4d %9d %9d %9d %s %d/%d %s %s\n",
++    logfilePrintf(storelog, "%9d.%03d %-7s %08X %4d %9d %9d %9d %s %d/%d %s %s\n",
+ 	(int) current_time.tv_sec,
+ 	(int) current_time.tv_usec / 1000,
+ 	storeLogTags[tag],
+@@ -78,69 +76,31 @@ storeLog(int tag, const StoreEntry * e)
+ 	(int) (mem->inmem_hi - mem->reply->hdr_sz),
+ 	RequestMethodStr[mem->method],
+ 	mem->log_url);
+-    file_write_mbuf(storelog_fd, -1, mb, NULL, NULL);
+ }
+ 
+ void
+ storeLogRotate(void)
+ {
+-    char *fname = NULL;
+-    int i;
+-    LOCAL_ARRAY(char, from, MAXPATHLEN);
+-    LOCAL_ARRAY(char, to, MAXPATHLEN);
+-#ifdef S_ISREG
+-    struct stat sb;
+-#endif
+-
+-    if (storelog_fd > -1) {
+-	file_close(storelog_fd);
+-	storelog_fd = -1;
+-    }
+-    if ((fname = Config.Log.store) == NULL)
+-	return;
+-    if (strcmp(fname, "none") == 0)
++    if (NULL == storelog)
+ 	return;
+-#ifdef S_ISREG
+-    if (stat(fname, &sb) == 0)
+-	if (S_ISREG(sb.st_mode) == 0)
+-	    return;
+-#endif
+-
+-    debug(20, 1) ("storeLogRotate: Rotating.\n");
+-
+-    /* Rotate numbers 0 through N up one */
+-    for (i = Config.Log.rotateNumber; i > 1;) {
+-	i--;
+-	snprintf(from, MAXPATHLEN, "%s.%d", fname, i - 1);
+-	snprintf(to, MAXPATHLEN, "%s.%d", fname, i);
+-	xrename(from, to);
+-    }
+-    /* Rotate the current log to .0 */
+-    if (Config.Log.rotateNumber > 0) {
+-	snprintf(to, MAXPATHLEN, "%s.%d", fname, 0);
+-	xrename(fname, to);
+-    }
+-    storelog_fd = file_open(fname, O_WRONLY | O_CREAT);
+-    if (storelog_fd < 0) {
+-	debug(50, 0) ("storeLogRotate: %s: %s\n", fname, xstrerror());
+-	debug(20, 1) ("Store logging disabled\n");
+-    }
++    logfileRotate(storelog);
+ }
+ 
+ void
+ storeLogClose(void)
+ {
+-    if (storelog_fd >= 0)
+-	file_close(storelog_fd);
++    if (NULL == storelog)
++	return;
++    logfileClose(storelog);
++    storelog = NULL;
+ }
+ 
+ void
+ storeLogOpen(void)
+ {
+-    if (strcmp(Config.Log.store, "none") == 0)
+-	storelog_fd = -1;
+-    else
+-	storelog_fd = file_open(Config.Log.store, O_WRONLY | O_CREAT);
+-    if (storelog_fd < 0)
++    if (strcmp(Config.Log.store, "none") == 0) {
+ 	debug(20, 1) ("Store logging disabled\n");
++	return;
++    }
++    logfileOpen(Config.Log.store, 0);
+ }
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: structs.h,v 1.315 2000/03/14 22:59:13 wessels Exp $
++ * $Id: structs.h,v 1.316 2000/03/14 23:07:51 wessels Exp $
+  *
+  *
+  * SQUID Internet Object Cache  http://squid.nlanr.net/Squid/
+@@ -1870,3 +1870,11 @@ struct _store_rebuild_data {
+     int bad_log_op;
+     int zero_object_sz;
+ };
++
++struct _Logfile {
++    int fd;
++    char path[MAXPATHLEN];
++    char *buf;
++    size_t bufsz;
++    off_t offset;
++};
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: typedefs.h,v 1.100 2000/03/06 16:23:36 wessels Exp $
++ * $Id: typedefs.h,v 1.101 2000/03/14 23:07:51 wessels Exp $
+  *
+  *
+  * SQUID Internet Object Cache  http://squid.nlanr.net/Squid/
+@@ -168,6 +168,7 @@ typedef struct _helper_request helper_request;
+ typedef struct _generic_cbdata generic_cbdata;
+ typedef struct _storeIOState storeIOState;
+ typedef struct _link_list link_list;
++typedef struct _Logfile Logfile;
+ 
+ #if SQUID_SNMP
+ typedef variable_list *(oid_ParseFn) (variable_list *, snint *);
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * $Id: useragent.cc,v 1.19 2000/03/06 16:23:36 wessels Exp $
++ * $Id: useragent.cc,v 1.20 2000/03/14 23:07:51 wessels Exp $
+  *
+  * DEBUG: section 40    User-Agent logging
+  * AUTHOR: Joe Ramey <ramey@csc.ti.com>
+@@ -35,71 +35,30 @@
+ 
+ #include "squid.h"
+ 
++#if USE_USERAGENT_LOG
++static Logfile *useragentlog = NULL;
++#endif
++
+ void
+ useragentOpenLog(void)
+ {
+ #if USE_USERAGENT_LOG
+-    char *fname = NULL;
+-    int log_fd = -1;
+-    fname = Config.Log.useragent;
+-    /* Close and reopen the log.  It may have been renamed "manually"
+-     * before HUP'ing us. */
+-    if (cache_useragent_log) {
+-	file_close(fileno(cache_useragent_log));
+-	fclose(cache_useragent_log);
+-	cache_useragent_log = NULL;
+-    }
+-    if (fname && strcmp(fname, "none") != 0) {
+-	log_fd = file_open(fname, O_WRONLY | O_CREAT | O_APPEND);
+-	if (log_fd < 0) {
+-	    debug(50, 0) ("useragentOpenLog: %s: %s\n", fname, xstrerror());
+-	} else if ((cache_useragent_log = fdopen(log_fd, "a")) == NULL) {
+-	    file_close(log_fd);
+-	    debug(50, 0) ("useragentOpenLog: %s: %s\n", fname, xstrerror());
+-	}
+-    }
+-    if (log_fd < 0 || cache_useragent_log == NULL)
++    assert(NULL == useragentlog);
++    if (0 == strcmp(Config.Log.useragent, "none")) {
+ 	debug(40, 1) ("User-Agent logging is disabled.\n");
++	return;
++    }
++    logfileOpen(Config.Log.useragent, 0);
+ #endif
+ }
+ 
+ void
+ useragentRotateLog(void)
+ {
+ #if USE_USERAGENT_LOG
+-    char *fname = NULL;
+-    int i;
+-    LOCAL_ARRAY(char, from, MAXPATHLEN);
+-    LOCAL_ARRAY(char, to, MAXPATHLEN);
+-    struct stat sb;
+-    if ((fname = Config.Log.useragent) == NULL)
+-	return;
+-    if (strcmp(fname, "none") == 0)
++    if (NULL == useragentlog)
+ 	return;
+-#ifdef S_ISREG
+-    if (stat(fname, &sb) == 0)
+-	if (S_ISREG(sb.st_mode) == 0)
+-	    return;
+-#endif
+-    debug(40, 1) ("useragentRotateLog: Rotating.\n");
+-    /* Rotate numbers 0 through N up one */
+-    for (i = Config.Log.rotateNumber; i > 1;) {
+-	i--;
+-	snprintf(from, MAXPATHLEN, "%s.%d", fname, i - 1);
+-	snprintf(to, MAXPATHLEN, "%s.%d", fname, i);
+-	xrename(from, to);
+-    }
+-    if (cache_useragent_log) {
+-	file_close(fileno(cache_useragent_log));
+-	fclose(cache_useragent_log);
+-	cache_useragent_log = NULL;
+-    }
+-    /* Rotate the current log to .0 */
+-    if (Config.Log.rotateNumber > 0) {
+-	snprintf(to, MAXPATHLEN, "%s.%d", fname, 0);
+-	xrename(fname, to);
+-    }
+-    useragentOpenLog();
++    logfileRotate(useragentlog);
+ #endif
+ }
+ 
+@@ -110,18 +69,16 @@ logUserAgent(const char *client, const char *agent)
+     static time_t last_time = 0;
+     static char time_str[128];
+     const char *s;
+-    if (!cache_useragent_log)
++    if (NULL == useragentlog)
+ 	return;
+     if (squid_curtime != last_time) {
+ 	s = mkhttpdlogtime(&squid_curtime);
+ 	strcpy(time_str, s);
+ 	last_time = squid_curtime;
+     }
+-    fprintf(cache_useragent_log, "%s [%s] \"%s\"\n",
++    logfilePrintf(useragentlog, "%s [%s] \"%s\"\n",
+ 	client,
+ 	time_str,
+ 	agent);
+-    if (!Config.onoff.buffered_logs)
+-	fflush(cache_useragent_log);
+ #endif
+ }

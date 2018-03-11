@@ -1,0 +1,278 @@
+@@ -1,4 +1,4 @@
+-/* $Id: main.cc,v 1.21 1996/04/08 17:08:02 wessels Exp $ */
++/* $Id: main.cc,v 1.22 1996/04/08 19:32:39 wessels Exp $ */
+ 
+ /* DEBUG: Section 1             main: startup and main loop */
+ 
+@@ -14,6 +14,8 @@ int do_dns_test = 1;
+ char *config_file = NULL;
+ int vhost_mode = 0;
+ int unbuffered_logs = 1;	/* debug and hierarhcy unbuffered by default */
++int shutdown_pending = 0;	/* set by SIGTERM handler (shut_down()) */
++int reread_pending = 0;		/* set by SIGHUP handler */
+ 
+ extern void (*failure_notify) ();	/* for error reporting from xmalloc */
+ 
+@@ -97,35 +99,8 @@ static void mainParseOptions(argc, argv)
+     }
+ }
+ 
+-static void mainInitialize()
++void serverConnectionsOpen()
+ {
+-    parseConfigFile(config_file);
+-
+-    neighbors_create();
+-
+-    if (asciiPortNumOverride > 0)
+-	setAsciiPortNum(asciiPortNumOverride);
+-    if (udpPortNumOverride > 0)
+-	setUdpPortNum(udpPortNumOverride);
+-
+-    _db_init(getCacheLogFile());
+-    fdstat_open(fileno(debug_log), LOG);
+-    fd_note(fileno(debug_log), getCacheLogFile());
+-
+-    debug(1, 0, "Starting Harvest Cache (version %s)...\n", SQUID_VERSION);
+-
+-    /* init ipcache */
+-    ipcache_init();
+-
+-    /* init neighbors */
+-    neighbors_init();
+-
+-    ftpInitialize();
+-
+-#if defined(MALLOC_DBG)
+-    malloc_debug(0, malloc_debug_level);
+-#endif
+-
+     theAsciiConnection = comm_open(COMM_NONBLOCKING,
+ 	getAsciiPortNum(),
+ 	0,
+@@ -161,26 +136,90 @@ static void mainInitialize()
+ 		theUdpConnection);
+ 	}
+     }
+-    if (theUdpConnection > 0) {
+-	/* Now that the fd's are open, initialize neighbor connections */
+-	if (!httpd_accel_mode || getAccelWithProxy()) {
+-	    neighbors_open(theUdpConnection);
+-	}
++}
++
++void serverConnectionsClose()
++{
++    if (theAsciiConnection >= 0) {
++	debug(21, 1, "FD %d Closing Ascii connection\n",
++	    theAsciiConnection);
++	fdstat_close(theAsciiConnection);
++	comm_close(theAsciiConnection);
++	comm_set_select_handler(theAsciiConnection,
++	    COMM_SELECT_READ,
++	    NULL,
++	    0);
++	theAsciiConnection = -1;
+     }
++    if (theUdpConnection >= 0) {
++	debug(21, 1, "FD %d Closing Udp connection\n",
++	    theUdpConnection);
++	fdstat_close(theUdpConnection);
++	comm_close(theUdpConnection);
++	comm_set_select_handler(theUdpConnection,
++	    COMM_SELECT_READ,
++	    NULL,
++	    0);
++	theUdpConnection = -1;
++    }
++}
++
++static void mainUninitialize()
++{
++    neighborsDestroy();
++    serverConnectionsClose();
++    /* ipcache_uninit() */
++    /* neighbors_uninit(); */
++}
++
++static void mainInitialize()
++{
++    static int first_time = 1;
++    parseConfigFile(config_file);
++
++    neighbors_create();
++
++    if (asciiPortNumOverride > 0)
++	setAsciiPortNum(asciiPortNumOverride);
++    if (udpPortNumOverride > 0)
++	setUdpPortNum(udpPortNumOverride);
++
++    _db_init(getCacheLogFile());
++    fdstat_open(fileno(debug_log), LOG);
++    fd_note(fileno(debug_log), getCacheLogFile());
++
++    debug(1, 0, "Starting Harvest Cache (version %s)...\n", SQUID_VERSION);
++
++    ipcache_init();
++    neighbors_init();
++    ftpInitialize();
++
++#if defined(MALLOC_DBG)
++    malloc_debug(0, malloc_debug_level);
++#endif
++
++    serverConnectionsOpen();
++
+     /* do suid checking here */
+     check_suid();
+ 
+-    /* module initialization */
+-    disk_init();
+-    stat_init(&CacheInfo, getAccessLogFile());
+-    storeInit();
+-    stmemInit();
+-    writePidFile();
++    /* Now that the fd's are open, initialize neighbor connections */
++    if (theUdpConnection >= 0 && (!httpd_accel_mode || getAccelWithProxy()))
++	neighbors_open(theUdpConnection);
+ 
+-    /* after this point we want to see the mallinfo() output */
+-    do_mallinfo = 1;
+-    debug(1, 0, "Ready to serve requests.\n");
++    if (!first_time) {
++
++	/* module initialization */
++	disk_init();
++	stat_init(&CacheInfo, getAccessLogFile());
++	storeInit();
++	stmemInit();
++	writePidFile();
+ 
++	/* after this point we want to see the mallinfo() output */
++	do_mallinfo = 1;
++    }
++    debug(1, 0, "Ready to serve requests.\n");
+ }
+ 
+ 
+@@ -287,8 +326,16 @@ int main(argc, argv)
+ 	    /* house keeping */
+ 	    break;
+ 	case COMM_SHUTDOWN:
+-	    normal_shutdown();
+-	    exit(0);
++	    if (shutdown_pending) {
++		normal_shutdown();
++		exit(0);
++	    } else if (reread_pending) {
++		mainUninitialize();
++		mainInitialize();
++		reread_pending = 0;	/* reset */
++	    } else {
++		fatal_dump("MAIN: SHUTDOWN from comm_select, but nothing pending.");
++	    }
+ 	default:
+ 	    fatal_dump("MAIN: Internal error -- this should never happen.");
+ 	    break;
+@@ -1,4 +1,4 @@
+-/* $Id: neighbors.cc,v 1.11 1996/04/08 17:08:03 wessels Exp $ */
++/* $Id: neighbors.cc,v 1.12 1996/04/08 19:32:40 wessels Exp $ */
+ 
+ /* TODO:
+  * - change 'neighbor' to 'sibling'
+@@ -259,12 +259,12 @@ void neighbors_install(host, type, ascii_port, udp_port, proxy_only, domains)
+     friends->n++;
+ }
+ 
+-static void neighborFriendsFree()
++void neighborsDestroy()
+ {
+     edge *e = NULL;
+     edge *next = NULL;
+ 
+-    debug(15, 1, "neighborFriendsFree()\n");
++    debug(15, 1, "neighborEdgesFree()\n");
+ 
+     for (e = friends->edges_head; e; e = next) {
+ 	next = e->next;
+@@ -1,5 +1,5 @@
+ 
+-/* $Id: squid.h,v 1.10 1996/04/08 18:28:58 wessels Exp $ */
++/* $Id: squid.h,v 1.11 1996/04/08 19:32:41 wessels Exp $ */
+ 
+ #include "config.h"
+ #include "autoconf.h"
+@@ -121,6 +121,8 @@ typedef unsigned long u_num32;
+ extern time_t cached_starttime;	/* main.c */
+ extern time_t next_cleaning;	/* main.c */
+ extern int catch_signals;	/* main.c */
+-extern int do_reuse;
+-extern int theAsciiConnection;
+-extern int theUdpConnection;
++extern int do_reuse;		/* main.c */
++extern int theAsciiConnection;	/* main.c */
++extern int theUdpConnection;	/* main.c */
++extern int shutdown_pending;	/* main.c */
++extern int reread_pending;	/* main.c */
+@@ -1,5 +1,5 @@
+ 
+-/* $Id: tools.cc,v 1.24 1996/04/08 17:08:04 wessels Exp $ */
++/* $Id: tools.cc,v 1.25 1996/04/08 19:32:42 wessels Exp $ */
+ 
+ /*
+  * DEBUG: Section 21          tools
+@@ -11,6 +11,8 @@ int do_mallinfo = 0;		/* don't do mallinfo() unless this gets set */
+ time_t cached_curtime;
+ struct timeval current_time;
+ 
++extern void serverConnectionsClose _PARAMS((void));
++
+ #define DEAD_MSG "\
+ The Harvest Cache (version %s) died.\n\
+ \n\
+@@ -178,27 +180,9 @@ void shut_down(sig)
+      int sig;
+ {
+     debug(21, 1, "Preparing for shutdown...\n");
+-    if (theAsciiConnection) {
+-	debug(21, 1, "FD %d Closing Ascii connection\n",
+-	    theAsciiConnection);
+-	comm_close(theAsciiConnection);
+-	comm_set_select_handler(theAsciiConnection,
+-	    COMM_SELECT_READ,
+-	    NULL,
+-	    0);
+-	theAsciiConnection = -1;
+-    }
+-    if (theUdpConnection) {
+-	debug(21, 1, "FD %d Closing Udp connection\n",
+-	    theUdpConnection);
+-	comm_close(theUdpConnection);
+-	comm_set_select_handler(theUdpConnection,
+-	    COMM_SELECT_READ,
+-	    NULL,
+-	    0);
+-	theUdpConnection = -1;
+-    }
++    serverConnectionsClose();
+     ipcacheShutdownServers();
++    shutdown_pending = 1;
+ }
+ #endif
+ 
+@@ -427,3 +411,15 @@ time_t getCurrentTime()
+     gettimeofday(&current_time, NULL);
+     return cached_curtime = current_time.tv_sec;
+ }
++
++
++void usr1_handle(sig)
++     int sig;
++{
++    debug(21, 1, "usr1_handle: SIGUSR1 received.\n");
++
++    reread_pending = 1;
++#if defined(_SQUID_SYSV_SIGNALS_)
++    signal(sig, rotate_logs);
++#endif
++}

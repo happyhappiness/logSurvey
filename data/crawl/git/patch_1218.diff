@@ -1,0 +1,4619 @@
+@@ -55,6 +55,9 @@ UI, Workflows & Features
+  * The "multi-mail" post-receive hook (in contrib/) has been updated
+    to a more recent version from the upstream.
+ 
++ * The "remote-hg/bzr" remote-helper interfaces (in contrib/) are
++   now maintained separately as a third-party plug-in.
++
+  * "git gc --aggressive" learned "--depth" option and
+    "gc.aggressiveDepth" configuration variable to allow use of a less
+    insane depth than the built-in default value of 250.
+@@ -88,6 +91,10 @@ UI, Workflows & Features
+  * "git grep" learned to behave in a way similar to native grep when
+    "-h" (no header) and "-c" (count) options are given.
+ 
++ * "git push" via transport-helper interface has been updated to
++   allow forced ref updates in a way similar to the natively
++   supported transports.
++
+  * The "simple" mode is the default for "git push".
+ 
+  * "git add -u" and "git add -A", when run without any pathspec, is a
+@@ -1,14 +0,0 @@
+-TESTS := $(wildcard test*.sh)
+-
+-export T := $(addprefix $(CURDIR)/,$(TESTS))
+-export MAKE := $(MAKE) -e
+-export PATH := $(CURDIR):$(PATH)
+-export TEST_LINT := test-lint-executable test-lint-shell-syntax
+-
+-test:
+-	$(MAKE) -C ../../t $@
+-
+-$(TESTS):
+-	$(MAKE) -C ../../t $(CURDIR)/$@
+-
+-.PHONY: $(TESTS)
+@@ -1,6 +1,6 @@
+ The remote-helper bridges to access data stored in Mercurial and
+ Bazaar are maintained outside the git.git tree in the repositories
+-of its primary author:
++of their primary author:
+ 
+     https://github.com/felipec/git-remote-hg (for Mercurial)
+     https://github.com/felipec/git-remote-bzr (for Bazaar)
+@@ -13,7 +13,3 @@ repositories, e.g.:
+   $ wget -O $HOME/bin/git-remote-bzr \
+     https://raw.github.com/felipec/git-remote-bzr/master/git-remote-bzr
+   $ chmod +x $HOME/bin/git-remote-hg $HOME/bin/git-remote-bzr
+-
+-As a convenience, copies of the last-bundled version of these two
+-remote-helper bridges are still kept here, but they may become
+-stale over time.
+@@ -1,986 +1,13 @@
+ #!/usr/bin/env python
+-#
+-# Copyright (c) 2012 Felipe Contreras
+-#
+-
+-#
+-# Just copy to your ~/bin, or anywhere in your $PATH.
+-# Then you can clone with:
+-# % git clone bzr::/path/to/bzr/repo/or/url
+-#
+-# For example:
+-# % git clone bzr::$HOME/myrepo
+-# or
+-# % git clone bzr::lp:myrepo
+-#
+-# If you want to specify which branches you want to track (per repo):
+-# % git config remote.origin.bzr-branches 'trunk, devel, test'
+-#
+-# Where 'origin' is the name of the repository you want to specify the
+-# branches.
+-#
+-
+-import sys
+-
+-import bzrlib
+-if hasattr(bzrlib, "initialize"):
+-    bzrlib.initialize()
+-
+-import bzrlib.plugin
+-bzrlib.plugin.load_plugins()
+-
+-import bzrlib.generate_ids
+-import bzrlib.transport
+-import bzrlib.errors
+-import bzrlib.ui
+-import bzrlib.urlutils
+-import bzrlib.branch
+ 
+ import sys
+-import os
+-import json
+-import re
+-import StringIO
+-import atexit, shutil, hashlib, urlparse, subprocess
+ 
+ sys.stderr.write('WARNING: git-remote-bzr is now maintained independently.\n')
+ sys.stderr.write('WARNING: For more information visit https://github.com/felipec/git-remote-bzr\n')
+ 
+-NAME_RE = re.compile('^([^<>]+)')
+-AUTHOR_RE = re.compile('^([^<>]+?)? ?[<>]([^<>]*)(?:$|>)')
+-EMAIL_RE = re.compile(r'([^ \t<>]+@[^ \t<>]+)')
+-RAW_AUTHOR_RE = re.compile('^(\w+) (.+)? <(.*)> (\d+) ([+-]\d+)')
+-
+-def die(msg, *args):
+-    sys.stderr.write('ERROR: %s\n' % (msg % args))
+-    sys.exit(1)
+-
+-def warn(msg, *args):
+-    sys.stderr.write('WARNING: %s\n' % (msg % args))
+-
+-def gittz(tz):
+-    return '%+03d%02d' % (tz / 3600, tz % 3600 / 60)
+-
+-def get_config(config):
+-    cmd = ['git', 'config', '--get', config]
+-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+-    output, _ = process.communicate()
+-    return output
+-
+-class Marks:
+-
+-    def __init__(self, path):
+-        self.path = path
+-        self.tips = {}
+-        self.marks = {}
+-        self.rev_marks = {}
+-        self.last_mark = 0
+-        self.load()
+-
+-    def load(self):
+-        if not os.path.exists(self.path):
+-            return
+-
+-        tmp = json.load(open(self.path))
+-        self.tips = tmp['tips']
+-        self.marks = tmp['marks']
+-        self.last_mark = tmp['last-mark']
+-
+-        for rev, mark in self.marks.iteritems():
+-            self.rev_marks[mark] = rev
+-
+-    def dict(self):
+-        return { 'tips': self.tips, 'marks': self.marks, 'last-mark' : self.last_mark }
+-
+-    def store(self):
+-        json.dump(self.dict(), open(self.path, 'w'))
+-
+-    def __str__(self):
+-        return str(self.dict())
+-
+-    def from_rev(self, rev):
+-        return self.marks[rev]
+-
+-    def to_rev(self, mark):
+-        return str(self.rev_marks[mark])
+-
+-    def next_mark(self):
+-        self.last_mark += 1
+-        return self.last_mark
+-
+-    def get_mark(self, rev):
+-        self.last_mark += 1
+-        self.marks[rev] = self.last_mark
+-        return self.last_mark
+-
+-    def is_marked(self, rev):
+-        return rev in self.marks
+-
+-    def new_mark(self, rev, mark):
+-        self.marks[rev] = mark
+-        self.rev_marks[mark] = rev
+-        self.last_mark = mark
+-
+-    def get_tip(self, branch):
+-        try:
+-            return str(self.tips[branch])
+-        except KeyError:
+-            return None
+-
+-    def set_tip(self, branch, tip):
+-        self.tips[branch] = tip
+-
+-class Parser:
+-
+-    def __init__(self, repo):
+-        self.repo = repo
+-        self.line = self.get_line()
+-
+-    def get_line(self):
+-        return sys.stdin.readline().strip()
+-
+-    def __getitem__(self, i):
+-        return self.line.split()[i]
+-
+-    def check(self, word):
+-        return self.line.startswith(word)
+-
+-    def each_block(self, separator):
+-        while self.line != separator:
+-            yield self.line
+-            self.line = self.get_line()
+-
+-    def __iter__(self):
+-        return self.each_block('')
+-
+-    def next(self):
+-        self.line = self.get_line()
+-        if self.line == 'done':
+-            self.line = None
+-
+-    def get_mark(self):
+-        i = self.line.index(':') + 1
+-        return int(self.line[i:])
+-
+-    def get_data(self):
+-        if not self.check('data'):
+-            return None
+-        i = self.line.index(' ') + 1
+-        size = int(self.line[i:])
+-        return sys.stdin.read(size)
+-
+-    def get_author(self):
+-        m = RAW_AUTHOR_RE.match(self.line)
+-        if not m:
+-            return None
+-        _, name, email, date, tz = m.groups()
+-        name = name.decode('utf-8')
+-        committer = '%s <%s>' % (name, email)
+-        tz = int(tz)
+-        tz = ((tz / 100) * 3600) + ((tz % 100) * 60)
+-        return (committer, int(date), tz)
+-
+-def rev_to_mark(rev):
+-    return marks.from_rev(rev)
+-
+-def mark_to_rev(mark):
+-    return marks.to_rev(mark)
+-
+-def fixup_user(user):
+-    name = mail = None
+-    user = user.replace('"', '')
+-    m = AUTHOR_RE.match(user)
+-    if m:
+-        name = m.group(1)
+-        mail = m.group(2).strip()
+-    else:
+-        m = EMAIL_RE.match(user)
+-        if m:
+-            mail = m.group(1)
+-        else:
+-            m = NAME_RE.match(user)
+-            if m:
+-                name = m.group(1).strip()
+-
+-    if not name:
+-        name = 'unknown'
+-    if not mail:
+-        mail = 'Unknown'
+-
+-    return '%s <%s>' % (name, mail)
+-
+-def get_filechanges(cur, prev):
+-    modified = {}
+-    removed = {}
+-
+-    changes = cur.changes_from(prev)
+-
+-    def u(s):
+-        return s.encode('utf-8')
+-
+-    for path, fid, kind in changes.added:
+-        modified[u(path)] = fid
+-    for path, fid, kind in changes.removed:
+-        removed[u(path)] = None
+-    for path, fid, kind, mod, _ in changes.modified:
+-        modified[u(path)] = fid
+-    for oldpath, newpath, fid, kind, mod, _ in changes.renamed:
+-        removed[u(oldpath)] = None
+-        if kind == 'directory':
+-            lst = cur.list_files(from_dir=newpath, recursive=True)
+-            for path, file_class, kind, fid, entry in lst:
+-                if kind != 'directory':
+-                    modified[u(newpath + '/' + path)] = fid
+-        else:
+-            modified[u(newpath)] = fid
+-
+-    return modified, removed
+-
+-def export_files(tree, files):
+-    final = []
+-    for path, fid in files.iteritems():
+-        kind = tree.kind(fid)
+-
+-        h = tree.get_file_sha1(fid)
+-
+-        if kind == 'symlink':
+-            d = tree.get_symlink_target(fid)
+-            mode = '120000'
+-        elif kind == 'file':
+-
+-            if tree.is_executable(fid):
+-                mode = '100755'
+-            else:
+-                mode = '100644'
+-
+-            # is the blob already exported?
+-            if h in filenodes:
+-                mark = filenodes[h]
+-                final.append((mode, mark, path))
+-                continue
+-
+-            d = tree.get_file_text(fid)
+-        elif kind == 'directory':
+-            continue
+-        else:
+-            die("Unhandled kind '%s' for path '%s'" % (kind, path))
+-
+-        mark = marks.next_mark()
+-        filenodes[h] = mark
+-
+-        print "blob"
+-        print "mark :%u" % mark
+-        print "data %d" % len(d)
+-        print d
+-
+-        final.append((mode, mark, path))
+-
+-    return final
+-
+-def export_branch(repo, name):
+-    ref = '%s/heads/%s' % (prefix, name)
+-    tip = marks.get_tip(name)
+-
+-    branch = get_remote_branch(name)
+-    repo = branch.repository
+-
+-    branch.lock_read()
+-    revs = branch.iter_merge_sorted_revisions(None, tip, 'exclude', 'forward')
+-    try:
+-        tip_revno = branch.revision_id_to_revno(tip)
+-        last_revno, _ = branch.last_revision_info()
+-        total = last_revno - tip_revno
+-    except bzrlib.errors.NoSuchRevision:
+-        tip_revno = 0
+-        total = 0
+-
+-    for revid, _, seq, _ in revs:
+-
+-        if marks.is_marked(revid):
+-            continue
+-
+-        rev = repo.get_revision(revid)
+-        revno = seq[0]
+-
+-        parents = rev.parent_ids
+-        time = rev.timestamp
+-        tz = rev.timezone
+-        committer = rev.committer.encode('utf-8')
+-        committer = "%s %u %s" % (fixup_user(committer), time, gittz(tz))
+-        authors = rev.get_apparent_authors()
+-        if authors:
+-            author = authors[0].encode('utf-8')
+-            author = "%s %u %s" % (fixup_user(author), time, gittz(tz))
+-        else:
+-            author = committer
+-        msg = rev.message.encode('utf-8')
+-
+-        msg += '\n'
+-
+-        if len(parents) == 0:
+-            parent = bzrlib.revision.NULL_REVISION
+-        else:
+-            parent = parents[0]
+-
+-        cur_tree = repo.revision_tree(revid)
+-        prev = repo.revision_tree(parent)
+-        modified, removed = get_filechanges(cur_tree, prev)
+-
+-        modified_final = export_files(cur_tree, modified)
+-
+-        if len(parents) == 0:
+-            print 'reset %s' % ref
+-
+-        print "commit %s" % ref
+-        print "mark :%d" % (marks.get_mark(revid))
+-        print "author %s" % (author)
+-        print "committer %s" % (committer)
+-        print "data %d" % (len(msg))
+-        print msg
+-
+-        for i, p in enumerate(parents):
+-            try:
+-                m = rev_to_mark(p)
+-            except KeyError:
+-                # ghost?
+-                continue
+-            if i == 0:
+-                print "from :%s" % m
+-            else:
+-                print "merge :%s" % m
+-
+-        for f in removed:
+-            print "D %s" % (f,)
+-        for f in modified_final:
+-            print "M %s :%u %s" % f
+-        print
+-
+-        if len(seq) > 1:
+-            # let's skip branch revisions from the progress report
+-            continue
+-
+-        progress = (revno - tip_revno)
+-        if (progress % 100 == 0):
+-            if total:
+-                print "progress revision %d '%s' (%d/%d)" % (revno, name, progress, total)
+-            else:
+-                print "progress revision %d '%s' (%d)" % (revno, name, progress)
+-
+-    branch.unlock()
+-
+-    revid = branch.last_revision()
+-
+-    # make sure the ref is updated
+-    print "reset %s" % ref
+-    print "from :%u" % rev_to_mark(revid)
+-    print
+-
+-    marks.set_tip(name, revid)
+-
+-def export_tag(repo, name):
+-    ref = '%s/tags/%s' % (prefix, name)
+-    print "reset %s" % ref
+-    print "from :%u" % rev_to_mark(tags[name])
+-    print
+-
+-def do_import(parser):
+-    repo = parser.repo
+-    path = os.path.join(dirname, 'marks-git')
+-
+-    print "feature done"
+-    if os.path.exists(path):
+-        print "feature import-marks=%s" % path
+-    print "feature export-marks=%s" % path
+-    print "feature force"
+-    sys.stdout.flush()
+-
+-    while parser.check('import'):
+-        ref = parser[1]
+-        if ref.startswith('refs/heads/'):
+-            name = ref[len('refs/heads/'):]
+-            export_branch(repo, name)
+-        if ref.startswith('refs/tags/'):
+-            name = ref[len('refs/tags/'):]
+-            export_tag(repo, name)
+-        parser.next()
+-
+-    print 'done'
+-
+-    sys.stdout.flush()
+-
+-def parse_blob(parser):
+-    parser.next()
+-    mark = parser.get_mark()
+-    parser.next()
+-    data = parser.get_data()
+-    blob_marks[mark] = data
+-    parser.next()
+-
+-class CustomTree():
+-
+-    def __init__(self, branch, revid, parents, files):
+-        self.updates = {}
+-        self.branch = branch
+-
+-        def copy_tree(revid):
+-            files = files_cache[revid] = {}
+-            branch.lock_read()
+-            tree = branch.repository.revision_tree(revid)
+-            try:
+-                for path, entry in tree.iter_entries_by_dir():
+-                    files[path] = [entry.file_id, None]
+-            finally:
+-                branch.unlock()
+-            return files
+-
+-        if len(parents) == 0:
+-            self.base_id = bzrlib.revision.NULL_REVISION
+-            self.base_files = {}
+-        else:
+-            self.base_id = parents[0]
+-            self.base_files = files_cache.get(self.base_id, None)
+-            if not self.base_files:
+-                self.base_files = copy_tree(self.base_id)
+-
+-        self.files = files_cache[revid] = self.base_files.copy()
+-        self.rev_files = {}
+-
+-        for path, data in self.files.iteritems():
+-            fid, mark = data
+-            self.rev_files[fid] = [path, mark]
+-
+-        for path, f in files.iteritems():
+-            fid, mark = self.files.get(path, [None, None])
+-            if not fid:
+-                fid = bzrlib.generate_ids.gen_file_id(path)
+-            f['path'] = path
+-            self.rev_files[fid] = [path, mark]
+-            self.updates[fid] = f
+-
+-    def last_revision(self):
+-        return self.base_id
+-
+-    def iter_changes(self):
+-        changes = []
+-
+-        def get_parent(dirname, basename):
+-            parent_fid, mark = self.base_files.get(dirname, [None, None])
+-            if parent_fid:
+-                return parent_fid
+-            parent_fid, mark = self.files.get(dirname, [None, None])
+-            if parent_fid:
+-                return parent_fid
+-            if basename == '':
+-                return None
+-            fid = bzrlib.generate_ids.gen_file_id(path)
+-            add_entry(fid, dirname, 'directory')
+-            return fid
+-
+-        def add_entry(fid, path, kind, mode=None):
+-            dirname, basename = os.path.split(path)
+-            parent_fid = get_parent(dirname, basename)
+-
+-            executable = False
+-            if mode == '100755':
+-                executable = True
+-            elif mode == '120000':
+-                kind = 'symlink'
+-
+-            change = (fid,
+-                    (None, path),
+-                    True,
+-                    (False, True),
+-                    (None, parent_fid),
+-                    (None, basename),
+-                    (None, kind),
+-                    (None, executable))
+-            self.files[path] = [change[0], None]
+-            changes.append(change)
+-
+-        def update_entry(fid, path, kind, mode=None):
+-            dirname, basename = os.path.split(path)
+-            parent_fid = get_parent(dirname, basename)
+-
+-            executable = False
+-            if mode == '100755':
+-                executable = True
+-            elif mode == '120000':
+-                kind = 'symlink'
+-
+-            change = (fid,
+-                    (path, path),
+-                    True,
+-                    (True, True),
+-                    (None, parent_fid),
+-                    (None, basename),
+-                    (None, kind),
+-                    (None, executable))
+-            self.files[path] = [change[0], None]
+-            changes.append(change)
+-
+-        def remove_entry(fid, path, kind):
+-            dirname, basename = os.path.split(path)
+-            parent_fid = get_parent(dirname, basename)
+-            change = (fid,
+-                    (path, None),
+-                    True,
+-                    (True, False),
+-                    (parent_fid, None),
+-                    (None, None),
+-                    (None, None),
+-                    (None, None))
+-            del self.files[path]
+-            changes.append(change)
+-
+-        for fid, f in self.updates.iteritems():
+-            path = f['path']
+-
+-            if 'deleted' in f:
+-                remove_entry(fid, path, 'file')
+-                continue
+-
+-            if path in self.base_files:
+-                update_entry(fid, path, 'file', f['mode'])
+-            else:
+-                add_entry(fid, path, 'file', f['mode'])
+-
+-            self.files[path][1] = f['mark']
+-            self.rev_files[fid][1] = f['mark']
+-
+-        return changes
+-
+-    def get_content(self, file_id):
+-        path, mark = self.rev_files[file_id]
+-        if mark:
+-            return blob_marks[mark]
+-
+-        # last resort
+-        tree = self.branch.repository.revision_tree(self.base_id)
+-        return tree.get_file_text(file_id)
+-
+-    def get_file_with_stat(self, file_id, path=None):
+-        content = self.get_content(file_id)
+-        return (StringIO.StringIO(content), None)
+-
+-    def get_symlink_target(self, file_id):
+-        return self.get_content(file_id)
+-
+-    def id2path(self, file_id):
+-        path, mark = self.rev_files[file_id]
+-        return path
+-
+-def c_style_unescape(string):
+-    if string[0] == string[-1] == '"':
+-        return string.decode('string-escape')[1:-1]
+-    return string
+-
+-def parse_commit(parser):
+-    parents = []
+-
+-    ref = parser[1]
+-    parser.next()
+-
+-    if ref.startswith('refs/heads/'):
+-        name = ref[len('refs/heads/'):]
+-        branch = get_remote_branch(name)
+-    else:
+-        die('unknown ref')
+-
+-    commit_mark = parser.get_mark()
+-    parser.next()
+-    author = parser.get_author()
+-    parser.next()
+-    committer = parser.get_author()
+-    parser.next()
+-    data = parser.get_data()
+-    parser.next()
+-    if parser.check('from'):
+-        parents.append(parser.get_mark())
+-        parser.next()
+-    while parser.check('merge'):
+-        parents.append(parser.get_mark())
+-        parser.next()
+-
+-    # fast-export adds an extra newline
+-    if data[-1] == '\n':
+-        data = data[:-1]
+-
+-    files = {}
+-
+-    for line in parser:
+-        if parser.check('M'):
+-            t, m, mark_ref, path = line.split(' ', 3)
+-            mark = int(mark_ref[1:])
+-            f = { 'mode' : m, 'mark' : mark }
+-        elif parser.check('D'):
+-            t, path = line.split(' ', 1)
+-            f = { 'deleted' : True }
+-        else:
+-            die('Unknown file command: %s' % line)
+-        path = c_style_unescape(path).decode('utf-8')
+-        files[path] = f
+-
+-    committer, date, tz = committer
+-    author, _, _ = author
+-    parents = [mark_to_rev(p) for p in parents]
+-    revid = bzrlib.generate_ids.gen_revision_id(committer, date)
+-    props = {}
+-    props['branch-nick'] = branch.nick
+-    props['authors'] = author
+-
+-    mtree = CustomTree(branch, revid, parents, files)
+-    changes = mtree.iter_changes()
+-
+-    branch.lock_write()
+-    try:
+-        builder = branch.get_commit_builder(parents, None, date, tz, committer, props, revid)
+-        try:
+-            list(builder.record_iter_changes(mtree, mtree.last_revision(), changes))
+-            builder.finish_inventory()
+-            builder.commit(data.decode('utf-8', 'replace'))
+-        except Exception, e:
+-            builder.abort()
+-            raise
+-    finally:
+-        branch.unlock()
+-
+-    parsed_refs[ref] = revid
+-    marks.new_mark(revid, commit_mark)
+-
+-def parse_reset(parser):
+-    ref = parser[1]
+-    parser.next()
+-
+-    # ugh
+-    if parser.check('commit'):
+-        parse_commit(parser)
+-        return
+-    if not parser.check('from'):
+-        return
+-    from_mark = parser.get_mark()
+-    parser.next()
+-
+-    parsed_refs[ref] = mark_to_rev(from_mark)
+-
+-def do_export(parser):
+-    parser.next()
+-
+-    for line in parser.each_block('done'):
+-        if parser.check('blob'):
+-            parse_blob(parser)
+-        elif parser.check('commit'):
+-            parse_commit(parser)
+-        elif parser.check('reset'):
+-            parse_reset(parser)
+-        elif parser.check('tag'):
+-            pass
+-        elif parser.check('feature'):
+-            pass
+-        else:
+-            die('unhandled export command: %s' % line)
+-
+-    for ref, revid in parsed_refs.iteritems():
+-        if ref.startswith('refs/heads/'):
+-            name = ref[len('refs/heads/'):]
+-            branch = get_remote_branch(name)
+-            branch.generate_revision_history(revid, marks.get_tip(name))
+-
+-            if name in peers:
+-                peer = bzrlib.branch.Branch.open(peers[name],
+-                                                 possible_transports=transports)
+-                try:
+-                    peer.bzrdir.push_branch(branch, revision_id=revid,
+-                                            overwrite=force)
+-                except bzrlib.errors.DivergedBranches:
+-                    print "error %s non-fast forward" % ref
+-                    continue
+-
+-            try:
+-                wt = branch.bzrdir.open_workingtree()
+-                wt.update()
+-            except bzrlib.errors.NoWorkingTree:
+-                pass
+-        elif ref.startswith('refs/tags/'):
+-            # TODO: implement tag push
+-            print "error %s pushing tags not supported" % ref
+-            continue
+-        else:
+-            # transport-helper/fast-export bugs
+-            continue
+-
+-        print "ok %s" % ref
+-
+-    print
+-
+-def do_capabilities(parser):
+-    print "import"
+-    print "export"
+-    print "refspec refs/heads/*:%s/heads/*" % prefix
+-    print "refspec refs/tags/*:%s/tags/*" % prefix
+-
+-    path = os.path.join(dirname, 'marks-git')
+-
+-    if os.path.exists(path):
+-        print "*import-marks %s" % path
+-    print "*export-marks %s" % path
+-
+-    print "option"
+-    print
+-
+-class InvalidOptionValue(Exception):
+-    pass
+-
+-def get_bool_option(val):
+-    if val == 'true':
+-        return True
+-    elif val == 'false':
+-        return False
+-    else:
+-        raise InvalidOptionValue()
+-
+-def do_option(parser):
+-    global force
+-    opt, val = parser[1:3]
+-    try:
+-        if opt == 'force':
+-            force = get_bool_option(val)
+-            print 'ok'
+-        else:
+-            print 'unsupported'
+-    except InvalidOptionValue:
+-        print "error '%s' is not a valid value for option '%s'" % (val, opt)
+-
+-def ref_is_valid(name):
+-    return not True in [c in name for c in '~^: \\']
+-
+-def do_list(parser):
+-    master_branch = None
+-
+-    for name in branches:
+-        if not master_branch:
+-            master_branch = name
+-        print "? refs/heads/%s" % name
+-
+-    branch = get_remote_branch(master_branch)
+-    branch.lock_read()
+-    for tag, revid in branch.tags.get_tag_dict().items():
+-        try:
+-            branch.revision_id_to_dotted_revno(revid)
+-        except bzrlib.errors.NoSuchRevision:
+-            continue
+-        if not ref_is_valid(tag):
+-            continue
+-        print "? refs/tags/%s" % tag
+-        tags[tag] = revid
+-    branch.unlock()
+-
+-    print "@refs/heads/%s HEAD" % master_branch
+-    print
+-
+-def clone(path, remote_branch):
+-    try:
+-        bdir = bzrlib.bzrdir.BzrDir.create(path, possible_transports=transports)
+-    except bzrlib.errors.AlreadyControlDirError:
+-        bdir = bzrlib.bzrdir.BzrDir.open(path, possible_transports=transports)
+-    repo = bdir.find_repository()
+-    repo.fetch(remote_branch.repository)
+-    return remote_branch.sprout(bdir, repository=repo)
+-
+-def get_remote_branch(name):
+-    remote_branch = bzrlib.branch.Branch.open(branches[name],
+-                                              possible_transports=transports)
+-    if isinstance(remote_branch.bzrdir.root_transport, bzrlib.transport.local.LocalTransport):
+-        return remote_branch
+-
+-    branch_path = os.path.join(dirname, 'clone', name)
+-
+-    try:
+-        branch = bzrlib.branch.Branch.open(branch_path,
+-                                           possible_transports=transports)
+-    except bzrlib.errors.NotBranchError:
+-        # clone
+-        branch = clone(branch_path, remote_branch)
+-    else:
+-        # pull
+-        try:
+-            branch.pull(remote_branch, overwrite=True)
+-        except bzrlib.errors.DivergedBranches:
+-            # use remote branch for now
+-            return remote_branch
+-
+-    return branch
+-
+-def find_branches(repo):
+-    transport = repo.bzrdir.root_transport
+-
+-    for fn in transport.iter_files_recursive():
+-        if not fn.endswith('.bzr/branch-format'):
+-            continue
+-
+-        name = subdir = fn[:-len('/.bzr/branch-format')]
+-        name = name if name != '' else 'master'
+-        name = name.replace('/', '+')
+-
+-        try:
+-            cur = transport.clone(subdir)
+-            branch = bzrlib.branch.Branch.open_from_transport(cur)
+-        except bzrlib.errors.NotBranchError:
+-            continue
+-        else:
+-            yield name, branch.base
+-
+-def get_repo(url, alias):
+-    normal_url = bzrlib.urlutils.normalize_url(url)
+-    origin = bzrlib.bzrdir.BzrDir.open(url, possible_transports=transports)
+-    is_local = isinstance(origin.transport, bzrlib.transport.local.LocalTransport)
+-
+-    shared_path = os.path.join(gitdir, 'bzr')
+-    try:
+-        shared_dir = bzrlib.bzrdir.BzrDir.open(shared_path,
+-                                               possible_transports=transports)
+-    except bzrlib.errors.NotBranchError:
+-        shared_dir = bzrlib.bzrdir.BzrDir.create(shared_path,
+-                                                 possible_transports=transports)
+-    try:
+-        shared_repo = shared_dir.open_repository()
+-    except bzrlib.errors.NoRepositoryPresent:
+-        shared_repo = shared_dir.create_repository(shared=True)
+-
+-    if not is_local:
+-        clone_path = os.path.join(dirname, 'clone')
+-        if not os.path.exists(clone_path):
+-            os.mkdir(clone_path)
+-        else:
+-            # check and remove old organization
+-            try:
+-                bdir = bzrlib.bzrdir.BzrDir.open(clone_path,
+-                                                 possible_transports=transports)
+-                bdir.destroy_repository()
+-            except bzrlib.errors.NotBranchError:
+-                pass
+-            except bzrlib.errors.NoRepositoryPresent:
+-                pass
+-
+-    wanted = get_config('remote.%s.bzr-branches' % alias).rstrip().split(', ')
+-    # stupid python
+-    wanted = [e for e in wanted if e]
+-    if not wanted:
+-        wanted = get_config('remote-bzr.branches').rstrip().split(', ')
+-        # stupid python
+-        wanted = [e for e in wanted if e]
+-
+-    if not wanted:
+-        try:
+-            repo = origin.open_repository()
+-            if not repo.bzrdir.root_transport.listable():
+-                # this repository is not usable for us
+-                raise bzrlib.errors.NoRepositoryPresent(repo.bzrdir)
+-        except bzrlib.errors.NoRepositoryPresent:
+-            wanted = ['master']
+-
+-    if wanted:
+-        def list_wanted(url, wanted):
+-            for name in wanted:
+-                subdir = name if name != 'master' else ''
+-                yield name, bzrlib.urlutils.join(url, subdir)
+-
+-        branch_list = list_wanted(url, wanted)
+-    else:
+-        branch_list = find_branches(repo)
+-
+-    for name, url in branch_list:
+-        if not is_local:
+-            peers[name] = url
+-        branches[name] = url
+-
+-    return origin
+-
+-def fix_path(alias, orig_url):
+-    url = urlparse.urlparse(orig_url, 'file')
+-    if url.scheme != 'file' or os.path.isabs(url.path):
+-        return
+-    abs_url = urlparse.urljoin("%s/" % os.getcwd(), orig_url)
+-    cmd = ['git', 'config', 'remote.%s.url' % alias, "bzr::%s" % abs_url]
+-    subprocess.call(cmd)
+-
+-def main(args):
+-    global marks, prefix, gitdir, dirname
+-    global tags, filenodes
+-    global blob_marks
+-    global parsed_refs
+-    global files_cache
+-    global is_tmp
+-    global branches, peers
+-    global transports
+-    global force
+-
+-    marks = None
+-    is_tmp = False
+-    gitdir = os.environ.get('GIT_DIR', None)
+-
+-    if len(args) < 3:
+-        die('Not enough arguments.')
+-
+-    if not gitdir:
+-        die('GIT_DIR not set')
+-
+-    alias = args[1]
+-    url = args[2]
+-
+-    tags = {}
+-    filenodes = {}
+-    blob_marks = {}
+-    parsed_refs = {}
+-    files_cache = {}
+-    branches = {}
+-    peers = {}
+-    transports = []
+-    force = False
+-
+-    if alias[5:] == url:
+-        is_tmp = True
+-        alias = hashlib.sha1(alias).hexdigest()
+-
+-    prefix = 'refs/bzr/%s' % alias
+-    dirname = os.path.join(gitdir, 'bzr', alias)
+-
+-    if not is_tmp:
+-        fix_path(alias, url)
+-
+-    if not os.path.exists(dirname):
+-        os.makedirs(dirname)
+-
+-    if hasattr(bzrlib.ui.ui_factory, 'be_quiet'):
+-        bzrlib.ui.ui_factory.be_quiet(True)
+-
+-    repo = get_repo(url, alias)
+-
+-    marks_path = os.path.join(dirname, 'marks-int')
+-    marks = Marks(marks_path)
+-
+-    parser = Parser(repo)
+-    for line in parser:
+-        if parser.check('capabilities'):
+-            do_capabilities(parser)
+-        elif parser.check('list'):
+-            do_list(parser)
+-        elif parser.check('import'):
+-            do_import(parser)
+-        elif parser.check('export'):
+-            do_export(parser)
+-        elif parser.check('option'):
+-            do_option(parser)
+-        else:
+-            die('unhandled command: %s' % line)
+-        sys.stdout.flush()
+-
+-def bye():
+-    if not marks:
+-        return
+-    if not is_tmp:
+-        marks.store()
+-    else:
+-        shutil.rmtree(dirname)
+-
+-atexit.register(bye)
+-sys.exit(main(sys.argv))
++sys.stderr.write('''WARNING:
++WARNING: You can pick a directory on your $PATH and download it, e.g.:
++WARNING:   $ wget -O $HOME/bin/git-remote-bzr \\
++WARNING:     https://raw.github.com/felipec/git-remote-bzr/master/git-remote-bzr
++WARNING:   $ chmod +x $HOME/bin/git-remote-bzr
++''')
+@@ -1,1261 +1,13 @@
+ #!/usr/bin/env python
+-#
+-# Copyright (c) 2012 Felipe Contreras
+-#
+ 
+-# Inspired by Rocco Rutte's hg-fast-export
+-
+-# Just copy to your ~/bin, or anywhere in your $PATH.
+-# Then you can clone with:
+-# git clone hg::/path/to/mercurial/repo/
+-#
+-# For remote repositories a local clone is stored in
+-# "$GIT_DIR/hg/origin/clone/.hg/".
+-
+-from mercurial import hg, ui, bookmarks, context, encoding, node, error, extensions, discovery, util
+-
+-import re
+ import sys
+-import os
+-import json
+-import shutil
+-import subprocess
+-import urllib
+-import atexit
+-import urlparse, hashlib
+-import time as ptime
+ 
+ sys.stderr.write('WARNING: git-remote-hg is now maintained independently.\n')
+ sys.stderr.write('WARNING: For more information visit https://github.com/felipec/git-remote-hg\n')
+ 
+-#
+-# If you want to see Mercurial revisions as Git commit notes:
+-# git config core.notesRef refs/notes/hg
+-#
+-# If you are not in hg-git-compat mode and want to disable the tracking of
+-# named branches:
+-# git config --global remote-hg.track-branches false
+-#
+-# If you want the equivalent of hg's clone/pull--insecure option:
+-# git config --global remote-hg.insecure true
+-#
+-# If you want to switch to hg-git compatibility mode:
+-# git config --global remote-hg.hg-git-compat true
+-#
+-# git:
+-# Sensible defaults for git.
+-# hg bookmarks are exported as git branches, hg branches are prefixed
+-# with 'branches/', HEAD is a special case.
+-#
+-# hg:
+-# Emulate hg-git.
+-# Only hg bookmarks are exported as git branches.
+-# Commits are modified to preserve hg information and allow bidirectionality.
+-#
+-
+-NAME_RE = re.compile('^([^<>]+)')
+-AUTHOR_RE = re.compile('^([^<>]+?)? ?[<>]([^<>]*)(?:$|>)')
+-EMAIL_RE = re.compile(r'([^ \t<>]+@[^ \t<>]+)')
+-AUTHOR_HG_RE = re.compile('^(.*?) ?<(.*?)(?:>(.+)?)?$')
+-RAW_AUTHOR_RE = re.compile('^(\w+) (?:(.+)? )?<(.*)> (\d+) ([+-]\d+)')
+-
+-VERSION = 2
+-
+-def die(msg, *args):
+-    sys.stderr.write('ERROR: %s\n' % (msg % args))
+-    sys.exit(1)
+-
+-def warn(msg, *args):
+-    sys.stderr.write('WARNING: %s\n' % (msg % args))
+-
+-def gitmode(flags):
+-    return 'l' in flags and '120000' or 'x' in flags and '100755' or '100644'
+-
+-def gittz(tz):
+-    return '%+03d%02d' % (-tz / 3600, -tz % 3600 / 60)
+-
+-def hgmode(mode):
+-    m = { '100755': 'x', '120000': 'l' }
+-    return m.get(mode, '')
+-
+-def hghex(n):
+-    return node.hex(n)
+-
+-def hgbin(n):
+-    return node.bin(n)
+-
+-def hgref(ref):
+-    return ref.replace('___', ' ')
+-
+-def gitref(ref):
+-    return ref.replace(' ', '___')
+-
+-def check_version(*check):
+-    if not hg_version:
+-        return True
+-    return hg_version >= check
+-
+-def get_config(config):
+-    cmd = ['git', 'config', '--get', config]
+-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+-    output, _ = process.communicate()
+-    return output
+-
+-def get_config_bool(config, default=False):
+-    value = get_config(config).rstrip('\n')
+-    if value == "true":
+-        return True
+-    elif value == "false":
+-        return False
+-    else:
+-        return default
+-
+-class Marks:
+-
+-    def __init__(self, path, repo):
+-        self.path = path
+-        self.repo = repo
+-        self.clear()
+-        self.load()
+-
+-        if self.version < VERSION:
+-            if self.version == 1:
+-                self.upgrade_one()
+-
+-            # upgraded?
+-            if self.version < VERSION:
+-                self.clear()
+-                self.version = VERSION
+-
+-    def clear(self):
+-        self.tips = {}
+-        self.marks = {}
+-        self.rev_marks = {}
+-        self.last_mark = 0
+-        self.version = 0
+-        self.last_note = 0
+-
+-    def load(self):
+-        if not os.path.exists(self.path):
+-            return
+-
+-        tmp = json.load(open(self.path))
+-
+-        self.tips = tmp['tips']
+-        self.marks = tmp['marks']
+-        self.last_mark = tmp['last-mark']
+-        self.version = tmp.get('version', 1)
+-        self.last_note = tmp.get('last-note', 0)
+-
+-        for rev, mark in self.marks.iteritems():
+-            self.rev_marks[mark] = rev
+-
+-    def upgrade_one(self):
+-        def get_id(rev):
+-            return hghex(self.repo.changelog.node(int(rev)))
+-        self.tips = dict((name, get_id(rev)) for name, rev in self.tips.iteritems())
+-        self.marks = dict((get_id(rev), mark) for rev, mark in self.marks.iteritems())
+-        self.rev_marks = dict((mark, get_id(rev)) for mark, rev in self.rev_marks.iteritems())
+-        self.version = 2
+-
+-    def dict(self):
+-        return { 'tips': self.tips, 'marks': self.marks, 'last-mark' : self.last_mark, 'version' : self.version, 'last-note' : self.last_note }
+-
+-    def store(self):
+-        json.dump(self.dict(), open(self.path, 'w'))
+-
+-    def __str__(self):
+-        return str(self.dict())
+-
+-    def from_rev(self, rev):
+-        return self.marks[rev]
+-
+-    def to_rev(self, mark):
+-        return str(self.rev_marks[mark])
+-
+-    def next_mark(self):
+-        self.last_mark += 1
+-        return self.last_mark
+-
+-    def get_mark(self, rev):
+-        self.last_mark += 1
+-        self.marks[rev] = self.last_mark
+-        return self.last_mark
+-
+-    def new_mark(self, rev, mark):
+-        self.marks[rev] = mark
+-        self.rev_marks[mark] = rev
+-        self.last_mark = mark
+-
+-    def is_marked(self, rev):
+-        return rev in self.marks
+-
+-    def get_tip(self, branch):
+-        return str(self.tips[branch])
+-
+-    def set_tip(self, branch, tip):
+-        self.tips[branch] = tip
+-
+-class Parser:
+-
+-    def __init__(self, repo):
+-        self.repo = repo
+-        self.line = self.get_line()
+-
+-    def get_line(self):
+-        return sys.stdin.readline().strip()
+-
+-    def __getitem__(self, i):
+-        return self.line.split()[i]
+-
+-    def check(self, word):
+-        return self.line.startswith(word)
+-
+-    def each_block(self, separator):
+-        while self.line != separator:
+-            yield self.line
+-            self.line = self.get_line()
+-
+-    def __iter__(self):
+-        return self.each_block('')
+-
+-    def next(self):
+-        self.line = self.get_line()
+-        if self.line == 'done':
+-            self.line = None
+-
+-    def get_mark(self):
+-        i = self.line.index(':') + 1
+-        return int(self.line[i:])
+-
+-    def get_data(self):
+-        if not self.check('data'):
+-            return None
+-        i = self.line.index(' ') + 1
+-        size = int(self.line[i:])
+-        return sys.stdin.read(size)
+-
+-    def get_author(self):
+-        ex = None
+-        m = RAW_AUTHOR_RE.match(self.line)
+-        if not m:
+-            return None
+-        _, name, email, date, tz = m.groups()
+-        if name and 'ext:' in name:
+-            m = re.match('^(.+?) ext:\((.+)\)$', name)
+-            if m:
+-                name = m.group(1)
+-                ex = urllib.unquote(m.group(2))
+-
+-        if email != bad_mail:
+-            if name:
+-                user = '%s <%s>' % (name, email)
+-            else:
+-                user = '<%s>' % (email)
+-        else:
+-            user = name
+-
+-        if ex:
+-            user += ex
+-
+-        tz = int(tz)
+-        tz = ((tz / 100) * 3600) + ((tz % 100) * 60)
+-        return (user, int(date), -tz)
+-
+-def fix_file_path(path):
+-    path = os.path.normpath(path)
+-    if not os.path.isabs(path):
+-        return path
+-    return os.path.relpath(path, '/')
+-
+-def export_files(files):
+-    final = []
+-    for f in files:
+-        fid = node.hex(f.filenode())
+-
+-        if fid in filenodes:
+-            mark = filenodes[fid]
+-        else:
+-            mark = marks.next_mark()
+-            filenodes[fid] = mark
+-            d = f.data()
+-
+-            print "blob"
+-            print "mark :%u" % mark
+-            print "data %d" % len(d)
+-            print d
+-
+-        path = fix_file_path(f.path())
+-        final.append((gitmode(f.flags()), mark, path))
+-
+-    return final
+-
+-def get_filechanges(repo, ctx, parent):
+-    modified = set()
+-    added = set()
+-    removed = set()
+-
+-    # load earliest manifest first for caching reasons
+-    prev = parent.manifest().copy()
+-    cur = ctx.manifest()
+-
+-    for fn in cur:
+-        if fn in prev:
+-            if (cur.flags(fn) != prev.flags(fn) or cur[fn] != prev[fn]):
+-                modified.add(fn)
+-            del prev[fn]
+-        else:
+-            added.add(fn)
+-    removed |= set(prev.keys())
+-
+-    return added | modified, removed
+-
+-def fixup_user_git(user):
+-    name = mail = None
+-    user = user.replace('"', '')
+-    m = AUTHOR_RE.match(user)
+-    if m:
+-        name = m.group(1)
+-        mail = m.group(2).strip()
+-    else:
+-        m = EMAIL_RE.match(user)
+-        if m:
+-            mail = m.group(1)
+-        else:
+-            m = NAME_RE.match(user)
+-            if m:
+-                name = m.group(1).strip()
+-    return (name, mail)
+-
+-def fixup_user_hg(user):
+-    def sanitize(name):
+-        # stole this from hg-git
+-        return re.sub('[<>\n]', '?', name.lstrip('< ').rstrip('> '))
+-
+-    m = AUTHOR_HG_RE.match(user)
+-    if m:
+-        name = sanitize(m.group(1))
+-        mail = sanitize(m.group(2))
+-        ex = m.group(3)
+-        if ex:
+-            name += ' ext:(' + urllib.quote(ex) + ')'
+-    else:
+-        name = sanitize(user)
+-        if '@' in user:
+-            mail = name
+-        else:
+-            mail = None
+-
+-    return (name, mail)
+-
+-def fixup_user(user):
+-    if mode == 'git':
+-        name, mail = fixup_user_git(user)
+-    else:
+-        name, mail = fixup_user_hg(user)
+-
+-    if not name:
+-        name = bad_name
+-    if not mail:
+-        mail = bad_mail
+-
+-    return '%s <%s>' % (name, mail)
+-
+-def updatebookmarks(repo, peer):
+-    remotemarks = peer.listkeys('bookmarks')
+-    localmarks = repo._bookmarks
+-
+-    if not remotemarks:
+-        return
+-
+-    for k, v in remotemarks.iteritems():
+-        localmarks[k] = hgbin(v)
+-
+-    if hasattr(localmarks, 'write'):
+-        localmarks.write()
+-    else:
+-        bookmarks.write(repo)
+-
+-def get_repo(url, alias):
+-    global peer
+-
+-    myui = ui.ui()
+-    myui.setconfig('ui', 'interactive', 'off')
+-    myui.fout = sys.stderr
+-
+-    if get_config_bool('remote-hg.insecure'):
+-        myui.setconfig('web', 'cacerts', '')
+-
+-    extensions.loadall(myui)
+-
+-    if hg.islocal(url) and not os.environ.get('GIT_REMOTE_HG_TEST_REMOTE'):
+-        repo = hg.repository(myui, url)
+-        if not os.path.exists(dirname):
+-            os.makedirs(dirname)
+-    else:
+-        shared_path = os.path.join(gitdir, 'hg')
+-
+-        # check and upgrade old organization
+-        hg_path = os.path.join(shared_path, '.hg')
+-        if os.path.exists(shared_path) and not os.path.exists(hg_path):
+-            repos = os.listdir(shared_path)
+-            for x in repos:
+-                local_hg = os.path.join(shared_path, x, 'clone', '.hg')
+-                if not os.path.exists(local_hg):
+-                    continue
+-                if not os.path.exists(hg_path):
+-                    shutil.move(local_hg, hg_path)
+-                shutil.rmtree(os.path.join(shared_path, x, 'clone'))
+-
+-        # setup shared repo (if not there)
+-        try:
+-            hg.peer(myui, {}, shared_path, create=True)
+-        except error.RepoError:
+-            pass
+-
+-        if not os.path.exists(dirname):
+-            os.makedirs(dirname)
+-
+-        local_path = os.path.join(dirname, 'clone')
+-        if not os.path.exists(local_path):
+-            hg.share(myui, shared_path, local_path, update=False)
+-        else:
+-            # make sure the shared path is always up-to-date
+-            util.writefile(os.path.join(local_path, '.hg', 'sharedpath'), hg_path)
+-
+-        repo = hg.repository(myui, local_path)
+-        try:
+-            peer = hg.peer(myui, {}, url)
+-        except:
+-            die('Repository error')
+-        repo.pull(peer, heads=None, force=True)
+-
+-        updatebookmarks(repo, peer)
+-
+-    return repo
+-
+-def rev_to_mark(rev):
+-    return marks.from_rev(rev.hex())
+-
+-def mark_to_rev(mark):
+-    return marks.to_rev(mark)
+-
+-def export_ref(repo, name, kind, head):
+-    ename = '%s/%s' % (kind, name)
+-    try:
+-        tip = marks.get_tip(ename)
+-        tip = repo[tip].rev()
+-    except:
+-        tip = 0
+-
+-    revs = xrange(tip, head.rev() + 1)
+-    total = len(revs)
+-
+-    for rev in revs:
+-
+-        c = repo[rev]
+-        node = c.node()
+-
+-        if marks.is_marked(c.hex()):
+-            continue
+-
+-        (manifest, user, (time, tz), files, desc, extra) = repo.changelog.read(node)
+-        rev_branch = extra['branch']
+-
+-        author = "%s %d %s" % (fixup_user(user), time, gittz(tz))
+-        if 'committer' in extra:
+-            user, time, tz = extra['committer'].rsplit(' ', 2)
+-            committer = "%s %s %s" % (user, time, gittz(int(tz)))
+-        else:
+-            committer = author
+-
+-        parents = [repo[p] for p in repo.changelog.parentrevs(rev) if p >= 0]
+-
+-        if len(parents) == 0:
+-            modified = c.manifest().keys()
+-            removed = []
+-        else:
+-            modified, removed = get_filechanges(repo, c, parents[0])
+-
+-        desc += '\n'
+-
+-        if mode == 'hg':
+-            extra_msg = ''
+-
+-            if rev_branch != 'default':
+-                extra_msg += 'branch : %s\n' % rev_branch
+-
+-            renames = []
+-            for f in c.files():
+-                if f not in c.manifest():
+-                    continue
+-                rename = c.filectx(f).renamed()
+-                if rename:
+-                    renames.append((rename[0], f))
+-
+-            for e in renames:
+-                extra_msg += "rename : %s => %s\n" % e
+-
+-            for key, value in extra.iteritems():
+-                if key in ('author', 'committer', 'encoding', 'message', 'branch', 'hg-git'):
+-                    continue
+-                else:
+-                    extra_msg += "extra : %s : %s\n" % (key, urllib.quote(value))
+-
+-            if extra_msg:
+-                desc += '\n--HG--\n' + extra_msg
+-
+-        if len(parents) == 0 and rev:
+-            print 'reset %s/%s' % (prefix, ename)
+-
+-        modified_final = export_files(c.filectx(f) for f in modified)
+-
+-        print "commit %s/%s" % (prefix, ename)
+-        print "mark :%d" % (marks.get_mark(c.hex()))
+-        print "author %s" % (author)
+-        print "committer %s" % (committer)
+-        print "data %d" % (len(desc))
+-        print desc
+-
+-        if len(parents) > 0:
+-            print "from :%s" % (rev_to_mark(parents[0]))
+-            if len(parents) > 1:
+-                print "merge :%s" % (rev_to_mark(parents[1]))
+-
+-        for f in removed:
+-            print "D %s" % (fix_file_path(f))
+-        for f in modified_final:
+-            print "M %s :%u %s" % f
+-        print
+-
+-        progress = (rev - tip)
+-        if (progress % 100 == 0):
+-            print "progress revision %d '%s' (%d/%d)" % (rev, name, progress, total)
+-
+-    # make sure the ref is updated
+-    print "reset %s/%s" % (prefix, ename)
+-    print "from :%u" % rev_to_mark(head)
+-    print
+-
+-    pending_revs = set(revs) - notes
+-    if pending_revs:
+-        note_mark = marks.next_mark()
+-        ref = "refs/notes/hg"
+-
+-        print "commit %s" % ref
+-        print "mark :%d" % (note_mark)
+-        print "committer remote-hg <> %d %s" % (ptime.time(), gittz(ptime.timezone))
+-        desc = "Notes for %s\n" % (name)
+-        print "data %d" % (len(desc))
+-        print desc
+-        if marks.last_note:
+-            print "from :%u" % marks.last_note
+-
+-        for rev in pending_revs:
+-            notes.add(rev)
+-            c = repo[rev]
+-            print "N inline :%u" % rev_to_mark(c)
+-            msg = c.hex()
+-            print "data %d" % (len(msg))
+-            print msg
+-        print
+-
+-        marks.last_note = note_mark
+-
+-    marks.set_tip(ename, head.hex())
+-
+-def export_tag(repo, tag):
+-    export_ref(repo, tag, 'tags', repo[hgref(tag)])
+-
+-def export_bookmark(repo, bmark):
+-    head = bmarks[hgref(bmark)]
+-    export_ref(repo, bmark, 'bookmarks', head)
+-
+-def export_branch(repo, branch):
+-    tip = get_branch_tip(repo, branch)
+-    head = repo[tip]
+-    export_ref(repo, branch, 'branches', head)
+-
+-def export_head(repo):
+-    export_ref(repo, g_head[0], 'bookmarks', g_head[1])
+-
+-def do_capabilities(parser):
+-    print "import"
+-    print "export"
+-    print "refspec refs/heads/branches/*:%s/branches/*" % prefix
+-    print "refspec refs/heads/*:%s/bookmarks/*" % prefix
+-    print "refspec refs/tags/*:%s/tags/*" % prefix
+-
+-    path = os.path.join(dirname, 'marks-git')
+-
+-    if os.path.exists(path):
+-        print "*import-marks %s" % path
+-    print "*export-marks %s" % path
+-    print "option"
+-
+-    print
+-
+-def branch_tip(branch):
+-    return branches[branch][-1]
+-
+-def get_branch_tip(repo, branch):
+-    heads = branches.get(hgref(branch), None)
+-    if not heads:
+-        return None
+-
+-    # verify there's only one head
+-    if (len(heads) > 1):
+-        warn("Branch '%s' has more than one head, consider merging" % branch)
+-        return branch_tip(hgref(branch))
+-
+-    return heads[0]
+-
+-def list_head(repo, cur):
+-    global g_head, fake_bmark
+-
+-    if 'default' not in branches:
+-        # empty repo
+-        return
+-
+-    node = repo[branch_tip('default')]
+-    head = 'master' if not 'master' in bmarks else 'default'
+-    fake_bmark = head
+-    bmarks[head] = node
+-
+-    head = gitref(head)
+-    print "@refs/heads/%s HEAD" % head
+-    g_head = (head, node)
+-
+-def do_list(parser):
+-    repo = parser.repo
+-    for bmark, node in bookmarks.listbookmarks(repo).iteritems():
+-        bmarks[bmark] = repo[node]
+-
+-    cur = repo.dirstate.branch()
+-    orig = peer if peer else repo
+-
+-    for branch, heads in orig.branchmap().iteritems():
+-        # only open heads
+-        heads = [h for h in heads if 'close' not in repo.changelog.read(h)[5]]
+-        if heads:
+-            branches[branch] = heads
+-
+-    list_head(repo, cur)
+-
+-    if track_branches:
+-        for branch in branches:
+-            print "? refs/heads/branches/%s" % gitref(branch)
+-
+-    for bmark in bmarks:
+-        if  bmarks[bmark].hex() == '0000000000000000000000000000000000000000':
+-            warn("Ignoring invalid bookmark '%s'", bmark)
+-        else:
+-            print "? refs/heads/%s" % gitref(bmark)
+-
+-    for tag, node in repo.tagslist():
+-        if tag == 'tip':
+-            continue
+-        print "? refs/tags/%s" % gitref(tag)
+-
+-    print
+-
+-def do_import(parser):
+-    repo = parser.repo
+-
+-    path = os.path.join(dirname, 'marks-git')
+-
+-    print "feature done"
+-    if os.path.exists(path):
+-        print "feature import-marks=%s" % path
+-    print "feature export-marks=%s" % path
+-    print "feature force"
+-    sys.stdout.flush()
+-
+-    tmp = encoding.encoding
+-    encoding.encoding = 'utf-8'
+-
+-    # lets get all the import lines
+-    while parser.check('import'):
+-        ref = parser[1]
+-
+-        if (ref == 'HEAD'):
+-            export_head(repo)
+-        elif ref.startswith('refs/heads/branches/'):
+-            branch = ref[len('refs/heads/branches/'):]
+-            export_branch(repo, branch)
+-        elif ref.startswith('refs/heads/'):
+-            bmark = ref[len('refs/heads/'):]
+-            export_bookmark(repo, bmark)
+-        elif ref.startswith('refs/tags/'):
+-            tag = ref[len('refs/tags/'):]
+-            export_tag(repo, tag)
+-
+-        parser.next()
+-
+-    encoding.encoding = tmp
+-
+-    print 'done'
+-
+-def parse_blob(parser):
+-    parser.next()
+-    mark = parser.get_mark()
+-    parser.next()
+-    data = parser.get_data()
+-    blob_marks[mark] = data
+-    parser.next()
+-
+-def get_merge_files(repo, p1, p2, files):
+-    for e in repo[p1].files():
+-        if e not in files:
+-            if e not in repo[p1].manifest():
+-                continue
+-            f = { 'ctx' : repo[p1][e] }
+-            files[e] = f
+-
+-def c_style_unescape(string):
+-    if string[0] == string[-1] == '"':
+-        return string.decode('string-escape')[1:-1]
+-    return string
+-
+-def parse_commit(parser):
+-    from_mark = merge_mark = None
+-
+-    ref = parser[1]
+-    parser.next()
+-
+-    commit_mark = parser.get_mark()
+-    parser.next()
+-    author = parser.get_author()
+-    parser.next()
+-    committer = parser.get_author()
+-    parser.next()
+-    data = parser.get_data()
+-    parser.next()
+-    if parser.check('from'):
+-        from_mark = parser.get_mark()
+-        parser.next()
+-    if parser.check('merge'):
+-        merge_mark = parser.get_mark()
+-        parser.next()
+-        if parser.check('merge'):
+-            die('octopus merges are not supported yet')
+-
+-    # fast-export adds an extra newline
+-    if data[-1] == '\n':
+-        data = data[:-1]
+-
+-    files = {}
+-
+-    for line in parser:
+-        if parser.check('M'):
+-            t, m, mark_ref, path = line.split(' ', 3)
+-            mark = int(mark_ref[1:])
+-            f = { 'mode' : hgmode(m), 'data' : blob_marks[mark] }
+-        elif parser.check('D'):
+-            t, path = line.split(' ', 1)
+-            f = { 'deleted' : True }
+-        else:
+-            die('Unknown file command: %s' % line)
+-        path = c_style_unescape(path)
+-        files[path] = f
+-
+-    # only export the commits if we are on an internal proxy repo
+-    if dry_run and not peer:
+-        parsed_refs[ref] = None
+-        return
+-
+-    def getfilectx(repo, memctx, f):
+-        of = files[f]
+-        if 'deleted' in of:
+-            raise IOError
+-        if 'ctx' in of:
+-            return of['ctx']
+-        is_exec = of['mode'] == 'x'
+-        is_link = of['mode'] == 'l'
+-        rename = of.get('rename', None)
+-        return context.memfilectx(f, of['data'],
+-                is_link, is_exec, rename)
+-
+-    repo = parser.repo
+-
+-    user, date, tz = author
+-    extra = {}
+-
+-    if committer != author:
+-        extra['committer'] = "%s %u %u" % committer
+-
+-    if from_mark:
+-        p1 = mark_to_rev(from_mark)
+-    else:
+-        p1 = '0' * 40
+-
+-    if merge_mark:
+-        p2 = mark_to_rev(merge_mark)
+-    else:
+-        p2 = '0' * 40
+-
+-    #
+-    # If files changed from any of the parents, hg wants to know, but in git if
+-    # nothing changed from the first parent, nothing changed.
+-    #
+-    if merge_mark:
+-        get_merge_files(repo, p1, p2, files)
+-
+-    # Check if the ref is supposed to be a named branch
+-    if ref.startswith('refs/heads/branches/'):
+-        branch = ref[len('refs/heads/branches/'):]
+-        extra['branch'] = hgref(branch)
+-
+-    if mode == 'hg':
+-        i = data.find('\n--HG--\n')
+-        if i >= 0:
+-            tmp = data[i + len('\n--HG--\n'):].strip()
+-            for k, v in [e.split(' : ', 1) for e in tmp.split('\n')]:
+-                if k == 'rename':
+-                    old, new = v.split(' => ', 1)
+-                    files[new]['rename'] = old
+-                elif k == 'branch':
+-                    extra[k] = v
+-                elif k == 'extra':
+-                    ek, ev = v.split(' : ', 1)
+-                    extra[ek] = urllib.unquote(ev)
+-            data = data[:i]
+-
+-    ctx = context.memctx(repo, (p1, p2), data,
+-            files.keys(), getfilectx,
+-            user, (date, tz), extra)
+-
+-    tmp = encoding.encoding
+-    encoding.encoding = 'utf-8'
+-
+-    node = hghex(repo.commitctx(ctx))
+-
+-    encoding.encoding = tmp
+-
+-    parsed_refs[ref] = node
+-    marks.new_mark(node, commit_mark)
+-
+-def parse_reset(parser):
+-    ref = parser[1]
+-    parser.next()
+-    # ugh
+-    if parser.check('commit'):
+-        parse_commit(parser)
+-        return
+-    if not parser.check('from'):
+-        return
+-    from_mark = parser.get_mark()
+-    parser.next()
+-
+-    try:
+-        rev = mark_to_rev(from_mark)
+-    except KeyError:
+-        rev = None
+-    parsed_refs[ref] = rev
+-
+-def parse_tag(parser):
+-    name = parser[1]
+-    parser.next()
+-    from_mark = parser.get_mark()
+-    parser.next()
+-    tagger = parser.get_author()
+-    parser.next()
+-    data = parser.get_data()
+-    parser.next()
+-
+-    parsed_tags[name] = (tagger, data)
+-
+-def write_tag(repo, tag, node, msg, author):
+-    branch = repo[node].branch()
+-    tip = branch_tip(branch)
+-    tip = repo[tip]
+-
+-    def getfilectx(repo, memctx, f):
+-        try:
+-            fctx = tip.filectx(f)
+-            data = fctx.data()
+-        except error.ManifestLookupError:
+-            data = ""
+-        content = data + "%s %s\n" % (node, tag)
+-        return context.memfilectx(f, content, False, False, None)
+-
+-    p1 = tip.hex()
+-    p2 = '0' * 40
+-    if author:
+-        user, date, tz = author
+-        date_tz = (date, tz)
+-    else:
+-        cmd = ['git', 'var', 'GIT_COMMITTER_IDENT']
+-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+-        output, _ = process.communicate()
+-        m = re.match('^.* <.*>', output)
+-        if m:
+-            user = m.group(0)
+-        else:
+-            user = repo.ui.username()
+-        date_tz = None
+-
+-    ctx = context.memctx(repo, (p1, p2), msg,
+-            ['.hgtags'], getfilectx,
+-            user, date_tz, {'branch' : branch})
+-
+-    tmp = encoding.encoding
+-    encoding.encoding = 'utf-8'
+-
+-    tagnode = repo.commitctx(ctx)
+-
+-    encoding.encoding = tmp
+-
+-    return (tagnode, branch)
+-
+-def checkheads_bmark(repo, ref, ctx):
+-    bmark = ref[len('refs/heads/'):]
+-    if not bmark in bmarks:
+-        # new bmark
+-        return True
+-
+-    ctx_old = bmarks[bmark]
+-    ctx_new = ctx
+-    if not repo.changelog.descendant(ctx_old.rev(), ctx_new.rev()):
+-        if force_push:
+-            print "ok %s forced update" % ref
+-        else:
+-            print "error %s non-fast forward" % ref
+-            return False
+-
+-    return True
+-
+-def checkheads(repo, remote, p_revs):
+-
+-    remotemap = remote.branchmap()
+-    if not remotemap:
+-        # empty repo
+-        return True
+-
+-    new = {}
+-    ret = True
+-
+-    for node, ref in p_revs.iteritems():
+-        ctx = repo[node]
+-        branch = ctx.branch()
+-        if not branch in remotemap:
+-            # new branch
+-            continue
+-        if not ref.startswith('refs/heads/branches'):
+-            if ref.startswith('refs/heads/'):
+-                if not checkheads_bmark(repo, ref, ctx):
+-                    ret = False
+-
+-            # only check branches
+-            continue
+-        new.setdefault(branch, []).append(ctx.rev())
+-
+-    for branch, heads in new.iteritems():
+-        old = [repo.changelog.rev(x) for x in remotemap[branch]]
+-        for rev in heads:
+-            if check_version(2, 3):
+-                ancestors = repo.changelog.ancestors([rev], stoprev=min(old))
+-            else:
+-                ancestors = repo.changelog.ancestors(rev)
+-            found = False
+-
+-            for x in old:
+-                if x in ancestors:
+-                    found = True
+-                    break
+-
+-            if found:
+-                continue
+-
+-            node = repo.changelog.node(rev)
+-            ref = p_revs[node]
+-            if force_push:
+-                print "ok %s forced update" % ref
+-            else:
+-                print "error %s non-fast forward" % ref
+-                ret = False
+-
+-    return ret
+-
+-def push_unsafe(repo, remote, parsed_refs, p_revs):
+-
+-    force = force_push
+-
+-    fci = discovery.findcommonincoming
+-    commoninc = fci(repo, remote, force=force)
+-    common, _, remoteheads = commoninc
+-
+-    if not checkheads(repo, remote, p_revs):
+-        return None
+-
+-    cg = repo.getbundle('push', heads=list(p_revs), common=common)
+-
+-    unbundle = remote.capable('unbundle')
+-    if unbundle:
+-        if force:
+-            remoteheads = ['force']
+-        return remote.unbundle(cg, remoteheads, 'push')
+-    else:
+-        return remote.addchangegroup(cg, 'push', repo.url())
+-
+-def push(repo, remote, parsed_refs, p_revs):
+-    if hasattr(remote, 'canpush') and not remote.canpush():
+-        print "error cannot push"
+-
+-    if not p_revs:
+-        # nothing to push
+-        return
+-
+-    lock = None
+-    unbundle = remote.capable('unbundle')
+-    if not unbundle:
+-        lock = remote.lock()
+-    try:
+-        ret = push_unsafe(repo, remote, parsed_refs, p_revs)
+-    finally:
+-        if lock is not None:
+-            lock.release()
+-
+-    return ret
+-
+-def check_tip(ref, kind, name, heads):
+-    try:
+-        ename = '%s/%s' % (kind, name)
+-        tip = marks.get_tip(ename)
+-    except KeyError:
+-        return True
+-    else:
+-        return tip in heads
+-
+-def do_export(parser):
+-    p_bmarks = []
+-    p_revs = {}
+-
+-    parser.next()
+-
+-    for line in parser.each_block('done'):
+-        if parser.check('blob'):
+-            parse_blob(parser)
+-        elif parser.check('commit'):
+-            parse_commit(parser)
+-        elif parser.check('reset'):
+-            parse_reset(parser)
+-        elif parser.check('tag'):
+-            parse_tag(parser)
+-        elif parser.check('feature'):
+-            pass
+-        else:
+-            die('unhandled export command: %s' % line)
+-
+-    need_fetch = False
+-
+-    for ref, node in parsed_refs.iteritems():
+-        bnode = hgbin(node) if node else None
+-        if ref.startswith('refs/heads/branches'):
+-            branch = ref[len('refs/heads/branches/'):]
+-            if branch in branches and bnode in branches[branch]:
+-                # up to date
+-                continue
+-
+-            if peer:
+-                remotemap = peer.branchmap()
+-                if remotemap and branch in remotemap:
+-                    heads = [hghex(e) for e in remotemap[branch]]
+-                    if not check_tip(ref, 'branches', branch, heads):
+-                        print "error %s fetch first" % ref
+-                        need_fetch = True
+-                        continue
+-
+-            p_revs[bnode] = ref
+-            print "ok %s" % ref
+-        elif ref.startswith('refs/heads/'):
+-            bmark = ref[len('refs/heads/'):]
+-            new = node
+-            old = bmarks[bmark].hex() if bmark in bmarks else ''
+-
+-            if old == new:
+-                continue
+-
+-            print "ok %s" % ref
+-            if bmark != fake_bmark and \
+-                    not (bmark == 'master' and bmark not in parser.repo._bookmarks):
+-                p_bmarks.append((ref, bmark, old, new))
+-
+-            if peer:
+-                remote_old = peer.listkeys('bookmarks').get(bmark)
+-                if remote_old:
+-                    if not check_tip(ref, 'bookmarks', bmark, remote_old):
+-                        print "error %s fetch first" % ref
+-                        need_fetch = True
+-                        continue
+-
+-            p_revs[bnode] = ref
+-        elif ref.startswith('refs/tags/'):
+-            if dry_run:
+-                print "ok %s" % ref
+-                continue
+-            tag = ref[len('refs/tags/'):]
+-            tag = hgref(tag)
+-            author, msg = parsed_tags.get(tag, (None, None))
+-            if mode == 'git':
+-                if not msg:
+-                    msg = 'Added tag %s for changeset %s' % (tag, node[:12])
+-                tagnode, branch = write_tag(parser.repo, tag, node, msg, author)
+-                p_revs[tagnode] = 'refs/heads/branches/' + gitref(branch)
+-            else:
+-                fp = parser.repo.opener('localtags', 'a')
+-                fp.write('%s %s\n' % (node, tag))
+-                fp.close()
+-            p_revs[bnode] = ref
+-            print "ok %s" % ref
+-        else:
+-            # transport-helper/fast-export bugs
+-            continue
+-
+-    if need_fetch:
+-        print
+-        return
+-
+-    if dry_run:
+-        if peer and not force_push:
+-            checkheads(parser.repo, peer, p_revs)
+-        print
+-        return
+-
+-    if peer:
+-        if not push(parser.repo, peer, parsed_refs, p_revs):
+-            # do not update bookmarks
+-            print
+-            return
+-
+-        # update remote bookmarks
+-        remote_bmarks = peer.listkeys('bookmarks')
+-        for ref, bmark, old, new in p_bmarks:
+-            if force_push:
+-                old = remote_bmarks.get(bmark, '')
+-            if not peer.pushkey('bookmarks', bmark, old, new):
+-                print "error %s" % ref
+-    else:
+-        # update local bookmarks
+-        for ref, bmark, old, new in p_bmarks:
+-            if not bookmarks.pushbookmark(parser.repo, bmark, old, new):
+-                print "error %s" % ref
+-
+-    print
+-
+-def do_option(parser):
+-    global dry_run, force_push
+-    _, key, value = parser.line.split(' ')
+-    if key == 'dry-run':
+-        dry_run = (value == 'true')
+-        print 'ok'
+-    elif key == 'force':
+-        force_push = (value == 'true')
+-        print 'ok'
+-    else:
+-        print 'unsupported'
+-
+-def fix_path(alias, repo, orig_url):
+-    url = urlparse.urlparse(orig_url, 'file')
+-    if url.scheme != 'file' or os.path.isabs(os.path.expanduser(url.path)):
+-        return
+-    abs_url = urlparse.urljoin("%s/" % os.getcwd(), orig_url)
+-    cmd = ['git', 'config', 'remote.%s.url' % alias, "hg::%s" % abs_url]
+-    subprocess.call(cmd)
+-
+-def main(args):
+-    global prefix, gitdir, dirname, branches, bmarks
+-    global marks, blob_marks, parsed_refs
+-    global peer, mode, bad_mail, bad_name
+-    global track_branches, force_push, is_tmp
+-    global parsed_tags
+-    global filenodes
+-    global fake_bmark, hg_version
+-    global dry_run
+-    global notes, alias
+-
+-    marks = None
+-    is_tmp = False
+-    gitdir = os.environ.get('GIT_DIR', None)
+-
+-    if len(args) < 3:
+-        die('Not enough arguments.')
+-
+-    if not gitdir:
+-        die('GIT_DIR not set')
+-
+-    alias = args[1]
+-    url = args[2]
+-    peer = None
+-
+-    hg_git_compat = get_config_bool('remote-hg.hg-git-compat')
+-    track_branches = get_config_bool('remote-hg.track-branches', True)
+-    force_push = False
+-
+-    if hg_git_compat:
+-        mode = 'hg'
+-        bad_mail = 'none@none'
+-        bad_name = ''
+-    else:
+-        mode = 'git'
+-        bad_mail = 'unknown'
+-        bad_name = 'Unknown'
+-
+-    if alias[4:] == url:
+-        is_tmp = True
+-        alias = hashlib.sha1(alias).hexdigest()
+-
+-    dirname = os.path.join(gitdir, 'hg', alias)
+-    branches = {}
+-    bmarks = {}
+-    blob_marks = {}
+-    parsed_refs = {}
+-    parsed_tags = {}
+-    filenodes = {}
+-    fake_bmark = None
+-    try:
+-        hg_version = tuple(int(e) for e in util.version().split('.'))
+-    except:
+-        hg_version = None
+-    dry_run = False
+-    notes = set()
+-
+-    repo = get_repo(url, alias)
+-    prefix = 'refs/hg/%s' % alias
+-
+-    if not is_tmp:
+-        fix_path(alias, peer or repo, url)
+-
+-    marks_path = os.path.join(dirname, 'marks-hg')
+-    marks = Marks(marks_path, repo)
+-
+-    if sys.platform == 'win32':
+-        import msvcrt
+-        msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
+-
+-    parser = Parser(repo)
+-    for line in parser:
+-        if parser.check('capabilities'):
+-            do_capabilities(parser)
+-        elif parser.check('list'):
+-            do_list(parser)
+-        elif parser.check('import'):
+-            do_import(parser)
+-        elif parser.check('export'):
+-            do_export(parser)
+-        elif parser.check('option'):
+-            do_option(parser)
+-        else:
+-            die('unhandled command: %s' % line)
+-        sys.stdout.flush()
+-
+-def bye():
+-    if not marks:
+-        return
+-    if not is_tmp:
+-        marks.store()
+-    else:
+-        shutil.rmtree(dirname)
+-
+-atexit.register(bye)
+-sys.exit(main(sys.argv))
++sys.stderr.write('''WARNING:
++WARNING: You can pick a directory on your $PATH and download it, e.g.:
++WARNING:   $ wget -O $HOME/bin/git-remote-hg \\
++WARNING:     https://raw.github.com/felipec/git-remote-hg/master/git-remote-hg
++WARNING:   $ chmod +x $HOME/bin/git-remote-hg
++''')
+@@ -1,438 +0,0 @@
+-#!/bin/sh
+-#
+-# Copyright (c) 2012 Felipe Contreras
+-#
+-
+-test_description='Test remote-bzr'
+-
+-test -n "$TEST_DIRECTORY" || TEST_DIRECTORY=${0%/*}/../../t
+-. "$TEST_DIRECTORY"/test-lib.sh
+-
+-if ! test_have_prereq PYTHON
+-then
+-	skip_all='skipping remote-bzr tests; python not available'
+-	test_done
+-fi
+-
+-if ! python -c 'import bzrlib'
+-then
+-	skip_all='skipping remote-bzr tests; bzr not available'
+-	test_done
+-fi
+-
+-check () {
+-	echo $3 >expected &&
+-	git --git-dir=$1/.git log --format='%s' -1 $2 >actual
+-	test_cmp expected actual
+-}
+-
+-bzr whoami "A U Thor <author@example.com>"
+-
+-test_expect_success 'cloning' '
+-	(
+-	bzr init bzrrepo &&
+-	cd bzrrepo &&
+-	echo one >content &&
+-	bzr add content &&
+-	bzr commit -m one
+-	) &&
+-
+-	git clone "bzr::bzrrepo" gitrepo &&
+-	check gitrepo HEAD one
+-'
+-
+-test_expect_success 'pulling' '
+-	(
+-	cd bzrrepo &&
+-	echo two >content &&
+-	bzr commit -m two
+-	) &&
+-
+-	(cd gitrepo && git pull) &&
+-
+-	check gitrepo HEAD two
+-'
+-
+-test_expect_success 'pushing' '
+-	(
+-	cd gitrepo &&
+-	echo three >content &&
+-	git commit -a -m three &&
+-	git push
+-	) &&
+-
+-	echo three >expected &&
+-	cat bzrrepo/content >actual &&
+-	test_cmp expected actual
+-'
+-
+-test_expect_success 'forced pushing' '
+-	(
+-	cd gitrepo &&
+-	echo three-new >content &&
+-	git commit -a --amend -m three-new &&
+-	git push -f
+-	) &&
+-
+-	(
+-	cd bzrrepo &&
+-	# the forced update overwrites the bzr branch but not the bzr
+-	# working directory (it tries to merge instead)
+-	bzr revert
+-	) &&
+-
+-	echo three-new >expected &&
+-	cat bzrrepo/content >actual &&
+-	test_cmp expected actual
+-'
+-
+-test_expect_success 'roundtrip' '
+-	(
+-	cd gitrepo &&
+-	git pull &&
+-	git log --format="%s" -1 origin/master >actual
+-	) &&
+-	echo three-new >expected &&
+-	test_cmp expected actual &&
+-
+-	(cd gitrepo && git push && git pull) &&
+-
+-	(
+-	cd bzrrepo &&
+-	echo four >content &&
+-	bzr commit -m four
+-	) &&
+-
+-	(cd gitrepo && git pull && git push) &&
+-
+-	check gitrepo HEAD four &&
+-
+-	(
+-	cd gitrepo &&
+-	echo five >content &&
+-	git commit -a -m five &&
+-	git push && git pull
+-	) &&
+-
+-	(cd bzrrepo && bzr revert) &&
+-
+-	echo five >expected &&
+-	cat bzrrepo/content >actual &&
+-	test_cmp expected actual
+-'
+-
+-cat >expected <<\EOF
+-100644 blob 54f9d6da5c91d556e6b54340b1327573073030af	content
+-100755 blob 68769579c3eaadbe555379b9c3538e6628bae1eb	executable
+-120000 blob 6b584e8ece562ebffc15d38808cd6b98fc3d97ea	link
+-EOF
+-
+-test_expect_success 'special modes' '
+-	(
+-	cd bzrrepo &&
+-	echo exec >executable
+-	chmod +x executable &&
+-	bzr add executable
+-	bzr commit -m exec &&
+-	ln -s content link
+-	bzr add link
+-	bzr commit -m link &&
+-	mkdir dir &&
+-	bzr add dir &&
+-	bzr commit -m dir
+-	) &&
+-
+-	(
+-	cd gitrepo &&
+-	git pull
+-	git ls-tree HEAD >../actual
+-	) &&
+-
+-	test_cmp expected actual &&
+-
+-	(
+-	cd gitrepo &&
+-	git cat-file -p HEAD:link >../actual
+-	) &&
+-
+-	printf content >expected &&
+-	test_cmp expected actual
+-'
+-
+-cat >expected <<\EOF
+-100644 blob 54f9d6da5c91d556e6b54340b1327573073030af	content
+-100755 blob 68769579c3eaadbe555379b9c3538e6628bae1eb	executable
+-120000 blob 6b584e8ece562ebffc15d38808cd6b98fc3d97ea	link
+-040000 tree 35c0caa46693cef62247ac89a680f0c5ce32b37b	movedir-new
+-EOF
+-
+-test_expect_success 'moving directory' '
+-	(
+-	cd bzrrepo &&
+-	mkdir movedir &&
+-	echo one >movedir/one &&
+-	echo two >movedir/two &&
+-	bzr add movedir &&
+-	bzr commit -m movedir &&
+-	bzr mv movedir movedir-new &&
+-	bzr commit -m movedir-new
+-	) &&
+-
+-	(
+-	cd gitrepo &&
+-	git pull &&
+-	git ls-tree HEAD >../actual
+-	) &&
+-
+-	test_cmp expected actual
+-'
+-
+-test_expect_success 'different authors' '
+-	(
+-	cd bzrrepo &&
+-	echo john >>content &&
+-	bzr commit -m john \
+-	  --author "Jane Rey <jrey@example.com>" \
+-	  --author "John Doe <jdoe@example.com>"
+-	) &&
+-
+-	(
+-	cd gitrepo &&
+-	git pull &&
+-	git show --format="%an <%ae>, %cn <%ce>" --quiet >../actual
+-	) &&
+-
+-	echo "Jane Rey <jrey@example.com>, A U Thor <author@example.com>" >expected &&
+-	test_cmp expected actual
+-'
+-
+-# cleanup previous stuff
+-rm -rf bzrrepo gitrepo
+-
+-test_expect_success 'fetch utf-8 filenames' '
+-	test_when_finished "rm -rf bzrrepo gitrepo && LC_ALL=C" &&
+-
+-	LC_ALL=en_US.UTF-8
+-	export LC_ALL
+-
+-	(
+-	bzr init bzrrepo &&
+-	cd bzrrepo &&
+-
+-	echo test >>"ærø" &&
+-	bzr add "ærø" &&
+-	echo test >>"ø~?" &&
+-	bzr add "ø~?" &&
+-	bzr commit -m add-utf-8 &&
+-	echo test >>"ærø" &&
+-	bzr commit -m test-utf-8 &&
+-	bzr rm "ø~?" &&
+-	bzr mv "ærø" "ø~?" &&
+-	bzr commit -m bzr-mv-utf-8
+-	) &&
+-
+-	(
+-	git clone "bzr::bzrrepo" gitrepo &&
+-	cd gitrepo &&
+-	git -c core.quotepath=false ls-files >../actual
+-	) &&
+-	echo "ø~?" >expected &&
+-	test_cmp expected actual
+-'
+-
+-test_expect_success 'push utf-8 filenames' '
+-	test_when_finished "rm -rf bzrrepo gitrepo && LC_ALL=C" &&
+-
+-	mkdir -p tmp && cd tmp &&
+-
+-	LC_ALL=en_US.UTF-8
+-	export LC_ALL
+-
+-	(
+-	bzr init bzrrepo &&
+-	cd bzrrepo &&
+-
+-	echo one >>content &&
+-	bzr add content &&
+-	bzr commit -m one
+-	) &&
+-
+-	(
+-	git clone "bzr::bzrrepo" gitrepo &&
+-	cd gitrepo &&
+-
+-	echo test >>"ærø" &&
+-	git add "ærø" &&
+-	git commit -m utf-8 &&
+-
+-	git push
+-	) &&
+-
+-	(cd bzrrepo && bzr ls >../actual) &&
+-	printf "content\nærø\n" >expected &&
+-	test_cmp expected actual
+-'
+-
+-test_expect_success 'pushing a merge' '
+-	test_when_finished "rm -rf bzrrepo gitrepo" &&
+-
+-	(
+-	bzr init bzrrepo &&
+-	cd bzrrepo &&
+-	echo one >content &&
+-	bzr add content &&
+-	bzr commit -m one
+-	) &&
+-
+-	git clone "bzr::bzrrepo" gitrepo &&
+-
+-	(
+-	cd bzrrepo &&
+-	echo two >content &&
+-	bzr commit -m two
+-	) &&
+-
+-	(
+-	cd gitrepo &&
+-	echo three >content &&
+-	git commit -a -m three &&
+-	git fetch &&
+-	git merge origin/master || true &&
+-	echo three >content &&
+-	git commit -a --no-edit &&
+-	git push
+-	) &&
+-
+-	echo three >expected &&
+-	cat bzrrepo/content >actual &&
+-	test_cmp expected actual
+-'
+-
+-cat >expected <<\EOF
+-origin/HEAD
+-origin/branch
+-origin/trunk
+-EOF
+-
+-test_expect_success 'proper bzr repo' '
+-	test_when_finished "rm -rf bzrrepo gitrepo" &&
+-
+-	bzr init-repo bzrrepo &&
+-
+-	(
+-	bzr init bzrrepo/trunk &&
+-	cd bzrrepo/trunk &&
+-	echo one >>content &&
+-	bzr add content &&
+-	bzr commit -m one
+-	) &&
+-
+-	(
+-	bzr branch bzrrepo/trunk bzrrepo/branch &&
+-	cd bzrrepo/branch &&
+-	echo two >>content &&
+-	bzr commit -m one
+-	) &&
+-
+-	(
+-	git clone "bzr::bzrrepo" gitrepo &&
+-	cd gitrepo &&
+-	git for-each-ref --format "%(refname:short)" refs/remotes/origin >../actual
+-	) &&
+-
+-	test_cmp expected actual
+-'
+-
+-test_expect_success 'strip' '
+-	test_when_finished "rm -rf bzrrepo gitrepo" &&
+-
+-	(
+-	bzr init bzrrepo &&
+-	cd bzrrepo &&
+-
+-	echo one >>content &&
+-	bzr add content &&
+-	bzr commit -m one &&
+-
+-	echo two >>content &&
+-	bzr commit -m two
+-	) &&
+-
+-	git clone "bzr::bzrrepo" gitrepo &&
+-
+-	(
+-	cd bzrrepo &&
+-	bzr uncommit --force &&
+-
+-	echo three >>content &&
+-	bzr commit -m three &&
+-
+-	echo four >>content &&
+-	bzr commit -m four &&
+-	bzr log --line | sed -e "s/^[0-9][0-9]*: //" >../expected
+-	) &&
+-
+-	(
+-	cd gitrepo &&
+-	git fetch &&
+-	git log --format="%an %ad %s" --date=short origin/master >../actual
+-	) &&
+-
+-	test_cmp expected actual
+-'
+-
+-test_expect_success 'export utf-8 authors' '
+-	test_when_finished "rm -rf bzrrepo gitrepo && LC_ALL=C && GIT_COMMITTER_NAME=\"C O Mitter\""
+-
+-	LC_ALL=en_US.UTF-8
+-	export LC_ALL
+-
+-	GIT_COMMITTER_NAME="Grégoire"
+-	export GIT_COMMITTER_NAME
+-
+-	bzr init bzrrepo &&
+-
+-	(
+-	git init gitrepo &&
+-	cd gitrepo &&
+-	echo greg >>content &&
+-	git add content &&
+-	git commit -m one &&
+-	git remote add bzr "bzr::../bzrrepo" &&
+-	git push bzr master
+-	) &&
+-
+-	(
+-	cd bzrrepo &&
+-	bzr log | grep "^committer: " >../actual
+-	) &&
+-
+-	echo "committer: Grégoire <committer@example.com>" >expected &&
+-	test_cmp expected actual
+-'
+-
+-test_expect_success 'push different author' '
+-	test_when_finished "rm -rf bzrrepo gitrepo" &&
+-
+-	bzr init bzrrepo &&
+-
+-	(
+-	git init gitrepo &&
+-	cd gitrepo &&
+-	echo john >> content &&
+-	git add content &&
+-	git commit -m john --author "John Doe <jdoe@example.com>" &&
+-	git remote add bzr "bzr::../bzrrepo" &&
+-	git push bzr master
+-	) &&
+-
+-	(
+-	cd bzrrepo &&
+-	bzr log | grep "^author: " > ../actual
+-	) &&
+-
+-	echo "author: John Doe <jdoe@example.com>" > expected &&
+-	test_cmp expected actual
+-'
+-
+-test_done
+@@ -1,243 +0,0 @@
+-#!/bin/sh
+-#
+-# Copyright (c) 2012 Felipe Contreras
+-#
+-# Base commands from hg-git tests:
+-# https://bitbucket.org/durin42/hg-git/src
+-#
+-
+-test_description='Test bidirectionality of remote-hg'
+-
+-test -n "$TEST_DIRECTORY" || TEST_DIRECTORY=${0%/*}/../../t
+-. "$TEST_DIRECTORY"/test-lib.sh
+-
+-if ! test_have_prereq PYTHON
+-then
+-	skip_all='skipping remote-hg tests; python not available'
+-	test_done
+-fi
+-
+-if ! python -c 'import mercurial'
+-then
+-	skip_all='skipping remote-hg tests; mercurial not available'
+-	test_done
+-fi
+-
+-# clone to a git repo
+-git_clone () {
+-	git clone -q "hg::$1" $2
+-}
+-
+-# clone to an hg repo
+-hg_clone () {
+-	(
+-	hg init $2 &&
+-	cd $1 &&
+-	git push -q "hg::../$2" 'refs/tags/*:refs/tags/*' 'refs/heads/*:refs/heads/*'
+-	) &&
+-
+-	(cd $2 && hg -q update)
+-}
+-
+-# push an hg repo
+-hg_push () {
+-	(
+-	cd $2
+-	git checkout -q -b tmp &&
+-	git fetch -q "hg::../$1" 'refs/tags/*:refs/tags/*' 'refs/heads/*:refs/heads/*' &&
+-	git checkout -q @{-1} &&
+-	git branch -q -D tmp 2>/dev/null || true
+-	)
+-}
+-
+-hg_log () {
+-	hg -R $1 log --graph --debug
+-}
+-
+-setup () {
+-	(
+-	echo "[ui]"
+-	echo "username = A U Thor <author@example.com>"
+-	echo "[defaults]"
+-	echo "backout = -d \"0 0\""
+-	echo "commit = -d \"0 0\""
+-	echo "debugrawcommit = -d \"0 0\""
+-	echo "tag = -d \"0 0\""
+-	echo "[extensions]"
+-	echo "graphlog ="
+-	) >>"$HOME"/.hgrc &&
+-	git config --global remote-hg.hg-git-compat true
+-	git config --global remote-hg.track-branches true
+-
+-	HGEDITOR=/usr/bin/true
+-	GIT_AUTHOR_DATE="2007-01-01 00:00:00 +0230"
+-	GIT_COMMITTER_DATE="$GIT_AUTHOR_DATE"
+-	export HGEDITOR GIT_AUTHOR_DATE GIT_COMMITTER_DATE
+-}
+-
+-setup
+-
+-test_expect_success 'encoding' '
+-	test_when_finished "rm -rf gitrepo* hgrepo*" &&
+-
+-	(
+-	git init -q gitrepo &&
+-	cd gitrepo &&
+-
+-	echo alpha >alpha &&
+-	git add alpha &&
+-	git commit -m "add älphà" &&
+-
+-	GIT_AUTHOR_NAME="tést èncödîng" &&
+-	export GIT_AUTHOR_NAME &&
+-	echo beta >beta &&
+-	git add beta &&
+-	git commit -m "add beta" &&
+-
+-	echo gamma >gamma &&
+-	git add gamma &&
+-	git commit -m "add gämmâ" &&
+-
+-	: TODO git config i18n.commitencoding latin-1 &&
+-	echo delta >delta &&
+-	git add delta &&
+-	git commit -m "add déltà"
+-	) &&
+-
+-	hg_clone gitrepo hgrepo &&
+-	git_clone hgrepo gitrepo2 &&
+-	hg_clone gitrepo2 hgrepo2 &&
+-
+-	HGENCODING=utf-8 hg_log hgrepo >expected &&
+-	HGENCODING=utf-8 hg_log hgrepo2 >actual &&
+-
+-	test_cmp expected actual
+-'
+-
+-test_expect_success 'file removal' '
+-	test_when_finished "rm -rf gitrepo* hgrepo*" &&
+-
+-	(
+-	git init -q gitrepo &&
+-	cd gitrepo &&
+-	echo alpha >alpha &&
+-	git add alpha &&
+-	git commit -m "add alpha" &&
+-	echo beta >beta &&
+-	git add beta &&
+-	git commit -m "add beta"
+-	mkdir foo &&
+-	echo blah >foo/bar &&
+-	git add foo &&
+-	git commit -m "add foo" &&
+-	git rm alpha &&
+-	git commit -m "remove alpha" &&
+-	git rm foo/bar &&
+-	git commit -m "remove foo/bar"
+-	) &&
+-
+-	hg_clone gitrepo hgrepo &&
+-	git_clone hgrepo gitrepo2 &&
+-	hg_clone gitrepo2 hgrepo2 &&
+-
+-	hg_log hgrepo >expected &&
+-	hg_log hgrepo2 >actual &&
+-
+-	test_cmp expected actual
+-'
+-
+-test_expect_success 'git tags' '
+-	test_when_finished "rm -rf gitrepo* hgrepo*" &&
+-
+-	(
+-	git init -q gitrepo &&
+-	cd gitrepo &&
+-	git config receive.denyCurrentBranch ignore &&
+-	echo alpha >alpha &&
+-	git add alpha &&
+-	git commit -m "add alpha" &&
+-	git tag alpha &&
+-
+-	echo beta >beta &&
+-	git add beta &&
+-	git commit -m "add beta" &&
+-	git tag -a -m "added tag beta" beta
+-	) &&
+-
+-	hg_clone gitrepo hgrepo &&
+-	git_clone hgrepo gitrepo2 &&
+-	hg_clone gitrepo2 hgrepo2 &&
+-
+-	hg_log hgrepo >expected &&
+-	hg_log hgrepo2 >actual &&
+-
+-	test_cmp expected actual
+-'
+-
+-test_expect_success 'hg branch' '
+-	test_when_finished "rm -rf gitrepo* hgrepo*" &&
+-
+-	(
+-	git init -q gitrepo &&
+-	cd gitrepo &&
+-
+-	echo alpha >alpha &&
+-	git add alpha &&
+-	git commit -q -m "add alpha" &&
+-	git checkout -q -b not-master
+-	) &&
+-
+-	(
+-	hg_clone gitrepo hgrepo &&
+-
+-	cd hgrepo &&
+-	hg -q co default &&
+-	hg mv alpha beta &&
+-	hg -q commit -m "rename alpha to beta" &&
+-	hg branch gamma | grep -v "permanent and global" &&
+-	hg -q commit -m "started branch gamma"
+-	) &&
+-
+-	hg_push hgrepo gitrepo &&
+-	hg_clone gitrepo hgrepo2 &&
+-
+-	: Back to the common revision &&
+-	(cd hgrepo && hg checkout default) &&
+-
+-	hg_log hgrepo >expected &&
+-	hg_log hgrepo2 >actual &&
+-
+-	test_cmp expected actual
+-'
+-
+-test_expect_success 'hg tags' '
+-	test_when_finished "rm -rf gitrepo* hgrepo*" &&
+-
+-	(
+-	git init -q gitrepo &&
+-	cd gitrepo &&
+-
+-	echo alpha >alpha &&
+-	git add alpha &&
+-	git commit -m "add alpha" &&
+-	git checkout -q -b not-master
+-	) &&
+-
+-	(
+-	hg_clone gitrepo hgrepo &&
+-
+-	cd hgrepo &&
+-	hg co default &&
+-	hg tag alpha
+-	) &&
+-
+-	hg_push hgrepo gitrepo &&
+-	hg_clone gitrepo hgrepo2 &&
+-
+-	hg_log hgrepo >expected &&
+-	hg_log hgrepo2 >actual &&
+-
+-	test_cmp expected actual
+-'
+-
+-test_done
+@@ -1,542 +0,0 @@
+-#!/bin/sh
+-#
+-# Copyright (c) 2012 Felipe Contreras
+-#
+-# Base commands from hg-git tests:
+-# https://bitbucket.org/durin42/hg-git/src
+-#
+-
+-test_description='Test remote-hg output compared to hg-git'
+-
+-test -n "$TEST_DIRECTORY" || TEST_DIRECTORY=${0%/*}/../../t
+-. "$TEST_DIRECTORY"/test-lib.sh
+-
+-if ! test_have_prereq PYTHON
+-then
+-	skip_all='skipping remote-hg tests; python not available'
+-	test_done
+-fi
+-
+-if ! python -c 'import mercurial'
+-then
+-	skip_all='skipping remote-hg tests; mercurial not available'
+-	test_done
+-fi
+-
+-if ! python -c 'import hggit'
+-then
+-	skip_all='skipping remote-hg tests; hg-git not available'
+-	test_done
+-fi
+-
+-# clone to a git repo with git
+-git_clone_git () {
+-	git clone -q "hg::$1" $2 &&
+-	(cd $2 && git checkout master && git branch -D default)
+-}
+-
+-# clone to an hg repo with git
+-hg_clone_git () {
+-	(
+-	hg init $2 &&
+-	hg -R $2 bookmark -i master &&
+-	cd $1 &&
+-	git push -q "hg::../$2" 'refs/tags/*:refs/tags/*' 'refs/heads/*:refs/heads/*'
+-	) &&
+-
+-	(cd $2 && hg -q update)
+-}
+-
+-# clone to a git repo with hg
+-git_clone_hg () {
+-	(
+-	git init -q $2 &&
+-	cd $1 &&
+-	hg bookmark -i -f -r tip master &&
+-	hg -q push -r master ../$2 || true
+-	)
+-}
+-
+-# clone to an hg repo with hg
+-hg_clone_hg () {
+-	hg -q clone $1 $2
+-}
+-
+-# push an hg repo with git
+-hg_push_git () {
+-	(
+-	cd $2
+-	git checkout -q -b tmp &&
+-	git fetch -q "hg::../$1" 'refs/tags/*:refs/tags/*' 'refs/heads/*:refs/heads/*' &&
+-	git branch -D default &&
+-	git checkout -q @{-1} &&
+-	git branch -q -D tmp 2>/dev/null || true
+-	)
+-}
+-
+-# push an hg git repo with hg
+-hg_push_hg () {
+-	(
+-	cd $1 &&
+-	hg -q push ../$2 || true
+-	)
+-}
+-
+-hg_log () {
+-	hg -R $1 log --graph --debug >log &&
+-	grep -v 'tag: *default/' log
+-}
+-
+-git_log () {
+-	git --git-dir=$1/.git fast-export --branches
+-}
+-
+-setup () {
+-	(
+-	echo "[ui]"
+-	echo "username = A U Thor <author@example.com>"
+-	echo "[defaults]"
+-	echo "backout = -d \"0 0\""
+-	echo "commit = -d \"0 0\""
+-	echo "debugrawcommit = -d \"0 0\""
+-	echo "tag = -d \"0 0\""
+-	echo "[extensions]"
+-	echo "hgext.bookmarks ="
+-	echo "hggit ="
+-	echo "graphlog ="
+-	) >>"$HOME"/.hgrc &&
+-	git config --global receive.denycurrentbranch warn
+-	git config --global remote-hg.hg-git-compat true
+-	git config --global remote-hg.track-branches false
+-
+-	HGEDITOR=true
+-	HGMERGE=true
+-
+-	GIT_AUTHOR_DATE="2007-01-01 00:00:00 +0230"
+-	GIT_COMMITTER_DATE="$GIT_AUTHOR_DATE"
+-	export HGEDITOR HGMERGE GIT_AUTHOR_DATE GIT_COMMITTER_DATE
+-}
+-
+-setup
+-
+-test_expect_success 'executable bit' '
+-	test_when_finished "rm -rf gitrepo* hgrepo*" &&
+-
+-	(
+-	git init -q gitrepo &&
+-	cd gitrepo &&
+-	echo alpha >alpha &&
+-	chmod 0644 alpha &&
+-	git add alpha &&
+-	git commit -m "add alpha" &&
+-	chmod 0755 alpha &&
+-	git add alpha &&
+-	git commit -m "set executable bit" &&
+-	chmod 0644 alpha &&
+-	git add alpha &&
+-	git commit -m "clear executable bit"
+-	) &&
+-
+-	for x in hg git
+-	do
+-		(
+-		hg_clone_$x gitrepo hgrepo-$x &&
+-		cd hgrepo-$x &&
+-		hg_log . &&
+-		hg manifest -r 1 -v &&
+-		hg manifest -v
+-		) >"output-$x" &&
+-
+-		git_clone_$x hgrepo-$x gitrepo2-$x &&
+-		git_log gitrepo2-$x >"log-$x"
+-	done &&
+-
+-	test_cmp output-hg output-git &&
+-	test_cmp log-hg log-git
+-'
+-
+-test_expect_success 'symlink' '
+-	test_when_finished "rm -rf gitrepo* hgrepo*" &&
+-
+-	(
+-	git init -q gitrepo &&
+-	cd gitrepo &&
+-	echo alpha >alpha &&
+-	git add alpha &&
+-	git commit -m "add alpha" &&
+-	ln -s alpha beta &&
+-	git add beta &&
+-	git commit -m "add beta"
+-	) &&
+-
+-	for x in hg git
+-	do
+-		(
+-		hg_clone_$x gitrepo hgrepo-$x &&
+-		cd hgrepo-$x &&
+-		hg_log . &&
+-		hg manifest -v
+-		) >"output-$x" &&
+-
+-		git_clone_$x hgrepo-$x gitrepo2-$x &&
+-		git_log gitrepo2-$x >"log-$x"
+-	done &&
+-
+-	test_cmp output-hg output-git &&
+-	test_cmp log-hg log-git
+-'
+-
+-test_expect_success 'merge conflict 1' '
+-	test_when_finished "rm -rf gitrepo* hgrepo*" &&
+-
+-	(
+-	hg init hgrepo1 &&
+-	cd hgrepo1 &&
+-	echo A >afile &&
+-	hg add afile &&
+-	hg ci -m "origin" &&
+-
+-	echo B >afile &&
+-	hg ci -m "A->B" &&
+-
+-	hg up -r0 &&
+-	echo C >afile &&
+-	hg ci -m "A->C" &&
+-
+-	hg merge -r1 &&
+-	echo C >afile &&
+-	hg resolve -m afile &&
+-	hg ci -m "merge to C"
+-	) &&
+-
+-	for x in hg git
+-	do
+-		git_clone_$x hgrepo1 gitrepo-$x &&
+-		hg_clone_$x gitrepo-$x hgrepo2-$x &&
+-		hg_log hgrepo2-$x >"hg-log-$x" &&
+-		git_log gitrepo-$x >"git-log-$x"
+-	done &&
+-
+-	test_cmp hg-log-hg hg-log-git &&
+-	test_cmp git-log-hg git-log-git
+-'
+-
+-test_expect_success 'merge conflict 2' '
+-	test_when_finished "rm -rf gitrepo* hgrepo*" &&
+-
+-	(
+-	hg init hgrepo1 &&
+-	cd hgrepo1 &&
+-	echo A >afile &&
+-	hg add afile &&
+-	hg ci -m "origin" &&
+-
+-	echo B >afile &&
+-	hg ci -m "A->B" &&
+-
+-	hg up -r0 &&
+-	echo C >afile &&
+-	hg ci -m "A->C" &&
+-
+-	hg merge -r1 || true &&
+-	echo B >afile &&
+-	hg resolve -m afile &&
+-	hg ci -m "merge to B"
+-	) &&
+-
+-	for x in hg git
+-	do
+-		git_clone_$x hgrepo1 gitrepo-$x &&
+-		hg_clone_$x gitrepo-$x hgrepo2-$x &&
+-		hg_log hgrepo2-$x >"hg-log-$x" &&
+-		git_log gitrepo-$x >"git-log-$x"
+-	done &&
+-
+-	test_cmp hg-log-hg hg-log-git &&
+-	test_cmp git-log-hg git-log-git
+-'
+-
+-test_expect_success 'converged merge' '
+-	test_when_finished "rm -rf gitrepo* hgrepo*" &&
+-
+-	(
+-	hg init hgrepo1 &&
+-	cd hgrepo1 &&
+-	echo A >afile &&
+-	hg add afile &&
+-	hg ci -m "origin" &&
+-
+-	echo B >afile &&
+-	hg ci -m "A->B" &&
+-
+-	echo C >afile &&
+-	hg ci -m "B->C" &&
+-
+-	hg up -r0 &&
+-	echo C >afile &&
+-	hg ci -m "A->C" &&
+-
+-	hg merge -r2 || true &&
+-	hg ci -m "merge"
+-	) &&
+-
+-	for x in hg git
+-	do
+-		git_clone_$x hgrepo1 gitrepo-$x &&
+-		hg_clone_$x gitrepo-$x hgrepo2-$x &&
+-		hg_log hgrepo2-$x >"hg-log-$x" &&
+-		git_log gitrepo-$x >"git-log-$x"
+-	done &&
+-
+-	test_cmp hg-log-hg hg-log-git &&
+-	test_cmp git-log-hg git-log-git
+-'
+-
+-test_expect_success 'encoding' '
+-	test_when_finished "rm -rf gitrepo* hgrepo*" &&
+-
+-	(
+-	git init -q gitrepo &&
+-	cd gitrepo &&
+-
+-	echo alpha >alpha &&
+-	git add alpha &&
+-	git commit -m "add älphà" &&
+-
+-	GIT_AUTHOR_NAME="tést èncödîng" &&
+-	export GIT_AUTHOR_NAME &&
+-	echo beta >beta &&
+-	git add beta &&
+-	git commit -m "add beta" &&
+-
+-	echo gamma >gamma &&
+-	git add gamma &&
+-	git commit -m "add gämmâ" &&
+-
+-	: TODO git config i18n.commitencoding latin-1 &&
+-	echo delta >delta &&
+-	git add delta &&
+-	git commit -m "add déltà"
+-	) &&
+-
+-	for x in hg git
+-	do
+-		hg_clone_$x gitrepo hgrepo-$x &&
+-		git_clone_$x hgrepo-$x gitrepo2-$x &&
+-
+-		HGENCODING=utf-8 hg_log hgrepo-$x >"hg-log-$x" &&
+-		git_log gitrepo2-$x >"git-log-$x"
+-	done &&
+-
+-	test_cmp hg-log-hg hg-log-git &&
+-	test_cmp git-log-hg git-log-git
+-'
+-
+-test_expect_success 'file removal' '
+-	test_when_finished "rm -rf gitrepo* hgrepo*" &&
+-
+-	(
+-	git init -q gitrepo &&
+-	cd gitrepo &&
+-	echo alpha >alpha &&
+-	git add alpha &&
+-	git commit -m "add alpha" &&
+-	echo beta >beta &&
+-	git add beta &&
+-	git commit -m "add beta"
+-	mkdir foo &&
+-	echo blah >foo/bar &&
+-	git add foo &&
+-	git commit -m "add foo" &&
+-	git rm alpha &&
+-	git commit -m "remove alpha" &&
+-	git rm foo/bar &&
+-	git commit -m "remove foo/bar"
+-	) &&
+-
+-	for x in hg git
+-	do
+-		(
+-		hg_clone_$x gitrepo hgrepo-$x &&
+-		cd hgrepo-$x &&
+-		hg_log . &&
+-		hg manifest -r 3 &&
+-		hg manifest
+-		) >"output-$x" &&
+-
+-		git_clone_$x hgrepo-$x gitrepo2-$x &&
+-		git_log gitrepo2-$x >"log-$x"
+-	done &&
+-
+-	test_cmp output-hg output-git &&
+-	test_cmp log-hg log-git
+-'
+-
+-test_expect_success 'git tags' '
+-	test_when_finished "rm -rf gitrepo* hgrepo*" &&
+-
+-	(
+-	git init -q gitrepo &&
+-	cd gitrepo &&
+-	git config receive.denyCurrentBranch ignore &&
+-	echo alpha >alpha &&
+-	git add alpha &&
+-	git commit -m "add alpha" &&
+-	git tag alpha &&
+-
+-	echo beta >beta &&
+-	git add beta &&
+-	git commit -m "add beta" &&
+-	git tag -a -m "added tag beta" beta
+-	) &&
+-
+-	for x in hg git
+-	do
+-		hg_clone_$x gitrepo hgrepo-$x &&
+-		hg_log hgrepo-$x >"log-$x"
+-	done &&
+-
+-	test_cmp log-hg log-git
+-'
+-
+-test_expect_success 'hg author' '
+-	test_when_finished "rm -rf gitrepo* hgrepo*" &&
+-
+-	for x in hg git
+-	do
+-		(
+-		git init -q gitrepo-$x &&
+-		cd gitrepo-$x &&
+-
+-		echo alpha >alpha &&
+-		git add alpha &&
+-		git commit -m "add alpha" &&
+-		git checkout -q -b not-master
+-		) &&
+-
+-		(
+-		hg_clone_$x gitrepo-$x hgrepo-$x &&
+-		cd hgrepo-$x &&
+-
+-		hg co master &&
+-		echo beta >beta &&
+-		hg add beta &&
+-		hg commit -u "test" -m "add beta" &&
+-
+-		echo gamma >>beta &&
+-		hg commit -u "test <test@example.com> (comment)" -m "modify beta" &&
+-
+-		echo gamma >gamma &&
+-		hg add gamma &&
+-		hg commit -u "<test@example.com>" -m "add gamma" &&
+-
+-		echo delta >delta &&
+-		hg add delta &&
+-		hg commit -u "name<test@example.com>" -m "add delta" &&
+-
+-		echo epsilon >epsilon &&
+-		hg add epsilon &&
+-		hg commit -u "name <test@example.com" -m "add epsilon" &&
+-
+-		echo zeta >zeta &&
+-		hg add zeta &&
+-		hg commit -u " test " -m "add zeta" &&
+-
+-		echo eta >eta &&
+-		hg add eta &&
+-		hg commit -u "test < test@example.com >" -m "add eta" &&
+-
+-		echo theta >theta &&
+-		hg add theta &&
+-		hg commit -u "test >test@example.com>" -m "add theta" &&
+-
+-		echo iota >iota &&
+-		hg add iota &&
+-		hg commit -u "test <test <at> example <dot> com>" -m "add iota"
+-		) &&
+-
+-		hg_push_$x hgrepo-$x gitrepo-$x &&
+-		hg_clone_$x gitrepo-$x hgrepo2-$x &&
+-
+-		hg_log hgrepo2-$x >"hg-log-$x" &&
+-		git_log gitrepo-$x >"git-log-$x"
+-	done &&
+-
+-	test_cmp hg-log-hg hg-log-git &&
+-	test_cmp git-log-hg git-log-git
+-'
+-
+-test_expect_success 'hg branch' '
+-	test_when_finished "rm -rf gitrepo* hgrepo*" &&
+-
+-	for x in hg git
+-	do
+-		(
+-		git init -q gitrepo-$x &&
+-		cd gitrepo-$x &&
+-
+-		echo alpha >alpha &&
+-		git add alpha &&
+-		git commit -q -m "add alpha" &&
+-		git checkout -q -b not-master
+-		) &&
+-
+-		(
+-		hg_clone_$x gitrepo-$x hgrepo-$x &&
+-
+-		cd hgrepo-$x &&
+-		hg -q co master &&
+-		hg mv alpha beta &&
+-		hg -q commit -m "rename alpha to beta" &&
+-		hg branch gamma | grep -v "permanent and global" &&
+-		hg -q commit -m "started branch gamma"
+-		) &&
+-
+-		hg_push_$x hgrepo-$x gitrepo-$x &&
+-		hg_clone_$x gitrepo-$x hgrepo2-$x &&
+-
+-		hg_log hgrepo2-$x >"hg-log-$x" &&
+-		git_log gitrepo-$x >"git-log-$x"
+-	done &&
+-
+-	test_cmp hg-log-hg hg-log-git &&
+-	test_cmp git-log-hg git-log-git
+-'
+-
+-test_expect_success 'hg tags' '
+-	test_when_finished "rm -rf gitrepo* hgrepo*" &&
+-
+-	for x in hg git
+-	do
+-		(
+-		git init -q gitrepo-$x &&
+-		cd gitrepo-$x &&
+-
+-		echo alpha >alpha &&
+-		git add alpha &&
+-		git commit -m "add alpha" &&
+-		git checkout -q -b not-master
+-		) &&
+-
+-		(
+-		hg_clone_$x gitrepo-$x hgrepo-$x &&
+-
+-		cd hgrepo-$x &&
+-		hg co master &&
+-		hg tag alpha
+-		) &&
+-
+-		hg_push_$x hgrepo-$x gitrepo-$x &&
+-		hg_clone_$x gitrepo-$x hgrepo2-$x &&
+-
+-		(
+-		git --git-dir=gitrepo-$x/.git tag -l &&
+-		hg_log hgrepo2-$x &&
+-		cat hgrepo2-$x/.hgtags
+-		) >"output-$x"
+-	done &&
+-
+-	test_cmp output-hg output-git
+-'
+-
+-test_done
+@@ -1,848 +0,0 @@
+-#!/bin/sh
+-#
+-# Copyright (c) 2012 Felipe Contreras
+-#
+-# Base commands from hg-git tests:
+-# https://bitbucket.org/durin42/hg-git/src
+-#
+-
+-test_description='Test remote-hg'
+-
+-test -n "$TEST_DIRECTORY" || TEST_DIRECTORY=${0%/*}/../../t
+-. "$TEST_DIRECTORY"/test-lib.sh
+-
+-if ! test_have_prereq PYTHON
+-then
+-	skip_all='skipping remote-hg tests; python not available'
+-	test_done
+-fi
+-
+-if ! python -c 'import mercurial'
+-then
+-	skip_all='skipping remote-hg tests; mercurial not available'
+-	test_done
+-fi
+-
+-check () {
+-	echo $3 >expected &&
+-	git --git-dir=$1/.git log --format='%s' -1 $2 >actual
+-	test_cmp expected actual
+-}
+-
+-check_branch () {
+-	if test -n "$3"
+-	then
+-		echo $3 >expected &&
+-		hg -R $1 log -r $2 --template '{desc}\n' >actual &&
+-		test_cmp expected actual
+-	else
+-		hg -R $1 branches >out &&
+-		! grep $2 out
+-	fi
+-}
+-
+-check_bookmark () {
+-	if test -n "$3"
+-	then
+-		echo $3 >expected &&
+-		hg -R $1 log -r "bookmark('$2')" --template '{desc}\n' >actual &&
+-		test_cmp expected actual
+-	else
+-		hg -R $1 bookmarks >out &&
+-		! grep $2 out
+-	fi
+-}
+-
+-check_push () {
+-	expected_ret=$1 ret=0 ref_ret=0
+-
+-	shift
+-	git push origin "$@" 2>error
+-	ret=$?
+-	cat error
+-
+-	while IFS=':' read branch kind
+-	do
+-		case "$kind" in
+-		'new')
+-			grep "^ \* \[new branch\] *${branch} -> ${branch}$" error || ref_ret=1
+-			;;
+-		'non-fast-forward')
+-			grep "^ ! \[rejected\] *${branch} -> ${branch} (non-fast-forward)$" error || ref_ret=1
+-			;;
+-		'fetch-first')
+-			grep "^ ! \[rejected\] *${branch} -> ${branch} (fetch first)$" error || ref_ret=1
+-			;;
+-		'forced-update')
+-			grep "^ + [a-f0-9]*\.\.\.[a-f0-9]* *${branch} -> ${branch} (forced update)$" error || ref_ret=1
+-			;;
+-		'')
+-			grep "^   [a-f0-9]*\.\.[a-f0-9]* *${branch} -> ${branch}$" error || ref_ret=1
+-			;;
+-		esac
+-		test $ref_ret -ne 0 && echo "match for '$branch' failed" && break
+-	done
+-
+-	if test $expected_ret -ne $ret || test $ref_ret -ne 0
+-	then
+-		return 1
+-	fi
+-
+-	return 0
+-}
+-
+-setup () {
+-	(
+-	echo "[ui]"
+-	echo "username = H G Wells <wells@example.com>"
+-	echo "[extensions]"
+-	echo "mq ="
+-	) >>"$HOME"/.hgrc &&
+-
+-	GIT_AUTHOR_DATE="2007-01-01 00:00:00 +0230" &&
+-	GIT_COMMITTER_DATE="$GIT_AUTHOR_DATE" &&
+-	export GIT_COMMITTER_DATE GIT_AUTHOR_DATE
+-}
+-
+-setup
+-
+-test_expect_success 'cloning' '
+-	test_when_finished "rm -rf gitrepo*" &&
+-
+-	(
+-	hg init hgrepo &&
+-	cd hgrepo &&
+-	echo zero >content &&
+-	hg add content &&
+-	hg commit -m zero
+-	) &&
+-
+-	git clone "hg::hgrepo" gitrepo &&
+-	check gitrepo HEAD zero
+-'
+-
+-test_expect_success 'cloning with branches' '
+-	test_when_finished "rm -rf gitrepo*" &&
+-
+-	(
+-	cd hgrepo &&
+-	hg branch next &&
+-	echo next >content &&
+-	hg commit -m next
+-	) &&
+-
+-	git clone "hg::hgrepo" gitrepo &&
+-	check gitrepo origin/branches/next next
+-'
+-
+-test_expect_success 'cloning with bookmarks' '
+-	test_when_finished "rm -rf gitrepo*" &&
+-
+-	(
+-	cd hgrepo &&
+-	hg checkout default &&
+-	hg bookmark feature-a &&
+-	echo feature-a >content &&
+-	hg commit -m feature-a
+-	) &&
+-
+-	git clone "hg::hgrepo" gitrepo &&
+-	check gitrepo origin/feature-a feature-a
+-'
+-
+-test_expect_success 'update bookmark' '
+-	test_when_finished "rm -rf gitrepo*" &&
+-
+-	(
+-	cd hgrepo &&
+-	hg bookmark devel
+-	) &&
+-
+-	(
+-	git clone "hg::hgrepo" gitrepo &&
+-	cd gitrepo &&
+-	git checkout --quiet devel &&
+-	echo devel >content &&
+-	git commit -a -m devel &&
+-	git push --quiet
+-	) &&
+-
+-	check_bookmark hgrepo devel devel
+-'
+-
+-test_expect_success 'new bookmark' '
+-	test_when_finished "rm -rf gitrepo*" &&
+-
+-	(
+-	git clone "hg::hgrepo" gitrepo &&
+-	cd gitrepo &&
+-	git checkout --quiet -b feature-b &&
+-	echo feature-b >content &&
+-	git commit -a -m feature-b &&
+-	git push --quiet origin feature-b
+-	) &&
+-
+-	check_bookmark hgrepo feature-b feature-b
+-'
+-
+-# cleanup previous stuff
+-rm -rf hgrepo
+-
+-author_test () {
+-	echo $1 >>content &&
+-	hg commit -u "$2" -m "add $1" &&
+-	echo "$3" >>../expected
+-}
+-
+-test_expect_success 'authors' '
+-	test_when_finished "rm -rf hgrepo gitrepo" &&
+-
+-	(
+-	hg init hgrepo &&
+-	cd hgrepo &&
+-
+-	touch content &&
+-	hg add content &&
+-
+-	>../expected &&
+-	author_test alpha "" "H G Wells <wells@example.com>" &&
+-	author_test beta "beta" "beta <unknown>" &&
+-	author_test gamma "gamma <test@example.com> (comment)" "gamma <test@example.com>" &&
+-	author_test delta "<delta@example.com>" "Unknown <delta@example.com>" &&
+-	author_test epsilon "epsilon<test@example.com>" "epsilon <test@example.com>" &&
+-	author_test zeta "zeta <test@example.com" "zeta <test@example.com>" &&
+-	author_test eta " eta " "eta <unknown>" &&
+-	author_test theta "theta < test@example.com >" "theta <test@example.com>" &&
+-	author_test iota "iota >test@example.com>" "iota <test@example.com>" &&
+-	author_test kappa "kappa < test <at> example <dot> com>" "kappa <unknown>" &&
+-	author_test lambda "lambda@example.com" "Unknown <lambda@example.com>" &&
+-	author_test mu "mu.mu@example.com" "Unknown <mu.mu@example.com>"
+-	) &&
+-
+-	git clone "hg::hgrepo" gitrepo &&
+-	git --git-dir=gitrepo/.git log --reverse --format="%an <%ae>" >actual &&
+-
+-	test_cmp expected actual
+-'
+-
+-test_expect_success 'strip' '
+-	test_when_finished "rm -rf hgrepo gitrepo" &&
+-
+-	(
+-	hg init hgrepo &&
+-	cd hgrepo &&
+-
+-	echo one >>content &&
+-	hg add content &&
+-	hg commit -m one &&
+-
+-	echo two >>content &&
+-	hg commit -m two
+-	) &&
+-
+-	git clone "hg::hgrepo" gitrepo &&
+-
+-	(
+-	cd hgrepo &&
+-	hg strip 1 &&
+-
+-	echo three >>content &&
+-	hg commit -m three &&
+-
+-	echo four >>content &&
+-	hg commit -m four
+-	) &&
+-
+-	(
+-	cd gitrepo &&
+-	git fetch &&
+-	git log --format="%s" origin/master >../actual
+-	) &&
+-
+-	hg -R hgrepo log --template "{desc}\n" >expected &&
+-	test_cmp actual expected
+-'
+-
+-test_expect_success 'remote push with master bookmark' '
+-	test_when_finished "rm -rf hgrepo gitrepo*" &&
+-
+-	(
+-	hg init hgrepo &&
+-	cd hgrepo &&
+-	echo zero >content &&
+-	hg add content &&
+-	hg commit -m zero &&
+-	hg bookmark master &&
+-	echo one >content &&
+-	hg commit -m one
+-	) &&
+-
+-	(
+-	git clone "hg::hgrepo" gitrepo &&
+-	cd gitrepo &&
+-	echo two >content &&
+-	git commit -a -m two &&
+-	git push
+-	) &&
+-
+-	check_branch hgrepo default two
+-'
+-
+-cat >expected <<\EOF
+-changeset:   0:6e2126489d3d
+-tag:         tip
+-user:        A U Thor <author@example.com>
+-date:        Mon Jan 01 00:00:00 2007 +0230
+-summary:     one
+-
+-EOF
+-
+-test_expect_success 'remote push from master branch' '
+-	test_when_finished "rm -rf hgrepo gitrepo*" &&
+-
+-	hg init hgrepo &&
+-
+-	(
+-	git init gitrepo &&
+-	cd gitrepo &&
+-	git remote add origin "hg::../hgrepo" &&
+-	echo one >content &&
+-	git add content &&
+-	git commit -a -m one &&
+-	git push origin master
+-	) &&
+-
+-	hg -R hgrepo log >actual &&
+-	cat actual &&
+-	test_cmp expected actual &&
+-
+-	check_branch hgrepo default one
+-'
+-
+-GIT_REMOTE_HG_TEST_REMOTE=1
+-export GIT_REMOTE_HG_TEST_REMOTE
+-
+-test_expect_success 'remote cloning' '
+-	test_when_finished "rm -rf gitrepo*" &&
+-
+-	(
+-	hg init hgrepo &&
+-	cd hgrepo &&
+-	echo zero >content &&
+-	hg add content &&
+-	hg commit -m zero
+-	) &&
+-
+-	git clone "hg::hgrepo" gitrepo &&
+-	check gitrepo HEAD zero
+-'
+-
+-test_expect_success 'moving remote clone' '
+-	test_when_finished "rm -rf gitrepo*" &&
+-
+-	(
+-	git clone "hg::hgrepo" gitrepo &&
+-	mv gitrepo gitrepo2 &&
+-	cd gitrepo2 &&
+-	git fetch
+-	)
+-'
+-
+-test_expect_success 'remote update bookmark' '
+-	test_when_finished "rm -rf gitrepo*" &&
+-
+-	(
+-	cd hgrepo &&
+-	hg bookmark devel
+-	) &&
+-
+-	(
+-	git clone "hg::hgrepo" gitrepo &&
+-	cd gitrepo &&
+-	git checkout --quiet devel &&
+-	echo devel >content &&
+-	git commit -a -m devel &&
+-	git push --quiet
+-	) &&
+-
+-	check_bookmark hgrepo devel devel
+-'
+-
+-test_expect_success 'remote new bookmark' '
+-	test_when_finished "rm -rf gitrepo*" &&
+-
+-	(
+-	git clone "hg::hgrepo" gitrepo &&
+-	cd gitrepo &&
+-	git checkout --quiet -b feature-b &&
+-	echo feature-b >content &&
+-	git commit -a -m feature-b &&
+-	git push --quiet origin feature-b
+-	) &&
+-
+-	check_bookmark hgrepo feature-b feature-b
+-'
+-
+-test_expect_success 'remote push diverged' '
+-	test_when_finished "rm -rf gitrepo*" &&
+-
+-	git clone "hg::hgrepo" gitrepo &&
+-
+-	(
+-	cd hgrepo &&
+-	hg checkout default &&
+-	echo bump >content &&
+-	hg commit -m bump
+-	) &&
+-
+-	(
+-	cd gitrepo &&
+-	echo diverge >content &&
+-	git commit -a -m diverged &&
+-	check_push 1 <<-\EOF
+-	master:non-fast-forward
+-	EOF
+-	) &&
+-
+-	check_branch hgrepo default bump
+-'
+-
+-test_expect_success 'remote update bookmark diverge' '
+-	test_when_finished "rm -rf gitrepo*" &&
+-
+-	(
+-	cd hgrepo &&
+-	hg checkout tip^ &&
+-	hg bookmark diverge
+-	) &&
+-
+-	git clone "hg::hgrepo" gitrepo &&
+-
+-	(
+-	cd hgrepo &&
+-	echo "bump bookmark" >content &&
+-	hg commit -m "bump bookmark"
+-	) &&
+-
+-	(
+-	cd gitrepo &&
+-	git checkout --quiet diverge &&
+-	echo diverge >content &&
+-	git commit -a -m diverge &&
+-	check_push 1 <<-\EOF
+-	diverge:fetch-first
+-	EOF
+-	) &&
+-
+-	check_bookmark hgrepo diverge "bump bookmark"
+-'
+-
+-test_expect_success 'remote new bookmark multiple branch head' '
+-	test_when_finished "rm -rf gitrepo*" &&
+-
+-	(
+-	git clone "hg::hgrepo" gitrepo &&
+-	cd gitrepo &&
+-	git checkout --quiet -b feature-c HEAD^ &&
+-	echo feature-c >content &&
+-	git commit -a -m feature-c &&
+-	git push --quiet origin feature-c
+-	) &&
+-
+-	check_bookmark hgrepo feature-c feature-c
+-'
+-
+-# cleanup previous stuff
+-rm -rf hgrepo
+-
+-test_expect_success 'fetch special filenames' '
+-	test_when_finished "rm -rf hgrepo gitrepo && LC_ALL=C" &&
+-
+-	LC_ALL=en_US.UTF-8
+-	export LC_ALL
+-
+-	(
+-	hg init hgrepo &&
+-	cd hgrepo &&
+-
+-	echo test >> "æ rø" &&
+-	hg add "æ rø" &&
+-	echo test >> "ø~?" &&
+-	hg add "ø~?" &&
+-	hg commit -m add-utf-8 &&
+-	echo test >> "æ rø" &&
+-	hg commit -m test-utf-8 &&
+-	hg rm "ø~?" &&
+-	hg mv "æ rø" "ø~?" &&
+-	hg commit -m hg-mv-utf-8
+-	) &&
+-
+-	(
+-	git clone "hg::hgrepo" gitrepo &&
+-	cd gitrepo &&
+-	git -c core.quotepath=false ls-files > ../actual
+-	) &&
+-	echo "ø~?" > expected &&
+-	test_cmp expected actual
+-'
+-
+-test_expect_success 'push special filenames' '
+-	test_when_finished "rm -rf hgrepo gitrepo && LC_ALL=C" &&
+-
+-	mkdir -p tmp && cd tmp &&
+-
+-	LC_ALL=en_US.UTF-8
+-	export LC_ALL
+-
+-	(
+-	hg init hgrepo &&
+-	cd hgrepo &&
+-
+-	echo one >> content &&
+-	hg add content &&
+-	hg commit -m one
+-	) &&
+-
+-	(
+-	git clone "hg::hgrepo" gitrepo &&
+-	cd gitrepo &&
+-
+-	echo test >> "æ rø" &&
+-	git add "æ rø" &&
+-	git commit -m utf-8 &&
+-
+-	git push
+-	) &&
+-
+-	(cd hgrepo &&
+-	hg update &&
+-	hg manifest > ../actual
+-	) &&
+-
+-	printf "content\næ rø\n" > expected &&
+-	test_cmp expected actual
+-'
+-
+-setup_big_push () {
+-	(
+-	hg init hgrepo &&
+-	cd hgrepo &&
+-	echo zero >content &&
+-	hg add content &&
+-	hg commit -m zero &&
+-	hg bookmark bad_bmark1 &&
+-	echo one >content &&
+-	hg commit -m one &&
+-	hg bookmark bad_bmark2 &&
+-	hg bookmark good_bmark &&
+-	hg bookmark -i good_bmark &&
+-	hg -q branch good_branch &&
+-	echo "good branch" >content &&
+-	hg commit -m "good branch" &&
+-	hg -q branch bad_branch &&
+-	echo "bad branch" >content &&
+-	hg commit -m "bad branch"
+-	) &&
+-
+-	git clone "hg::hgrepo" gitrepo &&
+-
+-	(
+-	cd gitrepo &&
+-	echo two >content &&
+-	git commit -q -a -m two &&
+-
+-	git checkout -q good_bmark &&
+-	echo three >content &&
+-	git commit -q -a -m three &&
+-
+-	git checkout -q bad_bmark1 &&
+-	git reset --hard HEAD^ &&
+-	echo four >content &&
+-	git commit -q -a -m four &&
+-
+-	git checkout -q bad_bmark2 &&
+-	git reset --hard HEAD^ &&
+-	echo five >content &&
+-	git commit -q -a -m five &&
+-
+-	git checkout -q -b new_bmark master &&
+-	echo six >content &&
+-	git commit -q -a -m six &&
+-
+-	git checkout -q branches/good_branch &&
+-	echo seven >content &&
+-	git commit -q -a -m seven &&
+-	echo eight >content &&
+-	git commit -q -a -m eight &&
+-
+-	git checkout -q branches/bad_branch &&
+-	git reset --hard HEAD^ &&
+-	echo nine >content &&
+-	git commit -q -a -m nine &&
+-
+-	git checkout -q -b branches/new_branch master &&
+-	echo ten >content &&
+-	git commit -q -a -m ten
+-	)
+-}
+-
+-test_expect_success 'remote big push' '
+-	test_when_finished "rm -rf hgrepo gitrepo*" &&
+-
+-	setup_big_push
+-
+-	(
+-	cd gitrepo &&
+-
+-	check_push 1 --all <<-\EOF
+-	master
+-	good_bmark
+-	branches/good_branch
+-	new_bmark:new
+-	branches/new_branch:new
+-	bad_bmark1:non-fast-forward
+-	bad_bmark2:non-fast-forward
+-	branches/bad_branch:non-fast-forward
+-	EOF
+-	) &&
+-
+-	check_branch hgrepo default one &&
+-	check_branch hgrepo good_branch "good branch" &&
+-	check_branch hgrepo bad_branch "bad branch" &&
+-	check_branch hgrepo new_branch '' &&
+-	check_bookmark hgrepo good_bmark one &&
+-	check_bookmark hgrepo bad_bmark1 one &&
+-	check_bookmark hgrepo bad_bmark2 one &&
+-	check_bookmark hgrepo new_bmark ''
+-'
+-
+-test_expect_success 'remote big push fetch first' '
+-	test_when_finished "rm -rf hgrepo gitrepo*" &&
+-
+-	(
+-	hg init hgrepo &&
+-	cd hgrepo &&
+-	echo zero >content &&
+-	hg add content &&
+-	hg commit -m zero &&
+-	hg bookmark bad_bmark &&
+-	hg bookmark good_bmark &&
+-	hg bookmark -i good_bmark &&
+-	hg -q branch good_branch &&
+-	echo "good branch" >content &&
+-	hg commit -m "good branch" &&
+-	hg -q branch bad_branch &&
+-	echo "bad branch" >content &&
+-	hg commit -m "bad branch"
+-	) &&
+-
+-	git clone "hg::hgrepo" gitrepo &&
+-
+-	(
+-	cd hgrepo &&
+-	hg bookmark -f bad_bmark &&
+-	echo update_bmark >content &&
+-	hg commit -m "update bmark"
+-	) &&
+-
+-	(
+-	cd gitrepo &&
+-	echo two >content &&
+-	git commit -q -a -m two &&
+-
+-	git checkout -q good_bmark &&
+-	echo three >content &&
+-	git commit -q -a -m three &&
+-
+-	git checkout -q bad_bmark &&
+-	echo four >content &&
+-	git commit -q -a -m four &&
+-
+-	git checkout -q branches/bad_branch &&
+-	echo five >content &&
+-	git commit -q -a -m five &&
+-
+-	check_push 1 --all <<-\EOF &&
+-	master
+-	good_bmark
+-	bad_bmark:fetch-first
+-	branches/bad_branch:festch-first
+-	EOF
+-
+-	git fetch &&
+-
+-	check_push 1 --all <<-\EOF
+-	master
+-	good_bmark
+-	bad_bmark:non-fast-forward
+-	branches/bad_branch:non-fast-forward
+-	EOF
+-	)
+-'
+-
+-test_expect_success 'remote big push force' '
+-	test_when_finished "rm -rf hgrepo gitrepo*" &&
+-
+-	setup_big_push
+-
+-	(
+-	cd gitrepo &&
+-
+-	check_push 0 --force --all <<-\EOF
+-	master
+-	good_bmark
+-	branches/good_branch
+-	new_bmark:new
+-	branches/new_branch:new
+-	bad_bmark1:forced-update
+-	bad_bmark2:forced-update
+-	branches/bad_branch:forced-update
+-	EOF
+-	) &&
+-
+-	check_branch hgrepo default six &&
+-	check_branch hgrepo good_branch eight &&
+-	check_branch hgrepo bad_branch nine &&
+-	check_branch hgrepo new_branch ten &&
+-	check_bookmark hgrepo good_bmark three &&
+-	check_bookmark hgrepo bad_bmark1 four &&
+-	check_bookmark hgrepo bad_bmark2 five &&
+-	check_bookmark hgrepo new_bmark six
+-'
+-
+-test_expect_success 'remote big push dry-run' '
+-	test_when_finished "rm -rf hgrepo gitrepo*" &&
+-
+-	setup_big_push
+-
+-	(
+-	cd gitrepo &&
+-
+-	check_push 1 --dry-run --all <<-\EOF &&
+-	master
+-	good_bmark
+-	branches/good_branch
+-	new_bmark:new
+-	branches/new_branch:new
+-	bad_bmark1:non-fast-forward
+-	bad_bmark2:non-fast-forward
+-	branches/bad_branch:non-fast-forward
+-	EOF
+-
+-	check_push 0 --dry-run master good_bmark new_bmark branches/good_branch branches/new_branch <<-\EOF
+-	master
+-	good_bmark
+-	branches/good_branch
+-	new_bmark:new
+-	branches/new_branch:new
+-	EOF
+-	) &&
+-
+-	check_branch hgrepo default one &&
+-	check_branch hgrepo good_branch "good branch" &&
+-	check_branch hgrepo bad_branch "bad branch" &&
+-	check_branch hgrepo new_branch '' &&
+-	check_bookmark hgrepo good_bmark one &&
+-	check_bookmark hgrepo bad_bmark1 one &&
+-	check_bookmark hgrepo bad_bmark2 one &&
+-	check_bookmark hgrepo new_bmark ''
+-'
+-
+-test_expect_success 'remote double failed push' '
+-	test_when_finished "rm -rf hgrepo gitrepo*" &&
+-
+-	(
+-	hg init hgrepo &&
+-	cd hgrepo &&
+-	echo zero >content &&
+-	hg add content &&
+-	hg commit -m zero &&
+-	echo one >content &&
+-	hg commit -m one
+-	) &&
+-
+-	(
+-	git clone "hg::hgrepo" gitrepo &&
+-	cd gitrepo &&
+-	git reset --hard HEAD^ &&
+-	echo two >content &&
+-	git commit -a -m two &&
+-	test_expect_code 1 git push &&
+-	test_expect_code 1 git push
+-	)
+-'
+-
+-test_expect_success 'clone remote with master null bookmark, then push to the bookmark' '
+-	test_when_finished "rm -rf gitrepo* hgrepo*" &&
+-
+-	hg init hgrepo &&
+-	(
+-		cd hgrepo &&
+-		echo a >a &&
+-		hg add a &&
+-		hg commit -m a &&
+-		hg bookmark -r null master
+-	) &&
+-
+-	git clone "hg::hgrepo" gitrepo &&
+-	check gitrepo HEAD a &&
+-	(
+-		cd gitrepo &&
+-		git checkout --quiet -b master &&
+-		echo b >b &&
+-		git add b &&
+-		git commit -m b &&
+-		git push origin master
+-	)
+-'
+-
+-test_expect_success 'clone remote with default null bookmark, then push to the bookmark' '
+-	test_when_finished "rm -rf gitrepo* hgrepo*" &&
+-
+-	hg init hgrepo &&
+-	(
+-		cd hgrepo &&
+-		echo a >a &&
+-		hg add a &&
+-		hg commit -m a &&
+-		hg bookmark -r null -f default
+-	) &&
+-
+-	git clone "hg::hgrepo" gitrepo &&
+-	check gitrepo HEAD a &&
+-	(
+-		cd gitrepo &&
+-		git checkout --quiet -b default &&
+-		echo b >b &&
+-		git add b &&
+-		git commit -m b &&
+-		git push origin default
+-	)
+-'
+-
+-test_expect_success 'clone remote with generic null bookmark, then push to the bookmark' '
+-	test_when_finished "rm -rf gitrepo* hgrepo*" &&
+-
+-	hg init hgrepo &&
+-	(
+-		cd hgrepo &&
+-		echo a >a &&
+-		hg add a &&
+-		hg commit -m a &&
+-		hg bookmark -r null bmark
+-	) &&
+-
+-	git clone "hg::hgrepo" gitrepo &&
+-	check gitrepo HEAD a &&
+-	(
+-		cd gitrepo &&
+-		git checkout --quiet -b bmark &&
+-		git remote -v &&
+-		echo b >b &&
+-		git add b &&
+-		git commit -m b &&
+-		git push origin bmark
+-	)
+-'
+-
+-test_done
+@@ -212,27 +212,42 @@ test_expect_success 'push update refs failure' '
+ 	echo "update fail" >>file &&
+ 	git commit -a -m "update fail" &&
+ 	git rev-parse --verify testgit/origin/heads/update >expect &&
+-	GIT_REMOTE_TESTGIT_PUSH_ERROR="non-fast forward" &&
+-	export GIT_REMOTE_TESTGIT_PUSH_ERROR &&
+-	test_expect_code 1 git push origin update &&
++	test_expect_code 1 env GIT_REMOTE_TESTGIT_FAILURE="non-fast forward" \
++		git push origin update &&
+ 	git rev-parse --verify testgit/origin/heads/update >actual &&
+ 	test_cmp expect actual
+ 	)
+ '
+ 
++clean_mark () {
++	cut -f 2 -d ' ' "$1" |
++	git cat-file --batch-check |
++	grep commit |
++	sort >$(basename "$1")
++}
++
++cmp_marks () {
++	test_when_finished "rm -rf git.marks testgit.marks" &&
++	clean_mark ".git/testgit/$1/git.marks" &&
++	clean_mark ".git/testgit/$1/testgit.marks" &&
++	test_cmp git.marks testgit.marks
++}
++
+ test_expect_success 'proper failure checks for fetching' '
+-	(GIT_REMOTE_TESTGIT_FAILURE=1 &&
+-	export GIT_REMOTE_TESTGIT_FAILURE &&
+-	cd local &&
+-	test_must_fail git fetch 2> error &&
++	(cd local &&
++	test_must_fail env GIT_REMOTE_TESTGIT_FAILURE=1 git fetch 2>error &&
+ 	cat error &&
+ 	grep -q "Error while running fast-import" error
+ 	)
+ '
+ 
+ test_expect_success 'proper failure checks for pushing' '
+ 	(cd local &&
+-	test_must_fail env GIT_REMOTE_TESTGIT_FAILURE=1 git push --all
++	git checkout -b crash master &&
++	echo crash >>file &&
++	git commit -a -m crash &&
++	test_must_fail env GIT_REMOTE_TESTGIT_FAILURE=1 git push --all &&
++	cmp_marks origin
+ 	)
+ '
+ 
+@@ -58,7 +58,7 @@ static int recvline_fh(FILE *helper, struct strbuf *buffer, const char *name)
+ 	if (strbuf_getline(buffer, helper, '\n') == EOF) {
+ 		if (debug)
+ 			fprintf(stderr, "Debug: Remote helper quit.\n");
+-		exit(128);
++		return 1;
+ 	}
+ 
+ 	if (debug)
+@@ -71,12 +71,6 @@ static int recvline(struct helper_data *helper, struct strbuf *buffer)
+ 	return recvline_fh(helper->out, buffer, helper->name);
+ }
+ 
+-static void xchgline(struct helper_data *helper, struct strbuf *buffer)
+-{
+-	sendline(helper, buffer);
+-	recvline(helper, buffer);
+-}
+-
+ static void write_constant(int fd, const char *str)
+ {
+ 	if (debug)
+@@ -163,7 +157,8 @@ static struct child_process *get_helper(struct transport *transport)
+ 	while (1) {
+ 		const char *capname;
+ 		int mandatory = 0;
+-		recvline(data, &buf);
++		if (recvline(data, &buf))
++			exit(128);
+ 
+ 		if (!*buf.buf)
+ 			break;
+@@ -200,15 +195,9 @@ static struct child_process *get_helper(struct transport *transport)
+ 		} else if (!strcmp(capname, "signed-tags")) {
+ 			data->signed_tags = 1;
+ 		} else if (starts_with(capname, "export-marks ")) {
+-			struct strbuf arg = STRBUF_INIT;
+-			strbuf_addstr(&arg, "--export-marks=");
+-			strbuf_addstr(&arg, capname + strlen("export-marks "));
+-			data->export_marks = strbuf_detach(&arg, NULL);
++			data->export_marks = xstrdup(capname + strlen("export-marks "));
+ 		} else if (starts_with(capname, "import-marks")) {
+-			struct strbuf arg = STRBUF_INIT;
+-			strbuf_addstr(&arg, "--import-marks=");
+-			strbuf_addstr(&arg, capname + strlen("import-marks "));
+-			data->import_marks = strbuf_detach(&arg, NULL);
++			data->import_marks = xstrdup(capname + strlen("import-marks "));
+ 		} else if (starts_with(capname, "no-private-update")) {
+ 			data->no_private_update = 1;
+ 		} else if (mandatory) {
+@@ -307,7 +296,9 @@ static int set_helper_option(struct transport *transport,
+ 		quote_c_style(value, &buf, NULL, 0);
+ 	strbuf_addch(&buf, '\n');
+ 
+-	xchgline(data, &buf);
++	sendline(data, &buf);
++	if (recvline(data, &buf))
++		exit(128);
+ 
+ 	if (!strcmp(buf.buf, "ok"))
+ 		ret = 0;
+@@ -379,7 +370,8 @@ static int fetch_with_fetch(struct transport *transport,
+ 	sendline(data, &buf);
+ 
+ 	while (1) {
+-		recvline(data, &buf);
++		if (recvline(data, &buf))
++			exit(128);
+ 
+ 		if (starts_with(buf.buf, "lock ")) {
+ 			const char *name = buf.buf + 5;
+@@ -430,6 +422,8 @@ static int get_exporter(struct transport *transport,
+ 	struct helper_data *data = transport->data;
+ 	struct child_process *helper = get_helper(transport);
+ 	int argc = 0, i;
++	struct strbuf tmp = STRBUF_INIT;
++
+ 	memset(fastexport, 0, sizeof(*fastexport));
+ 
+ 	/* we need to duplicate helper->in because we want to use it after
+@@ -440,10 +434,14 @@ static int get_exporter(struct transport *transport,
+ 	fastexport->argv[argc++] = "--use-done-feature";
+ 	fastexport->argv[argc++] = data->signed_tags ?
+ 		"--signed-tags=verbatim" : "--signed-tags=warn-strip";
+-	if (data->export_marks)
+-		fastexport->argv[argc++] = data->export_marks;
+-	if (data->import_marks)
+-		fastexport->argv[argc++] = data->import_marks;
++	if (data->export_marks) {
++		strbuf_addf(&tmp, "--export-marks=%s.tmp", data->export_marks);
++		fastexport->argv[argc++] = strbuf_detach(&tmp, NULL);
++	}
++	if (data->import_marks) {
++		strbuf_addf(&tmp, "--import-marks=%s", data->import_marks);
++		fastexport->argv[argc++] = strbuf_detach(&tmp, NULL);
++	}
+ 
+ 	for (i = 0; i < revlist_args->nr; i++)
+ 		fastexport->argv[argc++] = revlist_args->items[i].string;
+@@ -563,7 +561,9 @@ static int process_connect_service(struct transport *transport,
+ 		goto exit;
+ 
+ 	sendline(data, &cmdbuf);
+-	recvline_fh(input, &cmdbuf, name);
++	if (recvline_fh(input, &cmdbuf, name))
++		exit(128);
++
+ 	if (!strcmp(cmdbuf.buf, "")) {
+ 		data->no_disconnect_req = 1;
+ 		if (debug)
+@@ -739,16 +739,22 @@ static int push_update_ref_status(struct strbuf *buf,
+ 	return !(status == REF_STATUS_OK);
+ }
+ 
+-static void push_update_refs_status(struct helper_data *data,
++static int push_update_refs_status(struct helper_data *data,
+ 				    struct ref *remote_refs,
+ 				    int flags)
+ {
+ 	struct strbuf buf = STRBUF_INIT;
+ 	struct ref *ref = remote_refs;
++	int ret = 0;
++
+ 	for (;;) {
+ 		char *private;
+ 
+-		recvline(data, &buf);
++		if (recvline(data, &buf)) {
++			ret = 1;
++			break;
++		}
++
+ 		if (!buf.len)
+ 			break;
+ 
+@@ -766,6 +772,7 @@ static void push_update_refs_status(struct helper_data *data,
+ 		free(private);
+ 	}
+ 	strbuf_release(&buf);
++	return ret;
+ }
+ 
+ static int push_refs_with_push(struct transport *transport,
+@@ -846,8 +853,7 @@ static int push_refs_with_push(struct transport *transport,
+ 	sendline(data, &buf);
+ 	strbuf_release(&buf);
+ 
+-	push_update_refs_status(data, remote_refs, flags);
+-	return 0;
++	return push_update_refs_status(data, remote_refs, flags);
+ }
+ 
+ static int push_refs_with_export(struct transport *transport,
+@@ -905,7 +911,15 @@ static int push_refs_with_export(struct transport *transport,
+ 
+ 	if (finish_command(&exporter))
+ 		die("Error while running fast-export");
+-	push_update_refs_status(data, remote_refs, flags);
++	if (push_update_refs_status(data, remote_refs, flags))
++		return 1;
++
++	if (data->export_marks) {
++		strbuf_addf(&buf, "%s.tmp", data->export_marks);
++		rename(buf.buf, data->export_marks);
++		strbuf_release(&buf);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -974,7 +988,8 @@ static struct ref *get_refs_list(struct transport *transport, int for_push)
+ 
+ 	while (1) {
+ 		char *eov, *eon;
+-		recvline(data, &buf);
++		if (recvline(data, &buf))
++			exit(128);
+ 
+ 		if (!*buf.buf)
+ 			break;

@@ -1,0 +1,1670 @@
+@@ -13,6 +13,7 @@ SYNOPSIS
+ 'git remote add' [-t <branch>] [-m <master>] [-f] [--mirror] <name> <url>
+ 'git remote rename' <old> <new>
+ 'git remote rm' <name>
++'git remote set-head' <name> [-a | -d | <branch>]
+ 'git remote show' [-n] <name>
+ 'git remote prune' [-n | --dry-run] <name>
+ 'git remote update' [group]
+@@ -53,8 +54,7 @@ is created.  You can give more than one `-t <branch>` to track
+ multiple branches without grabbing all branches.
+ +
+ With `-m <master>` option, `$GIT_DIR/remotes/<name>/HEAD` is set
+-up to point at remote's `<master>` branch instead of whatever
+-branch the `HEAD` at the remote repository actually points at.
++up to point at remote's `<master>` branch. See also the set-head command.
+ +
+ In mirror mode, enabled with `\--mirror`, the refs will not be stored
+ in the 'refs/remotes/' namespace, but in 'refs/heads/'.  This option
+@@ -76,6 +76,30 @@ the configuration file format.
+ Remove the remote named <name>. All remote tracking branches and
+ configuration settings for the remote are removed.
+ 
++'set-head'::
++
++Sets or deletes the default branch (`$GIT_DIR/remotes/<name>/HEAD`) for
++the named remote. Having a default branch for a remote is not required,
++but allows the name of the remote to be specified in lieu of a specific
++branch. For example, if the default branch for `origin` is set to
++`master`, then `origin` may be specified wherever you would normally
++specify `origin/master`.
+++
++With `-d`, `$GIT_DIR/remotes/<name>/HEAD` is deleted.
+++
++With `-a`, the remote is queried to determine its `HEAD`, then
++`$GIT_DIR/remotes/<name>/HEAD` is set to the same branch. e.g., if the remote
++`HEAD` is pointed at `next`, "`git remote set-head origin -a`" will set
++`$GIT_DIR/refs/remotes/origin/HEAD` to `refs/remotes/origin/next`. This will
++only work if `refs/remotes/origin/next` already exists; if not it must be
++fetched first.
+++
++Use `<branch>` to set `$GIT_DIR/remotes/<name>/HEAD` explicitly. e.g., "git
++remote set-head origin master" will set `$GIT_DIR/refs/remotes/origin/HEAD` to
++`refs/remotes/origin/master`. This will only work if
++`refs/remotes/origin/master` already exists; if not it must be fetched first.
+++
++
+ 'show'::
+ 
+ Gives some information about the remote <name>.
+@@ -1363,6 +1363,7 @@ GIT-CFLAGS: .FORCE-GIT-CFLAGS
+ GIT-BUILD-OPTIONS: .FORCE-GIT-BUILD-OPTIONS
+ 	@echo SHELL_PATH=\''$(subst ','\'',$(SHELL_PATH_SQ))'\' >$@
+ 	@echo TAR=\''$(subst ','\'',$(subst ','\'',$(TAR)))'\' >>$@
++	@echo NO_CURL=\''$(subst ','\'',$(subst ','\'',$(NO_CURL)))'\' >>$@
+ 
+ ### Detect Tck/Tk interpreter path changes
+ ifndef NO_TCLTK
+@@ -20,6 +20,7 @@
+ #include "dir.h"
+ #include "pack-refs.h"
+ #include "sigchain.h"
++#include "remote.h"
+ 
+ /*
+  * Overall FIXMEs:
+@@ -293,43 +294,6 @@ static void remove_junk_on_signal(int signo)
+ 	raise(signo);
+ }
+ 
+-static const struct ref *locate_head(const struct ref *refs,
+-				     const struct ref *mapped_refs,
+-				     const struct ref **remote_head_p)
+-{
+-	const struct ref *remote_head = NULL;
+-	const struct ref *remote_master = NULL;
+-	const struct ref *r;
+-	for (r = refs; r; r = r->next)
+-		if (!strcmp(r->name, "HEAD"))
+-			remote_head = r;
+-
+-	for (r = mapped_refs; r; r = r->next)
+-		if (!strcmp(r->name, "refs/heads/master"))
+-			remote_master = r;
+-
+-	if (remote_head_p)
+-		*remote_head_p = remote_head;
+-
+-	/* If there's no HEAD value at all, never mind. */
+-	if (!remote_head)
+-		return NULL;
+-
+-	/* If refs/heads/master could be right, it is. */
+-	if (remote_master && !hashcmp(remote_master->old_sha1,
+-				      remote_head->old_sha1))
+-		return remote_master;
+-
+-	/* Look for another ref that points there */
+-	for (r = mapped_refs; r; r = r->next)
+-		if (r != remote_head &&
+-		    !hashcmp(r->old_sha1, remote_head->old_sha1))
+-			return r;
+-
+-	/* Nothing is the same */
+-	return NULL;
+-}
+-
+ static struct ref *write_remote_refs(const struct ref *refs,
+ 		struct refspec *refspec, const char *reflog)
+ {
+@@ -546,7 +510,8 @@ int cmd_clone(int argc, const char **argv, const char *prefix)
+ 
+ 		mapped_refs = write_remote_refs(refs, refspec, reflog_msg.buf);
+ 
+-		head_points_at = locate_head(refs, mapped_refs, &remote_head);
++		remote_head = find_ref_by_name(refs, "HEAD");
++		head_points_at = guess_remote_head(remote_head, mapped_refs, 0);
+ 	}
+ 	else {
+ 		warning("You appear to have cloned an empty repository.");
+@@ -12,12 +12,17 @@ static const char * const builtin_remote_usage[] = {
+ 	"git remote add [-t <branch>] [-m <master>] [-f] [--mirror] <name> <url>",
+ 	"git remote rename <old> <new>",
+ 	"git remote rm <name>",
++	"git remote set-head <name> [-a | -d | <branch>]",
+ 	"git remote show [-n] <name>",
+ 	"git remote prune [-n | --dry-run] <name>",
+ 	"git remote [-v | --verbose] update [group]",
+ 	NULL
+ };
+ 
++#define GET_REF_STATES (1<<0)
++#define GET_HEAD_NAMES (1<<1)
++#define GET_PUSH_REF_STATES (1<<2)
++
+ static int verbose;
+ 
+ static int show_all(void);
+@@ -143,8 +148,9 @@ static int add(int argc, const char **argv)
+ }
+ 
+ struct branch_info {
+-	char *remote;
++	char *remote_name;
+ 	struct string_list merge;
++	int rebase;
+ };
+ 
+ static struct string_list branch_list;
+@@ -161,10 +167,11 @@ static const char *abbrev_ref(const char *name, const char *prefix)
+ static int config_read_branches(const char *key, const char *value, void *cb)
+ {
+ 	if (!prefixcmp(key, "branch.")) {
++		const char *orig_key = key;
+ 		char *name;
+ 		struct string_list_item *item;
+ 		struct branch_info *info;
+-		enum { REMOTE, MERGE } type;
++		enum { REMOTE, MERGE, REBASE } type;
+ 
+ 		key += 7;
+ 		if (!postfixcmp(key, ".remote")) {
+@@ -173,6 +180,9 @@ static int config_read_branches(const char *key, const char *value, void *cb)
+ 		} else if (!postfixcmp(key, ".merge")) {
+ 			name = xstrndup(key, strlen(key) - 6);
+ 			type = MERGE;
++		} else if (!postfixcmp(key, ".rebase")) {
++			name = xstrndup(key, strlen(key) - 7);
++			type = REBASE;
+ 		} else
+ 			return 0;
+ 
+@@ -182,10 +192,10 @@ static int config_read_branches(const char *key, const char *value, void *cb)
+ 			item->util = xcalloc(sizeof(struct branch_info), 1);
+ 		info = item->util;
+ 		if (type == REMOTE) {
+-			if (info->remote)
+-				warning("more than one branch.%s", key);
+-			info->remote = xstrdup(value);
+-		} else {
++			if (info->remote_name)
++				warning("more than one %s", orig_key);
++			info->remote_name = xstrdup(value);
++		} else if (type == MERGE) {
+ 			char *space = strchr(value, ' ');
+ 			value = abbrev_branch(value);
+ 			while (space) {
+@@ -196,7 +206,8 @@ static int config_read_branches(const char *key, const char *value, void *cb)
+ 				space = strchr(value, ' ');
+ 			}
+ 			string_list_append(xstrdup(value), &info->merge);
+-		}
++		} else
++			info->rebase = git_config_bool(orig_key, value);
+ 	}
+ 	return 0;
+ }
+@@ -206,12 +217,12 @@ static void read_branches(void)
+ 	if (branch_list.nr)
+ 		return;
+ 	git_config(config_read_branches, NULL);
+-	sort_string_list(&branch_list);
+ }
+ 
+ struct ref_states {
+ 	struct remote *remote;
+-	struct string_list new, stale, tracked;
++	struct string_list new, stale, tracked, heads, push;
++	int queried;
+ };
+ 
+ static int handle_one_branch(const char *refname,
+@@ -227,50 +238,163 @@ static int handle_one_branch(const char *refname,
+ 		const char *name = abbrev_branch(refspec.src);
+ 		/* symbolic refs pointing nowhere were handled already */
+ 		if ((flags & REF_ISSYMREF) ||
+-				unsorted_string_list_has_string(&states->tracked,
+-					name) ||
+-				unsorted_string_list_has_string(&states->new,
+-					name))
++		    string_list_has_string(&states->tracked, name) ||
++		    string_list_has_string(&states->new, name))
+ 			return 0;
+ 		item = string_list_append(name, &states->stale);
+ 		item->util = xstrdup(refname);
+ 	}
+ 	return 0;
+ }
+ 
+-static int get_ref_states(const struct ref *ref, struct ref_states *states)
++static int get_ref_states(const struct ref *remote_refs, struct ref_states *states)
+ {
+ 	struct ref *fetch_map = NULL, **tail = &fetch_map;
++	struct ref *ref;
+ 	int i;
+ 
+ 	for (i = 0; i < states->remote->fetch_refspec_nr; i++)
+-		if (get_fetch_map(ref, states->remote->fetch + i, &tail, 1))
++		if (get_fetch_map(remote_refs, states->remote->fetch + i, &tail, 1))
+ 			die("Could not get fetch map for refspec %s",
+ 				states->remote->fetch_refspec[i]);
+ 
+ 	states->new.strdup_strings = states->tracked.strdup_strings = 1;
+ 	for (ref = fetch_map; ref; ref = ref->next) {
+-		struct string_list *target = &states->tracked;
+ 		unsigned char sha1[20];
+-		void *util = NULL;
+-
+ 		if (!ref->peer_ref || read_ref(ref->peer_ref->name, sha1))
+-			target = &states->new;
+-		else {
+-			target = &states->tracked;
+-			if (hashcmp(sha1, ref->new_sha1))
+-				util = &states;
+-		}
+-		string_list_append(abbrev_branch(ref->name), target)->util = util;
++			string_list_append(abbrev_branch(ref->name), &states->new);
++		else
++			string_list_append(abbrev_branch(ref->name), &states->tracked);
+ 	}
+ 	free_refs(fetch_map);
+ 
++	sort_string_list(&states->new);
++	sort_string_list(&states->tracked);
+ 	for_each_ref(handle_one_branch, states);
+ 	sort_string_list(&states->stale);
+ 
+ 	return 0;
+ }
+ 
++struct push_info {
++	char *dest;
++	int forced;
++	enum {
++		PUSH_STATUS_CREATE = 0,
++		PUSH_STATUS_DELETE,
++		PUSH_STATUS_UPTODATE,
++		PUSH_STATUS_FASTFORWARD,
++		PUSH_STATUS_OUTOFDATE,
++		PUSH_STATUS_NOTQUERIED,
++	} status;
++};
++
++static int get_push_ref_states(const struct ref *remote_refs,
++	struct ref_states *states)
++{
++	struct remote *remote = states->remote;
++	struct ref *ref, *local_refs, *push_map, **push_tail;
++	if (remote->mirror)
++		return 0;
++
++	local_refs = get_local_heads();
++	ref = push_map = copy_ref_list(remote_refs);
++	while (ref->next)
++		ref = ref->next;
++	push_tail = &ref->next;
++
++	match_refs(local_refs, push_map, &push_tail, remote->push_refspec_nr,
++		   remote->push_refspec, MATCH_REFS_NONE);
++
++	states->push.strdup_strings = 1;
++	for (ref = push_map; ref; ref = ref->next) {
++		struct string_list_item *item;
++		struct push_info *info;
++
++		if (!ref->peer_ref)
++			continue;
++		hashcpy(ref->new_sha1, ref->peer_ref->new_sha1);
++
++		item = string_list_append(abbrev_branch(ref->peer_ref->name),
++					  &states->push);
++		item->util = xcalloc(sizeof(struct push_info), 1);
++		info = item->util;
++		info->forced = ref->force;
++		info->dest = xstrdup(abbrev_branch(ref->name));
++
++		if (is_null_sha1(ref->new_sha1)) {
++			info->status = PUSH_STATUS_DELETE;
++		} else if (!hashcmp(ref->old_sha1, ref->new_sha1))
++			info->status = PUSH_STATUS_UPTODATE;
++		else if (is_null_sha1(ref->old_sha1))
++			info->status = PUSH_STATUS_CREATE;
++		else if (has_sha1_file(ref->old_sha1) &&
++			 ref_newer(ref->new_sha1, ref->old_sha1))
++			info->status = PUSH_STATUS_FASTFORWARD;
++		else
++			info->status = PUSH_STATUS_OUTOFDATE;
++	}
++	free_refs(local_refs);
++	free_refs(push_map);
++	return 0;
++}
++
++static int get_push_ref_states_noquery(struct ref_states *states)
++{
++	int i;
++	struct remote *remote = states->remote;
++	struct string_list_item *item;
++	struct push_info *info;
++
++	if (remote->mirror)
++		return 0;
++
++	states->push.strdup_strings = 1;
++	if (!remote->push_refspec_nr) {
++		item = string_list_append("(matching)", &states->push);
++		info = item->util = xcalloc(sizeof(struct push_info), 1);
++		info->status = PUSH_STATUS_NOTQUERIED;
++		info->dest = xstrdup(item->string);
++	}
++	for (i = 0; i < remote->push_refspec_nr; i++) {
++		struct refspec *spec = remote->push + i;
++		if (spec->matching)
++			item = string_list_append("(matching)", &states->push);
++		else if (strlen(spec->src))
++			item = string_list_append(spec->src, &states->push);
++		else
++			item = string_list_append("(delete)", &states->push);
++
++		info = item->util = xcalloc(sizeof(struct push_info), 1);
++		info->forced = spec->force;
++		info->status = PUSH_STATUS_NOTQUERIED;
++		info->dest = xstrdup(spec->dst ? spec->dst : item->string);
++	}
++	return 0;
++}
++
++static int get_head_names(const struct ref *remote_refs, struct ref_states *states)
++{
++	struct ref *ref, *matches;
++	struct ref *fetch_map = NULL, **fetch_map_tail = &fetch_map;
++	struct refspec refspec;
++
++	refspec.force = 0;
++	refspec.pattern = 1;
++	refspec.src = refspec.dst = "refs/heads/*";
++	states->heads.strdup_strings = 1;
++	get_fetch_map(remote_refs, &refspec, &fetch_map_tail, 0);
++	matches = guess_remote_head(find_ref_by_name(remote_refs, "HEAD"),
++				    fetch_map, 1);
++	for(ref = matches; ref; ref = ref->next)
++		string_list_append(abbrev_branch(ref->name), &states->heads);
++
++	free_refs(fetch_map);
++	free_refs(matches);
++
++	return 0;
++}
++
+ struct known_remote {
+ 	struct known_remote *next;
+ 	struct remote *remote;
+@@ -466,7 +590,7 @@ static int mv(int argc, const char **argv)
+ 	for (i = 0; i < branch_list.nr; i++) {
+ 		struct string_list_item *item = branch_list.items + i;
+ 		struct branch_info *info = item->util;
+-		if (info->remote && !strcmp(info->remote, rename.old)) {
++		if (info->remote_name && !strcmp(info->remote_name, rename.old)) {
+ 			strbuf_reset(&buf);
+ 			strbuf_addf(&buf, "branch.%s.remote", item->string);
+ 			if (git_config_set(buf.buf, rename.new)) {
+@@ -576,7 +700,7 @@ static int rm(int argc, const char **argv)
+ 	for (i = 0; i < branch_list.nr; i++) {
+ 		struct string_list_item *item = branch_list.items + i;
+ 		struct branch_info *info = item->util;
+-		if (info->remote && !strcmp(info->remote, remote->name)) {
++		if (info->remote_name && !strcmp(info->remote_name, remote->name)) {
+ 			const char *keys[] = { "remote", "merge", NULL }, **k;
+ 			for (k = keys; *k; k++) {
+ 				strbuf_reset(&buf);
+@@ -618,26 +742,45 @@ static int rm(int argc, const char **argv)
+ 	return result;
+ }
+ 
+-static void show_list(const char *title, struct string_list *list,
+-		      const char *extra_arg)
++void clear_push_info(void *util, const char *string)
+ {
+-	int i;
++	struct push_info *info = util;
++	free(info->dest);
++	free(info);
++}
+ 
+-	if (!list->nr)
+-		return;
++static void free_remote_ref_states(struct ref_states *states)
++{
++	string_list_clear(&states->new, 0);
++	string_list_clear(&states->stale, 0);
++	string_list_clear(&states->tracked, 0);
++	string_list_clear(&states->heads, 0);
++	string_list_clear_func(&states->push, clear_push_info);
++}
+ 
+-	printf(title, list->nr > 1 ? "es" : "", extra_arg);
+-	printf("\n");
+-	for (i = 0; i < list->nr; i++)
+-		printf("    %s\n", list->items[i].string);
++static int append_ref_to_tracked_list(const char *refname,
++	const unsigned char *sha1, int flags, void *cb_data)
++{
++	struct ref_states *states = cb_data;
++	struct refspec refspec;
++
++	if (flags & REF_ISSYMREF)
++		return 0;
++
++	memset(&refspec, 0, sizeof(refspec));
++	refspec.dst = (char *)refname;
++	if (!remote_find_tracking(states->remote, &refspec))
++		string_list_append(abbrev_branch(refspec.src), &states->tracked);
++
++	return 0;
+ }
+ 
+ static int get_remote_ref_states(const char *name,
+ 				 struct ref_states *states,
+ 				 int query)
+ {
+ 	struct transport *transport;
+-	const struct ref *ref;
++	const struct ref *remote_refs;
+ 
+ 	states->remote = remote_get(name);
+ 	if (!states->remote)
+@@ -648,102 +791,318 @@ static int get_remote_ref_states(const char *name,
+ 	if (query) {
+ 		transport = transport_get(NULL, states->remote->url_nr > 0 ?
+ 			states->remote->url[0] : NULL);
+-		ref = transport_get_remote_refs(transport);
++		remote_refs = transport_get_remote_refs(transport);
+ 		transport_disconnect(transport);
+ 
+-		get_ref_states(ref, states);
++		states->queried = 1;
++		if (query & GET_REF_STATES)
++			get_ref_states(remote_refs, states);
++		if (query & GET_HEAD_NAMES)
++			get_head_names(remote_refs, states);
++		if (query & GET_PUSH_REF_STATES)
++			get_push_ref_states(remote_refs, states);
++	} else {
++		for_each_ref(append_ref_to_tracked_list, states);
++		sort_string_list(&states->tracked);
++		get_push_ref_states_noquery(states);
+ 	}
+ 
+ 	return 0;
+ }
+ 
+-static int append_ref_to_tracked_list(const char *refname,
+-	const unsigned char *sha1, int flags, void *cb_data)
++struct show_info {
++	struct string_list *list;
++	struct ref_states *states;
++	int width, width2;
++	int any_rebase;
++};
++
++int add_remote_to_show_info(struct string_list_item *item, void *cb_data)
+ {
+-	struct ref_states *states = cb_data;
+-	struct refspec refspec;
++	struct show_info *info = cb_data;
++	int n = strlen(item->string);
++	if (n > info->width)
++		info->width = n;
++	string_list_insert(item->string, info->list);
++	return 0;
++}
+ 
+-	memset(&refspec, 0, sizeof(refspec));
+-	refspec.dst = (char *)refname;
+-	if (!remote_find_tracking(states->remote, &refspec))
+-		string_list_append(abbrev_branch(refspec.src), &states->tracked);
++int show_remote_info_item(struct string_list_item *item, void *cb_data)
++{
++	struct show_info *info = cb_data;
++	struct ref_states *states = info->states;
++	const char *name = item->string;
++
++	if (states->queried) {
++		const char *fmt = "%s";
++		const char *arg = "";
++		if (string_list_has_string(&states->new, name)) {
++			fmt = " new (next fetch will store in remotes/%s)";
++			arg = states->remote->name;
++		} else if (string_list_has_string(&states->tracked, name))
++			arg = " tracked";
++		else if (string_list_has_string(&states->stale, name))
++			arg = " stale (use 'git remote prune' to remove)";
++		else
++			arg = " ???";
++		printf("    %-*s", info->width, name);
++		printf(fmt, arg);
++		printf("\n");
++	} else
++		printf("    %s\n", name);
++
++	return 0;
++}
++
++int add_local_to_show_info(struct string_list_item *branch_item, void *cb_data)
++{
++	struct show_info *show_info = cb_data;
++	struct ref_states *states = show_info->states;
++	struct branch_info *branch_info = branch_item->util;
++	struct string_list_item *item;
++	int n;
++
++	if (!branch_info->merge.nr || !branch_info->remote_name ||
++	    strcmp(states->remote->name, branch_info->remote_name))
++		return 0;
++	if ((n = strlen(branch_item->string)) > show_info->width)
++		show_info->width = n;
++	if (branch_info->rebase)
++		show_info->any_rebase = 1;
++
++	item = string_list_insert(branch_item->string, show_info->list);
++	item->util = branch_info;
++
++	return 0;
++}
++
++int show_local_info_item(struct string_list_item *item, void *cb_data)
++{
++	struct show_info *show_info = cb_data;
++	struct branch_info *branch_info = item->util;
++	struct string_list *merge = &branch_info->merge;
++	const char *also;
++	int i;
++
++	if (branch_info->rebase && branch_info->merge.nr > 1) {
++		error("invalid branch.%s.merge; cannot rebase onto > 1 branch",
++			item->string);
++		return 0;
++	}
++
++	printf("    %-*s ", show_info->width, item->string);
++	if (branch_info->rebase) {
++		printf("rebases onto remote %s\n", merge->items[0].string);
++		return 0;
++	} else if (show_info->any_rebase) {
++		printf(" merges with remote %s\n", merge->items[0].string);
++		also = "    and with remote";
++	} else {
++		printf("merges with remote %s\n", merge->items[0].string);
++		also = "   and with remote";
++	}
++	for (i = 1; i < merge->nr; i++)
++		printf("    %-*s %s %s\n", show_info->width, "", also,
++		       merge->items[i].string);
++
++	return 0;
++}
+ 
++int add_push_to_show_info(struct string_list_item *push_item, void *cb_data)
++{
++	struct show_info *show_info = cb_data;
++	struct push_info *push_info = push_item->util;
++	struct string_list_item *item;
++	int n;
++	if ((n = strlen(push_item->string)) > show_info->width)
++		show_info->width = n;
++	if ((n = strlen(push_info->dest)) > show_info->width2)
++		show_info->width2 = n;
++	item = string_list_append(push_item->string, show_info->list);
++	item->util = push_item->util;
++	return 0;
++}
++
++int show_push_info_item(struct string_list_item *item, void *cb_data)
++{
++	struct show_info *show_info = cb_data;
++	struct push_info *push_info = item->util;
++	char *src = item->string, *status = NULL;
++
++	switch (push_info->status) {
++	case PUSH_STATUS_CREATE:
++		status = "create";
++		break;
++	case PUSH_STATUS_DELETE:
++		status = "delete";
++		src = "(none)";
++		break;
++	case PUSH_STATUS_UPTODATE:
++		status = "up to date";
++		break;
++	case PUSH_STATUS_FASTFORWARD:
++		status = "fast forwardable";
++		break;
++	case PUSH_STATUS_OUTOFDATE:
++		status = "local out of date";
++		break;
++	case PUSH_STATUS_NOTQUERIED:
++		break;
++	}
++	if (status)
++		printf("    %-*s %s to %-*s (%s)\n", show_info->width, src,
++			push_info->forced ? "forces" : "pushes",
++			show_info->width2, push_info->dest, status);
++	else
++		printf("    %-*s %s to %s\n", show_info->width, src,
++			push_info->forced ? "forces" : "pushes",
++			push_info->dest);
+ 	return 0;
+ }
+ 
+ static int show(int argc, const char **argv)
+ {
+-	int no_query = 0, result = 0;
++	int no_query = 0, result = 0, query_flag = 0;
+ 	struct option options[] = {
+ 		OPT_GROUP("show specific options"),
+ 		OPT_BOOLEAN('n', NULL, &no_query, "do not query remotes"),
+ 		OPT_END()
+ 	};
+ 	struct ref_states states;
++	struct string_list info_list = { NULL, 0, 0, 0 };
++	struct show_info info;
+ 
+ 	argc = parse_options(argc, argv, options, builtin_remote_usage, 0);
+ 
+ 	if (argc < 1)
+ 		return show_all();
+ 
++	if (!no_query)
++		query_flag = (GET_REF_STATES | GET_HEAD_NAMES | GET_PUSH_REF_STATES);
++
+ 	memset(&states, 0, sizeof(states));
++	memset(&info, 0, sizeof(info));
++	info.states = &states;
++	info.list = &info_list;
+ 	for (; argc; argc--, argv++) {
+ 		int i;
+ 
+-		get_remote_ref_states(*argv, &states, !no_query);
++		get_remote_ref_states(*argv, &states, query_flag);
+ 
+ 		printf("* remote %s\n  URL: %s\n", *argv,
+ 			states.remote->url_nr > 0 ?
+ 				states.remote->url[0] : "(no URL)");
+-
+-		for (i = 0; i < branch_list.nr; i++) {
+-			struct string_list_item *branch = branch_list.items + i;
+-			struct branch_info *info = branch->util;
+-			int j;
+-
+-			if (!info->merge.nr || strcmp(*argv, info->remote))
+-				continue;
+-			printf("  Remote branch%s merged with 'git pull' "
+-				"while on branch %s\n   ",
+-				info->merge.nr > 1 ? "es" : "",
+-				branch->string);
+-			for (j = 0; j < info->merge.nr; j++)
+-				printf(" %s", info->merge.items[j].string);
+-			printf("\n");
++		if (no_query)
++			printf("  HEAD branch: (not queried)\n");
++		else if (!states.heads.nr)
++			printf("  HEAD branch: (unknown)\n");
++		else if (states.heads.nr == 1)
++			printf("  HEAD branch: %s\n", states.heads.items[0].string);
++		else {
++			printf("  HEAD branch (remote HEAD is ambiguous,"
++			       " may be one of the following):\n");
++			for (i = 0; i < states.heads.nr; i++)
++				printf("    %s\n", states.heads.items[i].string);
+ 		}
+ 
+-		if (!no_query) {
+-			show_list("  New remote branch%s (next fetch "
+-				"will store in remotes/%s)",
+-				&states.new, states.remote->name);
+-			show_list("  Stale tracking branch%s (use 'git remote "
+-				"prune')", &states.stale, "");
+-		}
++		/* remote branch info */
++		info.width = 0;
++		for_each_string_list(add_remote_to_show_info, &states.new, &info);
++		for_each_string_list(add_remote_to_show_info, &states.tracked, &info);
++		for_each_string_list(add_remote_to_show_info, &states.stale, &info);
++		if (info.list->nr)
++			printf("  Remote branch%s:%s\n",
++			       info.list->nr > 1 ? "es" : "",
++				no_query ? " (status not queried)" : "");
++		for_each_string_list(show_remote_info_item, info.list, &info);
++		string_list_clear(info.list, 0);
++
++		/* git pull info */
++		info.width = 0;
++		info.any_rebase = 0;
++		for_each_string_list(add_local_to_show_info, &branch_list, &info);
++		if (info.list->nr)
++			printf("  Local branch%s configured for 'git pull':\n",
++			       info.list->nr > 1 ? "es" : "");
++		for_each_string_list(show_local_info_item, info.list, &info);
++		string_list_clear(info.list, 0);
++
++		/* git push info */
++		if (states.remote->mirror)
++			printf("  Local refs will be mirrored by 'git push'\n");
++
++		info.width = info.width2 = 0;
++		for_each_string_list(add_push_to_show_info, &states.push, &info);
++		sort_string_list(info.list);
++		if (info.list->nr)
++			printf("  Local ref%s configured for 'git push'%s:\n",
++				info.list->nr > 1 ? "s" : "",
++				no_query ? " (status not queried)" : "");
++		for_each_string_list(show_push_info_item, info.list, &info);
++		string_list_clear(info.list, 0);
++
++		free_remote_ref_states(&states);
++	}
+ 
+-		if (no_query)
+-			for_each_ref(append_ref_to_tracked_list, &states);
+-		show_list("  Tracked remote branch%s", &states.tracked, "");
+-
+-		if (states.remote->push_refspec_nr) {
+-			printf("  Local branch%s pushed with 'git push'\n",
+-				states.remote->push_refspec_nr > 1 ?
+-					"es" : "");
+-			for (i = 0; i < states.remote->push_refspec_nr; i++) {
+-				struct refspec *spec = states.remote->push + i;
+-				printf("    %s%s%s%s\n",
+-				       spec->force ? "+" : "",
+-				       abbrev_branch(spec->src),
+-				       spec->dst ? ":" : "",
+-				       spec->dst ? abbrev_branch(spec->dst) : "");
+-			}
+-		}
++	return result;
++}
+ 
+-		/* NEEDSWORK: free remote */
+-		string_list_clear(&states.new, 0);
+-		string_list_clear(&states.stale, 0);
+-		string_list_clear(&states.tracked, 0);
++static int set_head(int argc, const char **argv)
++{
++	int i, opt_a = 0, opt_d = 0, result = 0;
++	struct strbuf buf = STRBUF_INIT, buf2 = STRBUF_INIT;
++	char *head_name = NULL;
++
++	struct option options[] = {
++		OPT_GROUP("set-head specific options"),
++		OPT_BOOLEAN('a', "auto", &opt_a,
++			    "set refs/remotes/<name>/HEAD according to remote"),
++		OPT_BOOLEAN('d', "delete", &opt_d,
++			    "delete refs/remotes/<name>/HEAD"),
++		OPT_END()
++	};
++	argc = parse_options(argc, argv, options, builtin_remote_usage, 0);
++	if (argc)
++		strbuf_addf(&buf, "refs/remotes/%s/HEAD", argv[0]);
++
++	if (!opt_a && !opt_d && argc == 2) {
++		head_name = xstrdup(argv[1]);
++	} else if (opt_a && !opt_d && argc == 1) {
++		struct ref_states states;
++		memset(&states, 0, sizeof(states));
++		get_remote_ref_states(argv[0], &states, GET_HEAD_NAMES);
++		if (!states.heads.nr)
++			result |= error("Cannot determine remote HEAD");
++		else if (states.heads.nr > 1) {
++			result |= error("Multiple remote HEAD branches. "
++					"Please choose one explicitly with:");
++			for (i = 0; i < states.heads.nr; i++)
++				fprintf(stderr, "  git remote set-head %s %s\n",
++					argv[0], states.heads.items[i].string);
++		} else
++			head_name = xstrdup(states.heads.items[0].string);
++		free_remote_ref_states(&states);
++	} else if (opt_d && !opt_a && argc == 1) {
++		if (delete_ref(buf.buf, NULL, REF_NODEREF))
++			result |= error("Could not delete %s", buf.buf);
++	} else
++		usage_with_options(builtin_remote_usage, options);
++
++	if (head_name) {
++		unsigned char sha1[20];
++		strbuf_addf(&buf2, "refs/remotes/%s/%s", argv[0], head_name);
++		/* make sure it's valid */
++		if (!resolve_ref(buf2.buf, sha1, 1, NULL))
++			result |= error("Not a valid ref: %s", buf2.buf);
++		else if (create_symref(buf.buf, buf2.buf, "remote set-head"))
++			result |= error("Could not setup %s", buf.buf);
++		if (opt_a)
++			printf("%s/HEAD set to %s\n", argv[0], head_name);
++		free(head_name);
+ 	}
+ 
++	strbuf_release(&buf);
++	strbuf_release(&buf2);
+ 	return result;
+ }
+ 
+@@ -771,7 +1130,7 @@ static int prune(int argc, const char **argv)
+ 	for (; argc; argc--, argv++) {
+ 		int i;
+ 
+-		get_remote_ref_states(*argv, &states, 1);
++		get_remote_ref_states(*argv, &states, GET_REF_STATES);
+ 
+ 		if (states.stale.nr) {
+ 			printf("Pruning %s\n", *argv);
+@@ -792,10 +1151,7 @@ static int prune(int argc, const char **argv)
+ 			warn_dangling_symref(dangling_msg, refname);
+ 		}
+ 
+-		/* NEEDSWORK: free remote */
+-		string_list_clear(&states.new, 0);
+-		string_list_clear(&states.stale, 0);
+-		string_list_clear(&states.tracked, 0);
++		free_remote_ref_states(&states);
+ 	}
+ 
+ 	return result;
+@@ -920,6 +1276,8 @@ int cmd_remote(int argc, const char **argv, const char *prefix)
+ 		result = mv(argc, argv);
+ 	else if (!strcmp(argv[0], "rm"))
+ 		result = rm(argc, argv);
++	else if (!strcmp(argv[0], "set-head"))
++		result = set_head(argc, argv);
+ 	else if (!strcmp(argv[0], "show"))
+ 		result = show(argc, argv);
+ 	else if (!strcmp(argv[0], "prune"))
+@@ -1,6 +1,5 @@
+ #include "cache.h"
+ #include "commit.h"
+-#include "tag.h"
+ #include "refs.h"
+ #include "pkt-line.h"
+ #include "run-command.h"
+@@ -84,82 +83,8 @@ static int pack_objects(int fd, struct ref *refs, struct extra_have_objects *ext
+ 	return 0;
+ }
+ 
+-static void unmark_and_free(struct commit_list *list, unsigned int mark)
+-{
+-	while (list) {
+-		struct commit_list *temp = list;
+-		temp->item->object.flags &= ~mark;
+-		list = temp->next;
+-		free(temp);
+-	}
+-}
+-
+-static int ref_newer(const unsigned char *new_sha1,
+-		     const unsigned char *old_sha1)
+-{
+-	struct object *o;
+-	struct commit *old, *new;
+-	struct commit_list *list, *used;
+-	int found = 0;
+-
+-	/* Both new and old must be commit-ish and new is descendant of
+-	 * old.  Otherwise we require --force.
+-	 */
+-	o = deref_tag(parse_object(old_sha1), NULL, 0);
+-	if (!o || o->type != OBJ_COMMIT)
+-		return 0;
+-	old = (struct commit *) o;
+-
+-	o = deref_tag(parse_object(new_sha1), NULL, 0);
+-	if (!o || o->type != OBJ_COMMIT)
+-		return 0;
+-	new = (struct commit *) o;
+-
+-	if (parse_commit(new) < 0)
+-		return 0;
+-
+-	used = list = NULL;
+-	commit_list_insert(new, &list);
+-	while (list) {
+-		new = pop_most_recent_commit(&list, 1);
+-		commit_list_insert(new, &used);
+-		if (new == old) {
+-			found = 1;
+-			break;
+-		}
+-	}
+-	unmark_and_free(list, 1);
+-	unmark_and_free(used, 1);
+-	return found;
+-}
+-
+-static struct ref *local_refs, **local_tail;
+ static struct ref *remote_refs, **remote_tail;
+ 
+-static int one_local_ref(const char *refname, const unsigned char *sha1, int flag, void *cb_data)
+-{
+-	struct ref *ref;
+-	int len;
+-
+-	/* we already know it starts with refs/ to get here */
+-	if (check_ref_format(refname + 5))
+-		return 0;
+-
+-	len = strlen(refname) + 1;
+-	ref = xcalloc(1, sizeof(*ref) + len);
+-	hashcpy(ref->new_sha1, sha1);
+-	memcpy(ref->name, refname, len);
+-	*local_tail = ref;
+-	local_tail = &ref->next;
+-	return 0;
+-}
+-
+-static void get_local_heads(void)
+-{
+-	local_tail = &local_refs;
+-	for_each_ref(one_local_ref, NULL);
+-}
+-
+ static int receive_status(int in, struct ref *refs)
+ {
+ 	struct ref *hint;
+@@ -387,7 +312,7 @@ static int refs_pushed(struct ref *ref)
+ 
+ static int do_send_pack(int in, int out, struct remote *remote, const char *dest, int nr_refspec, const char **refspec)
+ {
+-	struct ref *ref;
++	struct ref *ref, *local_refs;
+ 	int new_refs;
+ 	int ask_for_status_report = 0;
+ 	int allow_deleting_refs = 0;
+@@ -405,7 +330,7 @@ static int do_send_pack(int in, int out, struct remote *remote, const char *dest
+ 	/* No funny business with the matcher */
+ 	remote_tail = get_remote_heads(in, &remote_refs, 0, NULL, REF_NORMAL,
+ 				       &extra_have);
+-	get_local_heads();
++	local_refs = get_local_heads();
+ 
+ 	/* Does the other end support the reporting? */
+ 	if (server_supports("report-status"))
+@@ -801,7 +801,7 @@ struct ref {
+ #define REF_HEADS	(1u << 1)
+ #define REF_TAGS	(1u << 2)
+ 
+-extern struct ref *find_ref_by_name(struct ref *list, const char *name);
++extern struct ref *find_ref_by_name(const struct ref *list, const char *name);
+ 
+ #define CONNECT_VERBOSE       (1u << 0)
+ extern struct child_process *git_connect(int fd[2], const char *url, const char *prog, int flags);
+@@ -1452,7 +1452,7 @@ _git_config ()
+ 
+ _git_remote ()
+ {
+-	local subcommands="add rename rm show prune update"
++	local subcommands="add rename rm show prune update set-head"
+ 	local subcommand="$(__git_find_subcommand "$subcommands")"
+ 	if [ -z "$subcommand" ]; then
+ 		__gitcomp "$subcommands"
+@@ -1792,21 +1792,8 @@ static int update_remote(unsigned char *sha1, struct remote_lock *lock)
+ 	return 1;
+ }
+ 
+-static struct ref *local_refs, **local_tail;
+ static struct ref *remote_refs, **remote_tail;
+ 
+-static int one_local_ref(const char *refname, const unsigned char *sha1, int flag, void *cb_data)
+-{
+-	struct ref *ref;
+-	int len = strlen(refname) + 1;
+-	ref = xcalloc(1, sizeof(*ref) + len);
+-	hashcpy(ref->new_sha1, sha1);
+-	memcpy(ref->name, refname, len);
+-	*local_tail = ref;
+-	local_tail = &ref->next;
+-	return 0;
+-}
+-
+ static void one_remote_ref(char *refname)
+ {
+ 	struct ref *ref;
+@@ -1839,12 +1826,6 @@ static void one_remote_ref(char *refname)
+ 	remote_tail = &ref->next;
+ }
+ 
+-static void get_local_heads(void)
+-{
+-	local_tail = &local_refs;
+-	for_each_ref(one_local_ref, NULL);
+-}
+-
+ static void get_dav_remote_heads(void)
+ {
+ 	remote_tail = &remote_refs;
+@@ -1862,55 +1843,6 @@ static int is_zero_sha1(const unsigned char *sha1)
+ 	return 1;
+ }
+ 
+-static void unmark_and_free(struct commit_list *list, unsigned int mark)
+-{
+-	while (list) {
+-		struct commit_list *temp = list;
+-		temp->item->object.flags &= ~mark;
+-		list = temp->next;
+-		free(temp);
+-	}
+-}
+-
+-static int ref_newer(const unsigned char *new_sha1,
+-		     const unsigned char *old_sha1)
+-{
+-	struct object *o;
+-	struct commit *old, *new;
+-	struct commit_list *list, *used;
+-	int found = 0;
+-
+-	/* Both new and old must be commit-ish and new is descendant of
+-	 * old.  Otherwise we require --force.
+-	 */
+-	o = deref_tag(parse_object(old_sha1), NULL, 0);
+-	if (!o || o->type != OBJ_COMMIT)
+-		return 0;
+-	old = (struct commit *) o;
+-
+-	o = deref_tag(parse_object(new_sha1), NULL, 0);
+-	if (!o || o->type != OBJ_COMMIT)
+-		return 0;
+-	new = (struct commit *) o;
+-
+-	if (parse_commit(new) < 0)
+-		return 0;
+-
+-	used = list = NULL;
+-	commit_list_insert(new, &list);
+-	while (list) {
+-		new = pop_most_recent_commit(&list, TMP_MARK);
+-		commit_list_insert(new, &used);
+-		if (new == old) {
+-			found = 1;
+-			break;
+-		}
+-	}
+-	unmark_and_free(list, TMP_MARK);
+-	unmark_and_free(used, TMP_MARK);
+-	return found;
+-}
+-
+ static void add_remote_info_ref(struct remote_ls_ctx *ls)
+ {
+ 	struct strbuf *buf = (struct strbuf *)ls->userData;
+@@ -2195,7 +2127,7 @@ int main(int argc, char **argv)
+ 	int rc = 0;
+ 	int i;
+ 	int new_refs;
+-	struct ref *ref;
++	struct ref *ref, *local_refs;
+ 	char *rewritten_url = NULL;
+ 
+ 	git_extract_argv0_path(argv[0]);
+@@ -2302,7 +2234,7 @@ int main(int argc, char **argv)
+ 		fetch_indices();
+ 
+ 	/* Get a list of all local and remote heads to validate refspecs */
+-	get_local_heads();
++	local_refs = get_local_heads();
+ 	fprintf(stderr, "Fetching remote heads...\n");
+ 	get_dav_remote_heads();
+ 
+@@ -1629,10 +1629,10 @@ int update_ref(const char *action, const char *refname,
+ 	return 0;
+ }
+ 
+-struct ref *find_ref_by_name(struct ref *list, const char *name)
++struct ref *find_ref_by_name(const struct ref *list, const char *name)
+ {
+ 	for ( ; list; list = list->next)
+ 		if (!strcmp(list->name, name))
+-			return list;
++			return (struct ref *)list;
+ 	return NULL;
+ }
+@@ -5,6 +5,7 @@
+ #include "diff.h"
+ #include "revision.h"
+ #include "dir.h"
++#include "tag.h"
+ 
+ static struct refspec s_tag_refspec = {
+ 	0,
+@@ -801,10 +802,18 @@ struct ref *alloc_ref(const char *name)
+ 
+ static struct ref *copy_ref(const struct ref *ref)
+ {
+-	struct ref *ret = xmalloc(sizeof(struct ref) + strlen(ref->name) + 1);
+-	memcpy(ret, ref, sizeof(struct ref) + strlen(ref->name) + 1);
+-	ret->next = NULL;
+-	return ret;
++	struct ref *cpy;
++	size_t len;
++	if (!ref)
++		return NULL;
++	len = strlen(ref->name);
++	cpy = xmalloc(sizeof(struct ref) + len + 1);
++	memcpy(cpy, ref, sizeof(struct ref) + len + 1);
++	cpy->next = NULL;
++	cpy->symref = ref->symref ? xstrdup(ref->symref) : NULL;
++	cpy->remote_status = ref->remote_status ? xstrdup(ref->remote_status) : NULL;
++	cpy->peer_ref = copy_ref(ref->peer_ref);
++	return cpy;
+ }
+ 
+ struct ref *copy_ref_list(const struct ref *ref)
+@@ -823,6 +832,7 @@ static void free_ref(struct ref *ref)
+ {
+ 	if (!ref)
+ 		return;
++	free_ref(ref->peer_ref);
+ 	free(ref->remote_status);
+ 	free(ref->symref);
+ 	free(ref);
+@@ -833,7 +843,6 @@ void free_refs(struct ref *ref)
+ 	struct ref *next;
+ 	while (ref) {
+ 		next = ref->next;
+-		free(ref->peer_ref);
+ 		free_ref(ref);
+ 		ref = next;
+ 	}
+@@ -950,6 +959,7 @@ static int match_explicit(struct ref *src, struct ref *dst,
+ 			  struct refspec *rs)
+ {
+ 	struct ref *matched_src, *matched_dst;
++	int copy_src;
+ 
+ 	const char *dst_value = rs->dst;
+ 	char *dst_guess;
+@@ -960,6 +970,7 @@ static int match_explicit(struct ref *src, struct ref *dst,
+ 	matched_src = matched_dst = NULL;
+ 	switch (count_refspec_match(rs->src, src, &matched_src)) {
+ 	case 1:
++		copy_src = 1;
+ 		break;
+ 	case 0:
+ 		/* The source could be in the get_sha1() format
+@@ -969,6 +980,7 @@ static int match_explicit(struct ref *src, struct ref *dst,
+ 		matched_src = try_explicit_object_name(rs->src);
+ 		if (!matched_src)
+ 			return error("src refspec %s does not match any.", rs->src);
++		copy_src = 0;
+ 		break;
+ 	default:
+ 		return error("src refspec %s matches more than one.", rs->src);
+@@ -1014,7 +1026,7 @@ static int match_explicit(struct ref *src, struct ref *dst,
+ 		return error("dst ref %s receives from more than one src.",
+ 		      matched_dst->name);
+ 	else {
+-		matched_dst->peer_ref = matched_src;
++		matched_dst->peer_ref = copy_src ? copy_ref(matched_src) : matched_src;
+ 		matched_dst->force = rs->force;
+ 	}
+ 	return 0;
+@@ -1064,15 +1076,15 @@ int match_refs(struct ref *src, struct ref *dst, struct ref ***dst_tail,
+ 	struct refspec *rs;
+ 	int send_all = flags & MATCH_REFS_ALL;
+ 	int send_mirror = flags & MATCH_REFS_MIRROR;
++	int errs;
+ 	static const char *default_refspec[] = { ":", 0 };
+ 
+ 	if (!nr_refspec) {
+ 		nr_refspec = 1;
+ 		refspec = default_refspec;
+ 	}
+ 	rs = parse_push_refspec(nr_refspec, (const char **) refspec);
+-	if (match_explicit_refs(src, dst, dst_tail, rs, nr_refspec))
+-		return -1;
++	errs = match_explicit_refs(src, dst, dst_tail, rs, nr_refspec);
+ 
+ 	/* pick the remainder */
+ 	for ( ; src; src = src->next) {
+@@ -1121,11 +1133,13 @@ int match_refs(struct ref *src, struct ref *dst, struct ref ***dst_tail,
+ 			dst_peer = make_linked_ref(dst_name, dst_tail);
+ 			hashcpy(dst_peer->new_sha1, src->new_sha1);
+ 		}
+-		dst_peer->peer_ref = src;
++		dst_peer->peer_ref = copy_ref(src);
+ 		dst_peer->force = pat->force;
+ 	free_name:
+ 		free(dst_name);
+ 	}
++	if (errs)
++		return -1;
+ 	return 0;
+ }
+ 
+@@ -1289,6 +1303,54 @@ int resolve_remote_symref(struct ref *ref, struct ref *list)
+ 	return 1;
+ }
+ 
++static void unmark_and_free(struct commit_list *list, unsigned int mark)
++{
++	while (list) {
++		struct commit_list *temp = list;
++		temp->item->object.flags &= ~mark;
++		list = temp->next;
++		free(temp);
++	}
++}
++
++int ref_newer(const unsigned char *new_sha1, const unsigned char *old_sha1)
++{
++	struct object *o;
++	struct commit *old, *new;
++	struct commit_list *list, *used;
++	int found = 0;
++
++	/* Both new and old must be commit-ish and new is descendant of
++	 * old.  Otherwise we require --force.
++	 */
++	o = deref_tag(parse_object(old_sha1), NULL, 0);
++	if (!o || o->type != OBJ_COMMIT)
++		return 0;
++	old = (struct commit *) o;
++
++	o = deref_tag(parse_object(new_sha1), NULL, 0);
++	if (!o || o->type != OBJ_COMMIT)
++		return 0;
++	new = (struct commit *) o;
++
++	if (parse_commit(new) < 0)
++		return 0;
++
++	used = list = NULL;
++	commit_list_insert(new, &list);
++	while (list) {
++		new = pop_most_recent_commit(&list, TMP_MARK);
++		commit_list_insert(new, &used);
++		if (new == old) {
++			found = 1;
++			break;
++		}
++	}
++	unmark_and_free(list, TMP_MARK);
++	unmark_and_free(used, TMP_MARK);
++	return found;
++}
++
+ /*
+  * Return true if there is anything to report, otherwise false.
+  */
+@@ -1396,3 +1458,68 @@ int format_tracking_info(struct branch *branch, struct strbuf *sb)
+ 			    base, num_ours, num_theirs);
+ 	return 1;
+ }
++
++static int one_local_ref(const char *refname, const unsigned char *sha1, int flag, void *cb_data)
++{
++	struct ref ***local_tail = cb_data;
++	struct ref *ref;
++	int len;
++
++	/* we already know it starts with refs/ to get here */
++	if (check_ref_format(refname + 5))
++		return 0;
++
++	len = strlen(refname) + 1;
++	ref = xcalloc(1, sizeof(*ref) + len);
++	hashcpy(ref->new_sha1, sha1);
++	memcpy(ref->name, refname, len);
++	**local_tail = ref;
++	*local_tail = &ref->next;
++	return 0;
++}
++
++struct ref *get_local_heads(void)
++{
++	struct ref *local_refs, **local_tail = &local_refs;
++	for_each_ref(one_local_ref, &local_tail);
++	return local_refs;
++}
++
++struct ref *guess_remote_head(const struct ref *head,
++			      const struct ref *refs,
++			      int all)
++{
++	const struct ref *r;
++	struct ref *list = NULL;
++	struct ref **tail = &list;
++
++	if (!head)
++		return NULL;
++
++	/*
++	 * Some transports support directly peeking at
++	 * where HEAD points; if that is the case, then
++	 * we don't have to guess.
++	 */
++	if (head->symref)
++		return copy_ref(find_ref_by_name(refs, head->symref));
++
++	/* If refs/heads/master could be right, it is. */
++	if (!all) {
++		r = find_ref_by_name(refs, "refs/heads/master");
++		if (r && !hashcmp(r->old_sha1, head->old_sha1))
++			return copy_ref(r);
++	}
++
++	/* Look for another ref that points there */
++	for (r = refs; r; r = r->next) {
++		if (r != head && !hashcmp(r->old_sha1, head->old_sha1)) {
++			*tail = copy_ref(r);
++			tail = &((*tail)->next);
++			if (!all)
++				break;
++		}
++	}
++
++	return list;
++}
+@@ -74,6 +74,7 @@ int check_ref_type(const struct ref *ref, int flags);
+ void free_refs(struct ref *ref);
+ 
+ int resolve_remote_symref(struct ref *ref, struct ref *list);
++int ref_newer(const unsigned char *new_sha1, const unsigned char *old_sha1);
+ 
+ /*
+  * Removes and frees any duplicate refs in the map.
+@@ -137,4 +138,15 @@ enum match_refs_flags {
+ int stat_tracking_info(struct branch *branch, int *num_ours, int *num_theirs);
+ int format_tracking_info(struct branch *branch, struct strbuf *sb);
+ 
++struct ref *get_local_heads(void);
++/*
++ * Find refs from a list which are likely to be pointed to by the given HEAD
++ * ref. If 'all' is false, returns the most likely ref; otherwise, returns a
++ * list of all candidate refs. If no match is found (or 'head' is NULL),
++ * returns NULL. All returns are newly allocated and should be freed.
++ */
++struct ref *guess_remote_head(const struct ref *head,
++			      const struct ref *refs,
++			      int all);
++
+ #endif
+@@ -92,6 +92,16 @@ struct string_list_item *string_list_lookup(const char *string, struct string_li
+ 	return list->items + i;
+ }
+ 
++int for_each_string_list(string_list_each_func_t fn,
++			 struct string_list *list, void *cb_data)
++{
++	int i, ret = 0;
++	for (i = 0; i < list->nr; i++)
++		if ((ret = fn(&list->items[i], cb_data)))
++			break;
++	return ret;
++}
++
+ void string_list_clear(struct string_list *list, int free_util)
+ {
+ 	if (list->items) {
+@@ -20,6 +20,11 @@ void string_list_clear(struct string_list *list, int free_util);
+ typedef void (*string_list_clear_func_t)(void *p, const char *str);
+ void string_list_clear_func(struct string_list *list, string_list_clear_func_t clearfunc);
+ 
++/* Use this function to iterate over each item */
++typedef int (*string_list_each_func_t)(struct string_list_item *, void *);
++int for_each_string_list(string_list_each_func_t,
++			 struct string_list *list, void *cb_data);
++
+ /* Use these functions only on sorted lists: */
+ int string_list_has_string(const struct string_list *list, const char *string);
+ int string_list_find_insert_index(const struct string_list *list, const char *string,
+@@ -94,13 +94,18 @@ prepare_httpd() {
+ }
+ 
+ start_httpd() {
+-	prepare_httpd
++	prepare_httpd >&3 2>&4
+ 
+ 	trap 'stop_httpd; die' EXIT
+ 
+ 	"$LIB_HTTPD_PATH" -d "$HTTPD_ROOT_PATH" \
+ 		-f "$TEST_PATH/apache.conf" $HTTPD_PARA \
+-		-c "Listen 127.0.0.1:$LIB_HTTPD_PORT" -k start
++		-c "Listen 127.0.0.1:$LIB_HTTPD_PORT" -k start \
++		>&3 2>&4
++	if ! test $? = 0; then
++		say "skipping test, web server setup failed"
++		test_done
++	fi
+ }
+ 
+ stop_httpd() {
+@@ -28,7 +28,7 @@ tokens_match () {
+ }
+ 
+ check_remote_track () {
+-	actual=$(git remote show "$1" | sed -e '1,/Tracked/d') &&
++	actual=$(git remote show "$1" | sed -ne 's|^    \(.*\) tracked$|\1|p')
+ 	shift &&
+ 	tokens_match "$*" "$actual"
+ }
+@@ -136,47 +136,73 @@ EOF
+ cat > test/expect << EOF
+ * remote origin
+   URL: $(pwd)/one
+-  Remote branch merged with 'git pull' while on branch master
++  HEAD branch: master
++  Remote branches:
++    master new (next fetch will store in remotes/origin)
++    side   tracked
++  Local branches configured for 'git pull':
++    ahead    merges with remote master
++    master   merges with remote master
++    octopus  merges with remote topic-a
++                and with remote topic-b
++                and with remote topic-c
++    rebase  rebases onto remote master
++  Local refs configured for 'git push':
++    master pushes to master   (local out of date)
++    master pushes to upstream (create)
++* remote two
++  URL: ../two
++  HEAD branch (remote HEAD is ambiguous, may be one of the following):
++    another
+     master
+-  New remote branch (next fetch will store in remotes/origin)
+-    master
+-  Tracked remote branches
+-    side
+-    master
+-  Local branches pushed with 'git push'
+-    master:upstream
+-    +refs/tags/lastbackup
++  Local refs configured for 'git push':
++    ahead  forces to master  (fast forwardable)
++    master pushes to another (up to date)
+ EOF
+ 
+ test_expect_success 'show' '
+ 	(cd test &&
+-	 git config --add remote.origin.fetch \
+-		refs/heads/master:refs/heads/upstream &&
++	 git config --add remote.origin.fetch refs/heads/master:refs/heads/upstream &&
+ 	 git fetch &&
++	 git checkout -b ahead origin/master &&
++	 echo 1 >> file &&
++	 test_tick &&
++	 git commit -m update file &&
++	 git checkout master &&
++	 git branch --track octopus origin/master &&
++	 git branch --track rebase origin/master &&
+ 	 git branch -d -r origin/master &&
++	 git config --add remote.two.url ../two &&
++	 git config branch.rebase.rebase true &&
++	 git config branch.octopus.merge "topic-a topic-b topic-c" &&
+ 	 (cd ../one &&
+ 	  echo 1 > file &&
+ 	  test_tick &&
+ 	  git commit -m update file) &&
+-	 git config remote.origin.push \
+-		refs/heads/master:refs/heads/upstream &&
+-	 git config --add remote.origin.push \
+-		+refs/tags/lastbackup &&
+-	 git remote show origin > output &&
++	 git config --add remote.origin.push : &&
++	 git config --add remote.origin.push refs/heads/master:refs/heads/upstream &&
++	 git config --add remote.origin.push +refs/tags/lastbackup &&
++	 git config --add remote.two.push +refs/heads/ahead:refs/heads/master &&
++	 git config --add remote.two.push refs/heads/master:refs/heads/another &&
++	 git remote show origin two > output &&
++	 git branch -d rebase octopus &&
+ 	 test_cmp expect output)
+ '
+ 
+ cat > test/expect << EOF
+ * remote origin
+   URL: $(pwd)/one
+-  Remote branch merged with 'git pull' while on branch master
+-    master
+-  Tracked remote branches
++  HEAD branch: (not queried)
++  Remote branches: (status not queried)
+     master
+     side
+-  Local branches pushed with 'git push'
+-    master:upstream
+-    +refs/tags/lastbackup
++  Local branches configured for 'git pull':
++    ahead  merges with remote master
++    master merges with remote master
++  Local refs configured for 'git push' (status not queried):
++    (matching)           pushes to (matching)
++    refs/heads/master    pushes to refs/heads/upstream
++    refs/tags/lastbackup forces to refs/tags/lastbackup
+ EOF
+ 
+ test_expect_success 'show -n' '
+@@ -197,6 +223,46 @@ test_expect_success 'prune' '
+ 	 test_must_fail git rev-parse refs/remotes/origin/side)
+ '
+ 
++test_expect_success 'set-head --delete' '
++	(cd test &&
++	 git symbolic-ref refs/remotes/origin/HEAD &&
++	 git remote set-head --delete origin &&
++	 test_must_fail git symbolic-ref refs/remotes/origin/HEAD)
++'
++
++test_expect_success 'set-head --auto' '
++	(cd test &&
++	 git remote set-head --auto origin &&
++	 echo refs/remotes/origin/master >expect &&
++	 git symbolic-ref refs/remotes/origin/HEAD >output &&
++	 test_cmp expect output
++	)
++'
++
++cat >test/expect <<EOF
++error: Multiple remote HEAD branches. Please choose one explicitly with:
++  git remote set-head two another
++  git remote set-head two master
++EOF
++
++test_expect_success 'set-head --auto fails w/multiple HEADs' '
++	(cd test &&
++	 test_must_fail git remote set-head --auto two >output 2>&1 &&
++	test_cmp expect output)
++'
++
++cat >test/expect <<EOF
++refs/remotes/origin/side2
++EOF
++
++test_expect_success 'set-head explicit' '
++	(cd test &&
++	 git remote set-head origin side2 &&
++	 git symbolic-ref refs/remotes/origin/HEAD >output &&
++	 git remote set-head origin master &&
++	 test_cmp expect output)
++'
++
+ cat > test/expect << EOF
+ Pruning origin
+ URL: $(pwd)/one
+@@ -343,7 +409,7 @@ test_expect_success '"remote show" does not show symbolic refs' '
+ 	git clone one three &&
+ 	(cd three &&
+ 	 git remote show origin > output &&
+-	 ! grep HEAD < output &&
++	 ! grep "^ *HEAD$" < output &&
+ 	 ! grep -i stale < output)
+ 
+ '
+@@ -11,6 +11,7 @@ This test runs various sanity checks on http-push.'
+ 
+ ROOT_PATH="$PWD"
+ LIB_HTTPD_DAV=t
++LIB_HTTPD_PORT=${LIB_HTTPD_PORT-'5540'}
+ 
+ if git http-push > /dev/null 2>&1 || [ $? -eq 128 ]
+ then
+@@ -20,13 +21,7 @@ then
+ fi
+ 
+ . "$TEST_DIRECTORY"/lib-httpd.sh
+-
+-if ! start_httpd >&3 2>&4
+-then
+-	say "skipping test, web server setup failed"
+-	test_done
+-	exit
+-fi
++start_httpd
+ 
+ test_expect_success 'setup remote repository' '
+ 	cd "$ROOT_PATH" &&
+@@ -0,0 +1,57 @@
++#!/bin/sh
++
++test_description='test fetching over http'
++. ./test-lib.sh
++
++if test -n "$NO_CURL"; then
++	say 'skipping test, git built without http support'
++	test_done
++fi
++
++. "$TEST_DIRECTORY"/lib-httpd.sh
++LIB_HTTPD_PORT=${LIB_HTTPD_PORT-'5550'}
++start_httpd
++
++test_expect_success 'setup repository' '
++	echo content >file &&
++	git add file &&
++	git commit -m one
++'
++
++test_expect_success 'create http-accessible bare repository' '
++	mkdir "$HTTPD_DOCUMENT_ROOT_PATH/repo.git" &&
++	(cd "$HTTPD_DOCUMENT_ROOT_PATH/repo.git" &&
++	 git --bare init &&
++	 echo "exec git update-server-info" >hooks/post-update &&
++	 chmod +x hooks/post-update
++	) &&
++	git remote add public "$HTTPD_DOCUMENT_ROOT_PATH/repo.git" &&
++	git push public master:master
++'
++
++test_expect_success 'clone http repository' '
++	git clone $HTTPD_URL/repo.git clone &&
++	test_cmp file clone/file
++'
++
++test_expect_success 'fetch changes via http' '
++	echo content >>file &&
++	git commit -a -m two &&
++	git push public
++	(cd clone && git pull) &&
++	test_cmp file clone/file
++'
++
++test_expect_success 'http remote detects correct HEAD' '
++	git push public master:other &&
++	(cd clone &&
++	 git remote set-head origin -d &&
++	 git remote set-head origin -a &&
++	 git symbolic-ref refs/remotes/origin/HEAD > output &&
++	 echo refs/remotes/origin/master > expect &&
++	 test_cmp expect output
++	)
++'
++
++stop_httpd
++test_done

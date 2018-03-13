@@ -1,0 +1,279 @@
+@@ -3433,6 +3433,7 @@ dependency_warning="no"
+ dependency_error="no"
+ 
+ plugin_ascent="no"
++plugin_arc="no"
+ plugin_battery="no"
+ plugin_bind="no"
+ plugin_conntrack="no"
+@@ -3515,6 +3516,7 @@ fi
+ if test "x$with_kstat" = "xyes"
+ then
+ 	plugin_uptime="yes"
++	plugin_arc="yes"
+ fi
+ 
+ if test "x$with_devinfo$with_kstat" = "xyesyes"
+@@ -3703,6 +3705,7 @@ AC_PLUGIN([apache],      [$with_libcurl],      [Apache httpd statistics])
+ AC_PLUGIN([apcups],      [yes],                [Statistics of UPSes by APC])
+ AC_PLUGIN([apple_sensors], [$with_libiokit],   [Apple's hardware sensors])
+ AC_PLUGIN([ascent],      [$plugin_ascent],     [AscentEmu player statistics])
++AC_PLUGIN([arc],         [$plugin_arc],        [ARC statistics])
+ AC_PLUGIN([battery],     [$plugin_battery],    [Battery statistics])
+ AC_PLUGIN([bind],        [$plugin_bind],       [ISC Bind nameserver statistics])
+ AC_PLUGIN([conntrack],   [$plugin_conntrack],  [nf_conntrack statistics])
+@@ -4002,6 +4005,7 @@ Configuration:
+     apcups  . . . . . . . $enable_apcups
+     apple_sensors . . . . $enable_apple_sensors
+     ascent  . . . . . . . $enable_ascent
++    arc . . . . . . . . . $enable_arc
+     battery . . . . . . . $enable_battery
+     bind  . . . . . . . . $enable_bind
+     conntrack . . . . . . $enable_conntrack
+@@ -47,6 +47,52 @@ GraphWidth 400
+   Color starting     ff00ff
+   Color waiting      ffb000
+ </Type>
++<Type arc_counts>
++  Module ArcCounts
++  RRDTitle "ARC {type_instance} on {hostname}"
++# RRDOptions ...
++</Type>
++<Type arc_l2_bytes>
++  Module GenericIO
++  DataSources read write
++  DSName  "read Read   "
++  DSName "write Written"
++  RRDTitle "L2ARC traffic"
++  RRDVerticalLabel "Bytes per second"
++# RRDOptions ...
++  RRDFormat "%5.1lf%s"
++</Type>
++<Type arc_l2_size>
++  RRDTitle "L2ARC size on {hostname}"
++  RRDVerticalLabel "Size"
++  RRDFormat "%4.0lf%s"
++  RRDOptions -b 1024
++  DSName "value Current size"
++  Color value  00e000
++</Type>
++<Type arc_size>
++  DataSources "current target minlimit maxlimit"
++  RRDTitle "ARC size on {hostname}"
++  RRDVerticalLabel "Size"
++  RRDFormat "%4.0lf%s"
++  RRDOptions -b 1024
++  DSName  "current Current size"
++  DSName   "target Target size "
++  DSName "maxlimit Max size    "
++  DSName "minlimit Min size    "
++  Color current  00e000
++  Color target   0000ff
++  Color minlimit ff0000
++  Color maxlimit ff00ff
++</Type>
++<Type arc_ratio>
++  DataSources value
++  RRDTitle "{type_instance}ARC ratio on {hostname}"
++  RRDVerticalLabel "Ratio"
++  RRDFormat "%4.1lf"
++  RRDOptions -l 0
++  DSName "value Hit ratio"
++</Type>
+ <Type cpu>
+   Module GenericStacked
+   DataSources value
+@@ -142,6 +142,16 @@ collectd_LDADD += "-dlopen" ascent.la
+ collectd_DEPENDENCIES += ascent.la
+ endif
+ 
++if BUILD_PLUGIN_ARC
++pkglib_LTLIBRARIES += arc.la
++arc_la_SOURCES = arc.c
++arc_la_CFLAGS = $(AM_CFLAGS)
++arc_la_LDFLAGS = -module -avoid-version
++arc_la_LIBADD = -lkstat
++collectd_LDADD += "-dlopen" arc.la
++collectd_DEPENDENCIES += arc.la
++endif
++
+ if BUILD_PLUGIN_BATTERY
+ pkglib_LTLIBRARIES += battery.la
+ battery_la_SOURCES = battery.c
+@@ -0,0 +1,164 @@
++/**
++ * collectd - src/arc.c
++ * Copyright (C) 2009	Anthony Dewhurst
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; only version 2 of the License is applicable.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
++ *
++ * Authors:
++ *   Anthony Dewhurst <dewhurst at gmail>
++ **/
++
++#include "collectd.h"
++#include "common.h"
++#include "plugin.h"
++
++/*
++ * Global variables
++ */
++static kstat_t *ksp;
++extern kstat_ctl_t *kc;
++
++static void arc_submit (const char* type, const char* type_instance, value_t values[], int values_len)
++{
++	value_list_t vl = VALUE_LIST_INIT;
++
++	vl.values = values;
++	vl.values_len = values_len;
++
++	sstrncpy (vl.host, hostname_g, sizeof (vl.host));
++	sstrncpy (vl.plugin, "arc", sizeof (vl.plugin));
++	sstrncpy (vl.type, type, sizeof (vl.type));
++	sstrncpy (vl.type_instance, type_instance, sizeof (vl.type));
++
++	plugin_dispatch_values (&vl);
++}
++
++static void arc_submit_gauge (const char* type, const char* type_instance, gauge_t value)
++{
++	value_t values[1];
++
++	values[0].gauge = value;
++
++	arc_submit (type, type_instance, values, STATIC_ARRAY_SIZE(values));
++}
++
++static void arc_submit_size (gauge_t size, gauge_t size_target, gauge_t limit_min, gauge_t limit_max)
++{
++	value_t values[4];
++
++	values[0].gauge = size;
++	values[1].gauge = size_target;
++	values[2].gauge = limit_min;
++	values[3].gauge = limit_max;
++
++	arc_submit ("arc_size", "", values, STATIC_ARRAY_SIZE(values));
++}
++
++static void arc_submit_bytes (counter_t read, counter_t write)
++{
++	value_t values[2];
++
++	values[0].counter = read;
++	values[1].counter = write;
++
++	arc_submit ("arc_l2_bytes", "", values, STATIC_ARRAY_SIZE(values));
++}
++
++static void arc_submit_counts (char *type_instance, counter_t demand_data, counter_t demand_metadata,
++	counter_t prefetch_data, counter_t prefetch_metadata)
++{
++	value_t values[4];
++printf ("ARC: %llu\n", demand_metadata);
++	values[0].counter = demand_data;
++	values[1].counter = demand_metadata;
++	values[2].counter = prefetch_data;
++	values[3].counter = prefetch_metadata;
++
++	arc_submit ("arc_counts", type_instance, values, STATIC_ARRAY_SIZE(values));
++}
++
++static int arc_read (void)
++{
++	gauge_t   arcsize, targetsize, minlimit, maxlimit, hits, misses, l2_size, l2_hits, l2_misses;
++	counter_t demand_data_hits, demand_metadata_hits, prefetch_data_hits, prefetch_metadata_hits;
++	counter_t demand_data_misses, demand_metadata_misses, prefetch_data_misses, prefetch_metadata_misses;
++	counter_t l2_read_bytes, l2_write_bytes;
++
++	get_kstat (&ksp, "zfs", 0, "arcstats");
++	if (ksp == NULL)
++	{
++		ERROR ("arc plugin: Cannot find zfs:0:arcstats kstat.");
++		return (-1);
++	}
++
++	arcsize    = get_kstat_value(ksp, "size");
++	targetsize = get_kstat_value(ksp, "c");
++	minlimit   = get_kstat_value(ksp, "c_min");
++	maxlimit   = get_kstat_value(ksp, "c_max");
++
++	demand_data_hits       = get_kstat_value(ksp, "demand_data_hits");
++	demand_metadata_hits   = get_kstat_value(ksp, "demand_metadata_hits");
++	prefetch_data_hits     = get_kstat_value(ksp, "prefetch_data_hits");
++	prefetch_metadata_hits = get_kstat_value(ksp, "prefetch_metadata_hits");
++
++	demand_data_misses       = get_kstat_value(ksp, "demand_data_misses");
++	demand_metadata_misses   = get_kstat_value(ksp, "demand_metadata_misses");
++	prefetch_data_misses     = get_kstat_value(ksp, "prefetch_data_misses");
++	prefetch_metadata_misses = get_kstat_value(ksp, "prefetch_metadata_misses");
++
++	hits   = get_kstat_value(ksp, "hits");
++	misses = get_kstat_value(ksp, "misses");
++
++	l2_size        = get_kstat_value(ksp, "l2_size");
++	l2_read_bytes  = get_kstat_value(ksp, "l2_read_bytes");
++	l2_write_bytes = get_kstat_value(ksp, "l2_write_bytes");
++	l2_hits        = get_kstat_value(ksp, "l2_hits");
++	l2_misses      = get_kstat_value(ksp, "l2_misses");
++
++
++	arc_submit_size (arcsize, targetsize, minlimit, maxlimit);
++	arc_submit_gauge ("arc_l2_size", "", l2_size);
++
++	arc_submit_counts ("hits", 	demand_data_hits,     demand_metadata_hits,
++					prefetch_data_hits,   prefetch_metadata_hits);
++	arc_submit_counts ("misses", 	demand_data_misses,   demand_metadata_misses,
++					prefetch_data_misses, prefetch_metadata_misses);
++
++	arc_submit_gauge ("arc_ratio", "L1", hits / (hits + misses));
++	arc_submit_gauge ("arc_ratio", "L2", l2_hits / (l2_hits + l2_misses));
++
++	arc_submit_bytes (l2_read_bytes, l2_write_bytes);
++
++	return (0);
++}
++
++static int arc_init (void) /* {{{ */
++{
++	ksp = NULL;
++
++	/* kstats chain already opened by update_kstat (using *kc), verify everything went fine. */
++	if (kc == NULL)
++	{
++		ERROR ("arc plugin: kstat chain control structure not available.");
++		return (-1);
++	}
++
++	return (0);
++} /* }}} int arc_init */
++
++void module_register (void)
++{
++	plugin_register_init ("arc", arc_init);
++	plugin_register_read ("arc", arc_read);
++} /* void module_register */
+@@ -3,6 +3,11 @@ apache_bytes		count:COUNTER:0:134217728
+ apache_connections	count:GAUGE:0:65535
+ apache_requests		count:COUNTER:0:134217728
+ apache_scoreboard	count:GAUGE:0:65535
++arc_counts		demand_data:COUNTER:0:U, demand_metadata:COUNTER:0:U, prefetch_data:COUNTER:0:U, prefetch_metadata:COUNTER:0:U
++arc_l2_bytes		read:COUNTER:0:U, write:COUNTER:0:U
++arc_l2_size		value:GAUGE:0:U
++arc_ratio		value:GAUGE:0:U
++arc_size		current:GAUGE:0:U, target:GAUGE:0:U, minlimit:GAUGE:0:U, maxlimit:GAUGE:0:U
+ ath_nodes		value:GAUGE:0:65535
+ ath_stat		value:COUNTER:0:4294967295
+ bitrate			value:GAUGE:0:4294967295

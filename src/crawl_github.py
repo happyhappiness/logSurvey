@@ -8,8 +8,12 @@ import my_util
 reload(sys)
 sys.setdefaultencoding('utf8')
 
-USER_NAME = 'squid-cache'
-REPOS_NAME = 'squid'
+# USER_NAME = 'squid-cache'
+# REPOS_NAME = 'squid'
+# USER_NAME = 'collectd'
+# REPOS_NAME = 'collectd'
+USER_NAME = 'git'
+REPOS_NAME = 'git'
 LOG_PATTERN = my_util.get_log_function_pattern(REPOS_NAME)
 
 def store_patch_file(patch, counter, record, writer):
@@ -82,13 +86,13 @@ main function
 """
 if __name__ == "__main__":
     # several configuration constant: user, repos
-    commit_sha = 'eaa778413fd9619207139ed45af1abcd4f2c2c44'
+    commit_sha = '29bdbac1cd5fc4126b62c9a030403d56ae43c204'
 
     record_file = file('data/analyze/' + REPOS_NAME + '_log_commit.csv', 'ab')
     writer = csv.writer(record_file)
     # writer.writerow(['url', 'date', 'title', 'changes', 'file_name'])
 
     # analyze commit list of given repos with start commit
-    analyze_commit_list(commit_sha, writer, 17485, 1993)
+    analyze_commit_list(commit_sha, writer, 21535, 3487)
     record_file.close()
 

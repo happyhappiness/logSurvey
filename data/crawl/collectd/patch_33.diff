@@ -1,0 +1,450 @@
+@@ -68,7 +68,7 @@ static int set_option (value_list_t *vl, const char *key, const char *value)
+  * public API
+  */
+ 
+-cmd_status_t cmd_parse_putval (char *buffer,
++cmd_status_t cmd_parse_putval (size_t argc, char **argv,
+ 		cmd_putval_t *ret_putval, cmd_error_handler_t *err)
+ {
+ 	char *identifier;
+@@ -83,30 +83,30 @@ cmd_status_t cmd_parse_putval (char *buffer,
+ 
+ 	const data_set_t *ds;
+ 	value_list_t vl = VALUE_LIST_INIT;
+-	vl.values = NULL;
++	size_t i;
+ 
+-	identifier = NULL;
+-	status = parse_string (&buffer, &identifier);
+-	if (status != 0)
++	if (argc < 2)
+ 	{
+-		cmd_error (CMD_PARSE_ERROR, err, "Cannot parse identifier.");
++		cmd_error (CMD_PARSE_ERROR, err,
++				"Missing identifier and/or value-list.");
+ 		return (CMD_PARSE_ERROR);
+ 	}
+-	assert (identifier != NULL);
+ 
+-	/* parse_identifier() modifies its first argument,
+-	 * returning pointers into it */
++	identifier = argv[0];
++
++	/* parse_identifier() modifies its first argument, returning pointers into
++	 * it; retain the old value for later. */
+ 	identifier_copy = sstrdup (identifier);
+ 
+-	status = parse_identifier (identifier_copy, &hostname,
++	status = parse_identifier (identifier, &hostname,
+ 			&plugin, &plugin_instance,
+ 			&type, &type_instance);
+ 	if (status != 0)
+ 	{
+ 		DEBUG ("cmd_handle_putval: Cannot parse identifier `%s'.",
+-				identifier);
++				identifier_copy);
+ 		cmd_error (CMD_PARSE_ERROR, err, "Cannot parse identifier `%s'.",
+-				identifier);
++				identifier_copy);
+ 		sfree (identifier_copy);
+ 		return (CMD_PARSE_ERROR);
+ 	}
+@@ -139,65 +139,54 @@ cmd_status_t cmd_parse_putval (char *buffer,
+ 		return (CMD_PARSE_ERROR);
+ 	}
+ 
+-	/* Free identifier_copy */
+ 	hostname = NULL;
+ 	plugin = NULL; plugin_instance = NULL;
+ 	type = NULL;   type_instance = NULL;
+-	sfree (identifier_copy);
+ 
+ 	vl.values_len = ds->ds_num;
+ 	vl.values = malloc (vl.values_len * sizeof (*vl.values));
+ 	if (vl.values == NULL)
+ 	{
+ 		cmd_error (CMD_ERROR, err, "malloc failed.");
++		sfree (identifier_copy);
+ 		return (CMD_ERROR);
+ 	}
+ 
+-	ret_putval->identifier = strdup (identifier);
++	ret_putval->identifier = identifier_copy;
+ 	if (ret_putval->identifier == NULL)
+ 	{
+ 		cmd_error (CMD_ERROR, err, "malloc failed.");
+ 		cmd_destroy_putval (ret_putval);
+ 		return (CMD_ERROR);
+ 	}
+ 
+-	/* All the remaining fields are part of the optionlist. */
+-	while (*buffer != 0)
++	/* All the remaining fields are part of the option list. */
++	for (i = 1; i < argc; ++i)
+ 	{
+ 		value_list_t *tmp;
+ 
+-		char *string = NULL;
+-		char *value  = NULL;
++		char *key   = NULL;
++		char *value = NULL;
+ 
+-		status = parse_option (&buffer, &string, &value);
+-		if (status < 0)
++		status = cmd_parse_option (argv[i], &key, &value, err);
++		if (status == CMD_OK)
+ 		{
+-			/* parse_option failed, buffer has been modified.
+-			 * => we need to abort */
+-			cmd_error (CMD_PARSE_ERROR, err, "Misformatted option.");
+-			cmd_destroy_putval (ret_putval);
+-			return (CMD_PARSE_ERROR);
+-		}
+-		else if (status == 0)
+-		{
+-			assert (string != NULL);
++			assert (key != NULL);
+ 			assert (value != NULL);
+-			set_option (&vl, string, value);
++			set_option (&vl, key, value);
+ 			continue;
+ 		}
+-		/* else: parse_option but buffer has not been modified. This is
+-		 * the default if no `=' is found.. */
+-
+-		status = parse_string (&buffer, &string);
+-		if (status != 0)
++		else if (status != CMD_NO_OPTION)
+ 		{
+-			cmd_error (CMD_PARSE_ERROR, err, "Misformatted value.");
++			/* parse_option failed, buffer has been modified.
++			 * => we need to abort */
+ 			cmd_destroy_putval (ret_putval);
+-			return (CMD_PARSE_ERROR);
++			return (status);
+ 		}
+-		assert (string != NULL);
++		/* else: cmd_parse_option did not find an option; treat this as a
++		 * value list. */
+ 
+-		status = parse_values (string, &vl, ds);
++		status = parse_values (argv[i], &vl, ds);
+ 		if (status != 0)
+ 		{
+ 			cmd_error (CMD_PARSE_ERROR, err, "Parsing the values string failed.");
+@@ -32,7 +32,7 @@
+ #include "plugin.h"
+ #include "utils_cmds.h"
+ 
+-cmd_status_t cmd_parse_putval (char *buffer,
++cmd_status_t cmd_parse_putval (size_t argc, char **argv,
+ 		cmd_putval_t *ret_cmd, cmd_error_handler_t *err);
+ 
+ cmd_status_t cmd_handle_putval (FILE *fh, char *buffer);
+@@ -1,5 +1,6 @@
+ /**
+  * collectd - src/utils_cmds.c
++ * Copyright (C) 2008       Florian Forster
+  * Copyright (C) 2016       Sebastian 'tokkee' Harl
+  *
+  * Permission is hereby granted, free of charge, to any person obtaining a
+@@ -21,6 +22,7 @@
+  * DEALINGS IN THE SOFTWARE.
+  *
+  * Authors:
++ *   Florian octo Forster <octo at collectd.org>
+  *   Sebastian 'tokkee' Harl <sh at tokkee.org>
+  **/
+ 
+@@ -32,6 +34,147 @@
+ #include <stdbool.h>
+ #include <string.h>
+ 
++/*
++ * private helper functions
++ */
++
++static cmd_status_t cmd_split (char *buffer,
++		size_t *ret_len, char ***ret_fields,
++		cmd_error_handler_t *err)
++{
++	char *string, *field;
++	bool in_field, in_quotes;
++
++	size_t estimate, len;
++	char **fields;
++
++	estimate = 0;
++	in_field = false;
++	for (string = buffer; *string != '\0'; ++string)
++	{
++		/* Make a quick worst-case estimate of the number of fields by
++		 * counting spaces and ignoring quotation marks. */
++		if (!isspace ((int)*string))
++		{
++			if (!in_field)
++			{
++				estimate++;
++				in_field = true;
++			}
++		}
++		else
++		{
++			in_field = false;
++		}
++	}
++
++	/* fields will be NULL-terminated */
++	fields = malloc ((estimate + 1) * sizeof (*fields));
++	if (fields == NULL) {
++		cmd_error (CMD_ERROR, err, "malloc failed.");
++		return (CMD_ERROR);
++	}
++
++#define END_FIELD() \
++	do { \
++		*field = '\0'; \
++		field = NULL; \
++		in_field = false; \
++	} while (0)
++#define NEW_FIELD() \
++	do { \
++		field = string; \
++		in_field = true; \
++		assert (len < estimate); \
++		fields[len] = field; \
++		field++; \
++		len++; \
++	} while (0)
++
++	len = 0;
++	field = NULL;
++	in_field = false;
++	in_quotes = false;
++	for (string = buffer; *string != '\0'; string++)
++	{
++		if (isspace ((int)string[0]))
++		{
++			if (! in_quotes)
++			{
++				if (in_field)
++					END_FIELD ();
++
++				/* skip space */
++				continue;
++			}
++		}
++		else if (string[0] == '"')
++		{
++			/* Note: Two consecutive quoted fields not separated by space are
++			 * treated as different fields. This is the collectd 5.x behavior
++			 * around splitting fields. */
++
++			if (in_quotes)
++			{
++				/* end of quoted field */
++				if (! in_field) /* empty quoted string */
++					NEW_FIELD ();
++				END_FIELD ();
++				in_quotes = false;
++				continue;
++			}
++
++			in_quotes = true;
++			/* if (! in_field): add new field on next iteration
++			 * else: quoted string following an unquoted string (one field)
++			 * in either case: skip quotation mark */
++			continue;
++		}
++		else if ((string[0] == '\\') && in_quotes)
++		{
++			/* Outside of quotes, a backslash is a regular character (mostly
++			 * for backward compatibility). */
++
++			if (string[1] == '\0')
++			{
++				free (fields);
++				cmd_error (CMD_PARSE_ERROR, err,
++						"Backslash at end of string.");
++				return (CMD_PARSE_ERROR);
++			}
++
++			/* un-escape the next character; skip backslash */
++			string++;
++		}
++
++		if (! in_field)
++			NEW_FIELD ();
++		else {
++			*field = string[0];
++			field++;
++		}
++	}
++
++	if (in_quotes)
++	{
++		free (fields);
++		cmd_error (CMD_PARSE_ERROR, err, "Unterminated quoted string.");
++		return (CMD_PARSE_ERROR);
++	}
++
++#undef NEW_FIELD
++#undef END_FIELD
++
++	fields[len] = NULL;
++	if (ret_len != NULL)
++		*ret_len = len;
++	if (ret_fields != NULL)
++		*ret_fields = fields;
++	else
++		free (fields);
++	return (CMD_OK);
++} /* int cmd_split */
++
+ /*
+  * public API
+  */
+@@ -49,32 +192,25 @@ void cmd_error (cmd_status_t status, cmd_error_handler_t *err,
+ 	va_end (ap);
+ } /* void cmd_error */
+ 
+-cmd_status_t cmd_parse (char *buffer,
++cmd_status_t cmd_parsev (size_t argc, char **argv,
+ 		cmd_t *ret_cmd, cmd_error_handler_t *err)
+ {
+ 	char *command = NULL;
+-	int status;
+ 
+-	if ((buffer == NULL) || (ret_cmd == NULL))
++	if ((argc < 1) || (argv == NULL) || (ret_cmd == NULL))
+ 	{
+ 		errno = EINVAL;
+-		cmd_error (CMD_ERROR, err, "Invalid arguments to cmd_parse.");
++		cmd_error (CMD_ERROR, err, "Missing command.");
+ 		return CMD_ERROR;
+ 	}
+ 
+-	if ((status = parse_string (&buffer, &command)) != 0)
+-	{
+-		cmd_error (CMD_PARSE_ERROR, err,
+-				"Failed to extract command from `%s'.", buffer);
+-		return (CMD_PARSE_ERROR);
+-	}
+-	assert (command != NULL);
+-
+ 	memset (ret_cmd, 0, sizeof (*ret_cmd));
++	command = argv[0];
+ 	if (strcasecmp ("PUTVAL", command) == 0)
+ 	{
+ 		ret_cmd->type = CMD_PUTVAL;
+-		return cmd_parse_putval (buffer, &ret_cmd->cmd.putval, err);
++		return cmd_parse_putval (argc - 1, argv + 1,
++				&ret_cmd->cmd.putval, err);
+ 	}
+ 	else
+ 	{
+@@ -85,6 +221,21 @@ cmd_status_t cmd_parse (char *buffer,
+ 	}
+ 
+ 	return (CMD_OK);
++} /* cmd_status_t cmd_parsev */
++
++cmd_status_t cmd_parse (char *buffer,
++		cmd_t *ret_cmd, cmd_error_handler_t *err)
++{
++	char **fields = NULL;
++	size_t fields_num = 0;
++	cmd_status_t status;
++
++	if ((status = cmd_split (buffer, &fields_num, &fields, err)) != CMD_OK)
++		return status;
++
++	status = cmd_parsev (fields_num, fields, ret_cmd, err);
++	free (fields);
++	return (status);
+ } /* cmd_status_t cmd_parse */
+ 
+ void cmd_destroy (cmd_t *cmd)
+@@ -103,6 +254,38 @@ void cmd_destroy (cmd_t *cmd)
+ 	}
+ } /* void cmd_destroy */
+ 
++cmd_status_t cmd_parse_option (char *field,
++		char **ret_key, char **ret_value, cmd_error_handler_t *err)
++{
++	char *key, *value;
++
++	if (field == NULL)
++	{
++		errno = EINVAL;
++		cmd_error (CMD_ERROR, err, "Invalid argument to cmd_parse_option.");
++		return (CMD_ERROR);
++	}
++	key = value = field;
++
++	/* Look for the equal sign. */
++	while (isalnum ((int)value[0]) || (value[0] == '_') || (value[0] == ':'))
++		value++;
++	if ((value[0] != '=') || (value == key))
++	{
++		/* Whether this is a fatal error is up to the caller. */
++		return (CMD_NO_OPTION);
++	}
++	*value = '\0';
++	value++;
++
++	if (ret_key != NULL)
++		*ret_key = key;
++	if (ret_value != NULL)
++		*ret_value = value;
++
++	return (CMD_OK);
++} /* cmd_status_t cmd_parse_option */
++
+ void cmd_error_fh (void *ud, cmd_status_t status,
+ 		const char *format, va_list ap)
+ {
+@@ -75,6 +75,9 @@ typedef enum {
+ 	CMD_ERROR           = -1,
+ 	CMD_PARSE_ERROR     = -2,
+ 	CMD_UNKNOWN_COMMAND = -3,
++
++	/* Not necessarily fatal errors. */
++	CMD_NO_OPTION       =  1,
+ } cmd_status_t;
+ 
+ /*
+@@ -119,8 +122,33 @@ void cmd_error (cmd_status_t status, cmd_error_handler_t *err,
+ cmd_status_t cmd_parse (char *buffer,
+ 		cmd_t *ret_cmd, cmd_error_handler_t *err);
+ 
++cmd_status_t cmd_parsev (size_t argc, char **argv,
++		cmd_t *ret_cmd, cmd_error_handler_t *err);
++
+ void cmd_destroy (cmd_t *cmd);
+ 
++/*
++ * NAME
++ *   cmd_parse_option
++ *
++ * DESCRIPTION
++ *   Parses a command option which must be of the form:
++ *     name=value with \ and spaces
++ *
++ * PARAMETERS
++ *   `field'     The parsed input field with any quotes removed and special
++ *               characters unescaped.
++ *   `ret_key'   The parsed key will be stored at this location.
++ *   `ret_value' The parsed value will be stored at this location.
++ *
++ * RETURN VALUE
++ *   CMD_OK on success or an error code otherwise.
++ *   CMD_NO_OPTION if `field' does not represent an option at all (missing
++ *   equal sign).
++ */
++cmd_status_t cmd_parse_option (char *field,
++		char **ret_key, char **ret_value, cmd_error_handler_t *err);
++
+ /*
+  * NAME
+  *   cmd_error_fh

@@ -1,0 +1,898 @@
+@@ -0,0 +1,34 @@
++Git 1.8.1.6 Release Notes
++=========================
++
++Fixes since v1.8.1.5
++--------------------
++
++ * The code to keep track of what directory names are known to Git on
++   platforms with case insensitive filesystems can get confused upon a
++   hash collision between these pathnames and looped forever.
++
++ * When the "--prefix" option is used to "checkout-index", the code
++   did not pick the correct output filter based on the attribute
++   setting.
++
++ * Annotated tags outside refs/tags/ hierarchy were not advertised
++   correctly to the ls-remote and fetch with recent version of Git.
++
++ * The logic used by "git diff -M --stat" to shorten the names of
++   files before and after a rename did not work correctly when the
++   common prefix and suffix between the two filenames overlapped.
++
++ * "git update-index -h" did not do the usual "-h(elp)" thing.
++
++ * perl/Git.pm::cat_blob slurped everything in core only to write it
++   out to a file descriptor, which was not a very smart thing to do.
++
++ * The SSL peer verification done by "git imap-send" did not ask for
++   Server Name Indication (RFC 4366), failing to connect SSL/TLS
++   sites that serve multiple hostnames on a single IP.
++
++ * "git bundle verify" did not say "records a complete history" for a
++   bundle that does not have any prerequisites.
++
++Also contains various documentation fixes.
+@@ -126,6 +126,12 @@ This option is only applicable when listing tags without annotation lines.
+ 	linkgit:git-check-ref-format[1].  Some of these checks
+ 	may restrict the characters allowed in a tag name.
+ 
++<commit>::
++<object>::
++	The object that the new tag will refer to, usually a commit.
++	Defaults to HEAD.
++
++
+ CONFIGURATION
+ -------------
+ By default, 'git tag' in sign-with-default mode (-s) will use your
+@@ -820,9 +820,7 @@ int cmd_grep(int argc, const char **argv, const char *prefix)
+ 		unsigned char sha1[20];
+ 		/* Is it a rev? */
+ 		if (!get_sha1(arg, sha1)) {
+-			struct object *object = parse_object(sha1);
+-			if (!object)
+-				die(_("bad object %s"), arg);
++			struct object *object = parse_object_or_die(sha1, arg);
+ 			if (!seen_dashdash)
+ 				verify_non_filename(prefix, arg);
+ 			add_object_array(object, arg, &list);
+@@ -149,9 +149,7 @@ int cmd_prune(int argc, const char **argv, const char *prefix)
+ 		const char *name = *argv++;
+ 
+ 		if (!get_sha1(name, sha1)) {
+-			struct object *object = parse_object(sha1);
+-			if (!object)
+-				die("bad object: %s", name);
++			struct object *object = parse_object_or_die(sha1, name);
+ 			add_pending_object(&revs, object, "");
+ 		}
+ 		else
+@@ -279,12 +279,12 @@ int create_bundle(struct bundle_header *header, const char *path,
+ 		if (buf.len > 0 && buf.buf[0] == '-') {
+ 			write_or_die(bundle_fd, buf.buf, buf.len);
+ 			if (!get_sha1_hex(buf.buf + 1, sha1)) {
+-				struct object *object = parse_object(sha1);
++				struct object *object = parse_object_or_die(sha1, buf.buf);
+ 				object->flags |= UNINTERESTING;
+ 				add_pending_object(&revs, object, xstrdup(buf.buf));
+ 			}
+ 		} else if (!get_sha1_hex(buf.buf, sha1)) {
+-			struct object *object = parse_object(sha1);
++			struct object *object = parse_object_or_die(sha1, buf.buf);
+ 			object->flags |= SHOWN;
+ 		}
+ 	}
+@@ -361,7 +361,7 @@ int create_bundle(struct bundle_header *header, const char *path,
+ 				 * end up triggering "empty bundle"
+ 				 * error.
+ 				 */
+-				obj = parse_object(sha1);
++				obj = parse_object_or_die(sha1, e->name);
+ 				obj->flags |= SHOWN;
+ 				add_pending_object(&revs, obj, e->name);
+ 			}
+@@ -131,7 +131,6 @@ struct cache_entry {
+ 	unsigned int ce_namelen;
+ 	unsigned char sha1[20];
+ 	struct cache_entry *next;
+-	struct cache_entry *dir_next;
+ 	char name[FLEX_ARRAY]; /* more */
+ };
+ 
+@@ -267,25 +266,15 @@ struct index_state {
+ 	unsigned name_hash_initialized : 1,
+ 		 initialized : 1;
+ 	struct hash_table name_hash;
++	struct hash_table dir_hash;
+ };
+ 
+ extern struct index_state the_index;
+ 
+ /* Name hashing */
+ extern void add_name_hash(struct index_state *istate, struct cache_entry *ce);
+-/*
+- * We don't actually *remove* it, we can just mark it invalid so that
+- * we won't find it in lookups.
+- *
+- * Not only would we have to search the lists (simple enough), but
+- * we'd also have to rehash other hash buckets in case this makes the
+- * hash bucket empty (common). So it's much better to just mark
+- * it.
+- */
+-static inline void remove_name_hash(struct cache_entry *ce)
+-{
+-	ce->ce_flags |= CE_UNHASHED;
+-}
++extern void remove_name_hash(struct index_state *istate, struct cache_entry *ce);
++extern void free_name_hash(struct index_state *istate);
+ 
+ 
+ #ifndef NO_THE_INDEX_COMPATIBILITY_MACROS
+@@ -145,7 +145,7 @@ static int write_entry(struct cache_entry *ce, char *path, const struct checkout
+ 	struct stat st;
+ 
+ 	if (ce_mode_s_ifmt == S_IFREG) {
+-		struct stream_filter *filter = get_stream_filter(path, ce->sha1);
++		struct stream_filter *filter = get_stream_filter(ce->name, ce->sha1);
+ 		if (filter &&
+ 		    !streaming_write_entry(ce, path, filter,
+ 					   state, to_tempfile,
+@@ -32,38 +32,96 @@ static unsigned int hash_name(const char *name, int namelen)
+ 	return hash;
+ }
+ 
+-static void hash_index_entry_directories(struct index_state *istate, struct cache_entry *ce)
++struct dir_entry {
++	struct dir_entry *next;
++	struct dir_entry *parent;
++	struct cache_entry *ce;
++	int nr;
++	unsigned int namelen;
++};
++
++static struct dir_entry *find_dir_entry(struct index_state *istate,
++		const char *name, unsigned int namelen)
++{
++	unsigned int hash = hash_name(name, namelen);
++	struct dir_entry *dir;
++
++	for (dir = lookup_hash(hash, &istate->dir_hash); dir; dir = dir->next)
++		if (dir->namelen == namelen &&
++		    !strncasecmp(dir->ce->name, name, namelen))
++			return dir;
++	return NULL;
++}
++
++static struct dir_entry *hash_dir_entry(struct index_state *istate,
++		struct cache_entry *ce, int namelen)
+ {
+ 	/*
+ 	 * Throw each directory component in the hash for quick lookup
+ 	 * during a git status. Directory components are stored with their
+ 	 * closing slash.  Despite submodules being a directory, they never
+ 	 * reach this point, because they are stored without a closing slash
+-	 * in the cache.
++	 * in index_state.name_hash (as ordinary cache_entries).
+ 	 *
+-	 * Note that the cache_entry stored with the directory does not
+-	 * represent the directory itself.  It is a pointer to an existing
+-	 * filename, and its only purpose is to represent existence of the
+-	 * directory in the cache.  It is very possible multiple directory
+-	 * hash entries may point to the same cache_entry.
++	 * Note that the cache_entry stored with the dir_entry merely
++	 * supplies the name of the directory (up to dir_entry.namelen). We
++	 * track the number of 'active' files in a directory in dir_entry.nr,
++	 * so we can tell if the directory is still relevant, e.g. for git
++	 * status. However, if cache_entries are removed, we cannot pinpoint
++	 * an exact cache_entry that's still active. It is very possible that
++	 * multiple dir_entries point to the same cache_entry.
+ 	 */
+-	unsigned int hash;
+-	void **pos;
++	struct dir_entry *dir;
++
++	/* get length of parent directory */
++	while (namelen > 0 && !is_dir_sep(ce->name[namelen - 1]))
++		namelen--;
++	if (namelen <= 0)
++		return NULL;
++
++	/* lookup existing entry for that directory */
++	dir = find_dir_entry(istate, ce->name, namelen);
++	if (!dir) {
++		/* not found, create it and add to hash table */
++		void **pdir;
++		unsigned int hash = hash_name(ce->name, namelen);
+ 
+-	const char *ptr = ce->name;
+-	while (*ptr) {
+-		while (*ptr && *ptr != '/')
+-			++ptr;
+-		if (*ptr == '/') {
+-			++ptr;
+-			hash = hash_name(ce->name, ptr - ce->name);
+-			pos = insert_hash(hash, ce, &istate->name_hash);
+-			if (pos) {
+-				ce->dir_next = *pos;
+-				*pos = ce;
+-			}
++		dir = xcalloc(1, sizeof(struct dir_entry));
++		dir->namelen = namelen;
++		dir->ce = ce;
++
++		pdir = insert_hash(hash, dir, &istate->dir_hash);
++		if (pdir) {
++			dir->next = *pdir;
++			*pdir = dir;
+ 		}
++
++		/* recursively add missing parent directories */
++		dir->parent = hash_dir_entry(istate, ce, namelen - 1);
+ 	}
++	return dir;
++}
++
++static void add_dir_entry(struct index_state *istate, struct cache_entry *ce)
++{
++	/* Add reference to the directory entry (and parents if 0). */
++	struct dir_entry *dir = hash_dir_entry(istate, ce, ce_namelen(ce));
++	while (dir && !(dir->nr++))
++		dir = dir->parent;
++}
++
++static void remove_dir_entry(struct index_state *istate, struct cache_entry *ce)
++{
++	/*
++	 * Release reference to the directory entry (and parents if 0).
++	 *
++	 * Note: we do not remove / free the entry because there's no
++	 * hash.[ch]::remove_hash and dir->next may point to other entries
++	 * that are still valid, so we must not free the memory.
++	 */
++	struct dir_entry *dir = hash_dir_entry(istate, ce, ce_namelen(ce));
++	while (dir && dir->nr && !(--dir->nr))
++		dir = dir->parent;
+ }
+ 
+ static void hash_index_entry(struct index_state *istate, struct cache_entry *ce)
+@@ -74,16 +132,16 @@ static void hash_index_entry(struct index_state *istate, struct cache_entry *ce)
+ 	if (ce->ce_flags & CE_HASHED)
+ 		return;
+ 	ce->ce_flags |= CE_HASHED;
+-	ce->next = ce->dir_next = NULL;
++	ce->next = NULL;
+ 	hash = hash_name(ce->name, ce_namelen(ce));
+ 	pos = insert_hash(hash, ce, &istate->name_hash);
+ 	if (pos) {
+ 		ce->next = *pos;
+ 		*pos = ce;
+ 	}
+ 
+-	if (ignore_case)
+-		hash_index_entry_directories(istate, ce);
++	if (ignore_case && !(ce->ce_flags & CE_UNHASHED))
++		add_dir_entry(istate, ce);
+ }
+ 
+ static void lazy_init_name_hash(struct index_state *istate)
+@@ -99,11 +157,33 @@ static void lazy_init_name_hash(struct index_state *istate)
+ 
+ void add_name_hash(struct index_state *istate, struct cache_entry *ce)
+ {
++	/* if already hashed, add reference to directory entries */
++	if (ignore_case && (ce->ce_flags & CE_STATE_MASK) == CE_STATE_MASK)
++		add_dir_entry(istate, ce);
++
+ 	ce->ce_flags &= ~CE_UNHASHED;
+ 	if (istate->name_hash_initialized)
+ 		hash_index_entry(istate, ce);
+ }
+ 
++/*
++ * We don't actually *remove* it, we can just mark it invalid so that
++ * we won't find it in lookups.
++ *
++ * Not only would we have to search the lists (simple enough), but
++ * we'd also have to rehash other hash buckets in case this makes the
++ * hash bucket empty (common). So it's much better to just mark
++ * it.
++ */
++void remove_name_hash(struct index_state *istate, struct cache_entry *ce)
++{
++	/* if already hashed, release reference to directory entries */
++	if (ignore_case && (ce->ce_flags & CE_STATE_MASK) == CE_HASHED)
++		remove_dir_entry(istate, ce);
++
++	ce->ce_flags |= CE_UNHASHED;
++}
++
+ static int slow_same_name(const char *name1, int len1, const char *name2, int len2)
+ {
+ 	if (len1 != len2)
+@@ -137,18 +217,7 @@ static int same_name(const struct cache_entry *ce, const char *name, int namelen
+ 	if (!icase)
+ 		return 0;
+ 
+-	/*
+-	 * If the entry we're comparing is a filename (no trailing slash), then compare
+-	 * the lengths exactly.
+-	 */
+-	if (name[namelen - 1] != '/')
+-		return slow_same_name(name, namelen, ce->name, len);
+-
+-	/*
+-	 * For a directory, we point to an arbitrary cache_entry filename.  Just
+-	 * make sure the directory portion matches.
+-	 */
+-	return slow_same_name(name, namelen, ce->name, namelen < len ? namelen : len);
++	return slow_same_name(name, namelen, ce->name, len);
+ }
+ 
+ struct cache_entry *index_name_exists(struct index_state *istate, const char *name, int namelen, int icase)
+@@ -164,27 +233,54 @@ struct cache_entry *index_name_exists(struct index_state *istate, const char *na
+ 			if (same_name(ce, name, namelen, icase))
+ 				return ce;
+ 		}
+-		if (icase && name[namelen - 1] == '/')
+-			ce = ce->dir_next;
+-		else
+-			ce = ce->next;
++		ce = ce->next;
+ 	}
+ 
+ 	/*
+-	 * Might be a submodule.  Despite submodules being directories,
++	 * When looking for a directory (trailing '/'), it might be a
++	 * submodule or a directory. Despite submodules being directories,
+ 	 * they are stored in the name hash without a closing slash.
+-	 * When ignore_case is 1, directories are stored in the name hash
+-	 * with their closing slash.
++	 * When ignore_case is 1, directories are stored in a separate hash
++	 * table *with* their closing slash.
+ 	 *
+ 	 * The side effect of this storage technique is we have need to
++	 * lookup the directory in a separate hash table, and if not found
+ 	 * remove the slash from name and perform the lookup again without
+ 	 * the slash.  If a match is made, S_ISGITLINK(ce->mode) will be
+ 	 * true.
+ 	 */
+ 	if (icase && name[namelen - 1] == '/') {
++		struct dir_entry *dir = find_dir_entry(istate, name, namelen);
++		if (dir && dir->nr)
++			return dir->ce;
++
+ 		ce = index_name_exists(istate, name, namelen - 1, icase);
+ 		if (ce && S_ISGITLINK(ce->ce_mode))
+ 			return ce;
+ 	}
+ 	return NULL;
+ }
++
++static int free_dir_entry(void *entry, void *unused)
++{
++	struct dir_entry *dir = entry;
++	while (dir) {
++		struct dir_entry *next = dir->next;
++		free(dir);
++		dir = next;
++	}
++	return 0;
++}
++
++void free_name_hash(struct index_state *istate)
++{
++	if (!istate->name_hash_initialized)
++		return;
++	istate->name_hash_initialized = 0;
++	if (ignore_case)
++		/* free directory entries */
++		for_each_hash(&istate->dir_hash, free_dir_entry, NULL);
++
++	free_hash(&istate->name_hash);
++	free_hash(&istate->dir_hash);
++}
+@@ -185,6 +185,16 @@ struct object *parse_object_buffer(const unsigned char *sha1, enum object_type t
+ 	return obj;
+ }
+ 
++struct object *parse_object_or_die(const unsigned char *sha1,
++				   const char *name)
++{
++	struct object *o = parse_object(sha1);
++	if (o)
++		return o;
++
++	die(_("unable to parse object: %s"), name ? name : sha1_to_hex(sha1));
++}
++
+ struct object *parse_object(const unsigned char *sha1)
+ {
+ 	unsigned long size;
+@@ -54,9 +54,20 @@ struct object *lookup_object(const unsigned char *sha1);
+ 
+ extern void *create_object(const unsigned char *sha1, int type, void *obj);
+ 
+-/** Returns the object, having parsed it to find out what it is. **/
++/*
++ * Returns the object, having parsed it to find out what it is.
++ *
++ * Returns NULL if the object is missing or corrupt.
++ */
+ struct object *parse_object(const unsigned char *sha1);
+ 
++/*
++ * Like parse_object, but will die() instead of returning NULL. If the
++ * "name" parameter is not NULL, it is included in the error message
++ * (otherwise, the sha1 hex is given).
++ */
++struct object *parse_object_or_die(const unsigned char *sha1, const char *name);
++
+ /* Given the result of read_sha1_file(), returns the object after
+  * parsing it.  eaten_p indicates if the object has a borrowed copy
+  * of buffer and the caller should not free() it.
+@@ -27,6 +27,7 @@ static int handle_one_ref(const char *path, const unsigned char *sha1,
+ 			  int flags, void *cb_data)
+ {
+ 	struct pack_refs_cb_data *cb = cb_data;
++	struct object *o;
+ 	int is_tag_ref;
+ 
+ 	/* Do not pack the symbolic refs */
+@@ -39,14 +40,13 @@ static int handle_one_ref(const char *path, const unsigned char *sha1,
+ 		return 0;
+ 
+ 	fprintf(cb->refs_file, "%s %s\n", sha1_to_hex(sha1), path);
+-	if (is_tag_ref) {
+-		struct object *o = parse_object(sha1);
+-		if (o->type == OBJ_TAG) {
+-			o = deref_tag(o, path, 0);
+-			if (o)
+-				fprintf(cb->refs_file, "^%s\n",
+-					sha1_to_hex(o->sha1));
+-		}
++
++	o = parse_object_or_die(sha1, path);
++	if (o->type == OBJ_TAG) {
++		o = deref_tag(o, path, 0);
++		if (o)
++			fprintf(cb->refs_file, "^%s\n",
++				sha1_to_hex(o->sha1));
+ 	}
+ 
+ 	if ((cb->flags & PACK_REFS_PRUNE) && !do_not_prune(flags)) {
+@@ -128,7 +128,7 @@ int pack_refs(unsigned int flags)
+ 		die_errno("unable to create ref-pack file structure");
+ 
+ 	/* perhaps other traits later as well */
+-	fprintf(cbdata.refs_file, "# pack-refs with: peeled \n");
++	fprintf(cbdata.refs_file, "# pack-refs with: peeled fully-peeled \n");
+ 
+ 	for_each_ref(handle_one_ref, &cbdata);
+ 	if (ferror(cbdata.refs_file))
+@@ -152,11 +152,9 @@ static int add_one_reflog_ent(unsigned char *osha1, unsigned char *nsha1,
+ 
+ static int add_one_ref(const char *path, const unsigned char *sha1, int flag, void *cb_data)
+ {
+-	struct object *object = parse_object(sha1);
++	struct object *object = parse_object_or_die(sha1, path);
+ 	struct rev_info *revs = (struct rev_info *)cb_data;
+ 
+-	if (!object)
+-		die("bad object ref: %s:%s", path, sha1_to_hex(sha1));
+ 	add_pending_object(revs, object, "");
+ 
+ 	return 0;
+@@ -46,7 +46,7 @@ static void replace_index_entry(struct index_state *istate, int nr, struct cache
+ {
+ 	struct cache_entry *old = istate->cache[nr];
+ 
+-	remove_name_hash(old);
++	remove_name_hash(istate, old);
+ 	set_index_entry(istate, nr, ce);
+ 	istate->cache_changed = 1;
+ }
+@@ -460,7 +460,7 @@ int remove_index_entry_at(struct index_state *istate, int pos)
+ 	struct cache_entry *ce = istate->cache[pos];
+ 
+ 	record_resolve_undo(istate, ce);
+-	remove_name_hash(ce);
++	remove_name_hash(istate, ce);
+ 	istate->cache_changed = 1;
+ 	istate->cache_nr--;
+ 	if (pos >= istate->cache_nr)
+@@ -483,7 +483,7 @@ void remove_marked_cache_entries(struct index_state *istate)
+ 
+ 	for (i = j = 0; i < istate->cache_nr; i++) {
+ 		if (ce_array[i]->ce_flags & CE_REMOVE)
+-			remove_name_hash(ce_array[i]);
++			remove_name_hash(istate, ce_array[i]);
+ 		else
+ 			ce_array[j++] = ce_array[i];
+ 	}
+@@ -1515,8 +1515,7 @@ int discard_index(struct index_state *istate)
+ 	istate->cache_changed = 0;
+ 	istate->timestamp.sec = 0;
+ 	istate->timestamp.nsec = 0;
+-	istate->name_hash_initialized = 0;
+-	free_hash(&istate->name_hash);
++	free_name_hash(istate);
+ 	cache_tree_free(&(istate->cache_tree));
+ 	istate->initialized = 0;
+ 
+@@ -803,11 +803,38 @@ static const char *parse_ref_line(char *line, unsigned char *sha1)
+ 	return line;
+ }
+ 
++/*
++ * Read f, which is a packed-refs file, into dir.
++ *
++ * A comment line of the form "# pack-refs with: " may contain zero or
++ * more traits. We interpret the traits as follows:
++ *
++ *   No traits:
++ *
++ *      Probably no references are peeled. But if the file contains a
++ *      peeled value for a reference, we will use it.
++ *
++ *   peeled:
++ *
++ *      References under "refs/tags/", if they *can* be peeled, *are*
++ *      peeled in this file. References outside of "refs/tags/" are
++ *      probably not peeled even if they could have been, but if we find
++ *      a peeled value for such a reference we will use it.
++ *
++ *   fully-peeled:
++ *
++ *      All references in the file that can be peeled are peeled.
++ *      Inversely (and this is more important), any references in the
++ *      file for which no peeled value is recorded is not peelable. This
++ *      trait should typically be written alongside "peeled" for
++ *      compatibility with older clients, but we do not require it
++ *      (i.e., "peeled" is a no-op if "fully-peeled" is set).
++ */
+ static void read_packed_refs(FILE *f, struct ref_dir *dir)
+ {
+ 	struct ref_entry *last = NULL;
+ 	char refline[PATH_MAX];
+-	int flag = REF_ISPACKED;
++	enum { PEELED_NONE, PEELED_TAGS, PEELED_FULLY } peeled = PEELED_NONE;
+ 
+ 	while (fgets(refline, sizeof(refline), f)) {
+ 		unsigned char sha1[20];
+@@ -816,24 +843,36 @@ static void read_packed_refs(FILE *f, struct ref_dir *dir)
+ 
+ 		if (!strncmp(refline, header, sizeof(header)-1)) {
+ 			const char *traits = refline + sizeof(header) - 1;
+-			if (strstr(traits, " peeled "))
+-				flag |= REF_KNOWS_PEELED;
++			if (strstr(traits, " fully-peeled "))
++				peeled = PEELED_FULLY;
++			else if (strstr(traits, " peeled "))
++				peeled = PEELED_TAGS;
+ 			/* perhaps other traits later as well */
+ 			continue;
+ 		}
+ 
+ 		refname = parse_ref_line(refline, sha1);
+ 		if (refname) {
+-			last = create_ref_entry(refname, sha1, flag, 1);
++			last = create_ref_entry(refname, sha1, REF_ISPACKED, 1);
++			if (peeled == PEELED_FULLY ||
++			    (peeled == PEELED_TAGS && !prefixcmp(refname, "refs/tags/")))
++				last->flag |= REF_KNOWS_PEELED;
+ 			add_ref(dir, last);
+ 			continue;
+ 		}
+ 		if (last &&
+ 		    refline[0] == '^' &&
+ 		    strlen(refline) == 42 &&
+ 		    refline[41] == '\n' &&
+-		    !get_sha1_hex(refline + 1, sha1))
++		    !get_sha1_hex(refline + 1, sha1)) {
+ 			hashcpy(last->u.value.peeled, sha1);
++			/*
++			 * Regardless of what the file header said,
++			 * we definitely know the value of *this*
++			 * reference:
++			 */
++			last->flag |= REF_KNOWS_PEELED;
++		}
+ 	}
+ }
+ 
+@@ -709,7 +709,7 @@ static int still_interesting(struct commit_list *src, unsigned long date, int sl
+ 	 * Does the destination list contain entries with a date
+ 	 * before the source list? Definitely _not_ done.
+ 	 */
+-	if (date < src->item->date)
++	if (date <= src->item->date)
+ 		return SLOP;
+ 
+ 	/*
+@@ -12,85 +12,108 @@ the GIT controlled paths.
+ 
+ . ./test-lib.sh
+ 
+-test_expect_success \
+-    'setup' \
+-    'mkdir path1 &&
+-    echo frotz >path0 &&
+-    echo rezrov >path1/file1 &&
+-    git update-index --add path0 path1/file1'
++test_expect_success 'setup' '
++	mkdir path1 &&
++	echo frotz >path0 &&
++	echo rezrov >path1/file1 &&
++	git update-index --add path0 path1/file1
++'
++
++test_expect_success SYMLINKS 'have symlink in place where dir is expected.' '
++	rm -fr path0 path1 &&
++	mkdir path2 &&
++	ln -s path2 path1 &&
++	git checkout-index -f -a &&
++	test ! -h path1 && test -d path1 &&
++	test -f path1/file1 && test ! -f path2/file1
++'
+ 
+-test_expect_success SYMLINKS \
+-    'have symlink in place where dir is expected.' \
+-    'rm -fr path0 path1 &&
+-     mkdir path2 &&
+-     ln -s path2 path1 &&
+-     git checkout-index -f -a &&
+-     test ! -h path1 && test -d path1 &&
+-     test -f path1/file1 && test ! -f path2/file1'
++test_expect_success 'use --prefix=path2/' '
++	rm -fr path0 path1 path2 &&
++	mkdir path2 &&
++	git checkout-index --prefix=path2/ -f -a &&
++	test -f path2/path0 &&
++	test -f path2/path1/file1 &&
++	test ! -f path0 &&
++	test ! -f path1/file1
++'
++
++test_expect_success 'use --prefix=tmp-' '
++	rm -fr path0 path1 path2 tmp* &&
++	git checkout-index --prefix=tmp- -f -a &&
++	test -f tmp-path0 &&
++	test -f tmp-path1/file1 &&
++	test ! -f path0 &&
++	test ! -f path1/file1
++'
+ 
+-test_expect_success \
+-    'use --prefix=path2/' \
+-    'rm -fr path0 path1 path2 &&
+-     mkdir path2 &&
+-     git checkout-index --prefix=path2/ -f -a &&
+-     test -f path2/path0 &&
+-     test -f path2/path1/file1 &&
+-     test ! -f path0 &&
+-     test ! -f path1/file1'
++test_expect_success 'use --prefix=tmp- but with a conflicting file and dir' '
++	rm -fr path0 path1 path2 tmp* &&
++	echo nitfol >tmp-path1 &&
++	mkdir tmp-path0 &&
++	git checkout-index --prefix=tmp- -f -a &&
++	test -f tmp-path0 &&
++	test -f tmp-path1/file1 &&
++	test ! -f path0 &&
++	test ! -f path1/file1
++'
+ 
+-test_expect_success \
+-    'use --prefix=tmp-' \
+-    'rm -fr path0 path1 path2 tmp* &&
+-     git checkout-index --prefix=tmp- -f -a &&
+-     test -f tmp-path0 &&
+-     test -f tmp-path1/file1 &&
+-     test ! -f path0 &&
+-     test ! -f path1/file1'
++test_expect_success SYMLINKS 'use --prefix=tmp/orary/ where tmp is a symlink' '
++	rm -fr path0 path1 path2 tmp* &&
++	mkdir tmp1 tmp1/orary &&
++	ln -s tmp1 tmp &&
++	git checkout-index --prefix=tmp/orary/ -f -a &&
++	test -d tmp1/orary &&
++	test -f tmp1/orary/path0 &&
++	test -f tmp1/orary/path1/file1 &&
++	test -h tmp
++'
+ 
+-test_expect_success \
+-    'use --prefix=tmp- but with a conflicting file and dir' \
+-    'rm -fr path0 path1 path2 tmp* &&
+-     echo nitfol >tmp-path1 &&
+-     mkdir tmp-path0 &&
+-     git checkout-index --prefix=tmp- -f -a &&
+-     test -f tmp-path0 &&
+-     test -f tmp-path1/file1 &&
+-     test ! -f path0 &&
+-     test ! -f path1/file1'
++test_expect_success SYMLINKS 'use --prefix=tmp/orary- where tmp is a symlink' '
++	rm -fr path0 path1 path2 tmp* &&
++	mkdir tmp1 &&
++	ln -s tmp1 tmp &&
++	git checkout-index --prefix=tmp/orary- -f -a &&
++	test -f tmp1/orary-path0 &&
++	test -f tmp1/orary-path1/file1 &&
++	test -h tmp
++'
+ 
+-# Linus fix #1
+-test_expect_success SYMLINKS \
+-    'use --prefix=tmp/orary/ where tmp is a symlink' \
+-    'rm -fr path0 path1 path2 tmp* &&
+-     mkdir tmp1 tmp1/orary &&
+-     ln -s tmp1 tmp &&
+-     git checkout-index --prefix=tmp/orary/ -f -a &&
+-     test -d tmp1/orary &&
+-     test -f tmp1/orary/path0 &&
+-     test -f tmp1/orary/path1/file1 &&
+-     test -h tmp'
++test_expect_success SYMLINKS 'use --prefix=tmp- where tmp-path1 is a symlink' '
++	rm -fr path0 path1 path2 tmp* &&
++	mkdir tmp1 &&
++	ln -s tmp1 tmp-path1 &&
++	git checkout-index --prefix=tmp- -f -a &&
++	test -f tmp-path0 &&
++	test ! -h tmp-path1 &&
++	test -d tmp-path1 &&
++	test -f tmp-path1/file1
++'
+ 
+-# Linus fix #2
+-test_expect_success SYMLINKS \
+-    'use --prefix=tmp/orary- where tmp is a symlink' \
+-    'rm -fr path0 path1 path2 tmp* &&
+-     mkdir tmp1 &&
+-     ln -s tmp1 tmp &&
+-     git checkout-index --prefix=tmp/orary- -f -a &&
+-     test -f tmp1/orary-path0 &&
+-     test -f tmp1/orary-path1/file1 &&
+-     test -h tmp'
++test_expect_success 'apply filter from working tree .gitattributes with --prefix' '
++	rm -fr path0 path1 path2 tmp* &&
++	mkdir path1 &&
++	mkdir tmp &&
++	git config filter.replace-all.smudge "sed -e s/./,/g" &&
++	git config filter.replace-all.clean cat &&
++	git config filter.replace-all.required true &&
++	echo "file1 filter=replace-all" >path1/.gitattributes &&
++	git checkout-index --prefix=tmp/ -f -a &&
++	echo frotz >expected &&
++	test_cmp expected tmp/path0 &&
++	echo ,,,,,, >expected &&
++	test_cmp expected tmp/path1/file1
++'
+ 
+-# Linus fix #3
+-test_expect_success SYMLINKS \
+-    'use --prefix=tmp- where tmp-path1 is a symlink' \
+-    'rm -fr path0 path1 path2 tmp* &&
+-     mkdir tmp1 &&
+-     ln -s tmp1 tmp-path1 &&
+-     git checkout-index --prefix=tmp- -f -a &&
+-     test -f tmp-path0 &&
+-     test ! -h tmp-path1 &&
+-     test -d tmp-path1 &&
+-     test -f tmp-path1/file1'
++test_expect_success 'apply CRLF filter from working tree .gitattributes with --prefix' '
++	rm -fr path0 path1 path2 tmp* &&
++	mkdir path1 &&
++	mkdir tmp &&
++	echo "file1 eol=crlf" >path1/.gitattributes &&
++	git checkout-index --prefix=tmp/ -f -a &&
++	echo rezrovQ >expected &&
++	tr \\015 Q <tmp/path1/file1 >actual &&
++	test_cmp expected actual
++'
+ 
+ test_done
+@@ -0,0 +1,64 @@
++#!/bin/sh
++
++test_description='tests for the peel_ref optimization of packed-refs'
++. ./test-lib.sh
++
++test_expect_success 'create annotated tag in refs/tags' '
++	test_commit base &&
++	git tag -m annotated foo
++'
++
++test_expect_success 'create annotated tag outside of refs/tags' '
++	git update-ref refs/outside/foo refs/tags/foo
++'
++
++# This matches show-ref's output
++print_ref() {
++	echo "$(git rev-parse "$1") $1"
++}
++
++test_expect_success 'set up expected show-ref output' '
++	{
++		print_ref "refs/heads/master" &&
++		print_ref "refs/outside/foo" &&
++		print_ref "refs/outside/foo^{}" &&
++		print_ref "refs/tags/base" &&
++		print_ref "refs/tags/foo" &&
++		print_ref "refs/tags/foo^{}"
++	} >expect
++'
++
++test_expect_success 'refs are peeled outside of refs/tags (loose)' '
++	git show-ref -d >actual &&
++	test_cmp expect actual
++'
++
++test_expect_success 'refs are peeled outside of refs/tags (packed)' '
++	git pack-refs --all &&
++	git show-ref -d >actual &&
++	test_cmp expect actual
++'
++
++test_expect_success 'create old-style pack-refs without fully-peeled' '
++	# Git no longer writes without fully-peeled, so we just write our own
++	# from scratch; we could also munge the existing file to remove the
++	# fully-peeled bits, but that seems even more prone to failure,
++	# especially if the format ever changes again. At least this way we
++	# know we are emulating exactly what an older git would have written.
++	{
++		echo "# pack-refs with: peeled " &&
++		print_ref "refs/heads/master" &&
++		print_ref "refs/outside/foo" &&
++		print_ref "refs/tags/base" &&
++		print_ref "refs/tags/foo" &&
++		echo "^$(git rev-parse "refs/tags/foo^{}")"
++	} >tmp &&
++	mv tmp .git/packed-refs
++'
++
++test_expect_success 'refs are peeled outside of refs/tags (old packed)' '
++	git show-ref -d >actual &&
++	test_cmp expect actual
++'
++
++test_done
+@@ -133,4 +133,17 @@ test_expect_success 'dodecapus' '
+ 	check_revlist "--min-parents=13" &&
+ 	check_revlist "--min-parents=4 --max-parents=11" tetrapus
+ '
++
++test_expect_success 'ancestors with the same commit time' '
++
++	test_tick_keep=$test_tick &&
++	for i in 1 2 3 4 5 6 7 8; do
++		test_tick=$test_tick_keep
++		test_commit t$i
++	done &&
++	git rev-list t1^! --not t$i >result &&
++	>expect &&
++	test_cmp expect result
++'
++
+ test_done
+@@ -0,0 +1,20 @@
++#!/bin/sh
++
++test_description='git-status with core.ignorecase=true'
++
++. ./test-lib.sh
++
++test_expect_success 'status with hash collisions' '
++	# note: "V/", "V/XQANY/" and "WURZAUP/" produce the same hash code
++	# in name-hash.c::hash_name
++	mkdir V &&
++	mkdir V/XQANY &&
++	mkdir WURZAUP &&
++	touch V/XQANY/test &&
++	git config core.ignorecase true &&
++	git add . &&
++	# test is successful if git status completes (no endless loop)
++	git status
++'
++
++test_done

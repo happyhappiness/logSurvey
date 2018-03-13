@@ -1,0 +1,178 @@
+@@ -1,9 +1,11 @@
+-Git v1.7.0.4 Release Notes (draft)
+-==================================
++Git v1.7.0.4 Release Notes
++==========================
+ 
+ Fixes since v1.7.0.3
+ --------------------
+ 
++ * Optimized ntohl/htonl on big-endian machines were broken.
++
+  * Color values given to "color.<cmd>.<slot>" configuration can now have
+    more than one attributes (e.g. "bold ul").
+ 
+@@ -16,4 +18,10 @@ Fixes since v1.7.0.3
+  * "git fast-export" didn't check error status and stop when marks file
+    cannot be opened.
+ 
++ * "git format-patch --ignore-if-in-upstream" gave unwarranted errors
++   when the range was empty, instead of silently finishing.
++
++ * "git remote prune" did not detect remote tracking refs that became
++   dangling correctly.
++
+ And other minor fixes and documentation updates.
+@@ -35,7 +35,7 @@ These services can be enabled/disabled using the per-repository
+ configuration file:
+ 
+ http.getanyfile::
+-	This serves older Git clients which are unable to use the
++	This serves Git clients older than version 1.6.6 that are unable to use the
+ 	upload pack service.  When enabled, clients are able to read
+ 	any file within the repository, including objects that are
+ 	no longer reachable from a branch but are still present.
+@@ -10,7 +10,7 @@ SYNOPSIS
+ [verse]
+ 'git show-ref' [-q|--quiet] [--verify] [--head] [-d|--dereference]
+ 	     [-s|--hash[=<n>]] [--abbrev[=<n>]] [--tags]
+-	     [--heads] [--] <pattern>...
++	     [--heads] [--] [<pattern>...]
+ 'git show-ref' --exclude-existing[=<pattern>] < ref-list
+ 
+ DESCRIPTION
+@@ -43,9 +43,10 @@ unreleased) version of git, that is available from 'master'
+ branch of the `git.git` repository.
+ Documentation for older releases are available here:
+ 
+-* link:v1.7.0.3/git.html[documentation for release 1.7.0.3]
++* link:v1.7.0.4/git.html[documentation for release 1.7.0.4]
+ 
+ * release notes for
++  link:RelNotes-1.7.0.4.txt[1.7.0.4],
+   link:RelNotes-1.7.0.3.txt[1.7.0.3],
+   link:RelNotes-1.7.0.2.txt[1.7.0.2],
+   link:RelNotes-1.7.0.1.txt[1.7.0.1],
+@@ -1,7 +1,7 @@
+ #!/bin/sh
+ 
+ GVF=GIT-VERSION-FILE
+-DEF_VER=v1.7.0.3
++DEF_VER=v1.7.0.4
+ 
+ LF='
+ '
+@@ -919,6 +919,7 @@ ifeq ($(uname_S),IRIX)
+ 	SNPRINTF_RETURNS_BOGUS = YesPlease
+ 	SHELL_PATH = /usr/gnu/bin/bash
+ 	NEEDS_LIBGEN = YesPlease
++	NEEDS_LIBICONV = YesPlease
+ endif
+ ifeq ($(uname_S),IRIX64)
+ 	NO_SETENV=YesPlease
+@@ -937,6 +938,7 @@ ifeq ($(uname_S),IRIX64)
+ 	SNPRINTF_RETURNS_BOGUS = YesPlease
+ 	SHELL_PATH=/usr/gnu/bin/bash
+ 	NEEDS_LIBGEN = YesPlease
++	NEEDS_LIBICONV = YesPlease
+ endif
+ ifeq ($(uname_S),HP-UX)
+ 	NO_IPV6=YesPlease
+@@ -23,7 +23,8 @@
+ 
+ static const char * const git_reset_usage[] = {
+ 	"git reset [--mixed | --soft | --hard | --merge | --keep] [-q] [<commit>]",
+-	"git reset [--mixed] <commit> [--] <paths>...",
++	"git reset [-q] <commit> [--] <paths>...",
++	"git reset --patch [<commit>] [--] [<paths>...]",
+ 	NULL
+ };
+ 
+@@ -17,6 +17,8 @@ static inline uint32_t default_swab32(uint32_t val)
+ 		((val & 0x000000ff) << 24));
+ }
+ 
++#undef bswap32
++
+ #if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__))
+ 
+ #define bswap32(x) ({ \
+@@ -275,8 +275,17 @@ int mingw_utime (const char *file_name, const struct utimbuf *times)
+ 	int fh, rc;
+ 
+ 	/* must have write permission */
+-	if ((fh = open(file_name, O_RDWR | O_BINARY)) < 0)
+-		return -1;
++	DWORD attrs = GetFileAttributes(file_name);
++	if (attrs != INVALID_FILE_ATTRIBUTES &&
++	    (attrs & FILE_ATTRIBUTE_READONLY)) {
++		/* ignore errors here; open() will report them */
++		SetFileAttributes(file_name, attrs & ~FILE_ATTRIBUTE_READONLY);
++	}
++
++	if ((fh = open(file_name, O_RDWR | O_BINARY)) < 0) {
++		rc = -1;
++		goto revert_attrs;
++	}
+ 
+ 	time_t_to_filetime(times->modtime, &mft);
+ 	time_t_to_filetime(times->actime, &aft);
+@@ -286,6 +295,13 @@ int mingw_utime (const char *file_name, const struct utimbuf *times)
+ 	} else
+ 		rc = 0;
+ 	close(fh);
++
++revert_attrs:
++	if (attrs != INVALID_FILE_ATTRIBUTES &&
++	    (attrs & FILE_ATTRIBUTE_READONLY)) {
++		/* ignore errors again */
++		SetFileAttributes(file_name, attrs);
++	}
+ 	return rc;
+ }
+ 
+@@ -3883,6 +3883,7 @@ static char *run_textconv(const char *pgm, struct diff_filespec *spec,
+ 	const char **arg = argv;
+ 	struct child_process child;
+ 	struct strbuf buf = STRBUF_INIT;
++	int err = 0;
+ 
+ 	temp = prepare_temp_file(spec->path, spec);
+ 	*arg++ = pgm;
+@@ -3893,16 +3894,20 @@ static char *run_textconv(const char *pgm, struct diff_filespec *spec,
+ 	child.use_shell = 1;
+ 	child.argv = argv;
+ 	child.out = -1;
+-	if (start_command(&child) != 0 ||
+-	    strbuf_read(&buf, child.out, 0) < 0 ||
+-	    finish_command(&child) != 0) {
+-		close(child.out);
+-		strbuf_release(&buf);
++	if (start_command(&child)) {
+ 		remove_tempfile();
+-		error("error running textconv command '%s'", pgm);
+ 		return NULL;
+ 	}
++
++	if (strbuf_read(&buf, child.out, 0) < 0)
++		err = error("error reading from textconv command '%s'", pgm);
+ 	close(child.out);
++
++	if (finish_command(&child) || err) {
++		strbuf_release(&buf);
++		remove_tempfile();
++		return NULL;
++	}
+ 	remove_tempfile();
+ 
+ 	return strbuf_detach(&buf, outsize);
+@@ -2216,8 +2216,7 @@ sub config_to_multi {
+ sub git_get_project_config {
+ 	my ($key, $type) = @_;
+ 
+-	# do we have project
+-	return unless (defined $project && defined $git_dir);
++	return unless defined $git_dir;
+ 
+ 	# key sanity check
+ 	return unless ($key);

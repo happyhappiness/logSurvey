@@ -1,0 +1,218 @@
+@@ -413,6 +413,15 @@ data writes properly, but can be useful for filesystems that do not use
+ journalling (traditional UNIX filesystems) or that only journal metadata
+ and not file contents (OS X's HFS+, or Linux ext3 with "data=writeback").
+ 
++core.preloadindex::
++	Enable parallel index preload for operations like 'git diff'
+++
++This can speed up operations like 'git diff' and 'git status' especially
++on filesystems like NFS that have weak caching semantics and thus
++relatively high IO latencies.  With this set to 'true', git will do the
++index comparison to the filesystem data in parallel, allowing
++overlapping IO's.
++
+ alias.*::
+ 	Command aliases for the linkgit:git[1] command wrapper - e.g.
+ 	after defining "alias.last = cat-file commit HEAD", the invocation
+@@ -496,6 +496,7 @@ LIB_OBJS += write_or_die.o
+ LIB_OBJS += ws.o
+ LIB_OBJS += wt-status.o
+ LIB_OBJS += xdiff-interface.o
++LIB_OBJS += preload-index.o
+ 
+ BUILTIN_OBJS += builtin-add.o
+ BUILTIN_OBJS += builtin-annotate.o
+@@ -225,18 +225,18 @@ static char *prepare_index(int argc, const char **argv, const char *prefix)
+ 
+ 	if (interactive) {
+ 		interactive_add(argc, argv, prefix);
+-		if (read_cache() < 0)
++		if (read_cache_preload(NULL) < 0)
+ 			die("index file corrupt");
+ 		commit_style = COMMIT_AS_IS;
+ 		return get_index_file();
+ 	}
+ 
+-	if (read_cache() < 0)
+-		die("index file corrupt");
+-
+ 	if (*argv)
+ 		pathspec = get_pathspec(prefix, argv);
+ 
++	if (read_cache_preload(pathspec) < 0)
++		die("index file corrupt");
++
+ 	/*
+ 	 * Non partial, non as-is commit.
+ 	 *
+@@ -59,8 +59,8 @@ int cmd_diff_files(int argc, const char **argv, const char *prefix)
+ 	    (rev.diffopt.output_format & DIFF_FORMAT_PATCH))
+ 		rev.combine_merges = rev.dense_combined_merges = 1;
+ 
+-	if (read_cache() < 0) {
+-		perror("read_cache");
++	if (read_cache_preload(rev.diffopt.paths) < 0) {
++		perror("read_cache_preload");
+ 		return -1;
+ 	}
+ 	result = run_diff_files(&rev, options);
+@@ -134,8 +134,8 @@ static int builtin_diff_index(struct rev_info *revs,
+ 	    revs->max_count != -1 || revs->min_age != -1 ||
+ 	    revs->max_age != -1)
+ 		usage(builtin_diff_usage);
+-	if (read_cache() < 0) {
+-		perror("read_cache");
++	if (read_cache_preload(revs->diffopt.paths) < 0) {
++		perror("read_cache_preload");
+ 		return -1;
+ 	}
+ 	return run_diff_index(revs, cached);
+@@ -234,8 +234,8 @@ static int builtin_diff_files(struct rev_info *revs, int argc, const char **argv
+ 		revs->combine_merges = revs->dense_combined_merges = 1;
+ 
+ 	setup_work_tree();
+-	if (read_cache() < 0) {
+-		perror("read_cache");
++	if (read_cache_preload(revs->diffopt.paths) < 0) {
++		perror("read_cache_preload");
+ 		return -1;
+ 	}
+ 	result = run_diff_files(revs, options);
+@@ -262,6 +262,7 @@ static inline void remove_name_hash(struct cache_entry *ce)
+ 
+ #define read_cache() read_index(&the_index)
+ #define read_cache_from(path) read_index_from(&the_index, (path))
++#define read_cache_preload(pathspec) read_index_preload(&the_index, (pathspec))
+ #define is_cache_unborn() is_index_unborn(&the_index)
+ #define read_cache_unmerged() read_index_unmerged(&the_index)
+ #define write_cache(newfd, cache, entries) write_index(&the_index, (newfd))
+@@ -368,6 +369,7 @@ extern int init_db(const char *template_dir, unsigned int flags);
+ 
+ /* Initialize and use the cache information */
+ extern int read_index(struct index_state *);
++extern int read_index_preload(struct index_state *, const char **pathspec);
+ extern int read_index_from(struct index_state *, const char *path);
+ extern int is_index_unborn(struct index_state *);
+ extern int read_index_unmerged(struct index_state *);
+@@ -458,6 +460,7 @@ extern size_t packed_git_limit;
+ extern size_t delta_base_cache_limit;
+ extern int auto_crlf;
+ extern int fsync_object_files;
++extern int core_preload_index;
+ 
+ enum safe_crlf {
+ 	SAFE_CRLF_FALSE = 0,
+@@ -490,6 +490,11 @@ static int git_default_core_config(const char *var, const char *value)
+ 		return 0;
+ 	}
+ 
++	if (!strcmp(var, "core.preloadindex")) {
++		core_preload_index = git_config_bool(var, value);
++		return 0;
++	}
++
+ 	/* Add other config variables here and to Documentation/config.txt. */
+ 	return 0;
+ }
+@@ -43,6 +43,9 @@ unsigned whitespace_rule_cfg = WS_DEFAULT_RULE;
+ enum branch_track git_branch_track = BRANCH_TRACK_REMOTE;
+ enum rebase_setup_type autorebase = AUTOREBASE_NEVER;
+ 
++/* Parallel index stat data preload? */
++int core_preload_index = 0;
++
+ /* This is set by setup_git_dir_gently() and/or git_default_config() */
+ char *git_work_tree_cfg;
+ static char *work_tree;
+@@ -0,0 +1,91 @@
++/*
++ * Copyright (C) 2008 Linus Torvalds
++ */
++#include "cache.h"
++#include <pthread.h>
++
++/*
++ * Mostly randomly chosen maximum thread counts: we
++ * cap the parallelism to 20 threads, and we want
++ * to have at least 500 lstat's per thread for it to
++ * be worth starting a thread.
++ */
++#define MAX_PARALLEL (20)
++#define THREAD_COST (500)
++
++struct thread_data {
++	pthread_t pthread;
++	struct index_state *index;
++	const char **pathspec;
++	int offset, nr;
++};
++
++static void *preload_thread(void *_data)
++{
++	int nr;
++	struct thread_data *p = _data;
++	struct index_state *index = p->index;
++	struct cache_entry **cep = index->cache + p->offset;
++
++	nr = p->nr;
++	if (nr + p->offset > index->cache_nr)
++		nr = index->cache_nr - p->offset;
++
++	do {
++		struct cache_entry *ce = *cep++;
++		struct stat st;
++
++		if (ce_stage(ce))
++			continue;
++		if (ce_uptodate(ce))
++			continue;
++		if (!ce_path_match(ce, p->pathspec))
++			continue;
++		if (lstat(ce->name, &st))
++			continue;
++		if (ie_match_stat(index, ce, &st, 0))
++			continue;
++		ce_mark_uptodate(ce);
++	} while (--nr > 0);
++	return NULL;
++}
++
++static void preload_index(struct index_state *index, const char **pathspec)
++{
++	int threads, i, work, offset;
++	struct thread_data data[MAX_PARALLEL];
++
++	if (!core_preload_index)
++		return;
++
++	threads = index->cache_nr / THREAD_COST;
++	if (threads < 2)
++		return;
++	if (threads > MAX_PARALLEL)
++		threads = MAX_PARALLEL;
++	offset = 0;
++	work = (index->cache_nr + threads - 1) / threads;
++	for (i = 0; i < threads; i++) {
++		struct thread_data *p = data+i;
++		p->index = index;
++		p->pathspec = pathspec;
++		p->offset = offset;
++		p->nr = work;
++		offset += work;
++		if (pthread_create(&p->pthread, NULL, preload_thread, p))
++			die("unable to create threaded lstat");
++	}
++	for (i = 0; i < threads; i++) {
++		struct thread_data *p = data+i;
++		if (pthread_join(p->pthread, NULL))
++			die("unable to join threaded lstat");
++	}
++}
++
++int read_index_preload(struct index_state *index, const char **pathspec)
++{
++	int retval = read_index(index);
++
++	preload_index(index, pathspec);
++	return retval;
++}

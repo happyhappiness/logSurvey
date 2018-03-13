@@ -1,0 +1,215 @@
+@@ -0,0 +1,81 @@
++Git Repository Format Versions
++==============================
++
++Every git repository is marked with a numeric version in the
++`core.repositoryformatversion` key of its `config` file. This version
++specifies the rules for operating on the on-disk repository data. An
++implementation of git which does not understand a particular version
++advertised by an on-disk repository MUST NOT operate on that repository;
++doing so risks not only producing wrong results, but actually losing
++data.
++
++Because of this rule, version bumps should be kept to an absolute
++minimum. Instead, we generally prefer these strategies:
++
++  - bumping format version numbers of individual data files (e.g.,
++    index, packfiles, etc). This restricts the incompatibilities only to
++    those files.
++
++  - introducing new data that gracefully degrades when used by older
++    clients (e.g., pack bitmap files are ignored by older clients, which
++    simply do not take advantage of the optimization they provide).
++
++A whole-repository format version bump should only be part of a change
++that cannot be independently versioned. For instance, if one were to
++change the reachability rules for objects, or the rules for locking
++refs, that would require a bump of the repository format version.
++
++Note that this applies only to accessing the repository's disk contents
++directly. An older client which understands only format `0` may still
++connect via `git://` to a repository using format `1`, as long as the
++server process understands format `1`.
++
++The preferred strategy for rolling out a version bump (whether whole
++repository or for a single file) is to teach git to read the new format,
++and allow writing the new format with a config switch or command line
++option (for experimentation or for those who do not care about backwards
++compatibility with older gits). Then after a long period to allow the
++reading capability to become common, we may switch to writing the new
++format by default.
++
++The currently defined format versions are:
++
++Version `0`
++-----------
++
++This is the format defined by the initial version of git, including but
++not limited to the format of the repository directory, the repository
++configuration file, and the object and ref storage. Specifying the
++complete behavior of git is beyond the scope of this document.
++
++Version `1`
++-----------
++
++This format is identical to version `0`, with the following exceptions:
++
++  1. When reading the `core.repositoryformatversion` variable, a git
++     implementation which supports version 1 MUST also read any
++     configuration keys found in the `extensions` section of the
++     configuration file.
++
++  2. If a version-1 repository specifies any `extensions.*` keys that
++     the running git has not implemented, the operation MUST NOT
++     proceed. Similarly, if the value of any known key is not understood
++     by the implementation, the operation MUST NOT proceed.
++
++Note that if no extensions are specified in the config file, then
++`core.repositoryformatversion` SHOULD be set to `0` (setting it to `1`
++provides no benefit, and makes the repository incompatible with older
++implementations of git).
++
++This document will serve as the master list for extensions. Any
++implementation wishing to define a new extension should make a note of
++it here, in order to claim the name.
++
++The defined extensions are:
++
++`noop`
++~~~~~~
++
++This extension does not change git's behavior at all. It is useful only
++for testing format-1 compatibility.
+@@ -686,7 +686,13 @@ extern char *notes_ref_name;
+ 
+ extern int grafts_replace_parents;
+ 
++/*
++ * GIT_REPO_VERSION is the version we write by default. The
++ * _READ variant is the highest number we know how to
++ * handle.
++ */
+ #define GIT_REPO_VERSION 0
++#define GIT_REPO_VERSION_READ 1
+ extern int repository_format_version;
+ extern int check_repository_format(void);
+ 
+@@ -5,6 +5,7 @@
+ static int inside_git_dir = -1;
+ static int inside_work_tree = -1;
+ static int work_tree_config_is_bogus;
++static struct string_list unknown_extensions = STRING_LIST_INIT_DUP;
+ 
+ /*
+  * The input parameter must contain an absolute path, and it must already be
+@@ -352,10 +353,23 @@ void setup_work_tree(void)
+ 
+ static int check_repo_format(const char *var, const char *value, void *cb)
+ {
++	const char *ext;
++
+ 	if (strcmp(var, "core.repositoryformatversion") == 0)
+ 		repository_format_version = git_config_int(var, value);
+ 	else if (strcmp(var, "core.sharedrepository") == 0)
+ 		shared_repository = git_config_perm(var, value);
++	else if (skip_prefix(var, "extensions.", &ext)) {
++		/*
++		 * record any known extensions here; otherwise,
++		 * we fall through to recording it as unknown, and
++		 * check_repository_format will complain
++		 */
++		if (!strcmp(ext, "noop"))
++			;
++		else
++			string_list_append(&unknown_extensions, ext);
++	}
+ 	return 0;
+ }
+ 
+@@ -366,6 +380,8 @@ static int check_repository_format_gently(const char *gitdir, int *nongit_ok)
+ 	config_fn_t fn;
+ 	int ret = 0;
+ 
++	string_list_clear(&unknown_extensions, 0);
++
+ 	if (get_common_dir(&sb, gitdir))
+ 		fn = check_repo_format;
+ 	else
+@@ -383,16 +399,31 @@ static int check_repository_format_gently(const char *gitdir, int *nongit_ok)
+ 	 * is a good one.
+ 	 */
+ 	git_config_early(fn, NULL, repo_config);
+-	if (GIT_REPO_VERSION < repository_format_version) {
++	if (GIT_REPO_VERSION_READ < repository_format_version) {
+ 		if (!nongit_ok)
+ 			die ("Expected git repo version <= %d, found %d",
+-			     GIT_REPO_VERSION, repository_format_version);
++			     GIT_REPO_VERSION_READ, repository_format_version);
+ 		warning("Expected git repo version <= %d, found %d",
+-			GIT_REPO_VERSION, repository_format_version);
++			GIT_REPO_VERSION_READ, repository_format_version);
+ 		warning("Please upgrade Git");
+ 		*nongit_ok = -1;
+ 		ret = -1;
+ 	}
++
++	if (repository_format_version >= 1 && unknown_extensions.nr) {
++		int i;
++
++		if (!nongit_ok)
++			die("unknown repository extension: %s",
++			    unknown_extensions.items[0].string);
++
++		for (i = 0; i < unknown_extensions.nr; i++)
++			warning("unknown repository extension: %s",
++				unknown_extensions.items[i].string);
++		*nongit_ok = -1;
++		ret = -1;
++	}
++
+ 	strbuf_release(&sb);
+ 	return ret;
+ }
+@@ -67,4 +67,42 @@ test_expect_success 'gitdir required mode' '
+ 	)
+ '
+ 
++check_allow () {
++	git rev-parse --git-dir >actual &&
++	echo .git >expect &&
++	test_cmp expect actual
++}
++
++check_abort () {
++	test_must_fail git rev-parse --git-dir
++}
++
++# avoid git-config, since it cannot be trusted to run
++# in a repository with a broken version
++mkconfig () {
++	echo '[core]' &&
++	echo "repositoryformatversion = $1" &&
++	shift &&
++
++	if test $# -gt 0; then
++		echo '[extensions]' &&
++		for i in "$@"; do
++			echo "$i"
++		done
++	fi
++}
++
++while read outcome version extensions; do
++	test_expect_success "$outcome version=$version $extensions" "
++		mkconfig $version $extensions >.git/config &&
++		check_${outcome}
++	"
++done <<\EOF
++allow 0
++allow 1
++allow 1 noop
++abort 1 no-such-extension
++allow 0 no-such-extension
++EOF
++
+ test_done

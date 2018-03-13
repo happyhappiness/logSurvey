@@ -1,80 +1,482 @@
-----++++src/utils_cmd_putval.c
-@@ -138,14 +138,6 @@ cmd_status_t cmd_parse_putval(size_t argc, char **argv,
-   type = NULL;
-   type_instance = NULL;
+@@ -495,6 +495,11 @@ test_lib_server_CPPFLAGS = \
+ 	$(AM_CPPFLAGS) \
+ 	-I$(srcdir)/src/libcollectdclient \
+ 	-I$(top_builddir)/src/libcollectdclient
++if BUILD_WITH_LIBGCRYPT
++test_lib_server_CPPFLAGS += $(GCRYPT_CPPFLAGS)
++test_lib_server_LDFLAGS = $(GCRYPT_LDFLAGS)
++test_lib_server_LDADD = $(GCRYPT_LIBS)
++endif
  
--  vl.values_len = ds-&gt;ds_num;
--  vl.values = malloc(vl.values_len * sizeof(*vl.values));
--  if (vl.values == NULL) {
--    cmd_error(CMD_ERROR, err, &quot;malloc failed.&quot;);
--    sfree(identifier_copy);
--    return (CMD_ERROR);
--  }
--
-   ret_putval-&gt;raw_identifier = identifier_copy;
-   if (ret_putval-&gt;raw_identifier == NULL) {
-     cmd_error(CMD_ERROR, err, &quot;malloc failed.&quot;);
-@@ -177,33 +169,46 @@ cmd_status_t cmd_parse_putval(size_t argc, char **argv,
-     /* else: cmd_parse_option did not find an option; treat this as a
-      * value list. */
+ liboconfig_la_SOURCES = \
+ 	src/liboconfig/oconfig.c \
+@@ -29,6 +29,7 @@
+ #include "collectd/lcc_features.h"
  
-+    vl.values_len = ds-&gt;ds_num;
-+    vl.values = calloc(vl.values_len, sizeof(*vl.values));
-+    if (vl.values == NULL) {
-+      cmd_error(CMD_ERROR, err, &quot;malloc failed.&quot;);
-+      result = CMD_ERROR;
+ #include "collectd/types.h"
++#include "collectd/network.h" /* for lcc_security_level_t */
+ 
+ #include <stdint.h>
+ 
+@@ -38,6 +39,10 @@ LCC_BEGIN_DECLS
+  * dispatched. */
+ typedef int (*lcc_value_list_writer_t)(lcc_value_list_t const *);
+ 
++/* lcc_password_lookup_t is a callback for looking up the password for a given
++ * user. Must return NULL if the user is not known. */
++typedef char const *(*lcc_password_lookup_t)(char const *);
++
+ /* lcc_listener_t holds parameters for running a collectd server. */
+ typedef struct {
+   /* conn is a UDP socket for the server to listen on. */
+@@ -57,11 +62,11 @@ typedef struct {
+   /* buffer_size determines the maximum packet size to accept. */
+   uint16_t buffer_size;
+ 
+-  /* TODO(octo): User to password lookup. */
+-  /* char const * (*password_lookup) (char const *); */
++  /* password_lookup is used to look up the password for a given username. */
++  lcc_password_lookup_t password_lookup;
+ 
+-  /* TODO(octo): Minimal required security level. */
+-  /* int security_level; */
++  /* security_level is the minimal required security level. */
++  lcc_security_level_t security_level;
+ 
+   /* interface is the name of the interface to use when subscribing to a
+    * multicast group. Has no effect when using unicast. */
+@@ -74,14 +79,24 @@ typedef struct {
+  * failure and does not return otherwise. */
+ int lcc_listen_and_write(lcc_listener_t srv);
+ 
++typedef struct {
++  /* writer is the callback used to send incoming lcc_value_list_t to. */
++  lcc_value_list_writer_t writer;
++
++  /* password_lookup is used to look up the password for a given username. */
++  lcc_password_lookup_t password_lookup;
++
++  /* security_level is the minimal required security level. */
++  lcc_security_level_t security_level;
++} lcc_network_parse_options_t;
++
+ /* lcc_network_parse parses data received from the network and calls "w" with
+  * the parsed lcc_value_list_ts. */
+ /* TODO(octo): the Go code returns a []api.ValueList. Should we return a
+  * value_list_t** here? */
+ int lcc_network_parse(void *buffer, size_t buffer_size,
+-                      lcc_value_list_writer_t w);
++                      lcc_network_parse_options_t opts);
+ 
+ LCC_END_DECLS
+ 
+-/* vim: set sw=2 sts=2 et : */
+ #endif /* LIBCOLLECTD_SERVER_H */
+@@ -41,15 +41,26 @@
+ #include <math.h>
+ #include <net/if.h>
+ #include <netdb.h>
++#include <pthread.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/socket.h>
+ #include <sys/types.h>
+ #include <unistd.h>
+ 
++#define GCRYPT_NO_DEPRECATED
++#include <gcrypt.h>
++
+ #include <stdio.h>
+ #define DEBUG(...) printf(__VA_ARGS__)
+ 
++GCRY_THREAD_OPTION_PTHREAD_IMPL;
++
++/* forward declaration because parse_sign_sha256()/parse_encrypt_aes256() and
++ * network_parse() need to call each other. */
++static int network_parse(void *data, size_t data_size, lcc_security_level_t sl,
++                         lcc_network_parse_options_t const *opts);
++
+ static _Bool is_multicast(struct addrinfo const *ai) {
+   if (ai->ai_family == AF_INET) {
+     struct sockaddr_in *addr = (struct sockaddr_in *)ai->ai_addr;
+@@ -179,9 +190,45 @@ static int server_open(lcc_listener_t *srv) {
+   return status != 0 ? status : -1;
+ }
+ 
++static int init_gcrypt() {
++  /* http://lists.gnupg.org/pipermail/gcrypt-devel/2003-August/000458.html
++   * Because you can't know in a library whether another library has
++   * already initialized the library */
++  if (gcry_control(GCRYCTL_ANY_INITIALIZATION_P))
++    return (0);
++
++/* http://www.gnupg.org/documentation/manuals/gcrypt/Multi_002dThreading.html
++ * To ensure thread-safety, it's important to set GCRYCTL_SET_THREAD_CBS
++ * *before* initalizing Libgcrypt with gcry_check_version(), which itself must
++ * be called before any other gcry_* function. GCRYCTL_ANY_INITIALIZATION_P
++ * above doesn't count, as it doesn't implicitly initalize Libgcrypt.
++ *
++ * tl;dr: keep all these gry_* statements in this exact order please. */
++#if GCRYPT_VERSION_NUMBER < 0x010600
++  if (gcry_control(GCRYCTL_SET_THREAD_CBS, &gcry_threads_pthread)) {
++    return -1;
++  }
++#endif
++
++  gcry_check_version(NULL);
++
++  if (gcry_control(GCRYCTL_INIT_SECMEM, 32768)) {
++    return -1;
++  }
++
++  gcry_control(GCRYCTL_INITIALIZATION_FINISHED);
++  return 0;
++}
++
+ int lcc_listen_and_write(lcc_listener_t srv) {
+   _Bool close_socket = 0;
+ 
++  if (srv.password_lookup) {
++    int status = init_gcrypt();
++    if (status)
++      return status;
++  }
++
+   if (srv.conn < 0) {
+     int status = server_open(&srv);
+     if (status != 0)
+@@ -205,7 +252,12 @@ int lcc_listen_and_write(lcc_listener_t srv) {
+     }
+ 
+     /* TODO(octo): implement parse(). */
+-    (void)lcc_network_parse(buffer, (size_t)len, srv.writer);
++    (void)lcc_network_parse(buffer, (size_t)len,
++                            (lcc_network_parse_options_t){
++                                .writer = srv.writer,
++                                .password_lookup = srv.password_lookup,
++                                .security_level = srv.security_level,
++                            });
+   }
+ 
+   if (close_socket) {
+@@ -252,6 +304,8 @@ static int buffer_uint16(buffer_t *b, uint16_t *out) {
+ #define TYPE_VALUES 0x0006
+ #define TYPE_INTERVAL 0x0007
+ #define TYPE_INTERVAL_HR 0x0009
++#define TYPE_SIGN_SHA256 0x0200
++#define TYPE_ENCR_AES256 0x0210
+ 
+ static int parse_int(void *payload, size_t payload_size, uint64_t *out) {
+   uint64_t tmp;
+@@ -465,7 +519,147 @@ static int parse_values(void *payload, size_t payload_size,
+   return 0;
+ }
+ 
+-int lcc_network_parse(void *data, size_t data_size, lcc_value_list_writer_t w) {
++static int verify_sha256(void *payload, size_t payload_size,
++                         char const *username, char const *password,
++                         uint8_t hash_provided[32]) {
++  gcry_md_hd_t hd = NULL;
++
++  gcry_error_t err = gcry_md_open(&hd, GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC);
++  if (err != 0) {
++    /* TODO(octo): use gcry_strerror(err) to create an error string. */
++    return -1;
++  }
++
++  err = gcry_md_setkey(hd, password, strlen(password));
++  if (err != 0) {
++    gcry_md_close(hd);
++    return -1;
++  }
++
++  gcry_md_write(hd, username, strlen(username));
++  gcry_md_write(hd, payload, payload_size);
++
++  unsigned char *hash_calculated = gcry_md_read(hd, GCRY_MD_SHA256);
++  if (!hash_calculated) {
++    gcry_md_close(hd);
++    return -1;
++  }
++
++  int ret = memcmp(hash_provided, hash_calculated, 32);
++
++  gcry_md_close(hd);
++  hash_calculated = NULL;
++
++  return !!ret;
++}
++
++static int parse_sign_sha256(void *signature, size_t signature_len,
++                             void *payload, size_t payload_size,
++                             lcc_network_parse_options_t const *opts) {
++  if (opts->password_lookup == NULL) {
++    /* TODO(octo): print warning */
++    return network_parse(payload, payload_size, NONE, opts);
++  }
++
++  buffer_t *b = &(buffer_t){
++      .data = signature, .len = signature_len,
++  };
++
++  uint8_t hash[32];
++  if (buffer_next(b, hash, sizeof(hash)))
++    return EINVAL;
++
++  char username[b->len + 1];
++  memset(username, 0, sizeof(username));
++  if (buffer_next(b, username, sizeof(username) - 1)) {
++    return EINVAL;
++  }
++
++  char const *password = opts->password_lookup(username);
++  if (!password)
++    return network_parse(payload, payload_size, NONE, opts);
++
++  int status = verify_sha256(payload, payload_size, username, password, hash);
++  if (status != 0)
++    return status;
++
++  return network_parse(payload, payload_size, SIGN, opts);
++}
++
++static int decrypt_aes256(buffer_t *b, void *iv, size_t iv_size,
++                          char const *password) {
++  gcry_cipher_hd_t cipher = NULL;
++
++  if (gcry_cipher_open(&cipher, GCRY_CIPHER_AES256, GCRY_CIPHER_MODE_OFB,
++                       /* flags = */ 0))
++    return -1;
++
++  uint8_t pwhash[32] = {0};
++  gcry_md_hash_buffer(GCRY_MD_SHA256, pwhash, password, strlen(password));
++
++  fprintf(stderr, "sizeof(iv) = %zu\n", sizeof(iv));
++  if (gcry_cipher_setkey(cipher, pwhash, sizeof(pwhash)) ||
++      gcry_cipher_setiv(cipher, iv, iv_size) ||
++      gcry_cipher_decrypt(cipher, b->data, b->len, /* in = */ NULL,
++                          /* in_size = */ 0)) {
++    gcry_cipher_close(cipher);
++    return -1;
++  }
++
++  gcry_cipher_close(cipher);
++  return 0;
++}
++
++static int parse_encrypt_aes256(void *data, size_t data_size,
++                                lcc_network_parse_options_t const *opts) {
++  if (opts->password_lookup == NULL) {
++    /* TODO(octo): print warning */
++    return ENOENT;
++  }
++
++  buffer_t *b = &(buffer_t){
++      .data = data, .len = data_size,
++  };
++
++  uint16_t username_len;
++  if (buffer_uint16(b, &username_len))
++    return EINVAL;
++  if ((size_t)username_len > data_size)
++    return ENOMEM;
++  char username[((size_t)username_len) + 1];
++  memset(username, 0, sizeof(username));
++  if (buffer_next(b, username, sizeof(username)))
++    return EINVAL;
++
++  char const *password = opts->password_lookup(username);
++  if (!password)
++    return ENOENT;
++
++  uint8_t iv[16];
++  if (buffer_next(b, iv, sizeof(iv)))
++    return EINVAL;
++
++  int status = decrypt_aes256(b, iv, sizeof(iv), password);
++  if (status != 0)
++    return status;
++
++  uint8_t hash_provided[20];
++  if (buffer_next(b, hash_provided, sizeof(hash_provided))) {
++    return -1;
++  }
++
++  uint8_t hash_calculated[20];
++  gcry_md_hash_buffer(GCRY_MD_SHA1, hash_calculated, b->data, b->len);
++
++  if (memcmp(hash_provided, hash_calculated, sizeof(hash_provided)) != 0) {
++    return -1;
++  }
++
++  return network_parse(b->data, b->len, ENCRYPT, opts);
++}
++
++static int network_parse(void *data, size_t data_size, lcc_security_level_t sl,
++                         lcc_network_parse_options_t const *opts) {
+   buffer_t *b = &(buffer_t){
+       .data = data, .len = data_size,
+   };
+@@ -524,7 +718,7 @@ int lcc_network_parse(void *data, size_t data_size, lcc_value_list_writer_t w) {
+ 
+       /* TODO(octo): skip if current_security_level < required_security_level */
+ 
+-      int status = w(&vl);
++      int status = opts->writer(&vl);
+ 
+       free(vl.values);
+       free(vl.values_types);
+@@ -534,6 +728,28 @@ int lcc_network_parse(void *data, size_t data_size, lcc_value_list_writer_t w) {
+       break;
+     }
+ 
++    case TYPE_SIGN_SHA256: {
++      int status =
++          parse_sign_sha256(payload, sizeof(payload), b->data, b->len, opts);
++      if (status != 0) {
++        DEBUG("lcc_network_parse(): parse_sign_sha256() = %d\n", status);
++        return -1;
++      }
++      /* parse_sign_sha256, if successful, consumes all remaining data. */
++      b->data = NULL;
++      b->len = 0;
 +      break;
 +    }
 +
-     status = parse_values(argv[i], &amp;vl, ds);
-     if (status != 0) {
-       cmd_error(CMD_PARSE_ERROR, err, &quot;Parsing the values string failed.&quot;);
-       result = CMD_PARSE_ERROR;
-+      vl.values_len = 0;
-+      sfree(vl.values);
-       break;
-     }
- 
--    tmp = (value_list_t *)realloc(ret_putval-&gt;vl, (ret_putval-&gt;vl_num + 1) *
--                                                      sizeof(*ret_putval-&gt;vl));
-+    tmp = realloc(ret_putval-&gt;vl,
-+                  (ret_putval-&gt;vl_num + 1) * sizeof(*ret_putval-&gt;vl));
-     if (tmp == NULL) {
-       cmd_error(CMD_ERROR, err, &quot;realloc failed.&quot;);
-       cmd_destroy_putval(ret_putval);
-       result = CMD_ERROR;
-+      vl.values_len = 0;
-+      sfree(vl.values);
-       break;
-     }
- 
-     ret_putval-&gt;vl = tmp;
-     ret_putval-&gt;vl_num++;
-     memcpy(&amp;ret_putval-&gt;vl[ret_putval-&gt;vl_num - 1], &amp;vl, sizeof(vl));
++    case TYPE_ENCR_AES256: {
++      int status = parse_encrypt_aes256(payload, sizeof(payload), opts);
++      if (status != 0) {
++        DEBUG("lcc_network_parse(): parse_encrypt_aes256() = %d\n", status);
++        return -1;
++      }
++      break;
++    }
 +
-+    /* pointer is now owned by ret_putval-&gt;vl[] */
-+    vl.values_len = 0;
-+    vl.values = NULL;
-   } /* while (*buffer != 0) */
-   /* Done parsing the options. */
+     default: {
+       DEBUG("lcc_network_parse(): ignoring unknown type %" PRIu16 "\n", type);
+       return EINVAL;
+@@ -543,3 +759,15 @@ int lcc_network_parse(void *data, size_t data_size, lcc_value_list_writer_t w) {
  
--  if (result != CMD_OK) {
--    if (ret_putval-&gt;vl_num == 0)
--      sfree(vl.values);
-+  if (result != CMD_OK)
-     cmd_destroy_putval(ret_putval);
--  }
+   return 0;
+ }
++
++int lcc_network_parse(void *data, size_t data_size,
++                      lcc_network_parse_options_t opts) {
++  if (opts.password_lookup) {
++    int status;
++    if ((status = init_gcrypt())) {
++      return status;
++    }
++  }
++
++  return network_parse(data, data_size, NONE, &opts);
++}
+@@ -27,6 +27,7 @@
  
-   return (result);
- } /* cmd_status_t cmd_parse_putval */
-@@ -215,8 +220,7 @@ void cmd_destroy_putval(cmd_putval_t *putval) {
-   sfree(putval-&gt;raw_identifier);
+ #include "collectd/network_buffer.h"
  
-   for (size_t i = 0; i &lt; putval-&gt;vl_num; ++i) {
--    if (i == 0) /* values is shared between all entries */
--      sfree(putval-&gt;vl[i].values);
-+    sfree(putval-&gt;vl[i].values);
-     meta_data_destroy(putval-&gt;vl[i].meta);
-     putval-&gt;vl[i].meta = NULL;
++#include <assert.h>
+ #include <errno.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -255,7 +256,10 @@ static int test_network_parse() {
+       return -1;
+     }
+ 
+-    int status = lcc_network_parse(buffer, buffer_size, nop_writer);
++    int status =
++        lcc_network_parse(buffer, buffer_size, (lcc_network_parse_options_t){
++                                                   .writer = nop_writer,
++                                               });
+     if (status != 0) {
+       fprintf(stderr, "lcc_network_parse(raw_packet_data[%zu]) = %d, want 0\n",
+               i, status);
+@@ -412,6 +416,75 @@ static int test_parse_values() {
+   return ret;
+ }
+ 
++static int test_verify_sha256() {
++  int ret = 0;
++
++  int status = verify_sha256(
++      (char[]){'c', 'o', 'l', 'l', 'e', 'c', 't', 'd'}, 8, "admin", "admin",
++      (uint8_t[]){
++          0xcd, 0xa5, 0x9a, 0x37, 0xb0, 0x81, 0xc2, 0x31, 0x24, 0x2a, 0x6d,
++          0xbd, 0xfb, 0x44, 0xdb, 0xd7, 0x41, 0x2a, 0xf4, 0x29, 0x83, 0xde,
++          0xa5, 0x11, 0x96, 0xd2, 0xe9, 0x30, 0x21, 0xae, 0xc5, 0x45,
++      });
++  if (status != 0) {
++    fprintf(stderr, "verify_sha256() = %d, want 0\n", status);
++    ret = -1;
++  }
++
++  status = verify_sha256(
++      (char[]){'c', 'o', 'l', 'l', 'E', 'c', 't', 'd'}, 8, "admin", "admin",
++      (uint8_t[]){
++          0xcd, 0xa5, 0x9a, 0x37, 0xb0, 0x81, 0xc2, 0x31, 0x24, 0x2a, 0x6d,
++          0xbd, 0xfb, 0x44, 0xdb, 0xd7, 0x41, 0x2a, 0xf4, 0x29, 0x83, 0xde,
++          0xa5, 0x11, 0x96, 0xd2, 0xe9, 0x30, 0x21, 0xae, 0xc5, 0x45,
++      });
++  if (status != 1) {
++    fprintf(stderr, "verify_sha256() = %d, want 1\n", status);
++    ret = -1;
++  }
++
++  return ret;
++}
++
++static int test_decrypt_aes256() {
++  char const *iv_str = "4cbe2a747c9f9dcfa0e66f0c2fa74875";
++  uint8_t iv[16] = {0};
++  size_t iv_len = sizeof(iv);
++
++  char const *ciphertext_str =
++      "8f023b0b15178f8428da1221a5f653e840f065db4aff032c22e5a3df";
++  uint8_t ciphertext[28] = {0};
++  size_t ciphertext_len = sizeof(ciphertext);
++
++  if (decode_string(iv_str, iv, &iv_len) ||
++      decode_string(ciphertext_str, ciphertext, &ciphertext_len)) {
++    fprintf(stderr, "test_decrypt_aes256: decode_string failed.\n");
++    return -1;
++  }
++  assert(iv_len == sizeof(iv));
++  assert(ciphertext_len == sizeof(ciphertext));
++
++  int status = decrypt_aes256(
++      &(buffer_t){
++          .data = ciphertext, .len = ciphertext_len,
++      },
++      iv, iv_len, "admin");
++  if (status != 0) {
++    fprintf(stderr, "decrypt_aes256() = %d, want 0\n", status);
++    return -1;
++  }
++
++  char const *want = "collectd";
++  char got[9] = {0};
++  memmove(got, &ciphertext[20], sizeof(got) - 1);
++  if (strcmp(got, want) != 0) {
++    fprintf(stderr, "decrypt_aes256() = \"%s\", want \"%s\"\n", got, want);
++    return -1;
++  }
++
++  return 0;
++}
++
+ int main(void) {
+   int ret = 0;
+ 
+@@ -431,5 +504,12 @@ int main(void) {
+     ret = status;
    }
-----++++GitHub
+ 
++  if ((status = test_verify_sha256())) {
++    ret = status;
++  }
++  if ((status = test_decrypt_aes256())) {
++    ret = status;
++  }
++
+   return ret;
+ }

@@ -1,0 +1,436 @@
+@@ -42,9 +42,7 @@ kstat_ctl_t *kc;
+  */
+ time_t curtime;
+ 
+-#if HAVE_LIBRRD
+ int operating_mode;
+-#endif
+ 
+ static void sigIntHandler (int signal)
+ {
+@@ -403,7 +401,7 @@ int main (int argc, char **argv)
+ #if HAVE_LIBRRD
+ 	if (operating_mode == MODE_SERVER)
+ 		start_server ();
+-	else /* if (operating_mode == MODE_CLIENT || operating_mode == MODE_LOCAL) */
++	else /* if (operating_mode == MODE_CLIENT || operating_mode == MODE_LOCAL || operating_mode == MODE_LOG) */
+ #endif
+ 		start_client ();
+ 
+@@ -36,7 +36,7 @@ ignored.
+ 
+ =over 4
+ 
+-=item B<Mode> (B<Local>|B<Client>|B<Server>)
++=item B<Mode> (B<Local>|B<Client>|B<Server>|B<Log>)
+ 
+ Sets the operating mode. See the section B<MODES> in L<collectd(1)> for a
+ description. This option determines which other options are allowed. Defaults
+@@ -198,6 +198,7 @@
+ #define MODE_SERVER 0x01
+ #define MODE_CLIENT 0x02
+ #define MODE_LOCAL  0x04
++#define MODE_LOG    0x08
+ 
+ extern time_t curtime;
+ 
+@@ -115,16 +115,19 @@ The simplest mode is the so called B<local mode>. Data is collected locally and
+ written in RRD files that reside in I<DataDir>. This is the default mode when
+ collectd is linked against C<librrd>.
+ 
+-The other two modes, B<client mode> and B<server mode>, are used to send data
+-over a network and receive it again.
++The other modes, B<client mode> and B<server mode>, are used to send data over
++a network and receive it again.
+ 
+-In B<client mode> the daemon collects the data locally and sends it's results
++In B<client mode> the daemon collects the data locally and sends its results
+ to one or more network addresses. No RRD files are written in this case. This
+ is the only mode available if collectd is not linked against C<librrd>.
+ 
+ If started in B<server mode> the daemon will listen on one or more interfaces
+ and write the data it receives to RRD files. No data is collected locally.
+ 
++In the last mode, B<log mode>, data is collected locally and written in
++text files that reside in I<DataDir>.
++
+ Please refer to L<collectd.conf(5)> for the configuration options and default
+ values.
+ 
+@@ -25,6 +25,8 @@
+ #include "common.h"
+ #include "utils_debug.h"
+ 
++extern int operating_mode;
++
+ #ifdef HAVE_LIBKSTAT
+ extern kstat_ctl_t *kc;
+ #endif
+@@ -181,7 +183,6 @@ int escape_slashes (char *buf, int buf_len)
+ 	return (0);
+ }
+ 
+-#ifdef HAVE_LIBRRD
+ int check_create_dir (const char *file_orig)
+ {
+ 	struct stat statbuf;
+@@ -286,8 +287,133 @@ int check_create_dir (const char *file_orig)
+ 	return (0);
+ }
+ 
++int log_create_file (char *filename, char **ds_def, int ds_num)
++{
++	FILE *log;
++	int i;
++
++	log = fopen (filename, "w");
++	if (log == NULL)
++	{
++		syslog (LOG_WARNING, "Failed to create %s: %s", filename,
++				strerror(errno));
++		return (-1);
++	}
++
++	for (i = 0; i < ds_num; i++)
++	{
++		char *name;
++		char *tmp;
++
++		name = index (ds_def[i], ':');
++		if (name == NULL)
++		{
++			syslog (LOG_WARNING, "Invalid DS definition '%s' for %s",
++					ds_def[i], filename);
++			fclose(log);
++			remove(filename);
++			return (-1);
++		}
++
++		name += 1;
++		tmp = index(name, ':');
++		if (tmp == NULL)
++		{
++			syslog (LOG_WARNING, "Invalid DS definition '%s' for %s",
++					ds_def[i], filename);
++			fclose(log);
++			remove(filename);
++			return (-1);
++		}
++
++		if (i != 0)
++			fprintf (log, ":");
++		fprintf(log, "%.*s", (tmp - name), name);
++	}
++	fprintf(log, "\n");
++	fclose(log);
++
++	return 0;
++}
++
++int log_update_file (char *host, char *file, char *values,
++		char **ds_def, int ds_num)
++{
++	char *tmp;
++	FILE *fp;
++	struct stat statbuf;
++	char full_file[1024];
++
++	/* host == NULL => local mode */
++	if (host != NULL)
++	{
++		if (snprintf (full_file, 1024, "%s/%s", host, file) >= 1024)
++			return (-1);
++	}
++	else
++	{
++		if (snprintf (full_file, 1024, "%s", file) >= 1024)
++			return (-1);
++	}
++
++	strncpy (full_file, file, 1024);
++
++	tmp = full_file + strlen (full_file) - 4;
++	assert (tmp > 0);
++
++	/* Change the filename for logfiles. */
++	if (strncmp (tmp, ".rrd", 4) == 0)
++	{
++		time_t now;
++		struct tm *tm;
++
++		now = time (NULL);
++		tm = localtime (&now);
++
++		strftime (tmp, 1024 - (tmp - full_file), "-%Y-%m-%d", tm);
++
++		/* `localtime(3)' returns a pointer to static data,
++		 * therefore the pointer may not be free'd. */
++	}
++	else
++		DBG ("The filename ends with `%s' which is unexpected.", tmp);
++
++	if (stat (full_file, &statbuf) == -1)
++	{
++		if (errno == ENOENT)
++		{
++			if (log_create_file (full_file, ds_def, ds_num))
++				return (-1);
++		}
++		else
++		{
++			syslog (LOG_ERR, "stat %s: %s", full_file, strerror (errno));
++			return (-1);
++		}
++	}
++	else if (!S_ISREG (statbuf.st_mode))
++	{
++		syslog (LOG_ERR, "stat %s: Not a regular file!", full_file);
++		return (-1);
++	}
++
++
++	fp = fopen (full_file, "a");
++	if (fp == NULL)
++	{
++		syslog (LOG_WARNING, "Failed to append to %s: %s", full_file,
++				strerror(errno));
++		return (-1);
++	}
++	fprintf(fp, "%s\n", values);
++	fclose(fp);
++
++	return (0);
++} /* int log_update_file */
++
+ int rrd_create_file (char *filename, char **ds_def, int ds_num)
+ {
++#ifdef HAVE_LIBRRD
+ 	char **argv;
+ 	int argc;
+ 	int i, j;
+@@ -325,19 +451,26 @@ int rrd_create_file (char *filename, char **ds_def, int ds_num)
+ 	}
+ 
+ 	free (argv);
+-	
++
+ 	return (status);
+-}
++#else
++	return (1);
+ #endif /* HAVE_LIBRRD */
++}
+ 
+ int rrd_update_file (char *host, char *file, char *values,
+ 		char **ds_def, int ds_num)
+ {
+-#ifdef HAVE_LIBRRD
+ 	struct stat statbuf;
+ 	char full_file[1024];
+ 	char *argv[4] = { "update", full_file, values, NULL };
+ 
++	/* I'd rather have a function `common_update_file' to make this
++	 * decission, but for that we'd need to touch all plugins.. */
++	if (operating_mode == MODE_LOG)
++		return (log_update_file (host, file, values,
++					ds_def, ds_num));
++
+ 	/* host == NULL => local mode */
+ 	if (host != NULL)
+ 	{
+@@ -369,6 +502,7 @@ int rrd_update_file (char *host, char *file, char *values,
+ 		return (-1);
+ 	}
+ 
++#ifdef HAVE_LIBRRD
+ 	optind = 0; /* bug in librrd? */
+ 	rrd_clear_error ();
+ 	if (rrd_update (3, argv) == -1)
+@@ -377,7 +511,6 @@ int rrd_update_file (char *host, char *file, char *values,
+ 		return (-1);
+ 	}
+ #endif /* HAVE_LIBRRD */
+-
+ 	return (0);
+ }
+ 
+@@ -37,11 +37,7 @@
+ #define ERR_NEEDS_ARG "Section `%s' needs an argument.\n"
+ #define ERR_NEEDS_SECTION "`%s' can only be used within a section.\n"
+ 
+-#ifdef HAVE_LIBRRD
+ extern int operating_mode;
+-#else
+-static int operating_mode = MODE_CLIENT;
+-#endif
+ 
+ typedef struct cf_callback
+ {
+@@ -67,9 +63,9 @@ typedef struct cf_mode_item
+ static cf_mode_item_t cf_mode_list[] =
+ {
+ 	{"TimeToLive",  NULL, MODE_CLIENT                           },
+-	{"PIDFile",     NULL, MODE_CLIENT | MODE_SERVER | MODE_LOCAL},
+-	{"DataDir",     NULL, MODE_CLIENT | MODE_SERVER | MODE_LOCAL},
+-	{"LogFile",     NULL, MODE_CLIENT | MODE_SERVER | MODE_LOCAL}
++	{"PIDFile",     NULL, MODE_CLIENT | MODE_SERVER | MODE_LOCAL | MODE_LOG },
++	{"DataDir",     NULL, MODE_CLIENT | MODE_SERVER | MODE_LOCAL | MODE_LOG },
++	{"LogFile",     NULL, MODE_CLIENT | MODE_SERVER | MODE_LOCAL | MODE_LOG }
+ };
+ static int cf_mode_num = 4;
+ 
+@@ -240,14 +236,19 @@ static int cf_callback_mode (const char *shortvar, const char *var,
+ 		void *extra)
+ {
+ 	DBG ("shortvar = %s, var = %s, arguments = %s, value = %s, ...",
+-			shortvar, var, arguments, value);
++             shortvar, var, (arguments) ? arguments : "<NULL>",
++             (value) ? value : "?");
+ 
+ 	if (strcasecmp (value, "Client") == 0)
+ 		operating_mode = MODE_CLIENT;
++#if HAVE_LIBRRD
+ 	else if (strcasecmp (value, "Server") == 0)
+ 		operating_mode = MODE_SERVER;
+ 	else if (strcasecmp (value, "Local") == 0)
+ 		operating_mode = MODE_LOCAL;
++#endif
++	else if (strcasecmp (value, "Log") == 0)
++		operating_mode = MODE_LOG;
+ 	else
+ 	{
+ 		syslog (LOG_ERR, "Invalid value for config option `Mode': `%s'", value);
+@@ -270,7 +271,8 @@ static int cf_callback_mode_plugindir (const char *shortvar, const char *var,
+ 		void *extra)
+ {
+ 	DBG ("shortvar = %s, var = %s, arguments = %s, value = %s, ...",
+-			shortvar, var, arguments, value);
++             shortvar, var, (arguments) ? arguments : "<NULL>",
++             (value) ? value : "?");
+ 
+ 	plugin_set_dir (value);
+ 
+@@ -284,7 +286,8 @@ static int cf_callback_mode_option (const char *shortvar, const char *var,
+ 	cf_mode_item_t *item;
+ 
+ 	DBG ("shortvar = %s, var = %s, arguments = %s, value = %s, ...",
+-			shortvar, var, arguments, value);
++             shortvar, var, (arguments) ? arguments : "<NULL>",
++             (value) ? value : "?");
+ 
+ 	if (extra == NULL)
+ 	{
+@@ -334,7 +337,8 @@ static int cf_callback_mode_loadmodule (const char *shortvar, const char *var,
+ 		void *extra)
+ {
+ 	DBG ("shortvar = %s, var = %s, arguments = %s, value = %s, ...",
+-			shortvar, var, arguments, value);
++             shortvar, var, (arguments) ? arguments : "<NULL>",
++             (value) ? value : "?");
+ 
+ 	if (plugin_load (value))
+ 		syslog (LOG_ERR, "plugin_load (%s): failed to load plugin", value);
+@@ -357,7 +361,8 @@ static int cf_callback_socket (const char *shortvar, const char *var,
+ 	char *service = NET_DEFAULT_PORT;
+ 
+ 	DBG ("shortvar = %s, var = %s, arguments = %s, value = %s, ...",
+-			shortvar, var, arguments, value);
++             shortvar, var, (arguments) ? arguments : "<NULL>",
++             (value) ? value : "?");
+ 
+ 	buffer = strdup (value);
+ 	if (buffer == NULL)
+@@ -400,7 +405,8 @@ static int cf_callback_plugin (const char *shortvar, const char *var,
+ 		void *extra)
+ {
+ 	DBG ("shortvar = %s, var = %s, arguments = %s, value = %s, ...",
+-			shortvar, var, arguments, value);
++             shortvar, var, (arguments) ? arguments : "<NULL>",
++             (value) ? value : "?");
+ 
+ 	if (flags == LC_FLAGS_SECTIONSTART)
+ 	{
+@@ -461,7 +467,8 @@ static int cf_callback_plugin_dispatch (const char *shortvar, const char *var,
+ 		void *extra)
+ {
+ 	DBG ("shortvar = %s, var = %s, arguments = %s, value = %s, ...",
+-			shortvar, var, arguments, value);
++             shortvar, var, (arguments) ? arguments : "<NULL>",
++             (value) ? value : "?");
+ 
+ 	if ((nesting_depth == 0) || (current_module == NULL))
+ 	{
+@@ -49,11 +49,7 @@
+ 
+ #define BUFF_SIZE 4096
+ 
+-#ifdef HAVE_LIBRRD
+ extern int operating_mode;
+-#else
+-static int operating_mode = MODE_CLIENT;
+-#endif
+ 
+ typedef struct sockent
+ {
+@@ -218,7 +214,7 @@ int network_create_socket (const char *node, const char *service)
+ 
+ 	DBG ("node = %s, service = %s", node, service);
+ 
+-	if (operating_mode == MODE_LOCAL)
++	if (operating_mode == MODE_LOCAL || operating_mode == MODE_LOG)
+ 		return (-1);
+ 
+ 	socklist_tail = socklist_head;
+@@ -38,9 +38,7 @@ typedef struct plugin
+ 
+ static plugin_t *first_plugin = NULL;
+ 
+-#ifdef HAVE_LIBRRD
+ extern int operating_mode;
+-#endif
+ 
+ static char *plugindir = NULL;
+ 
+@@ -290,7 +288,7 @@ void plugin_register (char *type,
+ 		return;
+ 
+ #ifdef HAVE_LIBRRD
+-	if ((operating_mode == MODE_LOCAL) || (operating_mode == MODE_CLIENT))
++	if (operating_mode != MODE_SERVER)
+ #endif
+ 		if ((init != NULL) && (read == NULL))
+ 			syslog (LOG_NOTICE, "Plugin `%s' doesn't provide a read function.", type);
+@@ -316,7 +314,6 @@ void plugin_register (char *type,
+  * Send received data back to the plugin/module which will append DS
+  * definitions and pass it on to ``rrd_update_file''.
+  */
+-#ifdef HAVE_LIBRRD
+ void plugin_write (char *host, char *type, char *inst, char *val)
+ {
+ 	plugin_t *p;
+@@ -329,7 +326,6 @@ void plugin_write (char *host, char *type, char *inst, char *val)
+ 
+ 	(*p->write) (host, inst, val);
+ }
+-#endif /* HAVE_LIBRRD */
+ 
+ /*
+  * Receive data from the plugin/module and get it somehow to ``plugin_write'':
+@@ -338,14 +334,8 @@ void plugin_write (char *host, char *type, char *inst, char *val)
+  */
+ void plugin_submit (char *type, char *inst, char *val)
+ {
+-#ifdef HAVE_LIBRRD
+-	if (operating_mode == MODE_LOCAL)
+-		plugin_write (NULL, type, inst, val);
+-	else if (operating_mode == MODE_CLIENT)
++        if (operating_mode == MODE_CLIENT)
+ 		network_send (type, inst, val);
+-	else /* operating_mode == MODE_SERVER */
+-		syslog (LOG_ERR, "WTF is the server doing in ``plugin_submit''?!?\n");
+-#else
+-	network_send (type, inst, val);
+-#endif
++	else
++		plugin_write (NULL, type, inst, val);
+ }

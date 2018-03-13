@@ -1,31 +1,450 @@
-----++++src/logfile.c
-@@ -31,8 +31,6 @@
- #include &quot;common.h&quot;
- #include &quot;plugin.h&quot;
+@@ -475,7 +475,7 @@ Methods defined here:
  
--#define DEFAULT_LOGFILE LOCALSTATEDIR &quot;/log/collectd.log&quot;
--
- #if COLLECT_DEBUG
- static int log_level = LOG_DEBUG;
- #else
-@@ -118,8 +116,7 @@ static void logfile_print(const char *msg, int severity,
-   pthread_mutex_lock(&amp;file_lock);
+ =over 4
  
-   if (log_file == NULL) {
--    fh = fopen(DEFAULT_LOGFILE, &quot;a&quot;);
--    do_close = 1;
-+    fh = stderr;
-   } else if (strcasecmp(log_file, &quot;stderr&quot;) == 0)
-     fh = stderr;
-   else if (strcasecmp(log_file, &quot;stdout&quot;) == 0)
-@@ -131,8 +128,7 @@ static void logfile_print(const char *msg, int severity,
+-=item B<dispatch>([type][, values][, plugin_instance][, type_instance][, plugin][, host][, time][, interval]) -> None.  Dispatch a value list.
++=item B<dispatch>([type][, message][, plugin_instance][, type_instance][, plugin][, host][, time][, severity][, meta]) -> None.  Dispatch a notification.
  
-   if (fh == NULL) {
-     char errbuf[1024];
--    fprintf(stderr, &quot;logfile plugin: fopen (%s) failed: %s\n&quot;,
--            (log_file == NULL) ? DEFAULT_LOGFILE : log_file,
-+    fprintf(stderr, &quot;logfile plugin: fopen (%s) failed: %s\n&quot;, log_file,
-             sstrerror(errno, errbuf, sizeof(errbuf)));
-   } else {
-     if (print_timestamp)
-----++++GitHub
+ Dispatch this instance to the collectd process. The object has members for each
+ of the possible arguments for this method. For a detailed explanation of these
+@@ -501,6 +501,16 @@ generated.
+ The severity of this notification. Assign or compare to I<NOTIF_FAILURE>,
+ I<NOTIF_WARNING> or I<NOTIF_OKAY>.
+ 
++=item meta
++
++These are the meta data for the Notification object.
++It has to be a dictionary of numbers, strings or bools. All keys must be
++strings. I<int> and I<long> objects will be dispatched as signed integers unless
++they are between 2**63 and 2**64-1, which will result in a unsigned integer.
++One of these storage classes can be forced by using the classes
++B<collectd.Signed> and B<collectd.Unsigned>. A meta object received by a
++notification callback will always contain B<Signed> or B<Unsigned> objects.
++
+ =back
+ 
+ =head1 FUNCTIONS
+@@ -177,6 +177,7 @@ extern PyTypeObject ValuesType;
+ 
+ typedef struct {
+   PluginData data;
++  PyObject *meta;   /* dict */
+   int severity;
+   char message[NOTIF_MAX_MSG_LEN];
+ } Notification;
+@@ -510,6 +510,35 @@ static int cpy_notification_callback(const notification_t *notification,
+   Notification *n;
+ 
+   CPY_LOCK_THREADS
++  PyObject *dict = PyDict_New(); /* New reference. */
++  for (notification_meta_t *meta = notification->meta;
++       meta != NULL; meta = meta->next) {
++    PyObject *temp = NULL;
++    if (meta->type == NM_TYPE_STRING) {
++      temp = cpy_string_to_unicode_or_bytes(meta->nm_value.nm_string); /* New reference. */
++      PyDict_SetItemString(dict, meta->name, temp);
++      Py_XDECREF(temp);
++    } else if (meta->type == NM_TYPE_SIGNED_INT) {
++      PyObject *sival = PyLong_FromLongLong(meta->nm_value.nm_signed_int);
++      temp = PyObject_CallFunctionObjArgs((void *)&SignedType, sival,
++                                          (void *)0); /* New reference. */
++      PyDict_SetItemString(dict, meta->name, temp);
++      Py_XDECREF(temp);
++    } else if (meta->type == NM_TYPE_UNSIGNED_INT) {
++      PyObject *uval = PyLong_FromUnsignedLongLong(meta->nm_value.nm_unsigned_int);
++      temp = PyObject_CallFunctionObjArgs((void *)&UnsignedType, uval,
++                                          (void *)0); /* New reference. */
++      PyDict_SetItemString(dict, meta->name, temp);
++      Py_XDECREF(temp);
++    } else if (meta->type == NM_TYPE_DOUBLE) {
++      temp = PyFloat_FromDouble(meta->nm_value.nm_double); /* New reference. */
++      PyDict_SetItemString(dict, meta->name, temp);
++      Py_XDECREF(temp);
++    } else if (meta->type == NM_TYPE_BOOLEAN) {
++      PyDict_SetItemString(dict, meta->name,
++                            meta->nm_value.nm_boolean ? Py_True : Py_False);
++    }
++  }
+   notify = Notification_New(); /* New reference. */
+   n = (Notification *)notify;
+   sstrncpy(n->data.host, notification->host, sizeof(n->data.host));
+@@ -522,6 +551,8 @@ static int cpy_notification_callback(const notification_t *notification,
+   n->data.time = CDTIME_T_TO_DOUBLE(notification->time);
+   sstrncpy(n->message, notification->message, sizeof(n->message));
+   n->severity = notification->severity;
++  Py_CLEAR(n->meta);
++  n->meta = dict; /* Steals a reference. */
+   ret = PyObject_CallFunctionObjArgs(c->callback, n, c->data,
+                                      (void *)0); /* New reference. */
+   Py_XDECREF(notify);
+@@ -33,6 +33,14 @@
+ 
+ #include "cpython.h"
+ 
++typedef struct {
++  int (*add_string)(void *, const char *, const char *);
++  int (*add_signed_int)(void *, const char *, int64_t);
++  int (*add_unsigned_int)(void *, const char *, uint64_t);
++  int (*add_double)(void *, const char *, double);
++  int (*add_boolean)(void *, const char *, _Bool);
++} cpy_build_meta_handler_t;
++
+ #define FreeAll()                                                              \
+   do {                                                                         \
+     PyMem_Free(type);                                                          \
+@@ -42,6 +50,26 @@
+     PyMem_Free(host);                                                          \
+   } while (0)
+ 
++#define CPY_BUILD_META_FUNC(meta_type, func, val_type)                         \
++static int cpy_ ## func(void *meta, const char *key, val_type val)  {          \
++  return func((meta_type *)meta, key, val);                                    \
++}
++
++#define CPY_BUILD_META_HANDLER(func_prefix, meta_type)                         \
++CPY_BUILD_META_FUNC(meta_type, func_prefix ## _add_string, const char *)       \
++CPY_BUILD_META_FUNC(meta_type, func_prefix ## _add_signed_int, int64_t)        \
++CPY_BUILD_META_FUNC(meta_type, func_prefix ## _add_unsigned_int, uint64_t)     \
++CPY_BUILD_META_FUNC(meta_type, func_prefix ## _add_double, double)             \
++CPY_BUILD_META_FUNC(meta_type, func_prefix ## _add_boolean, _Bool)             \
++                                                                               \
++static cpy_build_meta_handler_t cpy_ ## func_prefix = {                        \
++  .add_string = cpy_ ## func_prefix ## _add_string,                            \
++  .add_signed_int = cpy_ ## func_prefix ## _add_signed_int,                    \
++  .add_unsigned_int = cpy_ ## func_prefix ## _add_unsigned_int,                \
++  .add_double = cpy_ ## func_prefix ## _add_double,                            \
++  .add_boolean = cpy_ ## func_prefix ## _add_boolean                           \
++}
++
+ static PyObject *cpy_common_repr(PyObject *s) {
+   PyObject *ret, *tmp;
+   static PyObject *l_type = NULL, *l_type_instance = NULL, *l_plugin = NULL,
+@@ -457,26 +485,25 @@ static int Values_init(PyObject *s, PyObject *args, PyObject *kwds) {
+   return 0;
+ }
+ 
+-static meta_data_t *cpy_build_meta(PyObject *meta) {
++static int cpy_build_meta(PyObject *meta, cpy_build_meta_handler_t *meta_func,
++                          void *m) {
+   int s;
+-  meta_data_t *m = NULL;
+   PyObject *l;
+ 
+   if ((meta == NULL) || (meta == Py_None))
+-    return NULL;
++    return -1;
+ 
+   l = PyDict_Items(meta); /* New reference. */
+   if (!l) {
+     cpy_log_exception("building meta data");
+-    return NULL;
++    return -1;
+   }
+   s = PyList_Size(l);
+   if (s <= 0) {
+     Py_XDECREF(l);
+-    return NULL;
++    return -1;
+   }
+ 
+-  m = meta_data_create();
+   for (int i = 0; i < s; ++i) {
+     const char *string, *keystring;
+     PyObject *key, *value, *item, *tmp;
+@@ -493,45 +520,45 @@ static meta_data_t *cpy_build_meta(PyObject *meta) {
+     value = PyTuple_GET_ITEM(item, 1);
+     Py_INCREF(value);
+     if (value == Py_True) {
+-      meta_data_add_boolean(m, keystring, 1);
++      meta_func->add_boolean(m, keystring, 1);
+     } else if (value == Py_False) {
+-      meta_data_add_boolean(m, keystring, 0);
++      meta_func->add_boolean(m, keystring, 0);
+     } else if (PyFloat_Check(value)) {
+-      meta_data_add_double(m, keystring, PyFloat_AsDouble(value));
++      meta_func->add_double(m, keystring, PyFloat_AsDouble(value));
+     } else if (PyObject_TypeCheck(value, &SignedType)) {
+       long long int lli;
+       lli = PyLong_AsLongLong(value);
+       if (!PyErr_Occurred() && (lli == (int64_t)lli))
+-        meta_data_add_signed_int(m, keystring, lli);
++        meta_func->add_signed_int(m, keystring, lli);
+     } else if (PyObject_TypeCheck(value, &UnsignedType)) {
+       long long unsigned llu;
+       llu = PyLong_AsUnsignedLongLong(value);
+       if (!PyErr_Occurred() && (llu == (uint64_t)llu))
+-        meta_data_add_unsigned_int(m, keystring, llu);
++        meta_func->add_unsigned_int(m, keystring, llu);
+     } else if (PyNumber_Check(value)) {
+       long long int lli;
+       long long unsigned llu;
+       tmp = PyNumber_Long(value);
+       lli = PyLong_AsLongLong(tmp);
+       if (!PyErr_Occurred() && (lli == (int64_t)lli)) {
+-        meta_data_add_signed_int(m, keystring, lli);
++        meta_func->add_signed_int(m, keystring, lli);
+       } else {
+         PyErr_Clear();
+         llu = PyLong_AsUnsignedLongLong(tmp);
+         if (!PyErr_Occurred() && (llu == (uint64_t)llu))
+-          meta_data_add_unsigned_int(m, keystring, llu);
++          meta_func->add_unsigned_int(m, keystring, llu);
+       }
+       Py_XDECREF(tmp);
+     } else {
+       string = cpy_unicode_or_bytes_to_string(&value);
+       if (string) {
+-        meta_data_add_string(m, keystring, string);
++        meta_func->add_string(m, keystring, string);
+       } else {
+         PyErr_Clear();
+         tmp = PyObject_Str(value);
+         string = cpy_unicode_or_bytes_to_string(&tmp);
+         if (string)
+-          meta_data_add_string(m, keystring, string);
++          meta_func->add_string(m, keystring, string);
+         Py_XDECREF(tmp);
+       }
+     }
+@@ -541,9 +568,22 @@ static meta_data_t *cpy_build_meta(PyObject *meta) {
+     Py_DECREF(key);
+   }
+   Py_XDECREF(l);
++  return 0;
++}
++
++CPY_BUILD_META_HANDLER(meta_data, meta_data_t);
++CPY_BUILD_META_HANDLER(plugin_notification_meta, notification_t);
++
++static meta_data_t *cpy_build_value_meta(PyObject *meta) {
++  meta_data_t *m = meta_data_create();
++  cpy_build_meta(meta, &cpy_meta_data, (void *)m);
+   return m;
+ }
+ 
++static void cpy_build_notification_meta(notification_t *n, PyObject *meta) {
++  cpy_build_meta(meta, &cpy_plugin_notification_meta, (void *)n);
++}
++
+ static PyObject *Values_dispatch(Values *self, PyObject *args, PyObject *kwds) {
+   int ret;
+   const data_set_t *ds;
+@@ -651,7 +691,7 @@ static PyObject *Values_dispatch(Values *self, PyObject *args, PyObject *kwds) {
+     }
+   }
+   value_list.values = value;
+-  value_list.meta = cpy_build_meta(meta);
++  value_list.meta = cpy_build_value_meta(meta);
+   value_list.values_len = size;
+   value_list.time = DOUBLE_TO_CDTIME_T(time);
+   value_list.interval = DOUBLE_TO_CDTIME_T(interval);
+@@ -778,7 +818,7 @@ static PyObject *Values_write(Values *self, PyObject *args, PyObject *kwds) {
+   value_list.values_len = size;
+   value_list.time = DOUBLE_TO_CDTIME_T(time);
+   value_list.interval = DOUBLE_TO_CDTIME_T(interval);
+-  value_list.meta = cpy_build_meta(meta);
++  value_list.meta = cpy_build_value_meta(meta);
+   if (value_list.host[0] == 0)
+     sstrncpy(value_list.host, hostname_g, sizeof(value_list.host));
+   if (value_list.plugin[0] == 0)
+@@ -910,6 +950,17 @@ PyTypeObject ValuesType = {
+     Values_new       /* tp_new */
+ };
+ 
++static char notification_meta_doc[] =
++    "These are the meta data for the Notification object.\n"
++    "It has to be a dictionary of numbers, strings or bools. All keys must be\n"
++    "strings. int and long objects will be dispatched as signed integers "
++    "unless\n"
++    "they are between 2**63 and 2**64-1, which will result in an unsigned "
++    "integer.\n"
++    "One of these storage classes can be forced by using the classes\n"
++    "collectd.Signed and collectd.Unsigned. A meta object received by a\n"
++    "notification callback will always contain Signed or Unsigned objects.";
++
+ static char severity_doc[] =
+     "The severity of this notification. Assign or compare to\n"
+     "NOTIF_FAILURE, NOTIF_WARNING or NOTIF_OKAY.";
+@@ -931,16 +982,18 @@ static int Notification_init(PyObject *s, PyObject *args, PyObject *kwds) {
+   int severity = 0;
+   double time = 0;
+   char *message = NULL;
++  PyObject *meta = NULL;
+   char *type = NULL, *plugin_instance = NULL, *type_instance = NULL,
+        *plugin = NULL, *host = NULL;
+   static char *kwlist[] = {"type",          "message",  "plugin_instance",
+                            "type_instance", "plugin",   "host",
+-                           "time",          "severity", NULL};
++                           "time",          "severity", "meta",
++                           NULL};
+ 
+-  if (!PyArg_ParseTupleAndKeywords(args, kwds, "|etetetetetetdi", kwlist, NULL,
++  if (!PyArg_ParseTupleAndKeywords(args, kwds, "|etetetetetetdiO", kwlist, NULL,
+                                    &type, NULL, &message, NULL,
+                                    &plugin_instance, NULL, &type_instance, NULL,
+-                                   &plugin, NULL, &host, &time, &severity))
++                                   &plugin, NULL, &host, &time, &severity, &meta))
+     return -1;
+ 
+   if (type && plugin_get_ds(type) == NULL) {
+@@ -963,6 +1016,18 @@ static int Notification_init(PyObject *s, PyObject *args, PyObject *kwds) {
+ 
+   FreeAll();
+   PyMem_Free(message);
++
++  if (meta == NULL) {
++    meta = PyDict_New();
++    PyErr_Clear();
++  } else {
++    Py_INCREF(meta);
++  }
++
++  PyObject *tmp = self->meta;
++  self->meta = meta;
++  Py_XDECREF(tmp);
++
+   return 0;
+ }
+ 
+@@ -972,18 +1037,20 @@ static PyObject *Notification_dispatch(Notification *self, PyObject *args,
+   const data_set_t *ds;
+   notification_t notification;
+   double t = self->data.time;
++  PyObject *meta = self->meta;
+   int severity = self->severity;
+   char *host = NULL, *plugin = NULL, *plugin_instance = NULL, *type = NULL,
+        *type_instance = NULL;
+   char *message = NULL;
+ 
+   static char *kwlist[] = {"type",          "message",  "plugin_instance",
+                            "type_instance", "plugin",   "host",
+-                           "time",          "severity", NULL};
+-  if (!PyArg_ParseTupleAndKeywords(args, kwds, "|etetetetetetdi", kwlist, NULL,
++                           "time",          "severity", "meta",
++                           NULL};
++  if (!PyArg_ParseTupleAndKeywords(args, kwds, "|etetetetetetdiO", kwlist, NULL,
+                                    &type, NULL, &message, NULL,
+                                    &plugin_instance, NULL, &type_instance, NULL,
+-                                   &plugin, NULL, &host, &t, &severity))
++                                   &plugin, NULL, &host, &t, &severity, &meta))
+     return NULL;
+ 
+   notification.time = DOUBLE_TO_CDTIME_T(t);
+@@ -1015,6 +1082,11 @@ static PyObject *Notification_dispatch(Notification *self, PyObject *args,
+     PyErr_Format(PyExc_TypeError, "Dataset %s not found", notification.type);
+     return NULL;
+   }
++  if (meta != NULL && meta != Py_None && !PyDict_Check(meta)) {
++    PyErr_Format(PyExc_TypeError, "meta must be a dict");
++    return NULL;
++  }
++  cpy_build_notification_meta(&notification, meta);
+ 
+   if (notification.time == 0)
+     notification.time = cdtime();
+@@ -1024,6 +1096,8 @@ static PyObject *Notification_dispatch(Notification *self, PyObject *args,
+     sstrncpy(notification.plugin, "python", sizeof(notification.plugin));
+   Py_BEGIN_ALLOW_THREADS;
+   ret = plugin_dispatch_notification(&notification);
++  if (notification.meta)
++    plugin_notification_meta_free(notification.meta);
+   Py_END_ALLOW_THREADS;
+   if (ret != 0) {
+     PyErr_SetString(PyExc_RuntimeError,
+@@ -1041,6 +1115,7 @@ static PyObject *Notification_new(PyTypeObject *type, PyObject *args,
+   if (self == NULL)
+     return NULL;
+ 
++  self->meta = PyDict_New();
+   self->message[0] = 0;
+   self->severity = 0;
+   return (PyObject *)self;
+@@ -1068,17 +1143,21 @@ static int Notification_setstring(PyObject *self, PyObject *value, void *data) {
+ 
+ static PyObject *Notification_repr(PyObject *s) {
+   PyObject *ret, *tmp;
+-  static PyObject *l_severity = NULL, *l_message = NULL, *l_closing = NULL;
++  static PyObject *l_severity = NULL, *l_message = NULL, *l_meta = NULL,
++                  *l_closing = NULL;
+   Notification *self = (Notification *)s;
+ 
+   if (l_severity == NULL)
+     l_severity = cpy_string_to_unicode_or_bytes(",severity=");
+   if (l_message == NULL)
+     l_message = cpy_string_to_unicode_or_bytes(",message=");
++  if (l_meta == NULL)
++    l_meta = cpy_string_to_unicode_or_bytes(",meta=");
+   if (l_closing == NULL)
+     l_closing = cpy_string_to_unicode_or_bytes(")");
+ 
+-  if (l_severity == NULL || l_message == NULL || l_closing == NULL)
++  if (l_severity == NULL || l_message == NULL || l_meta == NULL ||
++      l_closing == NULL)
+     return NULL;
+ 
+   ret = cpy_common_repr(s);
+@@ -1094,17 +1173,41 @@ static PyObject *Notification_repr(PyObject *s) {
+     CPY_SUBSTITUTE(PyObject_Repr, tmp, tmp);
+     CPY_STRCAT_AND_DEL(&ret, tmp);
+   }
++  if (self->meta &&
++      (!PyDict_Check(self->meta) || PyDict_Size(self->meta) > 0)) {
++    CPY_STRCAT(&ret, l_meta);
++    tmp = PyObject_Repr(self->meta);
++    CPY_STRCAT_AND_DEL(&ret, tmp);
++  }
+   CPY_STRCAT(&ret, l_closing);
+   return ret;
+ }
+ 
++static int Notification_traverse(PyObject *self, visitproc visit, void *arg) {
++  Notification *n = (Notification *)self;
++  Py_VISIT(n->meta);
++  return 0;
++}
++
++static int Notification_clear(PyObject *self) {
++  Notification *n = (Notification *)self;
++  Py_CLEAR(n->meta);
++  return 0;
++}
++
++static void Notification_dealloc(PyObject *self) {
++  Notification_clear(self);
++  self->ob_type->tp_free(self);
++}
++
+ static PyMethodDef Notification_methods[] = {
+     {"dispatch", (PyCFunction)Notification_dispatch,
+      METH_VARARGS | METH_KEYWORDS, dispatch_doc},
+     {NULL}};
+ 
+ static PyMemberDef Notification_members[] = {
+     {"severity", T_INT, offsetof(Notification, severity), 0, severity_doc},
++    {"meta", T_OBJECT_EX, offsetof(Notification, meta), 0, notification_meta_doc},
+     {NULL}};
+ 
+ static PyGetSetDef Notification_getseters[] = {
+@@ -1116,7 +1219,7 @@ PyTypeObject NotificationType = {
+     CPY_INIT_TYPE "collectd.Notification",    /* tp_name */
+     sizeof(Notification),                     /* tp_basicsize */
+     0,                                        /* Will be filled in later */
+-    0,                                        /* tp_dealloc */
++    Notification_dealloc,                     /* tp_dealloc */
+     0,                                        /* tp_print */
+     0,                                        /* tp_getattr */
+     0,                                        /* tp_setattr */
+@@ -1131,10 +1234,10 @@ PyTypeObject NotificationType = {
+     0,                                        /* tp_getattro */
+     0,                                        /* tp_setattro */
+     0,                                        /* tp_as_buffer */
+-    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE, /*tp_flags*/
++    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_GC, /*tp_flags*/
+     Notification_doc,                         /* tp_doc */
+-    0,                                        /* tp_traverse */
+-    0,                                        /* tp_clear */
++    Notification_traverse,                    /* tp_traverse */
++    Notification_clear,                       /* tp_clear */
+     0,                                        /* tp_richcompare */
+     0,                                        /* tp_weaklistoffset */
+     0,                                        /* tp_iter */

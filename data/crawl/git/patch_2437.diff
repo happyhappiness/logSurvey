@@ -1,0 +1,151 @@
+@@ -512,6 +512,7 @@ LIB_OBJS += read-cache.o
+ LIB_OBJS += reflog-walk.o
+ LIB_OBJS += refs.o
+ LIB_OBJS += remote.o
++LIB_OBJS += replace_object.o
+ LIB_OBJS += rerere.o
+ LIB_OBJS += revision.o
+ LIB_OBJS += run-command.o
+@@ -124,6 +124,8 @@ struct commit_graft *read_graft_line(char *buf, int len);
+ int register_commit_graft(struct commit_graft *, int);
+ struct commit_graft *lookup_commit_graft(const unsigned char *sha1);
+ 
++const unsigned char *lookup_replace_object(const unsigned char *sha1);
++
+ extern struct commit_list *get_merge_bases(struct commit *rev1, struct commit *rev2, int cleanup);
+ extern struct commit_list *get_merge_bases_many(struct commit *one, int n, struct commit **twos, int cleanup);
+ extern struct commit_list *get_octopus_merge_bases(struct commit_list *in);
+@@ -0,0 +1,111 @@
++#include "cache.h"
++#include "sha1-lookup.h"
++#include "refs.h"
++
++static struct replace_object {
++	unsigned char sha1[2][20];
++} **replace_object;
++
++static int replace_object_alloc, replace_object_nr;
++
++static const unsigned char *replace_sha1_access(size_t index, void *table)
++{
++	struct replace_object **replace = table;
++	return replace[index]->sha1[0];
++}
++
++static int replace_object_pos(const unsigned char *sha1)
++{
++	return sha1_pos(sha1, replace_object, replace_object_nr,
++			replace_sha1_access);
++}
++
++static int register_replace_object(struct replace_object *replace,
++				   int ignore_dups)
++{
++	int pos = replace_object_pos(replace->sha1[0]);
++
++	if (0 <= pos) {
++		if (ignore_dups)
++			free(replace);
++		else {
++			free(replace_object[pos]);
++			replace_object[pos] = replace;
++		}
++		return 1;
++	}
++	pos = -pos - 1;
++	if (replace_object_alloc <= ++replace_object_nr) {
++		replace_object_alloc = alloc_nr(replace_object_alloc);
++		replace_object = xrealloc(replace_object,
++					  sizeof(*replace_object) *
++					  replace_object_alloc);
++	}
++	if (pos < replace_object_nr)
++		memmove(replace_object + pos + 1,
++			replace_object + pos,
++			(replace_object_nr - pos - 1) *
++			sizeof(*replace_object));
++	replace_object[pos] = replace;
++	return 0;
++}
++
++static int register_replace_ref(const char *refname,
++				const unsigned char *sha1,
++				int flag, void *cb_data)
++{
++	/* Get sha1 from refname */
++	const char *slash = strrchr(refname, '/');
++	const char *hash = slash ? slash + 1 : refname;
++	struct replace_object *repl_obj = xmalloc(sizeof(*repl_obj));
++
++	if (strlen(hash) != 40 || get_sha1_hex(hash, repl_obj->sha1[0])) {
++		free(repl_obj);
++		warning("bad replace ref name: %s", refname);
++		return 0;
++	}
++
++	/* Copy sha1 from the read ref */
++	hashcpy(repl_obj->sha1[1], sha1);
++
++	/* Register new object */
++	if (register_replace_object(repl_obj, 1))
++		die("duplicate replace ref: %s", refname);
++
++	return 0;
++}
++
++static void prepare_replace_object(void)
++{
++	static int replace_object_prepared;
++
++	if (replace_object_prepared)
++		return;
++
++	for_each_replace_ref(register_replace_ref, NULL);
++	replace_object_prepared = 1;
++}
++
++/* We allow "recursive" replacement. Only within reason, though */
++#define MAXREPLACEDEPTH 5
++
++const unsigned char *lookup_replace_object(const unsigned char *sha1)
++{
++	int pos, depth = MAXREPLACEDEPTH;
++	const unsigned char *cur = sha1;
++
++	prepare_replace_object();
++
++	/* Try to recursively replace the object */
++	do {
++		if (--depth < 0)
++			die("replace depth too high for object %s",
++			    sha1_to_hex(sha1));
++
++		pos = replace_object_pos(cur);
++		if (0 <= pos)
++			cur = replace_object[pos]->sha1[1];
++	} while (0 <= pos);
++
++	return cur;
++}
+@@ -2148,10 +2148,18 @@ static void *read_object(const unsigned char *sha1, enum object_type *type,
+ void *read_sha1_file(const unsigned char *sha1, enum object_type *type,
+ 		     unsigned long *size)
+ {
+-	void *data = read_object(sha1, type, size);
++	const unsigned char *repl = lookup_replace_object(sha1);
++	void *data = read_object(repl, type, size);
++
++	/* die if we replaced an object with one that does not exist */
++	if (!data && repl != sha1)
++		die("replacement %s not found for %s",
++		    sha1_to_hex(repl), sha1_to_hex(sha1));
++
+ 	/* legacy behavior is to die on corrupted objects */
+-	if (!data && (has_loose_object(sha1) || has_packed_and_bad(sha1)))
+-		die("object %s is corrupted", sha1_to_hex(sha1));
++	if (!data && (has_loose_object(repl) || has_packed_and_bad(repl)))
++		die("object %s is corrupted", sha1_to_hex(repl));
++
+ 	return data;
+ }
+ 

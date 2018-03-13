@@ -1,0 +1,183 @@
+@@ -1833,6 +1833,16 @@ http.userAgent::
+ 	of common USER_AGENT strings (but not including those like git/1.7.1).
+ 	Can be overridden by the `GIT_HTTP_USER_AGENT` environment variable.
+ 
++http.followRedirects::
++	Whether git should follow HTTP redirects. If set to `true`, git
++	will transparently follow any redirect issued by a server it
++	encounters. If set to `false`, git will treat all redirects as
++	errors. If set to `initial`, git will follow redirects only for
++	the initial request to a remote, but not for subsequent
++	follow-up HTTP requests. Since git uses the redirected URL as
++	the base for the follow-up requests, this is generally
++	sufficient. The default is `initial`.
++
+ http.<url>.*::
+ 	Any of the http.* options above can be applied selectively to some URLs.
+ 	For a config key to match a URL, each element of the config key is
+@@ -98,6 +98,8 @@ static int http_proactive_auth;
+ static const char *user_agent;
+ static int curl_empty_auth;
+ 
++enum http_follow_config http_follow_config = HTTP_FOLLOW_INITIAL;
++
+ #if LIBCURL_VERSION_NUM >= 0x071700
+ /* Use CURLOPT_KEYPASSWD as is */
+ #elif LIBCURL_VERSION_NUM >= 0x070903
+@@ -337,6 +339,16 @@ static int http_options(const char *var, const char *value, void *cb)
+ 		return 0;
+ 	}
+ 
++	if (!strcmp("http.followredirects", var)) {
++		if (value && !strcmp(value, "initial"))
++			http_follow_config = HTTP_FOLLOW_INITIAL;
++		else if (git_config_bool(var, value))
++			http_follow_config = HTTP_FOLLOW_ALWAYS;
++		else
++			http_follow_config = HTTP_FOLLOW_NONE;
++		return 0;
++	}
++
+ 	/* Fall back on the default ones */
+ 	return git_default_config(var, value, cb);
+ }
+@@ -553,7 +565,6 @@ static CURL *get_curl_handle(void)
+ 				 curl_low_speed_time);
+ 	}
+ 
+-	curl_easy_setopt(result, CURLOPT_FOLLOWLOCATION, 1);
+ 	curl_easy_setopt(result, CURLOPT_MAXREDIRS, 20);
+ #if LIBCURL_VERSION_NUM >= 0x071301
+ 	curl_easy_setopt(result, CURLOPT_POSTREDIR, CURL_REDIR_POST_ALL);
+@@ -882,6 +893,16 @@ struct active_request_slot *get_active_slot(void)
+ 	curl_easy_setopt(slot->curl, CURLOPT_FAILONERROR, 1);
+ 	curl_easy_setopt(slot->curl, CURLOPT_RANGE, NULL);
+ 
++	/*
++	 * Default following to off unless "ALWAYS" is configured; this gives
++	 * callers a sane starting point, and they can tweak for individual
++	 * HTTP_FOLLOW_* cases themselves.
++	 */
++	if (http_follow_config == HTTP_FOLLOW_ALWAYS)
++		curl_easy_setopt(slot->curl, CURLOPT_FOLLOWLOCATION, 1);
++	else
++		curl_easy_setopt(slot->curl, CURLOPT_FOLLOWLOCATION, 0);
++
+ #if LIBCURL_VERSION_NUM >= 0x070a08
+ 	curl_easy_setopt(slot->curl, CURLOPT_IPRESOLVE, git_curl_ipresolve);
+ #endif
+@@ -1122,9 +1143,12 @@ static int handle_curl_result(struct slot_results *results)
+ 	 * If we see a failing http code with CURLE_OK, we have turned off
+ 	 * FAILONERROR (to keep the server's custom error response), and should
+ 	 * translate the code into failure here.
++	 *
++	 * Likewise, if we see a redirect (30x code), that means we turned off
++	 * redirect-following, and we should treat the result as an error.
+ 	 */
+ 	if (results->curl_result == CURLE_OK &&
+-	    results->http_code >= 400) {
++	    results->http_code >= 300) {
+ 		results->curl_result = CURLE_HTTP_RETURNED_ERROR;
+ 		/*
+ 		 * Normally curl will already have put the "reason phrase"
+@@ -1443,6 +1467,9 @@ static int http_request(const char *url,
+ 		strbuf_addstr(&buf, " no-cache");
+ 	if (options && options->keep_error)
+ 		curl_easy_setopt(slot->curl, CURLOPT_FAILONERROR, 0);
++	if (options && options->initial_request &&
++	    http_follow_config == HTTP_FOLLOW_INITIAL)
++		curl_easy_setopt(slot->curl, CURLOPT_FOLLOWLOCATION, 1);
+ 
+ 	headers = curl_slist_append(headers, buf.buf);
+ 
+@@ -116,6 +116,13 @@ extern struct credential http_auth;
+ 
+ extern char curl_errorstr[CURL_ERROR_SIZE];
+ 
++enum http_follow_config {
++	HTTP_FOLLOW_NONE,
++	HTTP_FOLLOW_ALWAYS,
++	HTTP_FOLLOW_INITIAL
++};
++extern enum http_follow_config http_follow_config;
++
+ static inline int missing__target(int code, int result)
+ {
+ 	return	/* file:// URL -- do we ever use one??? */
+@@ -139,7 +146,8 @@ extern char *get_remote_object_url(const char *url, const char *hex,
+ /* Options for http_get_*() */
+ struct http_get_options {
+ 	unsigned no_cache:1,
+-		 keep_error:1;
++		 keep_error:1,
++		 initial_request:1;
+ 
+ 	/* If non-NULL, returns the content-type of the response. */
+ 	struct strbuf *content_type;
+@@ -276,6 +276,7 @@ static struct discovery *discover_refs(const char *service, int for_push)
+ 	http_options.charset = &charset;
+ 	http_options.effective_url = &effective_url;
+ 	http_options.base_url = &url;
++	http_options.initial_request = 1;
+ 	http_options.no_cache = 1;
+ 	http_options.keep_error = 1;
+ 
+@@ -294,6 +295,9 @@ static struct discovery *discover_refs(const char *service, int for_push)
+ 		die("unable to access '%s': %s", url.buf, curl_errorstr);
+ 	}
+ 
++	if (options.verbosity && !starts_with(refs_url.buf, url.buf))
++		warning(_("redirecting to %s"), url.buf);
++
+ 	last= xcalloc(1, sizeof(*last_discovery));
+ 	last->service = service;
+ 	last->buf_alloc = strbuf_detach(&buffer, &last->len);
+@@ -123,6 +123,7 @@ ScriptAlias /error/ error.sh/
+ </Files>
+ 
+ RewriteEngine on
++RewriteRule ^/dumb-redir/(.*)$ /dumb/$1 [R=301]
+ RewriteRule ^/smart-redir-perm/(.*)$ /smart/$1 [R=301]
+ RewriteRule ^/smart-redir-temp/(.*)$ /smart/$1 [R=302]
+ RewriteRule ^/smart-redir-auth/(.*)$ /auth/smart/$1 [R=301]
+@@ -140,6 +141,11 @@ RewriteRule ^/loop-redir/(.*)$ /loop-redir/x-$1 [R=302]
+ RewriteRule ^/insane-redir/(.*)$ /intern-redir/$1/foo [R=301]
+ RewriteRule ^/intern-redir/(.*)/foo$ /smart/$1 [PT]
+ 
++# Serve info/refs internally without redirecting, but
++# issue a redirect for any object requests.
++RewriteRule ^/redir-objects/(.*/info/refs)$ /dumb/$1 [PT]
++RewriteRule ^/redir-objects/(.*/objects/.*)$ /dumb/$1 [R=301]
++
+ # Apache 2.2 does not understand <RequireAll>, so we use RewriteCond.
+ # And as RewriteCond does not allow testing for non-matches, we match
+ # the desired case first (one has abra, two has cadabra), and let it
+@@ -299,5 +299,28 @@ test_expect_success 'git client does not send an empty Accept-Language' '
+ 	! grep "^Accept-Language:" stderr
+ '
+ 
++test_expect_success 'redirects can be forbidden/allowed' '
++	test_must_fail git -c http.followRedirects=false \
++		clone $HTTPD_URL/dumb-redir/repo.git dumb-redir &&
++	git -c http.followRedirects=true \
++		clone $HTTPD_URL/dumb-redir/repo.git dumb-redir 2>stderr
++'
++
++test_expect_success 'redirects are reported to stderr' '
++	# just look for a snippet of the redirected-to URL
++	test_i18ngrep /dumb/ stderr
++'
++
++test_expect_success 'non-initial redirects can be forbidden' '
++	test_must_fail git -c http.followRedirects=initial \
++		clone $HTTPD_URL/redir-objects/repo.git redir-objects &&
++	git -c http.followRedirects=true \
++		clone $HTTPD_URL/redir-objects/repo.git redir-objects
++'
++
++test_expect_success 'http.followRedirects defaults to "initial"' '
++	test_must_fail git clone $HTTPD_URL/redir-objects/repo.git default
++'
++
+ stop_httpd
+ test_done

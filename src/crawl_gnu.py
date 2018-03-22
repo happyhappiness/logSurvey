@@ -6,8 +6,6 @@ import csv
 import my_util
 
 # some constants
-REPOS_NAME = 'tar'
-LOG_PATTERN = my_util.get_log_function_pattern(REPOS_NAME)
 MAIN_URL = 'http://git.savannah.gnu.org'
 
 def store_patch_file(patch, counter, record, writer):
@@ -20,9 +18,9 @@ def store_patch_file(patch, counter, record, writer):
         print record
     for line in patch:
         if line.startswith('-') or line.startswith('+'):
-            is_log = re.search(LOG_PATTERN, line, re.I)
+            is_log = re.search(my_util.LOG_PATTERN, line, re.I)
             if is_log:
-                file_name = 'data/crawl/' + REPOS_NAME + '/patch_' + str(counter) + '.diff'
+                file_name = my_util.PATCH_FILE_PREFIX + str(counter) + '.diff'
                 my_util.store_file(file_name, patch)
                 writer.writerow(record + [file_name])
                 return counter + 1
@@ -116,8 +114,8 @@ def analyze_commit_list(commit_list_page, total_counter, counter, writer):
     response = urllib2.urlopen(MAIN_URL + commit_list_page)
     html = response.read()
     html = html.split("\n")
-    commit_page_pattern = r"(?:href|HREF)='(/cgit/" + REPOS_NAME + r"\.git/commit/\?id=\w*)'>"
-    next_list_page_pattern = r"(?:href|HREF)='(/cgit/" + REPOS_NAME + r"\.git/log/\?ofs=\d*)'>\[next\]"
+    commit_page_pattern = r"(?:href|HREF)='(/cgit/" + my_util.REPOS_NAME + r"\.git/commit/\?id=\w*)'>"
+    next_list_page_pattern = r"(?:href|HREF)='(/cgit/" + my_util.REPOS_NAME + r"\.git/log/\?ofs=\d*)'>\[next\]"
 
     # check html content against git-2.*.tar.gz
     commit_count = 0
@@ -150,10 +148,13 @@ def analyze_commit_list(commit_list_page, total_counter, counter, writer):
 main function
 """
 if __name__ == "__main__":
-    record_file = file('data/analyze/' + REPOS_NAME + '_log_commit.csv', 'wb')
+
+    my_util.set_user_repos('', 'tar')
+
+    record_file = file(my_util.PATCH_RECORD_FILE, 'wb')
     writer = csv.writer(record_file)
-    writer.writerow(['url', 'date', 'title', 'changes', 'file_name'])
+    writer.writerow(my_util.PATCH_RECORD_TITLE)
     # analyze commit list
-    analyze_commit_list('/cgit/' + REPOS_NAME + '.git/log/', 0, 0, writer)
+    analyze_commit_list('/cgit/' + my_util.REPOS_NAME + '.git/log/', 0, 0, writer)
 
     record_file.close()

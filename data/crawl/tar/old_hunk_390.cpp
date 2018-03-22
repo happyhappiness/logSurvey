@@ -1,0 +1,6 @@
+  return symbolic_oflag;
+}
+
+/*---.
+| ?  |
+`---*/

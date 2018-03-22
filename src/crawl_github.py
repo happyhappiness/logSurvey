@@ -12,9 +12,6 @@ sys.setdefaultencoding('utf8')
 # REPOS_NAME = 'squid'
 # USER_NAME = 'collectd'
 # REPOS_NAME = 'collectd'
-USER_NAME = 'git'
-REPOS_NAME = 'git'
-LOG_PATTERN = my_util.get_log_function_pattern(REPOS_NAME)
 
 def store_patch_file(patch, counter, record, writer):
     """
@@ -26,9 +23,9 @@ def store_patch_file(patch, counter, record, writer):
         print record
     for line in patch:
         if line.startswith('-') or line.startswith('+'):
-            is_log = re.search(LOG_PATTERN, line, re.I)
+            is_log = re.search(my_util.LOG_PATTERN, line, re.I)
             if is_log:
-                file_name = 'data/crawl/' + REPOS_NAME + '/patch_' + str(counter) + '.diff'
+                file_name = my_util.PATCH_FILE_PREFIX + str(counter) + '.diff'
                 my_util.store_file(file_name, patch)
                 writer.writerow(record + [file_name])
                 return counter + 1
@@ -70,7 +67,7 @@ def analyze_commit_list(start_commit, writer, total_counter=0, counter=0):
     @ involve retrive record info of commit [url, date, title, changes, file_name]\n
     """
     # initiate Github with given user and repos 
-    gh = Github(login='993273596@qq.com', password='nx153156', user=USER_NAME, repo=REPOS_NAME)
+    gh = Github(login='993273596@qq.com', password='nx153156', user=my_util.USER_NAME, repo=my_util.REPOS_NAME)
 
     # fetch all the commits of given repos
     commits = gh.repos.commits.list(sha=start_commit)
@@ -86,11 +83,13 @@ main function
 """
 if __name__ == "__main__":
     # several configuration constant: user, repos
+    # set repos and user
+    my_util.set_user_repos('git', 'git')
     commit_sha = '29bdbac1cd5fc4126b62c9a030403d56ae43c204'
 
-    record_file = file('data/analyze/' + REPOS_NAME + '_log_commit.csv', 'ab')
+    record_file = file(my_util.PATCH_RECORD_FILE, 'ab')
     writer = csv.writer(record_file)
-    # writer.writerow(['url', 'date', 'title', 'changes', 'file_name'])
+    # writer.writerow(my_util.PATCH_RECORD_TITLE)
 
     # analyze commit list of given repos with start commit
     analyze_commit_list(commit_sha, writer, 21535, 3487)

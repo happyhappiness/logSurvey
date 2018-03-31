@@ -31,19 +31,25 @@ def cluster_edition():
     cluster_lists = cluster_api.cluster_record_with_equality(feature_lists)
     # record cluster index of each log statement
     read_file = file(my_util.LOG_RECORD_FILE, 'rb')
-    write_file = file(my_util.CLUSTER_RECORD_FILE, 'wb')
-    write_file_writer = csv.writer(write_file)
-    write_file_writer.writerow(my_util.CLUSTER_RECORD_TITLE)
     records = csv.reader(read_file)
+    sort_records = []
     index = 0
     for record in islice(records, 1, None):
         record = record + [cluster_lists[index]]
+        sort_records.append(record)
         index += 1
+    read_file.close()
+    #  call sort to sort
+    sort_records.sort(key=lambda x:x[-1], reverse=True)
+    #  writer sorted log record
+    write_file = file(my_util.CLUSTER_RECORD_FILE, 'wb')
+    write_file_writer = csv.writer(write_file)
+    write_file_writer.writerow(my_util.CLUSTER_RECORD_TITLE)
+    for record in sort_records:
         write_file_writer.writerow(record)
 
     # close files
     write_file.close()
-    read_file.close()
 
 """
 main function

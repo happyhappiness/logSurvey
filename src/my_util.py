@@ -24,6 +24,7 @@ PATCH_RECORD_FILE = ''
 HUNK_RECORD_FILE = ''
 LOG_RECORD_FILE = ''
 CLUSTER_RECORD_FILE = ''
+WAIT_TIME_RECORD_FILE = ''
 # patch, hunk file prefix
 PATCH_FILE_PREFIX = ''
 HUNK_FILE_PREFIX = ''
@@ -32,6 +33,7 @@ NEW_HUNK_FILE_PREFIX = ''
 
 # record title and index
 PATCH_RECORD_TITLE = ['url', 'date', 'title', 'changes', 'file_name', 'patch_type', 'other_info']
+DATE_INDEX = PATCH_RECORD_TITLE.index('date')
 FILE_NAME_INDEX = PATCH_RECORD_TITLE.index('file_name')
 
 HUNK_RECORD_TITLE = PATCH_RECORD_TITLE + ['old_hunk_file','new_hunk_file','old_log_locs', 'new_log_locs']
@@ -43,9 +45,11 @@ OLD_HUNK_INDEX = LOG_RECORD_TITLE.index('old_hunk_file')
 NEW_HUNK_INDEX = LOG_RECORD_TITLE.index('new_hunk_file')
 OLD_LOG_INDEX = LOG_RECORD_TITLE.index('old_log')
 NEW_LOG_INDEX = LOG_RECORD_TITLE.index('new_log')
+EDIT_TYPE_INDEX = LOG_RECORD_TITLE.index('edit_types')
 EDIT_FEATURE_INDEX = LOG_RECORD_TITLE.index('edit_feature')
 
 CLUSTER_RECORD_TITLE = LOG_RECORD_TITLE + ['cluster']
+WAIT_TIME_RECORD_TITLE = CLUSTER_RECORD_TITLE + ['wait_time']
 
 # log pattern
 LOG_PATTERN = ''
@@ -69,6 +73,8 @@ def set_user_repos(user_name='', repos_name='tar'):
     LOG_RECORD_FILE = 'data/analyze/' + REPOS_NAME + '_log.csv'
     global CLUSTER_RECORD_FILE
     CLUSTER_RECORD_FILE = 'data/analyze/' + REPOS_NAME + '_cluster.csv'
+    global WAIT_TIME_RECORD_FILE
+    WAIT_TIME_RECORD_FILE = 'data/analyze/' + REPOS_NAME + '_wait_time.csv'
     # patch, hunk file prefix
     global PATCH_FILE_PREFIX
     PATCH_FILE_PREFIX = 'data/crawl/' + REPOS_NAME + '/patch_'

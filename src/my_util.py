@@ -25,6 +25,7 @@ HUNK_RECORD_FILE = ''
 LOG_RECORD_FILE = ''
 CLUSTER_RECORD_FILE = ''
 WAIT_TIME_RECORD_FILE = ''
+AVERAGE_WAIT_TIME_FILE = ''
 # patch, hunk file prefix
 PATCH_FILE_PREFIX = ''
 HUNK_FILE_PREFIX = ''
@@ -75,6 +76,8 @@ def set_user_repos(user_name='', repos_name='tar'):
     CLUSTER_RECORD_FILE = 'data/analyze/' + REPOS_NAME + '_cluster.csv'
     global WAIT_TIME_RECORD_FILE
     WAIT_TIME_RECORD_FILE = 'data/analyze/' + REPOS_NAME + '_wait_time.csv'
+    global AVERAGE_WAIT_TIME_FILE
+    AVERAGE_WAIT_TIME_FILE = 'data/analyze/' + REPOS_NAME + '_average_wait_time.csv'
     # patch, hunk file prefix
     global PATCH_FILE_PREFIX
     PATCH_FILE_PREFIX = 'data/crawl/' + REPOS_NAME + '/patch_'

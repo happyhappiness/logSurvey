@@ -1,5 +1,6 @@
 from itertools import islice 
 from datetime import datetime
+from datetime import timedelta
 import cluster_api
 import csv
 import json
@@ -79,26 +80,39 @@ def get_edit_type(file_writer):
 def get_wait_time():
     """
     @ param nothing\n
-    @ return nothing\n
-    @ involve analyze each cluster to record wait time\n
+    @ return wait counter\n
+    @ involve analyze each cluster to record wait time and return wait cluster counter\n
     """
     writer_file = file(my_util.WAIT_TIME_RECORD_FILE, 'wb')
     writer = csv.writer(writer_file)
     writer.writerow(my_util.WAIT_TIME_RECORD_TITLE)
+    average_writer_file = file(my_util.AVERAGE_WAIT_TIME_FILE, 'wb')
+    average_writer = csv.writer(average_writer_file)
+    average_writer.writerow(my_util.WAIT_TIME_RECORD_TITLE)
+
     reading_file = file(my_util.CLUSTER_RECORD_FILE, 'rb')
     records = csv.reader(reading_file)
     pre_cluster_id = -1
     curr_cluster = []
+    wait_counter = 0
     for record in islice(records, 1, None):
         cluster_id = record[-1]
         if cluster_id == pre_cluster_id:
             curr_cluster.append(record)
         else:
             if len(curr_cluster) >= 2:
+                # calculate wait time and average wait time
+                average_wait_time = timedelta()
                 start_time = min(curr_cluster, key=lambda x: datetime.strptime(x[my_util.DATE_INDEX], "%d %b %Y"))
                 start_time = datetime.strptime(start_time[my_util.DATE_INDEX], "%d %b %Y")
                 for cluster_record in curr_cluster:
-                    writer.writerow(cluster_record + [datetime.strptime(cluster_record[my_util.DATE_INDEX], "%d %b %Y") - start_time])
+                    wait_time = datetime.strptime(cluster_record[my_util.DATE_INDEX], "%d %b %Y") - start_time
+                    writer.writerow(cluster_record + [wait_time])
+                    average_wait_time += wait_time
+                # write average wait time
+                average_writer.writerow(cluster_record + [average_wait_time/len(curr_cluster)])
+                if average_wait_time > timedelta():
+                    wait_counter += 1
             else:
                 for cluster_record in curr_cluster:
                     writer.writerow(cluster_record + [0])
@@ -115,7 +129,10 @@ def get_wait_time():
             writer.writerow(record + [0])
 
     reading_file.close()
+    average_writer_file.close()
     writer_file.close()
+
+    return wait_counter
 
 def get_statistic(file_name='data/analyze/statistic.csv'):
     """
@@ -123,10 +140,12 @@ def get_statistic(file_name='data/analyze/statistic.csv'):
     @ return nothing\n
     @ involve pre-verify historical modifications by hunk < function\n
     """
-    writer_file = file(file_name, 'wb')
+    writer_file = file(file_name, 'ab')
     writer = csv.writer(writer_file)
-    get_wait_time()
     get_edit_type(writer)
+    wait_counter = get_wait_time()
+    writer.writerow(['wait counter'])
+    writer.writerow([wait_counter])
 
     writer_file.close()
 

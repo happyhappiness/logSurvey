@@ -1,0 +1,8 @@
+        strcat(msg, "\r\n");
+    }
+
+    if (opt_verbose)
+        fprintf(stderr, "Request:'%s'\n", msg);
+
+    if (ping) {
+#if HAVE_SIGACTION

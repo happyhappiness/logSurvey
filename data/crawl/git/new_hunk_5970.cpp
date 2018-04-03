@@ -1,0 +1,8 @@
+{
+	struct object_request *entry = object_queue_head;
+
+	if (obj_req->req !=NULL && obj_req->req->localfile != -1)
+		error("fd leakage in release: %d", obj_req->req->localfile);
+	if (obj_req == object_queue_head) {
+		object_queue_head = obj_req->next;
+	} else {

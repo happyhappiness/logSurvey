@@ -1,0 +1,4 @@
+    return auth_user;
+}
+
+

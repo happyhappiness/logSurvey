@@ -1,0 +1,15 @@
+ 		if (!strcmp(arg, "--dry-run") || !strcmp(arg, "-n"))
+ 			cb.dry_run = 1;
+ 		else if (!prefixcmp(arg, "--expire=")) {
+-			cb.expire_total = approxidate(arg + 9);
++			if (parse_expiry_date(arg + 9, &cb.expire_total))
++				die(_("'%s' is not a valid timestamp"), arg);
+ 			explicit_expiry |= EXPIRE_TOTAL;
+ 		}
+ 		else if (!prefixcmp(arg, "--expire-unreachable=")) {
+-			cb.expire_unreachable = approxidate(arg + 21);
++			if (parse_expiry_date(arg + 21, &cb.expire_unreachable))
++				die(_("'%s' is not a valid timestamp"), arg);
+ 			explicit_expiry |= EXPIRE_UNREACH;
+ 		}
+ 		else if (!strcmp(arg, "--stale-fix"))

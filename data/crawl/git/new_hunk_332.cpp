@@ -1,0 +1,7 @@
+
+	if (has_loose_object(sha1))
+		return 0;
+	buf = read_object(sha1, &type, &len);
+	if (!buf)
+		return error("cannot read sha1_file for %s", sha1_to_hex(sha1));
+	hdrlen = xsnprintf(hdr, sizeof(hdr), "%s %lu", typename(type), len) + 1;

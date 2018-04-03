@@ -1,0 +1,8 @@
+
+    /* attempt to open /dev/poll device */
+    devpoll_fd = open("/dev/poll", O_RDWR);
+    if (devpoll_fd < 0)
+        fatalf("comm_select_init: can't open /dev/poll: %s\n", xstrerror());
+
+    fd_open(devpoll_fd, FD_UNKNOWN, "devpoll ctl");
+

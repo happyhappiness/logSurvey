@@ -1,0 +1,5 @@
+
+	closedir (dh);
+
+	return (ret);
+}

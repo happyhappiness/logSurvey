@@ -1,0 +1,10 @@
+	  int noerror = (p[0] != 'i');
+
+	  p = allocated_variable_expand (p2);
+
+          /* If no filenames, it's a no-op.  */
+	  if (*p == '\0')
+            continue;
+
+	  /* Parse the list of file names.  */
+	  p2 = p;

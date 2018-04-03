@@ -1,0 +1,8 @@
+  ht->ht_vec = (void**) CALLOC (struct token *, ht->ht_size);
+  if (ht->ht_vec == 0)
+    {
+      fprintf (stderr, _("can't allocate %lu bytes for hash table: memory exhausted"),
+	       ht->ht_size * (unsigned long) sizeof (struct token *));
+      exit (1);
+    }
+

@@ -10,6 +10,8 @@ sys.setdefaultencoding('utf8')
 
 # USER_NAME = 'squid-cache'
 # REPOS_NAME = 'squid'
+# USER_NAME = 'git'
+# REPOS_NAME = 'git'
 # USER_NAME = 'collectd'
 # REPOS_NAME = 'collectd'
 
@@ -85,13 +87,13 @@ if __name__ == "__main__":
     # several configuration constant: user, repos
     # set repos and user
     my_util.set_user_repos('git', 'git')
-    commit_sha = '29bdbac1cd5fc4126b62c9a030403d56ae43c204'
+    # commit_sha = '29bdbac1cd5fc4126b62c9a030403d56ae43c204'
 
-    record_file = file(my_util.PATCH_RECORD_FILE, 'ab')
+    record_file = file(my_util.PATCH_RECORD_FILE, 'wb')
     writer = csv.writer(record_file)
-    # writer.writerow(my_util.PATCH_RECORD_TITLE)
+    writer.writerow(my_util.PATCH_RECORD_TITLE)
 
     # analyze commit list of given repos with start commit
-    analyze_commit_list(commit_sha, writer, 21535, 3487)
+    analyze_commit_list(None, writer, 21535, 3487)
     record_file.close()
 

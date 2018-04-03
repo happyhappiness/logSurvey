@@ -1,0 +1,10 @@
+       if (!accdir (newdir))
+         {
+           logprintf (LOG_VERBOSE, _("\
+-Not descending to `%s' as it is excluded/not-included.\n"),
+-                     escnonprint (newdir));
++Not descending to %s as it is excluded/not-included.\n"),
++                     quote (escnonprint (newdir)));
+           continue;
+         }
+ 

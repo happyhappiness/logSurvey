@@ -1,0 +1,8 @@
+
+    mp = mallinfo();
+
+    storeAppendPrintf(sentry, "Memory usage for %s via mallinfo():\n",
+                      appname);
+
+    storeAppendPrintf(sentry, "\tTotal space in arena:  %6ld KB\n",
+                      (long)mp.arena >> 10);

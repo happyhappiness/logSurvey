@@ -1,0 +1,13 @@
+     if (!handler)
+ 	fatal_dump("fqdncache_nbgethostbyaddr: NULL handler");
+ 
+-    debug(35, 4, "fqdncache_nbgethostbyaddr: Name '%s'.\n", name);
++    debug(35, 4) ("fqdncache_nbgethostbyaddr: Name '%s'.\n", name);
+     FqdncacheStats.requests++;
+ 
+     if (name == NULL || name[0] == '\0') {
+-	debug(35, 4, "fqdncache_nbgethostbyaddr: Invalid name!\n");
++	debug(35, 4) ("fqdncache_nbgethostbyaddr: Invalid name!\n");
+ 	handler(NULL, handlerData);
+ 	return;
+     }

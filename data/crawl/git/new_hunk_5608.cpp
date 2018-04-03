@@ -1,0 +1,9 @@
+		    get_sha1_hex(line+5, sha1_buf))
+			die("git upload-pack: protocol error, "
+			    "expected to get sha, not '%s'", line);
+		if (strstr(line+45, "multi_ack_detailed"))
+			multi_ack = 2;
+		else if (strstr(line+45, "multi_ack"))
+			multi_ack = 1;
+		if (strstr(line+45, "thin-pack"))
+			use_thin_pack = 1;

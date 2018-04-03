@@ -1,0 +1,7 @@
+
+      if (d->file->updating)
+	{
+	  error (NILF, _("Circular %s <- %s prerequisite dropped."),
+		 file->name, d->file->name);
+	  /* We cannot free D here because our the caller will still have
+	     a reference to it when we were called recursively via

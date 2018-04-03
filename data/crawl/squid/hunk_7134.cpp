@@ -1,0 +1,16 @@
+     gen_conf(entries, fp);
+     fclose(fp);
+ 
+-    return (0);
++    return (rc);
+ }
+ 
+-static void
++static int
+ gen_default(Entry * head, FILE * fp)
+ {
+     Entry *entry;
++    int rc = 0;
+     fprintf(fp,
+ 	"void\n"
+ 	"default_all(void)\n"

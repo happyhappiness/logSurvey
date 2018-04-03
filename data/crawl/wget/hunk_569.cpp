@@ -1,0 +1,630 @@
+ "Found %d broken links.\n"
+ "\n"
+ msgstr[0] ""
++"Encontrou %d link quebrado.\n"
++"\n"
+ msgstr[1] ""
++"Encontrou %d links quebrados.\n"
++"\n"
+ 
+ #: src/spider.c:91
+ #, c-format
+ msgid "%s\n"
+-msgstr ""
++msgstr "%s\n"
+ 
+-#: src/url.c:620
++#: src/url.c:633
+ msgid "No error"
+ msgstr "Nenhum erro"
+ 
+-#: src/url.c:622
+-msgid "Unsupported scheme"
+-msgstr "Esquema não suportado"
++#: src/url.c:635
++#, fuzzy, c-format
++msgid "Unsupported scheme %s"
++msgstr "NÃ£o hÃ¡ suporte ao esquema"
+ 
+-#: src/url.c:624
+-#, fuzzy
++#: src/url.c:637
++msgid "Scheme missing"
++msgstr ""
++
++#: src/url.c:639
+ msgid "Invalid host name"
+-msgstr "Nome do usuário inválido"
++msgstr "Nome invÃ¡lido de mÃ¡quina"
+ 
+-#: src/url.c:626
++#: src/url.c:641
+ msgid "Bad port number"
+-msgstr "Número de porta inválido"
++msgstr "NÃºmero invÃ¡lido de porta"
+ 
+-#: src/url.c:628
++#: src/url.c:643
+ msgid "Invalid user name"
+-msgstr "Nome do usuário inválido"
++msgstr "Nome invÃ¡lido de usuÃ¡rio"
+ 
+-#: src/url.c:630
++#: src/url.c:645
+ msgid "Unterminated IPv6 numeric address"
+-msgstr "Endereço IPV6 indeterminado"
++msgstr "EndereÃ§o IPv6 incompleto"
+ 
+-#: src/url.c:632
++#: src/url.c:647
+ msgid "IPv6 addresses not supported"
+-msgstr "Endereço IPv6 não suportado"
++msgstr "NÃ£o hÃ¡ suporte a endereÃ§os IPv6"
+ 
+-#: src/url.c:634
++#: src/url.c:649
+ msgid "Invalid IPv6 numeric address"
+-msgstr "Endereço IPv6 inválido"
++msgstr "EndereÃ§o IPv6 invÃ¡lido"
+ 
+-#: src/utils.c:104
+-#, c-format
+-msgid "%s: %s: Failed to allocate enough memory; memory exhausted.\n"
++#: src/url.c:951
++msgid "HTTPS support not compiled in"
+ msgstr ""
+ 
+-#: src/utils.c:110
++#: src/utils.c:108
++#, fuzzy, c-format
++msgid "%s: %s: Failed to allocate enough memory; memory exhausted.\n"
++msgstr "%s: %s: Falhou em alocar %ld bytes; memÃ³ria esgotada.\n"
++
++#: src/utils.c:114
+ #, c-format
+ msgid "%s: %s: Failed to allocate %ld bytes; memory exhausted.\n"
+-msgstr ""
++msgstr "%s: %s: Falhou em alocar %ld bytes; memÃ³ria esgotada.\n"
+ 
+-#: src/utils.c:242
++#: src/utils.c:327
+ #, c-format
+ msgid "%s: aprintf: text buffer is too big (%ld bytes), aborting.\n"
+ msgstr ""
+ 
+-#: src/utils.c:375
++#: src/utils.c:470
+ #, c-format
+ msgid "Continuing in background, pid %d.\n"
+-msgstr "Continuando em background, pid %d.\n"
++msgstr "Continuando em plano de fundo, pid %d.\n"
+ 
+ # , c-format
+-#: src/utils.c:423
++#: src/utils.c:521
+ #, fuzzy, c-format
+ msgid "Failed to unlink symlink %s: %s\n"
+-msgstr "Falha na remoção do link simbólico `%s': %s\n"
+-
+-#~ msgid "Unable to convert `%s' to a bind address.  Reverting to ANY.\n"
+-#~ msgstr ""
+-#~ "Não foi possível converter `%s' para um endereço. Mudando para ANY\n"
+-
+-#~ msgid "Error in Set-Cookie, field `%s'"
+-#~ msgstr "Erro em Set-Cookie, campo `%s'"
+-
+-#~ msgid ""
+-#~ "\n"
+-#~ "REST failed; will not truncate `%s'.\n"
+-#~ msgstr ""
+-#~ "\n"
+-#~ "REST falhou; %s não será truncado.\n"
+-
+-# , c-format
+-#~ msgid " [%s to go]"
+-#~ msgstr " [%s para terminar]"
+-
+-#~ msgid "Host not found"
+-#~ msgstr "Host não encontrado"
+-
+-#~ msgid "Failed to set up an SSL context\n"
+-#~ msgstr "Falha ao definir um contexto SSL\n"
+-
+-#~ msgid "Failed to load certificates from %s\n"
+-#~ msgstr "Falha ao carregar certificados do %s\n"
+-
+-#~ msgid "Trying without the specified certificate\n"
+-#~ msgstr "Tentando sem o certificado especificado\n"
+-
+-#~ msgid "Failed to get certificate key from %s\n"
+-#~ msgstr "Falha ao obter a chave do certificado de %s\n"
+-
+-#~ msgid "End of file while parsing headers.\n"
+-#~ msgstr "Fim de arquivo durante a leitura dos headers.\n"
+-
+-#~ msgid ""
+-#~ "\n"
+-#~ "Continued download failed on this file, which conflicts with `-c'.\n"
+-#~ "Refusing to truncate existing file `%s'.\n"
+-#~ "\n"
+-#~ msgstr ""
+-#~ "\n"
+-#~ "Continuação de download falhou nesse arquivo, o qual conflita com `-c'.\n"
+-#~ "Arquivo existente não será truncado: `%s'.\n"
+-#~ "\n"
+-
+-# , c-format
+-#~ msgid " (%s to go)"
+-#~ msgstr " (%s para o fim)"
+-
+-# , c-format
+-#~ msgid "File `%s' already there, will not retrieve.\n"
+-#~ msgstr "Arquivo `%s' já presente, não será baixado.\n"
+-
+-#~ msgid ""
+-#~ "%s (%s) - `%s' saved [%ld/%ld])\n"
+-#~ "\n"
+-#~ msgstr ""
+-#~ "%s (%s) - `%s' recebido [%ld/%ld])\n"
+-#~ "\n"
+-
+-#~ msgid "%s (%s) - Connection closed at byte %ld/%ld. "
+-#~ msgstr "%s (%s) - Conexão fechada no byte %ld/%ld. "
+-
+-#~ msgid "%s: %s: Invalid boolean `%s', use always, on, off, or never.\n"
+-#~ msgstr ""
+-#~ "%s: %s: Expressão inválida `%s', use 'always', 'on', 'off', or 'never'.\n"
+-
+-#~ msgid ""
+-#~ "Startup:\n"
+-#~ "  -V,  --version           display the version of Wget and exit.\n"
+-#~ "  -h,  --help              print this help.\n"
+-#~ "  -b,  --background        go to background after startup.\n"
+-#~ "  -e,  --execute=COMMAND   execute a `.wgetrc'-style command.\n"
+-#~ "\n"
+-#~ msgstr ""
+-#~ "Início:\n"
+-#~ "  -V,  --version           mostra a versão do Wget e sai.\n"
+-#~ "  -h,  --help              mostra esta ajuda.\n"
+-#~ "  -b,  --background        executa em background depois de iniciar.\n"
+-#~ "  -e,  --execute=COMANDO   executa um comando `.wgetrc'.\n"
+-#~ "\n"
+-
+-#~ msgid ""
+-#~ "Logging and input file:\n"
+-#~ "  -o,  --output-file=FILE     log messages to FILE.\n"
+-#~ "  -a,  --append-output=FILE   append messages to FILE.\n"
+-#~ "  -d,  --debug                print debug output.\n"
+-#~ "  -q,  --quiet                quiet (no output).\n"
+-#~ "  -v,  --verbose              be verbose (this is the default).\n"
+-#~ "  -nv, --non-verbose          turn off verboseness, without being quiet.\n"
+-#~ "  -i,  --input-file=FILE      download URLs found in FILE.\n"
+-#~ "  -F,  --force-html           treat input file as HTML.\n"
+-#~ "  -B,  --base=URL             prepends URL to relative links in -F -i "
+-#~ "file.\n"
+-#~ "\n"
+-#~ msgstr ""
+-#~ "Geração de log e arquivo de entrada:\n"
+-#~ "  -o,  --output-file=ARQUIVO   mensagens de log para ARQUIVO.\n"
+-#~ "  -a,  --append-output=ARQUIVO apenda mensagens em ARQUIVO.\n"
+-#~ "  -d,  --debug                 mostra saídas de debug.\n"
+-#~ "  -q,  --quiet                 quieto (sem saídas).\n"
+-#~ "  -nv, --non-verbose           desliga modo verboso, sem ser quieto.\n"
+-#~ "  -i,  --input-file=ARQUIVO    lê URL-s de ARQUIVO.\n"
+-#~ "  -F,  --force-html            trata arquivo de entrada como HTML.\n"
+-#~ "\n"
+-
+-#~ msgid ""
+-#~ "Download:\n"
+-#~ "  -t,  --tries=NUMBER           set number of retries to NUMBER (0 "
+-#~ "unlimits).\n"
+-#~ "       --retry-connrefused      retry even if connection is refused.\n"
+-#~ "  -O   --output-document=FILE   write documents to FILE.\n"
+-#~ "  -nc, --no-clobber             don't clobber existing files or use .# "
+-#~ "suffixes.\n"
+-#~ "  -c,  --continue               resume getting a partially-downloaded "
+-#~ "file.\n"
+-#~ "       --progress=TYPE          select progress gauge type.\n"
+-#~ "  -N,  --timestamping           don't re-retrieve files unless newer than "
+-#~ "local.\n"
+-#~ "  -S,  --server-response        print server response.\n"
+-#~ "       --spider                 don't download anything.\n"
+-#~ "  -T,  --timeout=SECONDS        set all timeout values to SECONDS.\n"
+-#~ "       --dns-timeout=SECS       set the DNS lookup timeout to SECS.\n"
+-#~ "       --connect-timeout=SECS   set the connect timeout to SECS.\n"
+-#~ "       --read-timeout=SECS      set the read timeout to SECS.\n"
+-#~ "  -w,  --wait=SECONDS           wait SECONDS between retrievals.\n"
+-#~ "       --waitretry=SECONDS      wait 1...SECONDS between retries of a "
+-#~ "retrieval.\n"
+-#~ "       --random-wait            wait from 0...2*WAIT secs between "
+-#~ "retrievals.\n"
+-#~ "  -Y,  --proxy=on/off           turn proxy on or off.\n"
+-#~ "  -Q,  --quota=NUMBER           set retrieval quota to NUMBER.\n"
+-#~ "       --bind-address=ADDRESS   bind to ADDRESS (hostname or IP) on local "
+-#~ "host.\n"
+-#~ "       --limit-rate=RATE        limit download rate to RATE.\n"
+-#~ "       --dns-cache=off          disable caching DNS lookups.\n"
+-#~ "       --restrict-file-names=OS restrict chars in file names to ones OS "
+-#~ "allows.\n"
+-#~ "\n"
+-#~ msgstr ""
+-#~ "Download:\n"
+-#~ "  -t,  --tries=NÚMERO           define número de tentativas a NÚMERO\n"
+-#~ "                                (0 é ilimitado).\n"
+-#~ "       --retry-connrefused      tenta novamente mesmo se a conexão foi "
+-#~ "rejeitada.\n"
+-#~ "  -O   --output-document=ARQUIVO  escreve documentos para ARQUIVO.\n"
+-#~ "  -nc, --no-clobber             don't clobber existing files or use .# "
+-#~ "suffixes.\n"
+-#~ "  -c,  --continue               continuar usando arquivo parcialmente "
+-#~ "baixando.\n"
+-#~ "       --progress=TIPO          define o tipo de indicador de progresso.\n"
+-#~ "  -N,  --timestamping           não re-obtém arquivos, ao menos que sejam "
+-#~ "mais \n"
+-#~ "                                novos que os locais.\n"
+-#~ "  -S,  --server-response        mostra resposta do servidor.\n"
+-#~ "       --spider                 não baixa nada.\n"
+-#~ "  -T,  --timeout=SEGS           define todos os timeouts para SEGS "
+-#~ "(segundos).\n"
+-#~ "       --dns-timeout=SEGS       define o timeout de consuta ao DNS para "
+-#~ "SEGS.\n"
+-#~ "       --connect-timeout=SEGS   define o timeout de conexão para SEGS.\n"
+-#~ "       --read-timeout=SEGS      define o timeout de recepção para SEGS.\n"
+-#~ "  -w,  --wait=SEGS              aguarda SEGS segundos entre os "
+-#~ "downloads.\n"
+-#~ "       --waitretry=SEGS         aguarda 1...SEGS entre as re-tentativas "
+-#~ "de \n"
+-#~ "                                download.\n"
+-#~ "       --random-wait            aguarda de 0...2*WAIT segs entre re-"
+-#~ "tentativas \n"
+-#~ "                                de download.\n"
+-#~ "  -Y,  --proxy=on/off           ativa/desativa uso de proxy.\n"
+-#~ "  -Q,  --quota=NÚMERO           define quota de download para NÚMERO.\n"
+-#~ "       --bind-address=ENDEREÇO  usa o ENDEREÇO (nome de máquina ou IP) na "
+-#~ "máquina local.\n"
+-#~ "       --limit-rate=LIMITE      limita taxa de download para LIMITE.\n"
+-#~ "       --dns-cache=off          desabilita cache de resoluções DNS.\n"
+-#~ "       --restrict-file-names=OS restringe número de caracteres de "
+-#~ "arquivos para o\n"
+-#~ "                                aceitável pelo OS.\n"
+-#~ "\n"
+-
+-#~ msgid ""
+-#~ "Directories:\n"
+-#~ "  -nd, --no-directories            don't create directories.\n"
+-#~ "  -x,  --force-directories         force creation of directories.\n"
+-#~ "  -nH, --no-host-directories       don't create host directories.\n"
+-#~ "  -P,  --directory-prefix=PREFIX   save files to PREFIX/...\n"
+-#~ "       --cut-dirs=NUMBER           ignore NUMBER remote directory "
+-#~ "components.\n"
+-#~ "\n"
+-#~ msgstr ""
+-#~ "Diretórios:\n"
+-#~ "  -nd  --no-directories            não cria diretórios.\n"
+-#~ "  -x,  --force-directories         força a criação de diretórios.\n"
+-#~ "  -nH, --no-host-directories       não cria diretórios com nome do host.\n"
+-#~ "  -P,  --directory-prefix=PREFIXO  salva arquivos em PREFIXO/...\n"
+-#~ "\n"
+-
+-#~ msgid ""
+-#~ "HTTP options:\n"
+-#~ "       --http-user=USER      set http user to USER.\n"
+-#~ "       --http-passwd=PASS    set http password to PASS.\n"
+-#~ "  -C,  --cache=on/off        (dis)allow server-cached data (normally "
+-#~ "allowed).\n"
+-#~ "  -E,  --html-extension      save all text/html documents with .html "
+-#~ "extension.\n"
+-#~ "       --ignore-length       ignore `Content-Length' header field.\n"
+-#~ "       --header=STRING       insert STRING among the headers.\n"
+-#~ "       --proxy-user=USER     set USER as proxy username.\n"
+-#~ "       --proxy-passwd=PASS   set PASS as proxy password.\n"
+-#~ "       --referer=URL         include `Referer: URL' header in HTTP "
+-#~ "request.\n"
+-#~ "  -s,  --save-headers        save the HTTP headers to file.\n"
+-#~ "  -U,  --user-agent=AGENT    identify as AGENT instead of Wget/VERSION.\n"
+-#~ "       --no-http-keep-alive  disable HTTP keep-alive (persistent "
+-#~ "connections).\n"
+-#~ "       --cookies=off         don't use cookies.\n"
+-#~ "       --load-cookies=FILE   load cookies from FILE before session.\n"
+-#~ "       --save-cookies=FILE   save cookies to FILE after session.\n"
+-#~ "       --post-data=STRING    use the POST method; send STRING as the "
+-#~ "data.\n"
+-#~ "       --post-file=FILE      use the POST method; send contents of FILE.\n"
+-#~ "\n"
+-#~ msgstr ""
+-#~ "Opções HTTP:\n"
+-#~ "       --http-user=USUÁRIO   configura usuário http.\n"
+-#~ "       --http-passwd=SENHA   configura senha http.\n"
+-#~ "  -C,  --cache=on/off        liga/desliga busca de dados do cache\n"
+-#~ "                             (normalmente ligada).\n"
+-#~ "  -E,  --html-extension      grava todos arquivos texto/html com "
+-#~ "extensão .html.\n"
+-#~ "       --ignore-length       ignora o header `Content-Length'.\n"
+-#~ "       --header=STRING       insere STRING entre os headers.\n"
+-#~ "       --proxy-user=USUÁRIO  configura nome do usuário do proxy.\n"
+-#~ "       --proxy-passwd=SENHA  configura a senha do usuário do proxy.\n"
+-#~ "       --referer=URL         inclui no cabeçalho HTTP `Referer: URL'.\n"
+-#~ "  -s,  --save-headers        salva os headers HTTP no arquivo.\n"
+-#~ "  -U,  --user-agent=AGENTE   identifica cliente como AGENTE especificado "
+-#~ "ao invés de                             Wget/VERSÃO.\n"
+-#~ "       --no-http-keep-alive  desabilita HTTP keep-alive (conexões "
+-#~ "permanentes).\n"
+-#~ "       --cookies=off         não usa cookies.\n"
+-#~ "       --load-cookies=ARQUIVO carrega cookies de ARQUIVO antes da "
+-#~ "sessão.\n"
+-#~ "       --save-cookies=ARQUIVO grava cookies para ARQUIVO no final da "
+-#~ "sessão.\n"
+-#~ "       --post-data=STRING    usar o método POST; envia dados de STRING.\n"
+-#~ "       --post-file=ARQUIVO   usar o método POST; envia conteúdo de "
+-#~ "ARQUIVO.\n"
+-#~ "\n"
+-
+-#~ msgid ""
+-#~ "HTTPS (SSL) options:\n"
+-#~ "       --sslcertfile=FILE     optional client certificate.\n"
+-#~ "       --sslcertkey=KEYFILE   optional keyfile for this certificate.\n"
+-#~ "       --egd-file=FILE        file name of the EGD socket.\n"
+-#~ "       --sslcadir=DIR         dir where hash list of CA's are stored.\n"
+-#~ "       --sslcafile=FILE       file with bundle of CA's\n"
+-#~ "       --sslcerttype=0/1      Client-Cert type 0=PEM (default) / 1=ASN1 "
+-#~ "(DER)\n"
+-#~ "       --sslcheckcert=0/1     Check the server cert agenst given CA\n"
+-#~ "       --sslprotocol=0-3      choose SSL protocol; 0=automatic,\n"
+-#~ "                              1=SSLv2 2=SSLv3 3=TLSv1\n"
+-#~ "\n"
+-#~ msgstr ""
+-#~ "Opções HTTPS (SSL) :\n"
+-#~ "       --sslcertfile=ARQUIVO  certificado de cliente opcional.\n"
+-#~ "       --sslcertkey=KEYFILE   keyfile opcional para este certificado.\n"
+-#~ "       --egd-file=ARQUIVO     nome de arquivo do socket EGD.\n"
+-#~ "       --sslcadir=DIR         diretório onde a lista de CA's estão "
+-#~ "guardadas.\n"
+-#~ "       --sslcafile=ARQUIVO    arquivo com pacote de CA's\n"
+-#~ "       --sslcerttype=0/1      tipo de Client-Cert 0=PEM (padrão) / 1=ASN1 "
+-#~ "(DER)\n"
+-#~ "       --sslcheckcert=0/1     verificar o certificado do servidor com o "
+-#~ "CA dado\n"
+-#~ "       --sslprotocol=0-3      escolher protocolo SSL; 0=automático,\n"
+-#~ "                              1=SSLv2 2=SSLv3 3=TLSv1\n"
+-#~ "\n"
+-
+-#~ msgid ""
+-#~ "FTP options:\n"
+-#~ "  -nr, --dont-remove-listing   don't remove `.listing' files.\n"
+-#~ "  -g,  --glob=on/off           turn file name globbing on or off.\n"
+-#~ "       --passive-ftp           use the \"passive\" transfer mode.\n"
+-#~ "       --retr-symlinks         when recursing, get linked-to files (not "
+-#~ "dirs).\n"
+-#~ "\n"
+-#~ msgstr ""
+-#~ "Opções FTP:\n"
+-#~ "  -nr, --dont-remove-listing   não remove arquivos `.listing'.\n"
+-#~ "  -g,  --glob=on/off           liga/desliga expansão de nomes de "
+-#~ "arquivos.\n"
+-#~ "       --passive-ftp           usa modo de transferência \"passivo\".\n"
+-#~ "       --retr-symlinks         se recursivo, obtém links simbólicos (não "
+-#~ "diretórios).\n"
+-#~ "\n"
+-
+-#~ msgid ""
+-#~ "Recursive retrieval:\n"
+-#~ "  -r,  --recursive          recursive download.\n"
+-#~ "  -l,  --level=NUMBER       maximum recursion depth (inf or 0 for "
+-#~ "infinite).\n"
+-#~ "       --delete-after       delete files locally after downloading them.\n"
+-#~ "  -k,  --convert-links      convert non-relative links to relative.\n"
+-#~ "  -K,  --backup-converted   before converting file X, back up as X.orig.\n"
+-#~ "  -m,  --mirror             shortcut option equivalent to -r -N -l inf -"
+-#~ "nr.\n"
+-#~ "  -p,  --page-requisites    get all images, etc. needed to display HTML "
+-#~ "page.\n"
+-#~ "       --strict-comments    turn on strict (SGML) handling of HTML "
+-#~ "comments.\n"
+-#~ "\n"
+-#~ msgstr ""
+-#~ "Busca recursiva:\n"
+-#~ "  -r,  --recursive          downloads recursivos.\n"
+-#~ "  -l,  --level=NÚMERO       nível máximo de recursividade (0 para "
+-#~ "ilimitado).\n"
+-#~ "       --delete-after       apaga os arquivos baixados depois de "
+-#~ "finalizado.\n"
+-#~ "  -k,  --convert-links      converte links não relativos para relativos.\n"
+-#~ "  -K,  --backup-converted   antes de converter o arquivo, copia com a "
+-#~ "extensão .orig.\n"
+-#~ "  -m,  --mirror             liga opções para espelhamento (mirror).\n"
+-#~ "  -p,  --page-requisites    obtém todos objetos necessários para mostrar "
+-#~ "página HTML.\n"
+-#~ "       --strict-comments    ativa manipulação de comentários HTML.\n"
+-#~ "\n"
+-
+-#~ msgid ""
+-#~ "Recursive accept/reject:\n"
+-#~ "  -A,  --accept=LIST                comma-separated list of accepted "
+-#~ "extensions.\n"
+-#~ "  -R,  --reject=LIST                comma-separated list of rejected "
+-#~ "extensions.\n"
+-#~ "  -D,  --domains=LIST               comma-separated list of accepted "
+-#~ "domains.\n"
+-#~ "       --exclude-domains=LIST       comma-separated list of rejected "
+-#~ "domains.\n"
+-#~ "       --follow-ftp                 follow FTP links from HTML "
+-#~ "documents.\n"
+-#~ "       --follow-tags=LIST           comma-separated list of followed HTML "
+-#~ "tags.\n"
+-#~ "  -G,  --ignore-tags=LIST           comma-separated list of ignored HTML "
+-#~ "tags.\n"
+-#~ "  -H,  --span-hosts                 go to foreign hosts when recursive.\n"
+-#~ "  -L,  --relative                   follow relative links only.\n"
+-#~ "  -I,  --include-directories=LIST   list of allowed directories.\n"
+-#~ "  -X,  --exclude-directories=LIST   list of excluded directories.\n"
+-#~ "  -np, --no-parent                  don't ascend to the parent "
+-#~ "directory.\n"
+-#~ "\n"
+-#~ msgstr ""
+-#~ "Aceitação/rejeição recursiva:\n"
+-#~ "  -A,  --accept=LISTA              lista de extensões aceitas.\n"
+-#~ "  -R,  --reject=LISTA              lista de extensões rejeitadas.\n"
+-#~ "  -D,  --domains=LISTA             lista de domínios aceitos.\n"
+-#~ "       --exclude-domains=LISTA     lista de domínios rejeitados.\n"
+-#~ "       --follow-ftp                segue links FTP em documentos HTML.\n"
+-#~ "       --follow-tags=LISTA         lista de tags HTML aceitas.\n"
+-#~ "  -G,  --ignore-tags=LISTA         lista de tags HTML rejeitadas.\n"
+-#~ "  -H,  --span-hosts                segue hosts externos quando "
+-#~ "recursivo.\n"
+-#~ "  -L,  --relative                  segue somente links relativos.\n"
+-#~ "  -I,  --include-directories=LISTA lista de diretórios permitidos.\n"
+-#~ "  -X,  --exclude-directories=LISTA lista de diretórios excluídos.\n"
+-#~ "  -np, --no-parent                 não sobe para o diretório pai.\n"
+-#~ "\n"
+-
+-#~ msgid "%s: debug support not compiled in.\n"
+-#~ msgstr "%s: compilado sem opção de debug.\n"
+-
+-#~ msgid ""
+-#~ "This program is distributed in the hope that it will be useful,\n"
+-#~ "but WITHOUT ANY WARRANTY; without even the implied warranty of\n"
+-#~ "MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the\n"
+-#~ "GNU General Public License for more details.\n"
+-#~ msgstr ""
+-#~ "Este programa é distribuído com o objetivo de que seja útil,\n"
+-#~ "mas SEM QUALQUER GARANTIA; nem mesmo a garantia ímplicita de\n"
+-#~ "COMERCIABILIDADE ou de UTILIDADE PARA UM PROPÓSITO PARTICULAR.\n"
+-#~ "Veja a Licença Pública Geral GNU (GNU GPL) para mais detalhes.\n"
+-
+-# , c-format
+-#~ msgid "Starting WinHelp %s\n"
+-#~ msgstr "Disparando WinHelp %s\n"
+-
+-#~ msgid "Empty host"
+-#~ msgstr "Nome de host em branco"
+-
+-# , c-format
+-#~ msgid "%s: %s: Not enough memory.\n"
+-#~ msgstr "%s: %s: Memória insuficiente.\n"
+-
+-# , c-format
+-#~ msgid "Connection to %s:%hu refused.\n"
+-#~ msgstr "Conexão para %s:%hu recusada.\n"
+-
+-# , c-format
+-#~ msgid ""
+-#~ "Local file `%s' is more recent, not retrieving.\n"
+-#~ "\n"
+-#~ msgstr ""
+-#~ "Arquivo local `%s' é mais novo, não será baixado.\n"
+-#~ "\n"
+-
+-#~ msgid "%s: Cannot determine user-id.\n"
+-#~ msgstr "%s: Não foi possível determinar user-id.\n"
+-
+-# , c-format
+-#~ msgid "%s: Warning: uname failed: %s\n"
+-#~ msgstr "%s: Aviso: falha em uname: %s\n"
+-
+-#~ msgid "%s: Warning: gethostname failed\n"
+-#~ msgstr "%s: Aviso: falha em gethostname\n"
+-
+-#~ msgid "%s: Warning: cannot determine local IP address.\n"
+-#~ msgstr "%s: Aviso: não foi possível determinar endereço IP local.\n"
+-
+-#~ msgid "%s: Warning: cannot reverse-lookup local IP address.\n"
+-#~ msgstr "%s: Aviso: não foi possível resolver endereço IP local.\n"
+-
+-#~ msgid "%s: Warning: reverse-lookup of local address did not yield FQDN!\n"
+-#~ msgstr "%s: Aviso: resolução do endereço local não resultou em FQDN!\n"
+-
+-#~ msgid ""
+-#~ "Download:\n"
+-#~ "  -t,  --tries=NUMBER           set number of retries to NUMBER (0 "
+-#~ "unlimits).\n"
+-#~ "  -O   --output-document=FILE   write documents to FILE.\n"
+-#~ "  -nc, --no-clobber             don't clobber existing files.\n"
+-#~ "  -c,  --continue               restart getting an existing file.\n"
+-#~ "       --dot-style=STYLE        set retrieval display style.\n"
+-#~ "  -N,  --timestamping           don't retrieve files if older than "
+-#~ "local.\n"
+-#~ "  -S,  --server-response        print server response.\n"
+-#~ "       --spider                 don't download anything.\n"
+-#~ "  -T,  --timeout=SECONDS        set the read timeout to SECONDS.\n"
+-#~ "  -w,  --wait=SECONDS           wait SECONDS between retrievals.\n"
+-#~ "  -Y,  --proxy=on/off           turn proxy on or off.\n"
+-#~ "  -Q,  --quota=NUMBER           set retrieval quota to NUMBER.\n"
+-#~ "\n"
+-#~ msgstr ""
+-#~ "Download:\n"
+-#~ "  -t,  --tries=NÚMERO            configura número de tentativas "
+-#~ "(0=infinitas).\n"
+-#~ "  -O   --output-document=ARQUIVO escreve os documentos no ARQUIVO.\n"
+-#~ "  -nc, --no-clobber              não sobrescreve arquivos existentes.\n"
+-#~ "       --dot-style=ESTILO        configura estilo do display de "
+-#~ "download.\n"
+-#~ "  -N,  --timestamping            não busca arquivos mais antigos que os "
+-#~ "locais.\n"
+-#~ "  -S,  --server-response         mostra respostas do servidor.\n"
+-#~ "       --spider                  não baixa nenhum arquivo.\n"
+-#~ "  -T,  --timeout=SEGUNDOS        configura o timeout de leitura.\n"
+-#~ "  -w,  --wait=SEGUNDOS           espera SEGUNDOS entre buscas de "
+-#~ "arquivos.\n"
+-#~ "  -Y,  --proxy=on/off            liga ou desliga proxy.\n"
+-#~ "  -Q,  --quota=NÚMERO            configura quota de recepção.\n"
+-#~ "\n"
+-
+-# , c-format
+-#~ msgid "%s: %s: invalid command\n"
+-#~ msgstr "%s: %s: comando inválido\n"
+-
+-# , c-format
+-#~ msgid ""
+-#~ "\n"
+-#~ "CTRL+Break received, redirecting output to `%s'.\n"
+-#~ "Execution continued in background.\n"
+-#~ "You may stop Wget by pressing CTRL+ALT+DELETE.\n"
+-#~ msgstr ""
+-#~ "\n"
+-#~ "CTRL+Break recebido, redirecionando saída para `%s'.\n"
+-#~ "Execução continuará em background.\n"
+-#~ "Você pode parar o Wget pressionando CTRL+ALT+DELETE.\n"
+-
+-#~ msgid "Could not find proxy host.\n"
+-#~ msgstr "Não foi possível encontrar o proxy.\n"
+-
+-# , c-format
+-#~ msgid "Error (%s): Link %s without a base provided.\n"
+-#~ msgstr "Erro (%s): Link %s sem uma base fornecida.\n"
+-
+-# , c-format
+-#~ msgid "Error (%s): Base %s relative, without referer URL.\n"
+-#~ msgstr "Erro (%s): Base %s relativa, sem URL referenciadora.\n"
+-
+-#~ msgid "Unknown/unsupported protocol"
+-#~ msgstr "Protocolo desconhecido/não suportado"
+-
+-#~ msgid "Invalid port specification"
+-#~ msgstr "Especificação de porta inválida"
+-
+-# , c-format
+-#~ msgid "%s: unrecognized option, character code 0%o\n"
+-#~ msgstr "%s: opção não reconhecida, caractere código 0%o\n"
+-
+-# , c-format
+-#~ msgid "%s: unrecognized option `-%c'\n"
+-#~ msgstr "%s: opção não reconhecida `-%c'\n"
+-
+-# , c-format
+-#~ msgid "%s: option `-%c' requires an argument\n"
+-#~ msgstr "%s: opção `-%c' requer um argumento\n"
+-
+-# , c-format
+-#~ msgid "wget: %s: Invalid specification `%s'.\n"
+-#~ msgstr "wget: %s: Especificação inválida `%s'.\n"
+-
+-# , c-format
+-#~ msgid "wget: illegal option -- `-n%c'\n"
+-#~ msgstr "wget: opção ilegal -- `-n%c'\n"
+-
+-#~ msgid "done."
+-#~ msgstr "feito."
+-
+-#~ msgid "UNKNOWN"
+-#~ msgstr "DESCONHECIDO"
++msgstr "Falha na remoÃ§Ã£o da ligaÃ§Ã£o simbÃ³lica \"%s\": %s\n"

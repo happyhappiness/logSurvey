@@ -1,0 +1,8 @@
+ 
+         for (i = 0; i < e->n_addresses; i++) {
+             storeAppendPrintf(sentry, "Address[%d] : %s\n", i,
+-                              inet_ntoa(e->addresses[i]));
++                              e->addresses[i].NtoA(ntoabuf,MAX_IPSTRLEN) );
+         }
+ 
+         storeAppendPrintf(sentry, "Status     : %s\n",

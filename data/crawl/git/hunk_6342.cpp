@@ -1,0 +1,25 @@
+ 	if (!oldname)
+ 		die("cannot rename the current branch while not on any.");
+ 
+-	strbuf_addf(&oldref, "refs/heads/%s", oldname);
+-
++	strbuf_branchname(&oldref, oldname);
++	strbuf_splice(&oldref, 0, 0, "refs/heads/", 11);
+ 	if (check_ref_format(oldref.buf))
+-		die("Invalid branch name: %s", oldref.buf);
+-
+-	strbuf_addf(&newref, "refs/heads/%s", newname);
++		die("Invalid branch name: '%s'", oldname);
+ 
++	strbuf_branchname(&newref, newname);
++	strbuf_splice(&newref, 0, 0, "refs/heads/", 11);
+ 	if (check_ref_format(newref.buf))
+-		die("Invalid branch name: %s", newref.buf);
++		die("Invalid branch name: '%s'", newname);
+ 
+ 	if (resolve_ref(newref.buf, sha1, 1, NULL) && !force)
+-		die("A branch named '%s' already exists.", newname);
++		die("A branch named '%s' already exists.", newref.buf + 11);
+ 
+ 	strbuf_addf(&logmsg, "Branch: renamed %s to %s",
+ 		 oldref.buf, newref.buf);

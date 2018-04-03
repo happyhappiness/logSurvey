@@ -1,0 +1,6 @@
+    return retval;
+}
+
+/*
+ * storeDiskdDirCheckObj
+ *

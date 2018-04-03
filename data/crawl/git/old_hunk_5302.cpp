@@ -1,0 +1,3 @@
+	free(other);
+	return result;
+}

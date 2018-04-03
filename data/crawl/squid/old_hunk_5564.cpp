@@ -1,0 +1,6 @@
+    if (tracefp)
+	fprintf(tracefp, "c:%u:%u:%p\n", (unsigned int) n, (unsigned int) sz, p);
+#endif
+    return (p);
+}
+

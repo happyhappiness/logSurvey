@@ -1,0 +1,3 @@
+    /* NOTREACHED */
+    return 0;
+}

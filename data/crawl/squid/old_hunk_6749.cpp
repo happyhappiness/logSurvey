@@ -1,0 +1,38 @@
+ * Returns NULL on error.
+ */
+static int
+getoid(FILE * fp, struct subid *oid, int length)
+{
+    int count;
+    int type;
+    char token[MAXTOKEN];
+    char *cp;
+
+    if ((type = get_token(fp, token)) != LEFTBRACKET) {
+	print_error("Expected \"{\"", token, type);
+	return 0;
+    }
+    type = get_token(fp, token);
+    for (count = 0; count < length; count++, oid++) {
+	oid->label = 0;
+	oid->subid = -1;
+	if (type == RIGHTBRACKET) {
+	    return count;
+	} else if (type != LABEL && type != NUMBER) {
+	    print_error("Not valid for object identifier", token, type);
+	    return 0;
+	}
+	if (type == LABEL) {
+	    /* this entry has a label */
+	    cp = (char *) Malloc((unsigned) strlen(token) + 1);
+	    strcpy(cp, token);
+	    oid->label = cp;
+	    type = get_token(fp, token);
+	    if (type == LEFTPAREN) {
+		type = get_token(fp, token);
+		if (type == NUMBER) {
+		    oid->subid = atoi(token);
+		    if ((type = get_token(fp, token)) != RIGHTPAREN) {
+			print_error("Unexpected a closing parenthesis", token, type);
+			return 0;
+		    }

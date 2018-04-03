@@ -1,0 +1,6 @@
+- '%Cgreen': switch color to green
+- '%Cblue': switch color to blue
+- '%Creset': reset color
+- '%m': left, right or boundary mark
+- '%n': newline
+- '%%': a raw '%'

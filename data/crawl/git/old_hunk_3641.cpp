@@ -1,0 +1,6 @@
+	fi
+}
+
+setup () {
+	(
+	echo "[ui]"

@@ -1,0 +1,7 @@
+
+	/* Sanity check options */
+	if (amend && initial_commit)
+		die(_("You have nothing to amend."));
+	if (amend && in_merge)
+		die("You are in the middle of a merge -- cannot amend.");
+	if (fixup_message && squash_message)

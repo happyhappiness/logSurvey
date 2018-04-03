@@ -28,7 +28,7 @@ def cluster_edition():
     read_file.close()
 
     # cluster log statement based on cdg_list and ddg_list
-    cluster_lists = cluster_api.cluster_record_with_equality(feature_lists)
+    cluster_lists = cluster_api.cluster_record_with_equality_mine(feature_lists)
     # record cluster index of each log statement
     read_file = file(my_util.LOG_RECORD_FILE, 'rb')
     records = csv.reader(read_file)

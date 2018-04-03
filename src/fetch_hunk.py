@@ -51,7 +51,7 @@ def deal_patch(patch_record, total_hunk, writer):
             # if found log modification
             if len(old_log_locs) != 0 or len(new_log_locs) != 0:
                 total_hunk, old_hunk_name, new_hunk_name, patch_hunk_name = store_hunk(old_hunk, new_hunk, patch_hunk, total_hunk)
-                writer.writerow(patch_record[:-3] + [patch_hunk_name] + patch_record[-2:] + [old_hunk_name, new_hunk_name, \
+                writer.writerow(patch_record[:-1] + [patch_hunk_name] + [None, None] + [old_hunk_name, new_hunk_name, \
                     json.dumps(old_log_locs), json.dumps(new_log_locs)])
             # initialize hunk info
             old_hunk = new_hunk = patch_hunk = ''
@@ -84,7 +84,7 @@ def deal_patch(patch_record, total_hunk, writer):
     # deal with last hunk, if has log update
     if len(old_log_locs) != 0 or len(new_log_locs) != 0:
             total_hunk, old_hunk_name, new_hunk_name, patch_hunk_name = store_hunk(old_hunk, new_hunk, patch_hunk, total_hunk)
-            writer.writerow(patch_record[:-3] + [patch_hunk_name] + patch_record[-2:] + [old_hunk_name, new_hunk_name, \
+            writer.writerow(patch_record[:-1] + [patch_hunk_name] + [None, None] + [old_hunk_name, new_hunk_name, \
                 json.dumps(old_log_locs), json.dumps(new_log_locs)])
 
     patch_file.close()
@@ -107,6 +107,8 @@ def fetch_patch():
     total_hunk = 0
     total_patch = 0
     for record in islice(patch_records, 1, None):
+        if record == [] or record[0] == '':
+            continue
         total_hunk = deal_patch(record, total_hunk, hunk_writer)
         total_patch += 1
         print 'now processing patch %d, found hunk %d' %(total_patch, total_hunk)

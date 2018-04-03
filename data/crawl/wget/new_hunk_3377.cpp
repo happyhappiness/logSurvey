@@ -1,0 +1,13 @@
+    return cookie;
+
+  delete_cookie (cookie);
+  if (state != S_ERROR)
+    abort ();
+
+  if (!silent)
+    logprintf (LOG_NOTQUIET,
+	       _("Syntax error in Set-Cookie: %s at position %d.\n"),
+	       sc, p - sc);
+  return NULL;
+}
+

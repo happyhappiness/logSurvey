@@ -1,0 +1,3 @@
+	*sizep = size;
+	return used;
+}

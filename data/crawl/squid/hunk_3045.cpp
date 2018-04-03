@@ -1,0 +1,15 @@
+ SQUIDCEXTERN const char *getMyHostname(void);
+ SQUIDCEXTERN const char *uniqueHostname(void);
+ SQUIDCEXTERN void safeunlink(const char *path, int quiet);
+-SQUIDCEXTERN void death(int sig);
++void death(int sig);
+ SQUIDCEXTERN void fatal(const char *message);
+ SQUIDCEXTERN void fatalf(const char *fmt,...) PRINTF_FORMAT_ARG1;
+ SQUIDCEXTERN void fatal_dump(const char *message);
+-SQUIDCEXTERN void sigusr2_handle(int sig);
+-SQUIDCEXTERN void sig_child(int sig);
++void sigusr2_handle(int sig);
++void sig_child(int sig);
+ SQUIDCEXTERN void leave_suid(void);
+ SQUIDCEXTERN void enter_suid(void);
+ SQUIDCEXTERN void no_suid(void);

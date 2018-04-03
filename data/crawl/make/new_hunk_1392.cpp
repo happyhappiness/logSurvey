@@ -1,0 +1,17 @@
+
+  DEBUGPR ("Must remake target `%s'.\n");
+
+  /* It needs to be remade.  If it's VPATH and not reset via GPATH, toss the
+     VPATH */
+  if (!streq(file->name, file->hname))
+    {
+      if (debug_flag)
+        {
+          print_spaces (depth);
+          printf("  Ignoring VPATH name `%s'.\n", file->hname);
+          fflush(stdout);
+        }
+      file->ignore_vpath = 1;
+    }
+
+  /* Now, take appropriate actions to remake the file.  */

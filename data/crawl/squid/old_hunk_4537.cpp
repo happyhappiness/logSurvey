@@ -1,0 +1,4 @@
+    abortTransaction("ICAP failure");
+}
+
+#endif

@@ -1,0 +1,7 @@
+ void
+ self_destruct(void)
+ {
++    shutting_down = 1;
+     fatalf("Bungled %s line %d: %s",
+            cfg_filename, config_lineno, config_input_line);
+ }

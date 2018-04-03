@@ -1,0 +1,19 @@
+ 	if (!transaction)
+ 		return;
+ 
++	switch (transaction->state) {
++	case REF_TRANSACTION_OPEN:
++	case REF_TRANSACTION_CLOSED:
++		/* OK */
++		break;
++	case REF_TRANSACTION_PREPARED:
++		die("BUG: free called on a prepared reference transaction");
++		break;
++	default:
++		die("BUG: unexpected reference transaction state");
++		break;
++	}
++
+ 	for (i = 0; i < transaction->nr; i++) {
+ 		free(transaction->updates[i]->msg);
+ 		free(transaction->updates[i]);

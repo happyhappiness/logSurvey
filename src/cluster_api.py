@@ -236,6 +236,49 @@ def cluster_record_with_equality(feature_lists):
     return cluster_lists
 
 
+def cluster_record_with_equality_mine(feature_lists):
+    """
+    @param: feature lists\n
+    @return cluster index for each entity\n
+    @involve: split feature lists into equivalent cluster\n
+    """
+    num_item = len(feature_lists)
+    past_item = []
+    clusters = []
+    for i in range(num_item - 1):
+        # equality is transitive
+        if i in past_item:
+            continue
+        # add i to this cluster
+        clusters.append([i])
+        print 'now processing item %d/%d' %(len(past_item), num_item)
+        past_item.append(i)
+        for j in range(i + 1, num_item):
+            # equality is transitive
+            if j in past_item:
+                continue
+            # find new euqivilent element, then add to this cluster
+            if feature_lists[i] == feature_lists[j]:
+                clusters[-1].append(j)
+                past_item.append(j)
+
+    # deal with last element
+    i = num_item - 1
+    if i not in past_item:
+        clusters.append([i])
+        past_item.append(i)
+    
+    # sort clusters
+    clusters.sort(key=lambda x:len(x))
+    # compute cluster_indexes based on clusters and cluster number
+    cluster_indexes = [0 for i in range(len(feature_lists))]
+    index = 0
+    for cluster in clusters:
+        for item in cluster:
+            cluster_indexes[item] = index
+        index += 1
+    return cluster_indexes
+
 def generate_class_from_cluster(cluster_file_name, class_file_name, title, feature_index_list, min_frequence=2):
     """
     @param: cluster file name and class file name, class title, feature indexes to retrieve from cluster file, min occurrence time\n
@@ -304,9 +347,10 @@ def generate_records_for_class(cluster_file_name, class_index):
     cluster_file.close()
     return results
 
+
 """
 main function
 """
 if __name__ == "__main__":
 
-    cluster_record_with_similarity([])
+    print cluster_record_with_equality_mine([1, 2, 3, 4, 5, 6, 7, 7, 2, 3, 1, 2, 1, 2, 4, 5, 6, 2, 2, 1, 8])

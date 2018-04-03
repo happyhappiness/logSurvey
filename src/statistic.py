@@ -40,6 +40,8 @@ def get_edit_type(file_writer):
     pre_cluster_id = -1
     curr_cluster = []
     for record in islice(records, 1, None):
+        if json.loads(record[my_util.EDIT_FEATURE_INDEX]) == [0]:
+            continue
         log_counter += 1
 
         # record edit type for each log record
@@ -96,6 +98,8 @@ def get_wait_time():
     curr_cluster = []
     wait_counter = 0
     for record in islice(records, 1, None):
+        if json.loads(record[my_util.EDIT_FEATURE_INDEX]) == [0]:
+            continue
         cluster_id = record[-1]
         if cluster_id == pre_cluster_id:
             curr_cluster.append(record)
@@ -103,14 +107,14 @@ def get_wait_time():
             if len(curr_cluster) >= 2:
                 # calculate wait time and average wait time
                 average_wait_time = timedelta()
-                start_time = min(curr_cluster, key=lambda x: datetime.strptime(x[my_util.DATE_INDEX], "%d %b %Y"))
-                start_time = datetime.strptime(start_time[my_util.DATE_INDEX], "%d %b %Y")
-                for cluster_record in curr_cluster:
-                    wait_time = datetime.strptime(cluster_record[my_util.DATE_INDEX], "%d %b %Y") - start_time
-                    writer.writerow(cluster_record + [wait_time])
+                time_lists = [my_util.strptime_mine(x[my_util.DATE_INDEX]) for x in curr_cluster]
+                start_time = min(time_lists)
+                for i in range(len(curr_cluster)):
+                    wait_time = time_lists[i] - start_time
+                    writer.writerow(curr_cluster[i] + [wait_time])
                     average_wait_time += wait_time
                 # write average wait time
-                average_writer.writerow(cluster_record + [average_wait_time/len(curr_cluster)])
+                average_writer.writerow(curr_cluster[0] + [average_wait_time/len(curr_cluster)])
                 if average_wait_time > timedelta():
                     wait_counter += 1
             else:
@@ -142,6 +146,7 @@ def get_statistic(file_name='data/analyze/statistic.csv'):
     """
     writer_file = file(file_name, 'ab')
     writer = csv.writer(writer_file)
+    writer.writerow(['repos name', my_util.REPOS_NAME])
     get_edit_type(writer)
     wait_counter = get_wait_time()
     writer.writerow(['wait counter'])

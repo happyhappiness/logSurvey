@@ -1,0 +1,307 @@
+     f->page_faults = rusage_pagefaults(&rusage);
+     f->cputime = rusage_cputime(&rusage);
+ 
++    stats.sample_time = f->timestamp;
++    stats.client_http_requests = f->client_http.requests;
++    stats.client_http_hits = f->client_http.hits;
++    stats.client_http_errors = f->client_http.errors;
++    stats.client_http_kbytes_in = f->client_http.kbytes_in.kb;
++    stats.client_http_kbytes_out = f->client_http.kbytes_out.kb;
++    stats.client_http_hit_kbytes_out = f->client_http.hit_kbytes_out.kb;
++
++    stats.server_all_requests = f->server.all.requests;
++    stats.server_all_errors = f->server.all.errors;
++    stats.server_all_kbytes_in = f->server.all.kbytes_in.kb;
++    stats.server_all_kbytes_out = f->server.all.kbytes_out.kb;
++
++    stats.server_http_requests = f->server.http.requests;
++    stats.server_http_errors = f->server.http.errors;
++    stats.server_http_kbytes_in = f->server.http.kbytes_in.kb;
++    stats.server_http_kbytes_out = f->server.http.kbytes_out.kb;
++
++    stats.server_ftp_requests = f->server.ftp.requests;
++    stats.server_ftp_errors = f->server.ftp.errors;
++    stats.server_ftp_kbytes_in = f->server.ftp.kbytes_in.kb;
++    stats.server_ftp_kbytes_out = f->server.ftp.kbytes_out.kb;
++
++    stats.server_other_requests = f->server.other.requests;
++    stats.server_other_errors = f->server.other.errors;
++    stats.server_other_kbytes_in = f->server.other.kbytes_in.kb;
++    stats.server_other_kbytes_out = f->server.other.kbytes_out.kb;
++
++    stats.icp_pkts_sent = f->icp.pkts_sent;
++    stats.icp_pkts_recv = f->icp.pkts_recv;
++    stats.icp_queries_sent = f->icp.queries_sent;
++    stats.icp_replies_sent = f->icp.replies_sent;
++    stats.icp_queries_recv = f->icp.queries_recv;
++    stats.icp_replies_recv = f->icp.replies_recv;
++    stats.icp_query_timeouts = f->icp.query_timeouts;
++    stats.icp_replies_queued = f->icp.replies_queued;
++    stats.icp_kbytes_sent = f->icp.kbytes_sent.kb;
++    stats.icp_kbytes_recv = f->icp.kbytes_recv.kb;
++    stats.icp_q_kbytes_sent = f->icp.q_kbytes_sent.kb;
++    stats.icp_r_kbytes_sent = f->icp.r_kbytes_sent.kb;
++    stats.icp_q_kbytes_recv = f->icp.q_kbytes_recv.kb;
++    stats.icp_r_kbytes_recv = f->icp.r_kbytes_recv.kb;
++
++#if USE_CACHE_DIGESTS
++
++    stats.icp_times_used = f->icp.times_used;
++    stats.cd_times_used = f->cd.times_used;
++    stats.cd_msgs_sent = f->cd.msgs_sent;
++    stats.cd_msgs_recv = f->cd.msgs_recv;
++    stats.cd_memory = f->cd.memory.kb;
++    stats.cd_local_memory = store_digest ? store_digest->mask_size / 1024 : 0;
++    stats.cd_kbytes_sent = f->cd.kbytes_sent.kb;
++    stats.cd_kbytes_recv = f->cd.kbytes_recv.kb;
++#endif
++
++    stats.unlink_requests = f->unlink.requests;
++    stats.page_faults = f->page_faults;
++    stats.select_loops = f->select_loops;
++    stats.cpu_time = f->cputime;
++    stats.wall_time = tvSubDsec(f->timestamp, current_time);
++    stats.swap_outs = f->swap.outs;
++    stats.swap_ins = f->swap.ins;
++    stats.swap_files_cleaned = f->swap.files_cleaned;
++    stats.aborted_requests = f->aborted_requests;
++}
++
++void
++DumpCountersStats(Mgr::CountersActionData& stats, StoreEntry* sentry)
++{
+     storeAppendPrintf(sentry, "sample_time = %d.%d (%s)\n",
+-                      (int) f->timestamp.tv_sec,
+-                      (int) f->timestamp.tv_usec,
+-                      mkrfc1123(f->timestamp.tv_sec));
+-    storeAppendPrintf(sentry, "client_http.requests = %ld\n",
+-                      (long)f->client_http.requests);
+-    storeAppendPrintf(sentry, "client_http.hits = %ld\n",
+-                      (long)f->client_http.hits);
+-    storeAppendPrintf(sentry, "client_http.errors = %ld\n",
+-                      (long)f->client_http.errors);
+-    storeAppendPrintf(sentry, "client_http.kbytes_in = %ld\n",
+-                      (long)f->client_http.kbytes_in.kb);
+-    storeAppendPrintf(sentry, "client_http.kbytes_out = %ld\n",
+-                      (long)f->client_http.kbytes_out.kb);
+-    storeAppendPrintf(sentry, "client_http.hit_kbytes_out = %ld\n",
+-                      (long)f->client_http.hit_kbytes_out.kb);
+-
+-    storeAppendPrintf(sentry, "server.all.requests = %ld\n",
+-                      (long)f->server.all.requests);
+-    storeAppendPrintf(sentry, "server.all.errors = %ld\n",
+-                      (long) f->server.all.errors);
+-    storeAppendPrintf(sentry, "server.all.kbytes_in = %ld\n",
+-                      (long) f->server.all.kbytes_in.kb);
+-    storeAppendPrintf(sentry, "server.all.kbytes_out = %ld\n",
+-                      (long) f->server.all.kbytes_out.kb);
+-
+-    storeAppendPrintf(sentry, "server.http.requests = %ld\n",
+-                      (long) f->server.http.requests);
+-    storeAppendPrintf(sentry, "server.http.errors = %ld\n",
+-                      (long) f->server.http.errors);
+-    storeAppendPrintf(sentry, "server.http.kbytes_in = %ld\n",
+-                      (long) f->server.http.kbytes_in.kb);
+-    storeAppendPrintf(sentry, "server.http.kbytes_out = %ld\n",
+-                      (long) f->server.http.kbytes_out.kb);
+-
+-    storeAppendPrintf(sentry, "server.ftp.requests = %ld\n",
+-                      (long) f->server.ftp.requests);
+-    storeAppendPrintf(sentry, "server.ftp.errors = %ld\n",
+-                      (long) f->server.ftp.errors);
+-    storeAppendPrintf(sentry, "server.ftp.kbytes_in = %ld\n",
+-                      (long) f->server.ftp.kbytes_in.kb);
+-    storeAppendPrintf(sentry, "server.ftp.kbytes_out = %ld\n",
+-                      (long) f->server.ftp.kbytes_out.kb);
+-
+-    storeAppendPrintf(sentry, "server.other.requests = %ld\n",
+-                      (long) f->server.other.requests);
+-    storeAppendPrintf(sentry, "server.other.errors = %ld\n",
+-                      (long) f->server.other.errors);
+-    storeAppendPrintf(sentry, "server.other.kbytes_in = %ld\n",
+-                      (long) f->server.other.kbytes_in.kb);
+-    storeAppendPrintf(sentry, "server.other.kbytes_out = %ld\n",
+-                      (long) f->server.other.kbytes_out.kb);
+-
+-    storeAppendPrintf(sentry, "icp.pkts_sent = %ld\n",
+-                      (long)f->icp.pkts_sent);
+-    storeAppendPrintf(sentry, "icp.pkts_recv = %ld\n",
+-                      (long)f->icp.pkts_recv);
+-    storeAppendPrintf(sentry, "icp.queries_sent = %ld\n",
+-                      (long)f->icp.queries_sent);
+-    storeAppendPrintf(sentry, "icp.replies_sent = %ld\n",
+-                      (long)f->icp.replies_sent);
+-    storeAppendPrintf(sentry, "icp.queries_recv = %ld\n",
+-                      (long)f->icp.queries_recv);
+-    storeAppendPrintf(sentry, "icp.replies_recv = %ld\n",
+-                      (long)f->icp.replies_recv);
+-    storeAppendPrintf(sentry, "icp.query_timeouts = %ld\n",
+-                      (long)f->icp.query_timeouts);
+-    storeAppendPrintf(sentry, "icp.replies_queued = %ld\n",
+-                      (long)f->icp.replies_queued);
+-    storeAppendPrintf(sentry, "icp.kbytes_sent = %ld\n",
+-                      (long) f->icp.kbytes_sent.kb);
+-    storeAppendPrintf(sentry, "icp.kbytes_recv = %ld\n",
+-                      (long) f->icp.kbytes_recv.kb);
+-    storeAppendPrintf(sentry, "icp.q_kbytes_sent = %ld\n",
+-                      (long) f->icp.q_kbytes_sent.kb);
+-    storeAppendPrintf(sentry, "icp.r_kbytes_sent = %ld\n",
+-                      (long) f->icp.r_kbytes_sent.kb);
+-    storeAppendPrintf(sentry, "icp.q_kbytes_recv = %ld\n",
+-                      (long) f->icp.q_kbytes_recv.kb);
+-    storeAppendPrintf(sentry, "icp.r_kbytes_recv = %ld\n",
+-                      (long) f->icp.r_kbytes_recv.kb);
++                      (int) stats.sample_time.tv_sec,
++                      (int) stats.sample_time.tv_usec,
++                      mkrfc1123(stats.sample_time.tv_sec));
++    storeAppendPrintf(sentry, "client_http.requests = %.0f\n",
++                      stats.client_http_requests);
++    storeAppendPrintf(sentry, "client_http.hits = %.0f\n",
++                      stats.client_http_hits);
++    storeAppendPrintf(sentry, "client_http.errors = %.0f\n",
++                      stats.client_http_errors);
++    storeAppendPrintf(sentry, "client_http.kbytes_in = %.0f\n",
++                      stats.client_http_kbytes_in);
++    storeAppendPrintf(sentry, "client_http.kbytes_out = %.0f\n",
++                      stats.client_http_kbytes_out);
++    storeAppendPrintf(sentry, "client_http.hit_kbytes_out = %.0f\n",
++                      stats.client_http_hit_kbytes_out);
++
++    storeAppendPrintf(sentry, "server.all.requests = %.0f\n",
++                      stats.server_all_requests);
++    storeAppendPrintf(sentry, "server.all.errors = %.0f\n",
++                      stats.server_all_errors);
++    storeAppendPrintf(sentry, "server.all.kbytes_in = %.0f\n",
++                      stats.server_all_kbytes_in);
++    storeAppendPrintf(sentry, "server.all.kbytes_out = %.0f\n",
++                      stats.server_all_kbytes_out);
++
++    storeAppendPrintf(sentry, "server.http.requests = %.0f\n",
++                      stats.server_http_requests);
++    storeAppendPrintf(sentry, "server.http.errors = %.0f\n",
++                      stats.server_http_errors);
++    storeAppendPrintf(sentry, "server.http.kbytes_in = %.0f\n",
++                      stats.server_http_kbytes_in);
++    storeAppendPrintf(sentry, "server.http.kbytes_out = %.0f\n",
++                      stats.server_http_kbytes_out);
++
++    storeAppendPrintf(sentry, "server.ftp.requests = %.0f\n",
++                      stats.server_ftp_requests);
++    storeAppendPrintf(sentry, "server.ftp.errors = %.0f\n",
++                      stats.server_ftp_errors);
++    storeAppendPrintf(sentry, "server.ftp.kbytes_in = %.0f\n",
++                      stats.server_ftp_kbytes_in);
++    storeAppendPrintf(sentry, "server.ftp.kbytes_out = %.0f\n",
++                      stats.server_ftp_kbytes_out);
++
++    storeAppendPrintf(sentry, "server.other.requests = %.0f\n",
++                      stats.server_other_requests);
++    storeAppendPrintf(sentry, "server.other.errors = %.0f\n",
++                      stats.server_other_errors);
++    storeAppendPrintf(sentry, "server.other.kbytes_in = %.0f\n",
++                      stats.server_other_kbytes_in);
++    storeAppendPrintf(sentry, "server.other.kbytes_out = %.0f\n",
++                      stats.server_other_kbytes_out);
++
++    storeAppendPrintf(sentry, "icp.pkts_sent = %.0f\n",
++                      stats.icp_pkts_sent);
++    storeAppendPrintf(sentry, "icp.pkts_recv = %.0f\n",
++                      stats.icp_pkts_recv);
++    storeAppendPrintf(sentry, "icp.queries_sent = %.0f\n",
++                      stats.icp_queries_sent);
++    storeAppendPrintf(sentry, "icp.replies_sent = %.0f\n",
++                      stats.icp_replies_sent);
++    storeAppendPrintf(sentry, "icp.queries_recv = %.0f\n",
++                      stats.icp_queries_recv);
++    storeAppendPrintf(sentry, "icp.replies_recv = %.0f\n",
++                      stats.icp_replies_recv);
++    storeAppendPrintf(sentry, "icp.query_timeouts = %.0f\n",
++                      stats.icp_query_timeouts);
++    storeAppendPrintf(sentry, "icp.replies_queued = %.0f\n",
++                      stats.icp_replies_queued);
++    storeAppendPrintf(sentry, "icp.kbytes_sent = %.0f\n",
++                      stats.icp_kbytes_sent);
++    storeAppendPrintf(sentry, "icp.kbytes_recv = %.0f\n",
++                      stats.icp_kbytes_recv);
++    storeAppendPrintf(sentry, "icp.q_kbytes_sent = %.0f\n",
++                      stats.icp_q_kbytes_sent);
++    storeAppendPrintf(sentry, "icp.r_kbytes_sent = %.0f\n",
++                      stats.icp_r_kbytes_sent);
++    storeAppendPrintf(sentry, "icp.q_kbytes_recv = %.0f\n",
++                      stats.icp_q_kbytes_recv);
++    storeAppendPrintf(sentry, "icp.r_kbytes_recv = %.0f\n",
++                      stats.icp_r_kbytes_recv);
+ 
+ #if USE_CACHE_DIGESTS
+ 
+-    storeAppendPrintf(sentry, "icp.times_used = %ld\n",
+-                      (long)f->icp.times_used);
+-    storeAppendPrintf(sentry, "cd.times_used = %ld\n",
+-                      (long)f->cd.times_used);
+-    storeAppendPrintf(sentry, "cd.msgs_sent = %ld\n",
+-                      (long)f->cd.msgs_sent);
+-    storeAppendPrintf(sentry, "cd.msgs_recv = %ld\n",
+-                      (long)f->cd.msgs_recv);
+-    storeAppendPrintf(sentry, "cd.memory = %ld\n",
+-                      (long) f->cd.memory.kb);
+-    storeAppendPrintf(sentry, "cd.local_memory = %ld\n",
+-                      (long) (store_digest ? store_digest->mask_size / 1024 : 0));
+-    storeAppendPrintf(sentry, "cd.kbytes_sent = %ld\n",
+-                      (long) f->cd.kbytes_sent.kb);
+-    storeAppendPrintf(sentry, "cd.kbytes_recv = %ld\n",
+-                      (long) f->cd.kbytes_recv.kb);
++    storeAppendPrintf(sentry, "icp.times_used = %.0f\n",
++                      stats.icp_times_used);
++    storeAppendPrintf(sentry, "cd.times_used = %.0f\n",
++                      stats.cd_times_used);
++    storeAppendPrintf(sentry, "cd.msgs_sent = %.0f\n",
++                      stats.cd_msgs_sent);
++    storeAppendPrintf(sentry, "cd.msgs_recv = %.0f\n",
++                      stats.cd_msgs_recv);
++    storeAppendPrintf(sentry, "cd.memory = %.0f\n",
++                      stats.cd_memory);
++    storeAppendPrintf(sentry, "cd.local_memory = %.0f\n",
++                      stats.cd_local_memory);
++    storeAppendPrintf(sentry, "cd.kbytes_sent = %.0f\n",
++                      stats.cd_kbytes_sent);
++    storeAppendPrintf(sentry, "cd.kbytes_recv = %.0f\n",
++                      stats.cd_kbytes_recv);
+ #endif
+ 
+-    storeAppendPrintf(sentry, "unlink.requests = %ld\n",
+-                      (long)f->unlink.requests);
+-    storeAppendPrintf(sentry, "page_faults = %ld\n",
+-                      (long)f->page_faults);
+-    storeAppendPrintf(sentry, "select_loops = %ld\n",
+-                      (long)f->select_loops);
++    storeAppendPrintf(sentry, "unlink.requests = %.0f\n",
++                      stats.unlink_requests);
++    storeAppendPrintf(sentry, "page_faults = %.0f\n",
++                      stats.page_faults);
++    storeAppendPrintf(sentry, "select_loops = %.0f\n",
++                      stats.select_loops);
+     storeAppendPrintf(sentry, "cpu_time = %f\n",
+-                      f->cputime);
++                      stats.cpu_time);
+     storeAppendPrintf(sentry, "wall_time = %f\n",
+-                      tvSubDsec(f->timestamp, current_time));
+-    storeAppendPrintf(sentry, "swap.outs = %ld\n",
+-                      (long)f->swap.outs);
+-    storeAppendPrintf(sentry, "swap.ins = %ld\n",
+-                      (long)f->swap.ins);
+-    storeAppendPrintf(sentry, "swap.files_cleaned = %ld\n",
+-                      (long)f->swap.files_cleaned);
+-    storeAppendPrintf(sentry, "aborted_requests = %ld\n",
+-                      (long)f->aborted_requests);
++                      stats.wall_time);
++    storeAppendPrintf(sentry, "swap.outs = %.0f\n",
++                      stats.swap_outs);
++    storeAppendPrintf(sentry, "swap.ins = %.0f\n",
++                      stats.swap_ins);
++    storeAppendPrintf(sentry, "swap.files_cleaned = %.0f\n",
++                      stats.swap_files_cleaned);
++    storeAppendPrintf(sentry, "aborted_requests = %.0f\n",
++                      stats.aborted_requests);
+ }
+ 
+ void

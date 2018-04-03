@@ -1,0 +1,8 @@
+	if (recovery)
+		warning(_("Renamed a misnamed branch '%s' away"), oldref.buf + 11);
+
+	/* no need to pass logmsg here as HEAD didn't really move */
+	if (!strcmp(oldname, head) && create_symref("HEAD", newref.buf, NULL))
+		die(_("Branch renamed to %s, but HEAD is not updated!"), newname);
+
+	strbuf_addf(&oldsection, "branch.%s", oldref.buf + 11);

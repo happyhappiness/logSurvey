@@ -1,0 +1,3 @@
+{
+    fatal ("MemObject.cc required.");
+}

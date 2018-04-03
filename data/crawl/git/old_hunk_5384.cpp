@@ -1,0 +1,3 @@
+	free(conn);
+	return code;
+}

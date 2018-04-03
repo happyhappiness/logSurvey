@@ -1,0 +1,3 @@
+{
+    adapted = NULL;	// refcounted
+}

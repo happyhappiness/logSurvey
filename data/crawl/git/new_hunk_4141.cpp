@@ -1,0 +1,8 @@
+		if (!allow_fast_forward)
+			die(_("Non-fast-forward commit does not make sense into "
+			    "an empty head"));
+		remoteheads = collect_parents(argc, argv);
+		remote_head = remoteheads->item;
+		if (!remote_head)
+			die(_("%s - not something we can merge"), argv[0]);
+		read_empty(remote_head->object.sha1, 0);

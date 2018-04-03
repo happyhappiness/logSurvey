@@ -1,0 +1,6 @@
+      message (1, _("$SHELL changed (was `%s', now `%s')"), default_shell, shell);
+      unixy_shell = _is_unixy_shell (shell);
+      default_shell = shell;
+    }
+  if (unixy_shell)
+    {

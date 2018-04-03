@@ -2,6 +2,7 @@ import re
 import urllib2
 import numpy as np
 from scipy.spatial.distance import pdist
+from datetime import datetime
 
 
 """
@@ -33,15 +34,15 @@ OLD_HUNK_FILE_PREFIX = ''
 NEW_HUNK_FILE_PREFIX = ''
 
 # record title and index
-PATCH_RECORD_TITLE = ['url', 'date', 'title', 'changes', 'file_name', 'patch_type', 'other_info']
+PATCH_RECORD_TITLE = ['url', 'date', 'title', 'changes', 'file_name']
 DATE_INDEX = PATCH_RECORD_TITLE.index('date')
 FILE_NAME_INDEX = PATCH_RECORD_TITLE.index('file_name')
 
-HUNK_RECORD_TITLE = PATCH_RECORD_TITLE + ['old_hunk_file','new_hunk_file','old_log_locs', 'new_log_locs']
+HUNK_RECORD_TITLE = PATCH_RECORD_TITLE + ['reason_for_consistence', 'is_trivial', 'old_hunk_file','new_hunk_file','old_log_locs', 'new_log_locs']
 OLD_LOG_LOCS_INDEX = HUNK_RECORD_TITLE.index('old_log_locs')
 NEW_LOG_LOCS_INDEX = HUNK_RECORD_TITLE.index('new_log_locs')
 
-LOG_RECORD_TITLE = PATCH_RECORD_TITLE + ['old_hunk_file','new_hunk_file', 'old_loc', 'new_loc', 'old_log', 'new_log', 'edit_types', 'edit_words', 'edit_feature']
+LOG_RECORD_TITLE = PATCH_RECORD_TITLE + ['reason_for_consistence', 'is_trivial', 'old_hunk_file','new_hunk_file', 'old_loc', 'new_loc', 'old_log', 'new_log', 'edit_types', 'edit_words', 'edit_feature']
 OLD_HUNK_INDEX = LOG_RECORD_TITLE.index('old_hunk_file')
 NEW_HUNK_INDEX = LOG_RECORD_TITLE.index('new_hunk_file')
 OLD_LOG_INDEX = LOG_RECORD_TITLE.index('old_log')
@@ -193,4 +194,13 @@ def compute_similarity(in_vector1, in_vector2, method='braycurtis'):
     similairty = 1 - distance
     return similairty
 
-    
+def strptime_mine(date_string):
+    """
+    @ param date string \n
+    @ return retrived datetime\n
+    @ involve call strptime to understand the date according to initial date string\n
+    """
+    date_format = "%d %b %Y"
+    if date_string.find(',') != -1:
+        date_format = "%b %d, %Y"
+    return datetime.strptime(date_string, date_format)

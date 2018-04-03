@@ -1,0 +1,3 @@
+    return aHashEntry->user();
+}
+

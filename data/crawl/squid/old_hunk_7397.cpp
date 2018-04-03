@@ -1,0 +1,7 @@
+	    tmp_filename, xstrerror());
+	fatal("storeStartRebuildFromDisk: Can't open tmp swaplog");
+    }
+    swaplog_lock = file_write_lock(swaplog_fd);
+    /* Open the existing swap log for reading */
+    if ((data->log = fopen(swaplog_file, "r")) == (FILE *) NULL) {
+	sprintf(tmp_error_buf, "storeRebuildFromDisk: %s: %s",

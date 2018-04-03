@@ -1,0 +1,11 @@
+"Mo¿na zatrzymaæ Wget'a poprzez wci¶niêcie CTRL+ALT+DELETE.\n"
+
+#. parent, no error
+#: src/mswindows.c:140 src/utils.c:269
+msgid "Continuing in background.\n"
+msgstr "Kontunuacja w tle.\n"
+
+#: src/mswindows.c:142 src/utils.c:271
+#, c-format
+msgid "Output will be written to `%s'.\n"
+msgstr "Wyj¶cie zostanie zapisane do `%s'.\n"

@@ -1,0 +1,7 @@
+
+			done = read_in_full(fd, result, len);
+			if (done < 0)
+				die_errno("read error '%s'", elem->path);
+			else if (done < len)
+				die("early EOF '%s'", elem->path);
+

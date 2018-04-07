@@ -90,7 +90,7 @@ def get_wait_time():
     writer.writerow(my_util.WAIT_TIME_RECORD_TITLE)
     average_writer_file = file(my_util.AVERAGE_WAIT_TIME_FILE, 'wb')
     average_writer = csv.writer(average_writer_file)
-    average_writer.writerow(my_util.WAIT_TIME_RECORD_TITLE)
+    average_writer.writerow(my_util.WAIT_TIME_RECORD_TITLE + ['cluster_size'])
 
     reading_file = file(my_util.CLUSTER_RECORD_FILE, 'rb')
     records = csv.reader(reading_file)
@@ -111,10 +111,10 @@ def get_wait_time():
                 start_time = min(time_lists)
                 for i in range(len(curr_cluster)):
                     wait_time = time_lists[i] - start_time
-                    writer.writerow(curr_cluster[i] + [wait_time])
+                    writer.writerow(curr_cluster[i] + [wait_time.total_seconds()/60])
                     average_wait_time += wait_time
                 # write average wait time
-                average_writer.writerow(curr_cluster[0] + [average_wait_time/len(curr_cluster)])
+                average_writer.writerow(curr_cluster[0] + [average_wait_time.total_seconds()/60/len(curr_cluster)] + [len(curr_cluster)])
                 if average_wait_time > timedelta():
                     wait_counter += 1
             else:
@@ -138,6 +138,44 @@ def get_wait_time():
 
     return wait_counter
 
+def get_reason_for_consistence(file_writer):
+    """
+    @ param statistic file writer\n
+    @ return nothing\n
+    @ involve statistic each reason for consistence, summarize the average wait time, average size, trivial count and wait count\n
+    """
+    reading_file = file(my_util.AVERAGE_WAIT_TIME_FILE, 'rb')
+    records = csv.reader(reading_file)
+    # build dict for each sort of reason
+    # counter, sum of wait time, sum of wait count, sum of cluster size, sum of trivial
+    reason_dict = {}
+    for reason in my_util.REASON_FOR_CONSISTENCE:
+        reason_dict[reason] = [0, 0, 0, 0, 0]
+    for record in islice(records, 1, None):
+        if json.loads(record[my_util.EDIT_FEATURE_INDEX]) == [0]:
+            continue
+        # counster
+        reason = record[my_util.REASON_FOR_CONSISTENCE_INDEX]
+        if reason == '':
+            continue
+        reason_dict[reason][my_util.NUM_INDEX] += 1
+        # sum of wait time
+        wait_time = float(record[my_util.WAIT_TIME_INDEX])
+        reason_dict[reason][my_util.SUM_WAIT_TIME_INDEX] += wait_time
+        if wait_time != float(0):
+            reason_dict[reason][my_util.WAIT_COUNTER_INDEX] += 1
+        # sum of cluster size
+        cluster_size = int(record[-1])
+        reason_dict[reason][my_util.SUM_CLUSTER_SIZE_INDEX] += cluster_size
+        # sum of trivial
+        is_trivial = record[my_util.TRIVIAL_INDEX]
+        if is_trivial == my_util.IS_TRIVIAL:
+            reason_dict[reason][my_util.TRIVIAL_COUNTER_INDEX] += 1
+
+    file_writer.writerow(['reason'] + my_util.STATISTIC_REASON_FOR_CONSISTENCE_TITLE)
+    for reason in my_util.REASON_FOR_CONSISTENCE:
+        file_writer.writerow([reason] + reason_dict[reason])
+
 def get_statistic(file_name='data/analyze/statistic.csv'):
     """
     @ param nothing\n
@@ -151,6 +189,8 @@ def get_statistic(file_name='data/analyze/statistic.csv'):
     wait_counter = get_wait_time()
     writer.writerow(['wait counter'])
     writer.writerow([wait_counter])
+    get_reason_for_consistence(writer)
+
 
     writer_file.close()
 

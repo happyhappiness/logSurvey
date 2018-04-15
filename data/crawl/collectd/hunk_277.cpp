@@ -1,41 +1,12 @@
-       plugin = value;
-     }
-     else if (strcasecmp (key, "identifier") == 0) {
--      char hostname[1024];
--      char ident_str[1024] = "";
--      int  n_slashes;
--
--      n_slashes = count_chars (value, '/');
--      if (n_slashes == 1) {
--        /* The user has omitted the hostname part of the identifier
--         * (there is only one '/' in the identifier)
--         * Let's add the local hostname */
--        if (gethostname (hostname, sizeof (hostname)) != 0) {
--          fprintf (stderr, "ERROR: Failed to get local hostname: %s",
--              strerror (errno));
--          return (-1);
--        }
--        hostname[sizeof (hostname) - 1] = '\0';
--
--        snprintf (ident_str, sizeof (ident_str), "%s/%s", hostname, value);
--        ident_str[sizeof(ident_str) - 1] = '\0';
--      }
--      else {
--        strncpy (ident_str, value, sizeof (ident_str));
--        ident_str[sizeof (ident_str) - 1] = '\0';
--      }
-+      int status;
- 
--      status = lcc_string_to_identifier (c, &ident, ident_str);
--      if (status != 0) {
--        fprintf (stderr, "ERROR: Failed to parse identifier ``%s'': %s.\n",
--            ident_str, lcc_strerror(c));
--        return (-1);
--      }
-+      memset (&ident, 0, sizeof (ident));
-+      status = parse_identifier (c, value, &ident);
-+      if (status != 0)
-+        return (status);
-       identp = &ident;
-     }
-   }
+ 			if (item->values_num != 1 || item->values[0].type != OCONFIG_TYPE_BOOLEAN)
+ 				continue;
+ 			do_interactive = item->values[0].value.boolean;
++		} else if (strcasecmp(item->key, "Encoding") == 0) {
++			if (item->values_num != 1 || item->values[0].type != OCONFIG_TYPE_STRING)
++				continue;
++			/* Why is this even necessary? And undocumented? */
++			if (PyUnicode_SetDefaultEncoding(item->values[0].value.string))
++				cpy_log_exception("setting default encoding");
+ 		} else if (strcasecmp(item->key, "LogTraces") == 0) {
+ 			if (item->values_num != 1 || item->values[0].type != OCONFIG_TYPE_BOOLEAN)
+ 				continue;

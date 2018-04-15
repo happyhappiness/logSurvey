@@ -1,12 +1,9 @@
-		return (RET_UNKNOWN);
-	}
+	else
+	{
+		if (print_timestamp)
+			fprintf (fh, "[%s] %s\n", timestamp_str, msg);
+		else
+			fprintf (fh, "%s\n", msg);
 
-	for (i = 0; i < ret_ident_num; ++i) {
-		char id[1024];
-
-		if ((hostname_g != NULL) && (strcasecmp (hostname_g, ret_ident[i].host)))
-			continue;
-
-		status = lcc_identifier_to_string (connection,
-				id, sizeof (id), ret_ident + i);
-		if (status != 0) {
+		if (do_close != 0)
+			fclose (fh);

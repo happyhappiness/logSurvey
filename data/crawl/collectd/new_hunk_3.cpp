@@ -1,16 +1,8 @@
-  }
-
-  if (vl.values_len != 3) {
-    fprintf(stderr, "parse_values(): vl.values_len = %" PRIsz ", want 3\n",
-            vl.values_len);
-    return -1;
-  }
-
-  int want_types[] = {LCC_TYPE_GAUGE, LCC_TYPE_DERIVE, LCC_TYPE_GAUGE};
-  for (size_t i = 0; i < sizeof(want_types) / sizeof(want_types[0]); i++) {
-    if (vl.values_types[i] != want_types[i]) {
-      fprintf(stderr,
-              "parse_values(): vl.values_types[%" PRIsz "] = %d, want %d\n", i,
-              vl.values_types[i], want_types[i]);
-      ret = -1;
-    }
+	 if (strcmp ($1.key, $2) != 0)
+	 {
+		printf ("block_begin = %s; block_end = %s;\n", $1.key, $2);
+		yyerror("block not closed");
+		YYERROR;
+	 }
+	 free ($2); $2 = NULL;
+	 $$ = $1;

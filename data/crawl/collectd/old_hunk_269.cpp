@@ -1,7 +1,7 @@
-
-    if (! value) {
-      fprintf (stderr, "ERROR: flush: Invalid option ``%s''.\n", argv[i]);
-      return (-1);
-    }
-
-    *value = '\0';
+			if (module == NULL) {
+				ERROR("python plugin: Error importing module \"%s\".", module_name);
+				cpy_log_exception("importing module");
+				PyErr_Print();
+			}
+			free(module_name);
+			Py_XDECREF(module);

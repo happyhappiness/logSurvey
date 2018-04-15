@@ -1,58 +1,32 @@
- }
- 
- static PyObject *cpy_error(PyObject *self, PyObject *args) {
--	const char *text;
-+	char *text;
- 	if (PyArg_ParseTuple(args, "et", NULL, &text) == 0) return NULL;
- 	Py_BEGIN_ALLOW_THREADS
- 	plugin_log(LOG_ERR, "%s", text);
- 	Py_END_ALLOW_THREADS
-+	PyMem_Free(text);
- 	Py_RETURN_NONE;
- }
- 
- static PyObject *cpy_warning(PyObject *self, PyObject *args) {
--	const char *text;
-+	char *text;
- 	if (PyArg_ParseTuple(args, "et", NULL, &text) == 0) return NULL;
- 	Py_BEGIN_ALLOW_THREADS
- 	plugin_log(LOG_WARNING, "%s", text);
- 	Py_END_ALLOW_THREADS
-+	PyMem_Free(text);
- 	Py_RETURN_NONE;
- }
- 
- static PyObject *cpy_notice(PyObject *self, PyObject *args) {
--	const char *text;
-+	char *text;
- 	if (PyArg_ParseTuple(args, "et", NULL, &text) == 0) return NULL;
- 	Py_BEGIN_ALLOW_THREADS
- 	plugin_log(LOG_NOTICE, "%s", text);
- 	Py_END_ALLOW_THREADS
-+	PyMem_Free(text);
- 	Py_RETURN_NONE;
- }
- 
- static PyObject *cpy_info(PyObject *self, PyObject *args) {
--	const char *text;
-+	char *text;
- 	if (PyArg_ParseTuple(args, "et", NULL, &text) == 0) return NULL;
- 	Py_BEGIN_ALLOW_THREADS
- 	plugin_log(LOG_INFO, "%s", text);
- 	Py_END_ALLOW_THREADS
-+	PyMem_Free(text);
- 	Py_RETURN_NONE;
- }
- 
- static PyObject *cpy_debug(PyObject *self, PyObject *args) {
- #ifdef COLLECT_DEBUG
--	const char *text;
-+	char *text;
- 	if (PyArg_ParseTuple(args, "et", NULL, &text) == 0) return NULL;
- 	Py_BEGIN_ALLOW_THREADS
- 	plugin_log(LOG_DEBUG, "%s", text);
- 	Py_END_ALLOW_THREADS
-+	PyMem_Free(text);
- #endif
- 	Py_RETURN_NONE;
- }
+         snprintf (address, sizeof (address), "unix:%s", optarg);
+         address[sizeof (address) - 1] = '\0';
+         break;
+-      case 'p':
+-        plugin = optarg;
+-        break;
+-      case 'i':
+-        if (charoccurences (optarg, '/') == 1) {
+-          /* The user has omitted the hostname part of the identifier
+-           * (there is only one '/' in the identifier)
+-           * Let's add the local hostname */
+-          if (gethostname (hostname, sizeof (hostname)) != 0) {
+-            fprintf (stderr, "Could not get local hostname: %s", strerror (errno));
+-            return 1;
+-          }
+-          /* Make sure hostname is zero-terminated */
+-          hostname[sizeof (hostname) - 1] = '\0';
+-          snprintf (ident_str, sizeof (ident_str), "%s/%s", hostname, optarg);
+-          /* Make sure ident_str is zero terminated */
+-          ident_str[sizeof(ident_str) - 1] = '\0';
+-        } else {
+-          strncpy (ident_str, optarg, sizeof (ident_str));
+-          /* Make sure identifier is zero terminated */
+-          ident_str[sizeof (ident_str) - 1] = '\0';
+-        }
+-        break;
+-      case 't':
+-        timeout = atoi (optarg);
+-        break;
+       case 'h':
+         exit_usage (argv[0], 0);
+         break;

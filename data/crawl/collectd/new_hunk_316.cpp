@@ -1,7 +1,25 @@
 
-static PyObject *cpy_warning(PyObject *self, PyObject *args) {
-	const char *text;
-	if (PyArg_ParseTuple(args, "et", NULL, &text) == 0) return NULL;
-	Py_BEGIN_ALLOW_THREADS
-	plugin_log(LOG_WARNING, "%s", text);
-	Py_END_ALLOW_THREADS
+    escape_string (metric_name, sizeof (metric_name));
+
+    pthread_mutex_lock (&send_lock);
+
+    status = ssnprintf (send_buffer + send_buffer_fill, sizeof (send_buffer) - send_buffer_fill,
+        "\"%s\",%s,%s\n",
+        metric_name, timestamp, value);
+    send_buffer_fill += status;
+
+    printf(send_buffer);
+    printf("Fill: %i\n", send_buffer_fill);
+    printf("----\n");
+
+    if ((sizeof (send_buffer) - send_buffer_fill) < 128)
+    {
+            http_flush_buffer();
+    }
+
+    pthread_mutex_unlock (&send_lock);
+
+  } /* for */
+
+
+  return (0);

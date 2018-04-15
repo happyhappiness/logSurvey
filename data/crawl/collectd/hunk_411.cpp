@@ -1,8 +1,8 @@
- 		XSRETURN_EMPTY;
- 	}
+   char *tc_type;
+   char tc_inst[DATA_MAX_NAME_LEN];
  
--	plugin_log (SvIV (ST (0)), SvPV_nolen (ST (1)));
-+	plugin_log (SvIV (ST (0)), "%s", SvPV_nolen (ST (1)));
- 	XSRETURN_YES;
- } /* static XS (Collectd_plugin_log) */
- 
+-  printf ("=== qos_filter ===\n");
+-
+   if (nmh->nlmsg_type == RTM_NEWQDISC)
+     tc_type = "qdisc";
+   else if (nmh->nlmsg_type == RTM_NEWTCLASS)

@@ -1,9 +1,24 @@
-    if (meta->type == NM_TYPE_STRING)
-      fprintf (fh, "%s: %s\n", meta->name, meta->value_string);
-    else if (meta->type == NM_TYPE_SIGNED_INT)
-      fprintf (fh, "%s: %lli\n", meta->name, meta->value_signed_int);
-    else if (meta->type == NM_TYPE_UNSIGNED_INT)
-      fprintf (fh, "%s: %llu\n", meta->name, meta->value_unsigned_int);
-    else if (meta->type == NM_TYPE_DOUBLE)
-      fprintf (fh, "%s: %e\n", meta->name, meta->value_double);
-    else if (meta->type == NM_TYPE_BOOLEAN)
+	char **value_ptr;
+
+	if (fields_num != 3)
+		return (-1);
+
+	status = parse_identifier (fields[1], &hostname,
+			&plugin, &plugin_instance,
+			&type, &type_instance);
+	if (status != 0)
+		return (-1);
+
+	if ((strlen (hostname) > sizeof (vl.host))
+			|| (strlen (plugin) > sizeof (vl.plugin))
+			|| (strlen (plugin_instance) > sizeof (vl.plugin_instance))
+			|| (strlen (type_instance) > sizeof (vl.type_instance)))
+		return (-1);
+
+	strcpy (vl.host, hostname);
+	strcpy (vl.plugin, plugin);
+	strcpy (vl.plugin_instance, plugin_instance);
+	strcpy (vl.type_instance, type_instance);
+
+	{ /* parse the time */
+		char *t = fields[2];

@@ -1,7 +1,8 @@
-	}
-	size = (int) PySequence_Length(values);
-	if (size != ds->ds_num) {
-		PyErr_Format(PyExc_RuntimeError, "type %s needs %d values, got %i", type, ds->ds_num, size);
-		return NULL;
-	}
-	value = malloc(size * sizeof(*value));
+  return 0;
+}
+
+void usage (const char *name) {
+  fprintf (stderr, "Usage: %s [options]\n"
+      "\n"
+      "Valid options are:\n"
+      "  -h, --help               Display this help message.\n"

@@ -1,11 +1,31 @@
-	}
-	else
-	{
-		if (print_timestamp)
-			fprintf (fh, "[%s] %s\n", timestamp_str, msg);
-		else
-			fprintf (fh, "%s\n", msg);
 
-		if (do_close != 0)
-			fclose (fh);
-	}
+static int irq_config (char *key, char *value)
+{
+	if (strcasecmp (key, "Irq") == 0)
+	{
+		unsigned int *temp;
+		unsigned int irq;
+		char *endptr;
+
+		temp = (unsigned int *) realloc (irq_list, (irq_list_num + 1) * sizeof (unsigned int *));
+		if (temp == NULL)
+		{
+			fprintf (stderr, "irq plugin: Cannot allocate more memory.\n");
+			syslog (LOG_ERR, "irq plugin: Cannot allocate more memory.");
+			return (1);
+		}
+		irq_list = temp;
+
+		/* Clear errno, because we need it to see if an error occured. */
+		errno = 0;
+
+		irq = strtol(value, &endptr, 10);
+		if ((endptr == value) || (errno != 0))
+		{
+			fprintf (stderr, "irq plugin: Irq value is not a "
+					"number: `%s'\n", value);
+			syslog (LOG_ERR, "irq plugin: Irq value is not a "
+					"number: `%s'", value);
+			return (1);
+		}
+		irq_list[irq_list_num] = irq;

@@ -1,69 +1,47 @@
-     return 0;
+ 	return (NULL);
  }
  
--static const char *
--QnameToNld(const char *qname, int nld)
--{
--    const char *t = strrchr(qname, '.');
--    int dotcount = 1;
--    if (NULL == t)
--	t = qname;
--    if (0 == strcmp(t, ".arpa"))
--	dotcount--;
--    while (t > qname && dotcount < nld) {
--	t--;
--	if ('.' == *t)
--	    dotcount++;
--    }
--    if (t > qname)
--	t++;
--    return t;
--}
--
- static int
--handle_dns(const char *buf, int len, const struct in_addr sip, const struct in_addr dip)
-+handle_dns(const char *buf, int len,
-+	const struct in6_addr *s_addr,
-+	const struct in6_addr *d_addr)
- {
--    rfc1035_header qh;
--    unsigned short us;
--    char qname[MAX_QNAME_SZ];
--    unsigned short qtype;
--    unsigned short qclass;
-+    rfc1035_header_t qh;
-+    uint16_t us;
-     off_t offset;
-     char *t;
--    const char *s;
-     int x;
--    StringCounter *sc;
--    StringAddrCounter *ssc;
- 
--    fprintf (stderr, "handle_dns (buf = %p, len = %i)\n",
--		    (void *) buf, len);
--
--    if (len < sizeof(qh))
-+    /* The DNS header is 12 bytes long */
-+    if (len < 12)
- 	return 0;
- 
--    memcpy(&us, buf + 00, 2);
-+    memcpy(&us, buf + 0, 2);
-     qh.id = ntohs(us);
- 
-     memcpy(&us, buf + 2, 2);
-     us = ntohs(us);
-+    fprintf (stderr, "Bytes 0, 1: 0x%04hx\n", us);
-     qh.qr = (us >> 15) & 0x01;
-     qh.opcode = (us >> 11) & 0x0F;
-     qh.aa = (us >> 10) & 0x01;
-     qh.tc = (us >> 9) & 0x01;
-     qh.rd = (us >> 8) & 0x01;
-     qh.ra = (us >> 7) & 0x01;
-+    qh.z  = (us >> 6) & 0x01;
-+    qh.ad = (us >> 5) & 0x01;
-+    qh.cd = (us >> 4) & 0x01;
-     qh.rcode = us & 0x0F;
- 
-     memcpy(&us, buf + 4, 2);
++int cf_callback_usage (const char *shortvar, const char *var,
++		const char *arguments, const char *value, lc_flags_t flags,
++		void *extra)
++{
++	DBG ("shortvar = %s, var = %s, arguments = %s, value = %s, ...",
++			shortvar, var, arguments, value);
++
++	printf ("Usage: "PACKAGE" [OPTIONS]\n\n"
++			
++			"Available options:\n"
++#if COLLECT_DAEMON
++			"    -P <file>       PID file.\n"
++			"                    Default: "PIDFILE"\n"
++#endif
++			"    -M <dir>        Module/Plugin directory.\n"
++			"                    Default: "PLUGINDIR"\n"
++			"    -D <dir>        Data storage directory.\n"
++			"                    Default: "PKGLOCALSTATEDIR"\n"
++#if COLLECT_DEBUG
++			"    -L <file>       Log file.\n"
++			"                    Default: "LOGFILE"\n"
++#endif
++#if COLLECT_DAEMON
++			"    -f              Don't fork to the background.\n"
++#endif
++#if HAVE_LIBRRD
++			"    -l              Start in local mode (no network).\n"
++			"    -c              Start in client (sender) mode.\n"
++			"    -s              Start in server (listener) mode.\n"
++#endif /* HAVE_LIBRRD */
++#if COLLECT_PING
++			"  Ping:\n"
++			"    -p <host>       Host to ping periodically, may be repeated to ping\n"
++			"                    more than one host.\n"
++#endif /* COLLECT_PING */
++			"\n"PACKAGE" "VERSION", http://verplant.org/collectd/\n"
++			"by Florian octo Forster <octo@verplant.org>\n"
++			"for contributions see `AUTHORS'\n");
++	exit (0);
++} /* exit_usage */
++
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+  * Functions for the actual parsing                                    *
+  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */

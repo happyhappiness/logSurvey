@@ -1,35 +1,41 @@
-   return (0);
- } /* }}} int get_integer_opt */
+       plugin = value;
+     }
+     else if (strcasecmp (key, "identifier") == 0) {
+-      char hostname[1024];
+-      char ident_str[1024] = "";
+-      int  n_slashes;
+-
+-      n_slashes = count_chars (value, '/');
+-      if (n_slashes == 1) {
+-        /* The user has omitted the hostname part of the identifier
+-         * (there is only one '/' in the identifier)
+-         * Let's add the local hostname */
+-        if (gethostname (hostname, sizeof (hostname)) != 0) {
+-          fprintf (stderr, "ERROR: Failed to get local hostname: %s",
+-              strerror (errno));
+-          return (-1);
+-        }
+-        hostname[sizeof (hostname) - 1] = '\0';
+-
+-        snprintf (ident_str, sizeof (ident_str), "%s/%s", hostname, value);
+-        ident_str[sizeof(ident_str) - 1] = '\0';
+-      }
+-      else {
+-        strncpy (ident_str, value, sizeof (ident_str));
+-        ident_str[sizeof (ident_str) - 1] = '\0';
+-      }
++      int status;
  
-+static int get_double_opt (const char *str, double *ret_value) /* {{{ */
-+{
-+  char *endptr;
-+  double tmp;
-+
-+  errno = 0;
-+  endptr = NULL;
-+  tmp = strtod (str, &endptr);
-+  if (errno != 0)
-+  {
-+    fprintf (stderr, "Unable to parse option as a number: \"%s\": %s\n",
-+        str, strerror (errno));
-+    exit (EXIT_FAILURE);
-+  }
-+  else if (endptr == str)
-+  {
-+    fprintf (stderr, "Unable to parse option as a number: \"%s\"\n", str);
-+    exit (EXIT_FAILURE);
-+  }
-+  else if (*endptr != 0)
-+  {
-+    fprintf (stderr, "Garbage after end of value: \"%s\"\n", str);
-+    exit (EXIT_FAILURE);
-+  }
-+
-+  *ret_value = tmp;
-+  return (0);
-+} /* }}} int get_double_opt */
-+
- static int read_options (int argc, char **argv) /* {{{ */
- {
-   int opt;
+-      status = lcc_string_to_identifier (c, &ident, ident_str);
+-      if (status != 0) {
+-        fprintf (stderr, "ERROR: Failed to parse identifier ``%s'': %s.\n",
+-            ident_str, lcc_strerror(c));
+-        return (-1);
+-      }
++      memset (&ident, 0, sizeof (ident));
++      status = parse_identifier (c, value, &ident);
++      if (status != 0)
++        return (status);
+       identp = &ident;
+     }
+   }

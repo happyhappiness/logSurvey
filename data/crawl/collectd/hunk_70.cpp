@@ -1,10 +1,8 @@
-   }
- 
-   if (fh == NULL) {
--    char errbuf[1024];
-     fprintf(stderr, "logfile plugin: fopen (%s) failed: %s\n", log_file,
--            sstrerror(errno, errbuf, sizeof(errbuf)));
-+            STRERRNO);
-   } else {
-     if (print_timestamp)
-       fprintf(fh, "[%s] %s%s\n", timestamp_str, level_str, msg);
+ 			if (parse_identifier (opt_value,
+ 						&id->host, &id->plugin, &id->plugin_instance,
+ 						&id->type, &id->type_instance,
+-						NULL) != 0)
++						opts->identifier_default_host) != 0)
+ 			{
+ 				cmd_error (CMD_PARSE_ERROR, err,
+ 						"Invalid identifier `%s'.", opt_value);

@@ -1,7 +1,7 @@
-			module = PyImport_ImportModule(module_name); /* New reference. */
-			if (module == NULL) {
-				ERROR("python plugin: Error importing module \"%s\".", module_name);
-				cpy_log_exception("importing module");
-				PyErr_Print();
-			}
-			free(module_name);
+{
+  int status;
+
+  DEBUG ("domain_connection_change_handler (domain = %p, err = %i, "
+      "conn_num = %u, port_num = %u, still_connected = %i, "
+      "user_data = %p);\n",
+      (void *) domain, err, conn_num, port_num, still_connected, user_data);

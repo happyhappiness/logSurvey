@@ -1,6 +1,6 @@
-   */
-  native public static int RegisterShutdown (String name,
-      CollectdShutdownInterface obj);
-} /* class CollectdAPI */
-
-/* vim: set sw=2 sts=2 et fdm=marker : */
+%%
+static int yyerror (const char *s)
+{
+	fprintf (stderr, "Error in line %i near `%s': %s\n", yylineno, yytext, s);
+	return (-1);
+} /* int yyerror */

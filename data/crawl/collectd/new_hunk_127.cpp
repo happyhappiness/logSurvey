@@ -1,11 +1,8 @@
-#include "utils_cmd_flush.h"
+  CHECK_NOT_NULL (l = latency_counter_create ());
 
-cmd_status_t cmd_parse_flush (size_t argc, char **argv,
-		cmd_flush_t *ret_flush, const cmd_options_t *opts,
-		cmd_error_handler_t *err)
-{
+  for (i = 0; i < STATIC_ARRAY_SIZE (cases); i++) {
+    printf ("# case %zu: DOUBLE_TO_CDTIME_T(%g) = %"PRIu64"\n",
+        i, cases[i].val, DOUBLE_TO_CDTIME_T (cases[i].val));
+    latency_counter_add (l, DOUBLE_TO_CDTIME_T (cases[i].val));
 
-	if ((ret_flush == NULL) || (opts == NULL))
-	{
-		errno = EINVAL;
-		cmd_error (CMD_ERROR, err, "Invalid arguments to cmd_parse_flush.");
+    DBLEQ (cases[i].min, CDTIME_T_TO_DOUBLE (latency_counter_get_min (l)));

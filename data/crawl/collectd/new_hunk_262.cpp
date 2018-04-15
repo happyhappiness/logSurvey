@@ -1,25 +1,30 @@
 
-	str = global_option_get ("Interval");
-	if (str == NULL)
-	{
-		interval_g = TIME_T_TO_CDTIME_T (10);
+static int Values_init(PyObject *s, PyObject *args, PyObject *kwds) {
+	Values *self = (Values *) s;
+	int interval = 0;
+	double time = 0;
+	PyObject *values = NULL, *tmp;
+	const char *type = "", *plugin_instance = "", *type_instance = "", *plugin = "", *host = "";
+	static char *kwlist[] = {"type", "values", "plugin_instance", "type_instance",
+			"plugin", "host", "time", "interval", NULL};
+	
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "|etOetetetetdi", kwlist,
+			NULL, &type, &values, NULL, &plugin_instance, NULL, &type_instance,
+			NULL, &plugin, NULL, &host, &time, &interval))
+		return -1;
+	
+	if (type[0] != 0 && plugin_get_ds(type) == NULL) {
+		PyErr_Format(PyExc_TypeError, "Dataset %s not found", type);
+		return -1;
 	}
-	else
-	{
-		double tmp;
 
-		tmp = atof (str);
-		if (tmp <= 0.0)
-		{
-			fprintf (stderr, "Cannot set the interval to a "
-					"correct value.\n"
-					"Please check your settings.\n");
-			return (-1);
-		}
+	sstrncpy(self->data.host, host, sizeof(self->data.host));
+	sstrncpy(self->data.plugin, plugin, sizeof(self->data.plugin));
+	sstrncpy(self->data.plugin_instance, plugin_instance, sizeof(self->data.plugin_instance));
+	sstrncpy(self->data.type, type, sizeof(self->data.type));
+	sstrncpy(self->data.type_instance, type_instance, sizeof(self->data.type_instance));
+	self->data.time = time;
 
-		interval_g = DOUBLE_TO_CDTIME_T (tmp);
-	}
-	DEBUG ("interval_g = %.3f;", CDTIME_T_TO_DOUBLE (interval_g));
-
-	str = global_option_get ("Timeout");
-	if (str == NULL)
+	if (values == NULL) {
+		values = PyList_New(0);
+		PyErr_Clear();

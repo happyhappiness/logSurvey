@@ -1,7 +1,8 @@
-	CHECK(handle);
-
-	printf("libiptc v%s. %u bytes.\n",
-	       XTABLES_VERSION, handle->entries->size);
-	printf("Table `%s'\n", handle->info.name);
-	printf("Hooks: pre/in/fwd/out/post = %u/%u/%u/%u/%u\n",
-	       handle->info.hook_entry[HOOK_PRE_ROUTING],
+		if (i != ds->ds_num)
+		{
+			sfree (value_ptr);
+			fprintf (fh, "-1 Number of values incorrect: Got %i, "
+					"expected %i.", i, ds->ds_num);
+			return (-1);
+		}
+	} /* done parsing the value-list */

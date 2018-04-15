@@ -1,17 +1,59 @@
- 		PyErr_SetString(PyExc_TypeError, "Cannot delete this attribute");
- 		return -1;
- 	}
--	new = PyString_AsString(value);
--	if (new == NULL) return -1;
-+	Py_INCREF(value);
-+	new = cpy_unicode_or_bytes_to_string(&value);
-+	if (new == NULL) {
-+		Py_DECREF(value);
-+		return -1;
-+	}
- 	old = ((char *) self) + (intptr_t) data;
- 	sstrncpy(old, new, DATA_MAX_NAME_LEN);
-+	Py_DECREF(value);
- 	return 0;
- }
- 
+-#include <stdlib.h>
+-#include <stdio.h>
+-
+-#include "liboping.h"
+-
+-int main (int argc, char **argv)
+-{
+-	pingobj_t      *ping;
+-	pingobj_iter_t *iter;
+-
+-	int i;
+-
+-	if (argc < 2)
+-	{
+-		printf ("Usage: %s <host> [host [host [...]]]\n", argv[0]);
+-		return (1);
+-	}
+-
+-	if ((ping = ping_construct ()) == NULL)
+-	{
+-		fprintf (stderr, "ping_construct failed\n");
+-		return (-1);
+-	}
+-
+-	for (i = 1; i < argc; i++)
+-	{
+-		printf ("Adding host `%s'..\n", argv[i]);
+-
+-		if (ping_host_add (ping, argv[i]) > 0)
+-		{
+-			fprintf (stderr, "ping_host_add (verplant.org) failed\n");
+-			return (-1);
+-		}
+-	}
+-
+-	while (1)
+-	{
+-		if (ping_send (ping) < 0)
+-		{
+-			fprintf (stderr, "ping_send failed\n");
+-			return (-1);
+-		}
+-
+-		for (iter = ping_iterator_get (ping); iter != NULL; iter = ping_iterator_next (iter))
+-		{
+-			const char *host;
+-			double      latency;
+-
+-			host    = ping_iterator_get_host (iter);
+-			latency = ping_iterator_get_latency (iter);
+-
+-			printf ("host = %s, latency = %f\n", host, latency);
+-		}
+-
+-		sleep (5);
+-	}
+-
+-	return (0);
+-}

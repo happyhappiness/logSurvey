@@ -1,20 +1,31 @@
-#include "utils_cache.h"
+#include "plugin.h"
 #include "utils_parse_option.h"
 
-cmd_status_t cmd_parse_listval (size_t argc, char **argv,
-    cmd_listval_t *ret_listval __attribute__((unused)),
-    cmd_error_handler_t *err)
+int handle_flush (FILE *fh, char *buffer)
 {
-  if (argc != 0)
-  {
-    cmd_error (CMD_PARSE_ERROR, err,
-	"Garbage after end of command: `%s'.", argv[0]);
-    return (CMD_PARSE_ERROR);
-  }
+	int success = 0;
+	int error   = 0;
 
-  return (CMD_OK);
-} /* cmd_status_t cmd_parse_listval */
+	double timeout = 0.0;
+	char **plugins = NULL;
+	size_t plugins_num = 0;
+	char **identifiers = NULL;
+	size_t identifiers_num = 0;
 
-#define free_everything_and_return(status) do { \
-    for (size_t j = 0; j < number; j++) { \
-      sfree(names[j]); \
+	size_t i;
+
+#define PRINT_TO_SOCK(fh, ...) \
+	do { \
+		if (fprintf (fh, __VA_ARGS__) < 0) { \
+			char errbuf[1024]; \
+			WARNING ("handle_flush: failed to write to socket #%i: %s", \
+					fileno (fh), sstrerror (errno, errbuf, sizeof (errbuf))); \
+			strarray_free (plugins, plugins_num); \
+			strarray_free (identifiers, identifiers_num); \
+			return -1; \
+		} \
+		fflush(fh); \
+	} while (0)
+
+	if ((fh == NULL) || (buffer == NULL))
+		return (-1);

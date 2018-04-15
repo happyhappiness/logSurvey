@@ -1,18 +1,22 @@
-			NULL, &plugin, NULL, &host, &time, &interval, &meta))
-		return -1;
-	
-	if (type[0] != 0 && plugin_get_ds(type) == NULL) {
-		PyErr_Format(PyExc_TypeError, "Dataset %s not found", type);
-		return -1;
-	}
+}
 
-	sstrncpy(self->data.host, host, sizeof(self->data.host));
-	sstrncpy(self->data.plugin, plugin, sizeof(self->data.plugin));
-	sstrncpy(self->data.plugin_instance, plugin_instance, sizeof(self->data.plugin_instance));
-	sstrncpy(self->data.type, type, sizeof(self->data.type));
-	sstrncpy(self->data.type_instance, type_instance, sizeof(self->data.type_instance));
-	self->data.time = time;
+static void exit_usage (const char *name, int status) {
+  fprintf ((status == 0) ? stdout : stderr, "Usage: %s [options]\n"
+      "\n"
+      "Valid options are:\n"
+      "  -h, --help               Display this help message.\n"
+      "  -s, --socket=<socket>    Path to collectd's UNIX socket. Default: /var/run/collectd-unixsock\n"
+      "  -p, --plugin=<plugin>    Plugin to flush _to_ (not from). Example: rrdtool\n"
+      "  -i, --identifier=<identifier>\n"
+      "                           Only flush data specified by <identifier>, which has the format: \n"
+      "\n"
+      "                             [<hostname>/]<plugin>[-<plugin_instance>]/<type>[-<type_instance>]\n"
+      "\n"
+      "                           Hostname defaults to the local hostname if omitted.\n"
+      "                           No error is returned if the specified identifier does not exist.\n"
+      "                           Examples: uptime/uptime\n"
+      "                                     somehost/cpu-0/cpu-wait\n"
+      "  -t, --timeout=<timeout>  Only flush values older than this timeout.\n", name);
+  exit (status);
+}
 
-	if (values == NULL) {
-		values = PyList_New(0);
-		PyErr_Clear();

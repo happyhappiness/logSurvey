@@ -1,10 +1,6 @@
 
-static void http_send_buffer (char *buffer) /* {{{ */
-{
-        printf("Sending: --------\n");
-        printf(buffer);
-        printf("---------------\n");
+{NUMBER}		{yylval.number = strtod (yytext, NULL); return (NUMBER);}
 
-        int status = 0;
-        curl_easy_setopt (curl, CURLOPT_POSTFIELDS, buffer);
-        status = curl_easy_perform (curl);
+{QUOTED_STRING}		{yylval.string = yytext; return (QUOTED_STRING);}
+{UNQUOTED_STRING}	{yylval.string = yytext; return (UNQUOTED_STRING);}
+%%

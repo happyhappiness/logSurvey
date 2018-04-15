@@ -1,9 +1,8 @@
-  }
 
-  if (fh == NULL) {
-    char errbuf[1024];
-    fprintf(stderr, "log_logstash plugin: fopen (%s) failed: %s\n", log_file,
-            sstrerror(errno, errbuf, sizeof(errbuf)));
-  } else {
-    fprintf(fh, "%s\n", buf);
-    if (do_close) {
+    if ((pid = fork()) == -1) {
+      /* error */
+      char errbuf[1024];
+      fprintf(stderr, "fork: %s", sstrerror(errno, errbuf, sizeof(errbuf)));
+      return 1;
+    } else if (pid != 0) {
+      /* parent */

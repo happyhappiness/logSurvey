@@ -1,9 +1,8 @@
-	}
-	| block_begin block_end
-	{
-	 if (strcmp ($1.key, $2) != 0)
-	 {
-		printf ("block_begin = %s; block_end = %s;\n", $1.key, $2);
-		yyerror("block not closed");
-		YYERROR;
-	 }
+
+    if ((pid = fork()) == -1) {
+      /* error */
+      char errbuf[1024];
+      fprintf(stderr, "fork: %s", sstrerror(errno, errbuf, sizeof(errbuf)));
+      return 1;
+    } else if (pid != 0) {
+      /* parent */

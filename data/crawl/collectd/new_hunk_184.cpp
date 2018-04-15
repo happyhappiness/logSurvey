@@ -1,8 +1,11 @@
-  printf ("ok %i - %s evaluates to %d\n", ++check_count__, #actual, expect); \
-} while (0)
-
-#define EXPECT_EQ_UINT64(expect, actual) EXPECT_EQ((expect), (actual), "%"PRIu64)
-
-#define DBLEQ(expect, actual) do { \
-  double e = (expect); double a = (actual); \
-  if (isnan (e) && !isnan (a)) { \
+	Py_BEGIN_ALLOW_THREADS;
+	ret = plugin_write(dest, NULL, &value_list);
+	Py_END_ALLOW_THREADS;
+	meta_data_destroy(value_list.meta);
+	free(value);
+	if (ret != 0) {
+		PyErr_SetString(PyExc_RuntimeError, "error dispatching values, read the logs");
+		return NULL;
+	}
+	Py_RETURN_NONE;
+}

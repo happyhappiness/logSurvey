@@ -1,26 +1,16 @@
-
-static int Values_init(PyObject *s, PyObject *args, PyObject *kwds) {
-	Values *self = (Values *) s;
-	int interval = 0, ret;
-	double time = 0;
-	PyObject *values = NULL, *tmp;
-	const char *type = "", *plugin_instance = "", *type_instance = "", *plugin = "", *host = "";
-	static char *kwlist[] = {"type", "values", "plugin_instance", "type_instance",
-			"plugin", "host", "time", "interval", NULL};
-	
-	if (!PyArg_ParseTupleAndKeywords(args, kwds, "|sOssssdi", kwlist,
-			&type, &values, &plugin_instance, &type_instance,
-			&plugin, &host, &time, &interval))
-		return -1;
-	
-	tmp = Py_BuildValue("sssssd", type, plugin_instance, type_instance, plugin, host, time);
-	if (tmp == NULL)
-		return -1;
-	ret = PluginDataType.tp_init(s, tmp, NULL);
-	Py_DECREF(tmp);
-	if (ret != 0)
-		return -1;
-	
-	if (values == NULL) {
-		values = PyList_New(0);
-		PyErr_Clear();
+	}
+	else if (strcasecmp ("RandomTimeout", key) == 0)
+        {
+		random_timeout = atoi (value);
+		if( random_timeout < 0 )
+		{
+		fprintf (stderr, "rrdtool: `RandomTimeout' must "
+			 "be greater than or equal to zero.\n");
+		ERROR ("rrdtool: `RandomTimeout' must "
+		       "be greater then or equal to zero.\n");
+		}
+		else if (random_timeout==0) {random_timeout=1;}
+		else {random_timeout_mod = random_timeout * 2;}
+	}
+	else
+	{

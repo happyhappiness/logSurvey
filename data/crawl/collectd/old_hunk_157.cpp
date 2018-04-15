@@ -1,25 +1,21 @@
-	 * This will make sure that SIGINT won't kill collectd but
-	 * still interrupt syscalls like sleep and pause. */
+{
+    lvm_t lvm;
+    vg_t vg;
+    struct dm_list *vgnames;
+    struct lvm_str_list *strl;
 
-	PyEval_AcquireThread(state);
-	if (PyImport_ImportModule("readline") == NULL) {
-		/* This interactive session will suck. */
-		cpy_log_exception("interactive session init");
-	}
-	cur_sig = PyOS_setsig(SIGINT, python_sigint_handler);
-	/* We totally forked just now. Everyone saw that, right? */
-	PyOS_AfterFork();
-	PyRun_InteractiveLoop(stdin, "<stdin>");
-	PyOS_setsig(SIGINT, cur_sig);
-	PyErr_Print();
-	PyEval_ReleaseThread(state);
-	NOTICE("python: Interactive interpreter exited, stopping collectd ...");
-	pthread_kill(main_thread, SIGINT);
-	return NULL;
-}
+    lvm = lvm_init(NULL);
+    if (!lvm) {
+        fprintf(stderr, "lvm_init() failed\n");
+    }
 
-static int cpy_init(void) {
-	PyObject *ret;
-	static pthread_t thread;
+    vgnames = lvm_list_vg_names(lvm);
+    if (!vgnames) {
+        fprintf(stderr, "lvm_list_vg_names() failed\n");
+    }
 
-	if (!Py_IsInitialized()) {
+    dm_list_iterate_items(strl, vgnames) {
+        vg = lvm_vg_open(lvm, strl->str, "r", 0);
+        volume_submit(strl->str, lvm_vg_get_size(vg), lvm_vg_get_free_size(vg));
+        lvm_vg_close(vg);
+    }

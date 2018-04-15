@@ -1,8 +1,11 @@
-  }
-
-  if (fh == NULL) {
-    fprintf(stderr, "log_logstash plugin: fopen (%s) failed: %s\n", log_file,
-            STRERRNO);
-  } else {
-    fprintf(fh, "%s\n", buf);
-    if (do_close) {
+#if COLLECT_DEBUG
+  case IPMI_LOG_DEBUG_START:
+  case IPMI_LOG_DEBUG:
+    DEBUG("ipmi plugin: %s", msg);
+    break;
+  case IPMI_LOG_DEBUG_CONT:
+  case IPMI_LOG_DEBUG_END:
+    DEBUG("%s", msg);
+    break;
+#else
+  case IPMI_LOG_DEBUG_START:

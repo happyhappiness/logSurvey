@@ -1,15 +1,47 @@
-      * non-blocking call added for Mac OS X bugfix.  Sent by Max Horn.
-      * ref http://www.tcpdump.org/lists/workers/2002/09/msg00033.html
-      */
--    x = pcap_setnonblock(pcap, 1, errbuf);
-+    x = pcap_setnonblock(pcap_obj, 1, errbuf);
-     if (x < 0) {
- 	fprintf(stderr, "pcap_setnonblock failed: %s\n", errbuf);
- 	exit(1);
-     }
+ 	return (LC_CBRET_OKAY);
+ }
  
--    switch (pcap_datalink(pcap)) {
-+    switch (pcap_datalink(pcap_obj)) {
-     case DLT_EN10MB:
- 	handle_datalink = handle_ether;
- 	break;
++int cf_callback_options_mode (const char *shortvar, const char *var,
++		const char *arguments, const char *value, lc_flags_t flags,
++		void *extra)
++{
++	cf_mode_item_t *item;
++
++	if (extra == NULL)
++	{
++		fprintf (stderr, "No extra..?\n");
++		return (LC_CBRET_ERROR);
++	}
++
++	item = (cf_mode_item_t *) extra;
++
++	if (strcasecmp (item->key, shortvar))
++	{
++		fprintf (stderr, "Wrong extra..\n");
++		return (LC_CBRET_ERROR);
++	}
++
++	if ((operating_mode & item->mode) == 0)
++	{
++		fprintf (stderr, "Option `%s' is not valid in this mode!\n", shortvar);
++		return (LC_CBRET_ERROR);
++	}
++
++	if (item->value != NULL)
++	{
++		free (item->value);
++		item->value = NULL;
++	}
++
++	if ((item->value = strdup (value)) == NULL)
++	{
++		perror ("strdup");
++		return (LC_CBRET_ERROR);
++	}
++
++	return (LC_CBRET_OKAY);
++}
++
+ int cf_callback_section_mode (const char *shortvar, const char *var,
+ 		const char *arguments, const char *value, lc_flags_t flags,
+ 		void *extra)

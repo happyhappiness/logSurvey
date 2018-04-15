@@ -1,42 +1,35 @@
-/**
- * collectd - src/mock/plugin.c
- *
- * Copyright (C) 2013       Florian octo Forster
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
- *
- * Authors:
- *   Florian octo Forster <octo at collectd.org>
- */
+  for (i = 0; i < ret_values_num; ++i)
+    printf ("%s=%e\n", ret_values_names[i], ret_values[i]);
+  BAIL_OUT (0);
+#undef BAIL_OUT
+} /* getval */
 
-#include "plugin.h"
-
-void plugin_log (int level, char const *format, ...)
+static int flush (lcc_connection_t *c, int argc, char **argv)
 {
-  char buffer[1024];
-  va_list ap;
+  int timeout = -1;
 
-  va_start (ap, format);
-  vsnprintf (buffer, sizeof (buffer), format, ap);
-  va_end (ap);
+  lcc_identifier_t *identifiers = NULL;
+  int identifiers_num = 0;
 
-  printf ("plugin_log (%i, \"%s\");\n", level, buffer);
-}
+  char **plugins = NULL;
+  int plugins_num = 0;
 
-/* vim: set sw=2 sts=2 et : */
+  int status;
+  int i;
+
+  assert (strcasecmp (argv[0], "flush") == 0);
+
+#define BAIL_OUT(s) \
+  do { \
+    if (identifiers != NULL) \
+      free (identifiers); \
+    identifiers_num = 0; \
+    if (plugins != NULL) \
+      free (plugins); \
+    plugins_num = 0; \
+    return (s); \
+  } while (0)
+
+  for (i = 1; i < argc; ++i) {
+    char *key, *value;
+

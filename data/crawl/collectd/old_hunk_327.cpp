@@ -1,7 +1,7 @@
-			if (module == NULL) {
-				ERROR("python plugin: Error importing module \"%s\".", module_name);
-				cpy_log_exception("importing module");
-				PyErr_Print();
-			}
-			free(module_name);
-			Py_XDECREF(module);
+  if (fh == NULL)
+  {
+    char errbuf[1024];
+    ERROR ("open (%s) failed: %s", 
+	file, sstrerror (errno, errbuf, sizeof (errbuf)));
+    return (-1);
+  }

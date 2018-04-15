@@ -1,26 +1,26 @@
+} /* static void update_kstat (void) */
+#endif /* HAVE_LIBKSTAT */
 
-	pthread_mutex_lock (&cache_lock);
+/* TODO
+ * Remove all settings but `-f' and `-C'
+ */
+static void exit_usage (char *name)
+{
+	printf ("Usage: "PACKAGE" [OPTIONS]\n\n"
+			
+			"Available options:\n"
+			"  General:\n"
+			"    -C <file>       Configuration file.\n"
+			"                    Default: "CONFIGFILE"\n"
+#if COLLECT_DAEMON
+			"    -f              Don't fork to the background.\n"
+#endif
+			"\n"PACKAGE" "VERSION", http://verplant.org/collectd/\n"
+			"by Florian octo Forster <octo@verplant.org>\n"
+			"for contributions see `AUTHORS'\n");
+	exit (0);
+} /* static void exit_usage (char *name) */
 
-	DBG ("vc = cache_search (%s)", name);
-	vc = cache_search (name);
-
-	if (vc == NULL)
-	{
-		DBG ("Did not find cache entry.");
-		fprintf (fh, "-1 No such value");
-	}
-	else
-	{
-		DBG ("Found cache entry.");
-		fprintf (fh, "%i", vc->values_num);
-		for (i = 0; i < vc->values_num; i++)
-		{
-			fprintf (fh, " %s=", vc->ds->ds[i].name);
-			if (vc->gauge[i] == NAN)
-				fprintf (fh, "NaN");
-			else
-				fprintf (fh, "%12e", vc->gauge[i]);
-		}
-	}
-
-	/* Free the mutex as soon as possible and definitely before flushing */
+static int start_client (void)
+{
+	int sleepingtime;

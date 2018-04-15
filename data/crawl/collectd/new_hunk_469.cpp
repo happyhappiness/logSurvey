@@ -1,6 +1,7 @@
-  char *tc_type;
-  char tc_inst[DATA_MAX_NAME_LEN];
-
-  if (nmh->nlmsg_type == RTM_NEWQDISC)
-    tc_type = "qdisc";
-  else if (nmh->nlmsg_type == RTM_NEWTCLASS)
+	 * Change directory. We do this _after_ reading the config and loading
+	 * modules to relative paths work as expected.
+	 */
+	if ((datadir = global_option_get ("BaseDir")) != NULL)
+	{
+		fprintf (stderr, "Don't have a datadir to use. This should not happen. Ever.");
+		return (1);

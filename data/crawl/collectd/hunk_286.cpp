@@ -1,51 +1,57 @@
+ 		PyErr_SetString(PyExc_TypeError, "callback needs a be a callable object.");
+ 		return NULL;
+ 	}
+-	if (name == NULL) {
+-		mod = PyObject_GetAttrString(callback, "__module__"); /* New reference. */
+-		if (mod != NULL) name = PyString_AsString(mod);
+-		if (name == NULL) {
+-			Py_XDECREF(mod);
+-			PyErr_SetString(PyExc_ValueError, "No module name specified and "
+-				"callback function does not have a \"__module__\" attribute.");
+-			return NULL;
+-		}
+-	}
++	cpy_build_name(buf, sizeof(buf), callback, name, short_name);
++
+ 	Py_INCREF(callback);
+ 	Py_XINCREF(data);
+ 	c = malloc(sizeof(*c));
+-	c->name = strdup(name);
++	c->name = strdup(buf);
+ 	c->callback = callback;
+ 	c->data = data;
+ 	c->next = *list_head;
+ 	*list_head = c;
+ 	Py_XDECREF(mod);
++	return PyString_FromString(buf);
++}
++
++static PyObject *cpy_flush(cpy_callback_t **list_head, PyObject *args, PyObject *kwds) {
++	int timeout = -1;
++	const char *plugin = NULL, *identifier = NULL;
++	static char *kwlist[] = {"plugin", "timeout", "identifier", NULL};
++	
++	if (PyArg_ParseTupleAndKeywords(args, kwds, "|ziz", kwlist, &plugin, &timeout, &identifier) == 0) return NULL;
++	Py_BEGIN_ALLOW_THREADS
++	plugin_flush(plugin, timeout, identifier);
++	Py_END_ALLOW_THREADS
+ 	Py_RETURN_NONE;
  }
  
- static void exit_usage (const char *name, int status) {
--  fprintf ((status == 0) ? stdout : stderr, "Usage: %s [options]\n"
--      "\n"
--      "Valid options are:\n"
--      "  -h, --help               Display this help message.\n"
--      "  -s, --socket=<socket>    Path to collectd's UNIX socket. Default: /var/run/collectd-unixsock\n"
--      "  -p, --plugin=<plugin>    Plugin to flush _to_ (not from). Example: rrdtool\n"
--      "  -i, --identifier=<identifier>\n"
--      "                           Only flush data specified by <identifier>, which has the format: \n"
--      "\n"
--      "                             [<hostname>/]<plugin>[-<plugin_instance>]/<type>[-<type_instance>]\n"
--      "\n"
--      "                           Hostname defaults to the local hostname if omitted.\n"
--      "                           No error is returned if the specified identifier does not exist.\n"
--      "                           Examples: uptime/uptime\n"
--      "                                     somehost/cpu-0/cpu-wait\n"
--      "  -t, --timeout=<timeout>  Only flush values older than this timeout.\n", name);
-+  fprintf ((status == 0) ? stdout : stderr,
-+      "Usage: %s [options]\n\n"
-+
-+      "Available options:\n"
-+      "  -s             Path to collectd's UNIX socket.\n"
-+      "                 Default: /var/run/collectd-unixsock\n"
-+      "  -p <plugin>    Plugin to be flushed.\n"
-+      "  -i <id>        Flush data identified by <id> only (see below).\n"
-+      "  -t <seconds>   Flush values older than this value only.\n"
-+
-+      "\n  -h             Display this help and exit.\n"
-+
-+      "\nIdentfiers:\n\n"
-+
-+      "An identifier (as accepted by the -i option) has the following\n"
-+      "format:\n\n"
-+
-+      "  [<hostname>/]<plugin>[-<plugin_instance>]/<type>[-<type_instance>]\n\n"
-+
-+      "Hostname defaults to the local hostname if omitted (e.g., uptime/uptime).\n"
-+      "No error is returned if the specified identifier does not exist.\n"
-+
-+      "\nExample:\n\n"
-+
-+      "  collectd-flush -p rrdtool -i somehost/cpu-0/cpu-wait\n\n"
-+
-+      "Flushes all CPU wait RRD values of the first CPU of the local host.\n"
-+      "I.e., writes all pending RRD updates of that data-source to disk.\n"
-+      , name);
-   exit (status);
+ static PyObject *cpy_register_config(PyObject *self, PyObject *args, PyObject *kwds) {
+-	return cpy_register_generic(&cpy_config_callbacks, args, kwds);
++	return cpy_register_generic(&cpy_config_callbacks, args, kwds, 1);
  }
  
+ static PyObject *cpy_register_init(PyObject *self, PyObject *args, PyObject *kwds) {
+-	return cpy_register_generic(&cpy_init_callbacks, args, kwds);
++	return cpy_register_generic(&cpy_init_callbacks, args, kwds, 0);
+ }
+ 
+ typedef int reg_function_t(const char *name, void *callback, void *data);
+ 
+-static PyObject *cpy_register_generic_userdata(void *reg, void *handler, PyObject *args, PyObject *kwds) {
++static PyObject *cpy_register_generic_userdata(void *reg, void *handler, PyObject *args, PyObject *kwds, int short_name) {
+ 	char buf[512];
+ 	reg_function_t *register_function = (reg_function_t *) reg;
+ 	cpy_callback_t *c = NULL;

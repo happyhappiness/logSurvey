@@ -1,44 +1,13 @@
-	return;
-} /* static void my_log (int, const char *) */
-
-/*
- * This function is called when plugin_dispatch_notification () has been used.
  */
-static int my_notify (const notification_t *notif)
-{
-	char time_str[32] = "";
-	struct tm *tm = NULL;
+int plugin_dispatch_values (const char *name, const value_list_t *vl);
 
-	int n = 0;
+void plugin_log (int level, const char *format, ...);
+#define ERROR(...)   plugin_log (LOG_ERR,     __VA_ARGS__)
+#define WARNING(...) plugin_log (LOG_WARNING, __VA_ARGS__)
+#define NOTICE(...)  plugin_log (LOG_NOTICE,  __VA_ARGS__)
+#define INFO(...)    plugin_log (LOG_INFO,    __VA_ARGS__)
+#define DEBUG(...)   plugin_log (LOG_DEBUG,   __VA_ARGS__)
 
-	if (NULL == (tm = localtime (&notif->time)))
-		time_str[0] = '\0';
-
-	n = strftime (time_str, 32, "%F %T", tm);
-	if (n >= 32) n = 31;
-	time_str[n] = '\0';
-
-	printf ("NOTIF (%s): %i - ", time_str, notif->severity);
-
-	if ('\0' != *notif->host)
-		printf ("%s: ", notif->host);
-
-	if ('\0' != *notif->plugin)
-		printf ("%s: ", notif->plugin);
-
-	if ('\0' != *notif->plugin_instance)
-		printf ("%s: ", notif->plugin_instance);
-
-	if ('\0' != *notif->type)
-		printf ("%s: ", notif->type);
-
-	if ('\0' != *notif->type_instance)
-		printf ("%s: ", notif->type_instance);
-
-	printf ("%s\n", notif->message);
-	return 0;
-} /* static int my_notify (notification_t *) */
-
-/*
- * This function is called before shutting down collectd.
- */
+/* TODO: Move plugin_{complain,relief} into `utils_complain.[ch]'. -octo */
+void plugin_complain (int level, complain_t *c, const char *format, ...);
+void plugin_relief (int level, complain_t *c, const char *format, ...);

@@ -1,24 +1,47 @@
- 		PyErr_SetString(PyExc_TypeError, "Cannot delete this attribute");
- 		return -1;
- 	}
--	new = PyString_AsString(value);
--	if (new == NULL) return -1;
-+	Py_INCREF(value);
-+	new = cpy_unicode_or_bytes_to_string(&value);
-+	if (new == NULL) {
-+		Py_DECREF(value);
-+		return -1;
-+	}
+    */
+   native public static int RegisterShutdown (String name,
+       CollectdShutdownInterface obj);
++
++  /**
++   * Java representation of collectd/src/plugin.h:plugin_dispatch_values
++   */
++  native public static int DispatchValues (ValueList vl);
++
++  /**
++   * Java representation of collectd/src/plugin.h:plugin_get_ds
++   */
++  native public static DataSet GetDS (String type);
++
++  /**
++   * Java representation of collectd/src/plugin.h:plugin_log
++   */
++  native private static void Log (int severity, String message);
++
++  public static void LogError (String message)
++  {
++    Log (LOG_ERR, message);
++  } /* void LogError */
++
++  public static void LogWarning (String message)
++  {
++    Log (LOG_WARNING, message);
++  } /* void LogWarning */
++
++  public static void LogNotice (String message)
++  {
++    Log (LOG_NOTICE, message);
++  } /* void LogNotice */
++
++  public static void LogInfo (String message)
++  {
++    Log (LOG_INFO, message);
++  } /* void LogInfo */
++
++  public static void LogDebug (String message)
++  {
++    Log (LOG_DEBUG, message);
++  } /* void LogDebug */
++
+ } /* class CollectdAPI */
  
- 	if (plugin_get_ds(new) == NULL) {
- 		PyErr_Format(PyExc_TypeError, "Dataset %s not found", new);
-+		Py_DECREF(value);
- 		return -1;
- 	}
- 
- 	old = ((char *) self) + (intptr_t) data;
- 	sstrncpy(old, new, DATA_MAX_NAME_LEN);
-+	Py_DECREF(value);
- 	return 0;
- }
- 
+ /* vim: set sw=2 sts=2 et fdm=marker : */

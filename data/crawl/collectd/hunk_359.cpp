@@ -1,39 +1,66 @@
- 	return PyString_FromString(buf);
- }
+ 	}
  
-+static PyObject *cpy_register_read(PyObject *self, PyObject *args, PyObject *kwds) {
-+	char buf[512];
-+	cpy_callback_t *c = NULL;
-+	user_data_t *user_data = NULL;
-+	double interval = 0;
-+	const char *name = NULL;
-+	PyObject *callback = NULL, *data = NULL;
-+	struct timespec ts;
-+	static char *kwlist[] = {"callback", "interval", "data", "name", NULL};
-+	
-+	if (PyArg_ParseTupleAndKeywords(args, kwds, "O|dOz", kwlist, &callback, &interval, &data, &name) == 0) return NULL;
-+	if (PyCallable_Check(callback) == 0) {
-+		PyErr_SetString(PyExc_TypeError, "callback needs a be a callable object.");
-+		return NULL;
+ 	if (total_num == 0)
+-		average = NAN;
+-	else
+-		average = total / total_num;
+-	printf ("%lf average |", average);
+-	for (i = 0; i < values_num; i++)
+-		printf (" %s=%lf;;;;", values_names[i], values[i]);
+-
+-	if (total_num == 0)
++	{
++		printf ("WARNING: No defined values found\n");
+ 		return (RET_WARNING);
 +	}
-+	cpy_build_name(buf, sizeof(buf), callback, name);
-+	
-+	Py_INCREF(callback);
-+	Py_XINCREF(data);
-+	c = malloc(sizeof(*c));
-+	c->name = strdup(buf);
-+	c->callback = callback;
-+	c->data = data;
-+	c->next = NULL;
-+	user_data = malloc(sizeof(*user_data));
-+	user_data->free_func = cpy_destroy_user_data;
-+	user_data->data = c;
-+	ts.tv_sec = interval;
-+	ts.tv_nsec = (interval - ts.tv_sec) * 1000000000;
-+	plugin_register_complex_read(buf, cpy_read_callback, &ts, user_data);
-+	return PyString_FromString(buf);
-+}
+ 
+-	if (isnan (average)
+-			|| match_range (&range_critical_g, average))
+-		return (RET_CRITICAL);
++	average = total / total_num;
 +
- static PyObject *cpy_register_log(PyObject *self, PyObject *args, PyObject *kwds) {
- 	return cpy_register_generic_userdata(plugin_register_log, cpy_log_callback, args, kwds);
- }
++	if (match_range (&range_critical_g, average) != 0)
++	{
++		status_str = "CRITICAL";
++		status_code = RET_CRITICAL;
++	}
+ 	else if (match_range (&range_warning_g, average) != 0)
+-		return (RET_WARNING);
++	{
++		status_str = "WARNING";
++		status_code = RET_WARNING;
++	}
++	else
++	{
++		status_str = "OKAY";
++		status_code = RET_OKAY;
++	}
++
++	printf ("%s: %g average |", status_str, average);
++	for (i = 0; i < values_num; i++)
++		printf (" %s=%g;;;;", values_names[i], values[i]);
++	printf ("\n");
+ 
+-	return (RET_OKAY);
++	return (status_code);
+ } /* int do_check_con_average */
+ 
+-int do_check_con_sum (int values_num, double *values, char **values_names)
++static int do_check_con_sum (int values_num, double *values, char **values_names)
+ {
+ 	int i;
+ 	double total;
+ 	int total_num;
++	const char *status_str = "UNKNOWN";
++	int status_code = RET_UNKNOWN;
+ 
+ 	total = 0.0;
+ 	total_num = 0;
+ 	for (i = 0; i < values_num; i++)
+ 	{
++		if (ignore_ds (values_names[i]))
++			continue;
++
+ 		if (!isnan (values[i]))
+ 		{
+ 			total += values[i];

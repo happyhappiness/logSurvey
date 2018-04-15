@@ -1,13 +1,83 @@
- static int kafka_write(const data_set_t *, const value_list_t *, user_data_t *);
- static int32_t kafka_partition(const rd_kafka_topic_t *, const void *, size_t,
-                                int32_t, void *, void *);
-+static void kafka_log(const rd_kafka_t *, int, const char *, const char *);
+       if (endptr == value) {
+         fprintf (stderr, "ERROR: Failed to parse timeout as number: %s.\n",
+             value);
+-        return (-1);
++        BAIL_OUT (-1);
+       }
+       else if ((endptr != NULL) && (*endptr != '\0')) {
+         fprintf (stderr, "WARNING: Ignoring trailing garbage after timeout: "
+             "%s.\n", endptr);
+       }
+     }
+     else if (strcasecmp (key, "plugin") == 0) {
+-      plugin = value;
++      status = array_grow ((void **)&plugins, &plugins_num,
++          sizeof (*plugins));
++      if (status != 0)
++        BAIL_OUT (status);
 +
-+static void kafka_log(const rd_kafka_t *rkt, int level,
-+                      const char *fac, const char *msg)
-+{
-+    plugin_log(level, "%s", msg);
-+}
++      plugins[plugins_num - 1] = value;
+     }
+     else if (strcasecmp (key, "identifier") == 0) {
+-      int status;
++      status = array_grow ((void **)&identifiers, &identifiers_num,
++          sizeof (*identifiers));
++      if (status != 0)
++        BAIL_OUT (status);
  
- static int32_t kafka_partition(const rd_kafka_topic_t *rkt,
-                                const void *keydata, size_t keylen,
+-      memset (&ident, 0, sizeof (ident));
+-      status = parse_identifier (c, value, &ident);
++      memset (identifiers + (identifiers_num - 1), 0, sizeof (*identifiers));
++      status = parse_identifier (c, value,
++          identifiers + (identifiers_num - 1));
+       if (status != 0)
+-        return (status);
+-      identp = &ident;
++        BAIL_OUT (status);
+     }
+   }
+ 
+-  status = lcc_flush (c, plugin, identp, timeout);
+-  if (status != 0) {
+-    fprintf (stderr, "ERROR: Flushing failed: %s.\n",
+-        lcc_strerror (c));
+-    return (-1);
++  if (plugins_num == 0) {
++    status = array_grow ((void **)&plugins, &plugins_num, sizeof (*plugins));
++    if (status != 0)
++      BAIL_OUT (status);
++
++    assert (plugins_num == 1);
++    plugins[0] = NULL;
+   }
+ 
+-  return 0;
++  for (i = 0; i < plugins_num; ++i) {
++    if (identifiers_num == 0) {
++      status = lcc_flush (c, plugins[i], NULL, timeout);
++      if (status != 0)
++        fprintf (stderr, "ERROR: Failed to flush plugin `%s': %s.\n",
++            (plugins[i] == NULL) ? "(all)" : plugins[i], lcc_strerror (c));
++    }
++    else {
++      int j;
++
++      for (j = 0; j < identifiers_num; ++j) {
++        status = lcc_flush (c, plugins[i], identifiers + j, timeout);
++        if (status != 0) {
++          char id[1024];
++
++          lcc_identifier_to_string (c, id, sizeof (id), identifiers + j);
++          fprintf (stderr, "ERROR: Failed to flush plugin `%s', "
++              "identifier `%s': %s.\n",
++              (plugins[i] == NULL) ? "(all)" : plugins[i],
++              id, lcc_strerror (c));
++        }
++      }
++    }
++  }
++
++  BAIL_OUT (0);
+ #undef BAIL_OUT
+ } /* flush */
+ 

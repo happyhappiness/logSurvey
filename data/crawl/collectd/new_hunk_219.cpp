@@ -1,35 +1,12 @@
-  return (0);
-} /* }}} int get_integer_opt */
+      plugin = value;
+    }
+    else if (strcasecmp (key, "identifier") == 0) {
+      int status;
 
-static int get_double_opt (const char *str, double *ret_value) /* {{{ */
-{
-  char *endptr;
-  double tmp;
-
-  errno = 0;
-  endptr = NULL;
-  tmp = strtod (str, &endptr);
-  if (errno != 0)
-  {
-    fprintf (stderr, "Unable to parse option as a number: \"%s\": %s\n",
-        str, strerror (errno));
-    exit (EXIT_FAILURE);
+      memset (&ident, 0, sizeof (ident));
+      status = parse_identifier (c, value, &ident);
+      if (status != 0)
+        return (status);
+      identp = &ident;
+    }
   }
-  else if (endptr == str)
-  {
-    fprintf (stderr, "Unable to parse option as a number: \"%s\"\n", str);
-    exit (EXIT_FAILURE);
-  }
-  else if (*endptr != 0)
-  {
-    fprintf (stderr, "Garbage after end of value: \"%s\"\n", str);
-    exit (EXIT_FAILURE);
-  }
-
-  *ret_value = tmp;
-  return (0);
-} /* }}} int get_double_opt */
-
-static int read_options (int argc, char **argv) /* {{{ */
-{
-  int opt;

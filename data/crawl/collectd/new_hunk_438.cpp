@@ -1,30 +1,39 @@
 
-		if (strcasecmp (fields[0], "getval") == 0)
-		{
-			us_handle_getval (fhout, fields, fields_num);
-		}
-		else if (strcasecmp (fields[0], "putval") == 0)
-		{
-			handle_putval (fhout, fields, fields_num);
-		}
-		else if (strcasecmp (fields[0], "listval") == 0)
-		{
-			us_handle_listval (fhout, fields, fields_num);
-		}
-		else if (strcasecmp (fields[0], "putnotif") == 0)
-		{
-			handle_putnotif (fhout, fields, fields_num);
-		}
-		else
-		{
-			fprintf (fhout, "-1 Unknown command: %s\n", fields[0]);
-			fflush (fhout);
-		}
-	} /* while (fgets) */
+static void stderr_log (int severity, const char *msg)
+{
+	FILE *fh;
+	int do_close = 0;
 
-	DEBUG ("Exiting..");
-	fclose (fhin);
-	fclose (fhout);
+	if (severity > log_level)
+		return;
 
-	pthread_exit ((void *) 0);
-	return ((void *) 0);
+	pthread_mutex_lock (&file_lock);
+
+	if ((log_file == NULL) || (strcasecmp (log_file, "stderr") == 0))
+		fh = stderr;
+	else if (strcasecmp (log_file, "stdout") == 0)
+		fh = stdout;
+	else
+	{
+		fh = fopen (log_file, "a");
+		do_close = 1;
+	}
+
+	if (fh == NULL)
+	{
+			char errbuf[1024];
+			fprintf (stderr, "stderr plugin: fopen (%s) failed: %s\n",
+					(log_file == NULL) ? "<null>" : log_file,
+					sstrerror (errno, errbuf, sizeof (errbuf)));
+	}
+	else
+	{
+		fprintf (fh, "%s\n", msg);
+		if (do_close != 0)
+			fclose (fh);
+	}
+
+	pthread_mutex_unlock (&file_lock);
+
+	return;
+} /* void stderr_log (int, const char *) */

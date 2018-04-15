@@ -1,14 +1,13 @@
- 	else
- 	{
- 		if (print_timestamp)
--			fprintf (fh, "[%s] %s%s\n", timestamp_str,
--					print_level ? level_str : "",
--					msg);
-+			fprintf (fh, "[%s] %s%s\n", timestamp_str, level_str, msg);
- 		else
--			fprintf (fh, "%s%s\n", print_level ? level_str : "",
--						msg);
-+			fprintf (fh, "%s%s\n", level_str, msg);
- 
- 		if (do_close != 0)
- 			fclose (fh);
+ 		return NULL;
+ 	}
+ 	if (name == NULL) {
+-		PyObject *mod;
+-		
+-		mod = PyObject_GetAttrString(callback, "__module__");
++		mod = PyObject_GetAttrString(callback, "__module__"); /* New reference. */
+ 		if (mod != NULL) name = PyString_AsString(mod);
+ 		if (name == NULL) {
++			Py_XDECREF(mod);
+ 			PyErr_SetString(PyExc_ValueError, "No module name specified and "
+ 				"callback function does not have a \"__module__\" attribute.");
+ 			return NULL;

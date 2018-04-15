@@ -1,28 +1,23 @@
- static int	pf_read(void);
- static void	submit_counter(const char *, const char *, counter_t);
  
--void
--submit_counter(const char *type, const char *inst, counter_t val)
--{
--#ifndef TEST
--	value_t		values[1];
--	value_list_t	vl = VALUE_LIST_INIT;
--
--	values[0].counter = val;
--
--	vl.values = values;
--	vl.values_len = 1;
--	sstrncpy (vl.host, hostname_g, sizeof (vl.host));
--	sstrncpy (vl.plugin, "pf", sizeof (vl.plugin));
--	sstrncpy (vl.type, type, sizeof(vl.type));
--	sstrncpy (vl.type_instance, inst, sizeof(vl.type_instance));
--	plugin_dispatch_values(&vl);
--#else
--	printf("%s.%s: %lld\n", type, inst, val);
--#endif
--}
--
--
- int
- pf_init(void)
- {
+ static int cpy_notification_callback(const notification_t *notification, user_data_t *data) {
+ 	cpy_callback_t *c = data->data;
+-	PyObject *ret, *n;
++	PyObject *ret;
++	Notification *n;
+ 
+ 	CPY_LOCK_THREADS
+-		n = PyObject_CallFunction((void *) &NotificationType, "ssssssdi", notification->type, notification->message,
+-				notification->plugin_instance, notification->type_instance, notification->plugin,
+-				notification->host, (double) notification->time, notification->severity);
++		n = PyObject_New(Notification, (void *) &NotificationType);
++		sstrncpy(n->data.host, notification->host, sizeof(n->data.host));
++		sstrncpy(n->data.type, notification->type, sizeof(n->data.type));
++		sstrncpy(n->data.type_instance, notification->type_instance, sizeof(n->data.type_instance));
++		sstrncpy(n->data.plugin, notification->plugin, sizeof(n->data.plugin));
++		sstrncpy(n->data.plugin_instance, notification->plugin_instance, sizeof(n->data.plugin_instance));
++		n->data.time = notification->time;
++		sstrncpy(n->message, notification->message, sizeof(n->message));
++		n->severity = notification->severity;
+ 		ret = PyObject_CallFunctionObjArgs(c->callback, n, c->data, (void *) 0); /* New reference. */
+ 		if (ret == NULL) {
+ 			cpy_log_exception("notification callback");

@@ -1,8 +1,8 @@
-
-#define print_to_socket(fh, ...)                                               \
-  if (fprintf(fh, __VA_ARGS__) < 0) {                                          \
-    WARNING("handle_getthreshold: failed to write to socket #%i: %s",          \
-            fileno(fh), STRERRNO);                                             \
-    return -1;                                                                 \
   }
 
+  if (fh == NULL) {
+    fprintf(stderr, "logfile plugin: fopen (%s) failed: %s\n", log_file,
+            STRERRNO);
+  } else {
+    if (print_timestamp)
+      fprintf(fh, "[%s] %s%s\n", timestamp_str, level_str, msg);

@@ -1,8 +1,7 @@
-#define DEBUGP_C(x, args...)
-#endif
+		char *t = fields[2];
+		char *v = strchr (t, ':');
+		if (v == NULL)
+			return (-1);
+		*v = '\0'; v++;
 
-#ifndef IPT_LIB_DIR
-#define IPT_LIB_DIR "/usr/local/lib/iptables"
-#endif
-
-static int sockfd = -1;
+		vl.time = (time_t) atoi (t);

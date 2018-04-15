@@ -1,7 +1,7 @@
 
-static void usage (const char *name)
+static void cpu_init (void)
 {
-	fprintf (stderr, "Usage: %s <-s socket> <-n value_spec> [options]\n"
-			"\n"
-			"Valid options are:\n"
-			"  -s <socket>    Path to collectd's UNIX-socket.\n"
+#ifdef HAVE_LIBKSTAT
+	kstat_t *ksp_chain;
+
+	numcpu = 0;

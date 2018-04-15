@@ -1,7 +1,14 @@
-		return (NULL);
-	}
+		{
+			fprintf (stderr, "Cannot compile regex %s: %i/%s",
+					entry, rcompile, regerr);
+			syslog (LOG_ERR, "Cannot compile regex %s: %i/%s",
+					entry, rcompile, regerr);
+		}
+		else
+		{
+			fprintf (stderr, "Cannot compile regex %s: %i",
+					entry, rcompile);
+			syslog (LOG_ERR, "Cannot compile regex %s: %i",
+					entry, rcompile);
+		}
 
-	fprintf (stderr, "cf_read_generic (path = %s, depth = %i);", path, depth);
-
-	status = stat (path, &statbuf);
-	if (status != 0)

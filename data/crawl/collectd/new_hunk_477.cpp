@@ -1,15 +1,23 @@
-	}
-	else if (strcasecmp ("StepSize", key) == 0)
+	double  *values;
+	char   **values_names;
+	int      values_num;
+
+	if (get_values (&values_num, &values, &values_names) != 0)
 	{
-		stepsize = atoi (value);
-		if (stepsize < 0)
-			stepsize = 0;
+		fputs ("ERROR: Cannot get values from daemon\n", stdout);
+		return (RET_CRITICAL);
 	}
-	else if (strcasecmp ("HeartBeat", key) == 0)
-	{
-		heartbeat = atoi (value);
-		if (heartbeat < 0)
-			heartbeat = 0;
-	}
-	else if (strcasecmp ("RRARows", key) == 0)
-	{
+
+	if (consolitation_g == CON_NONE)
+		return (do_check_con_none (values_num, values, values_names));
+	else if (consolitation_g == CON_AVERAGE)
+		return (do_check_con_average (values_num, values, values_names));
+	else if (consolitation_g == CON_SUM)
+		return (do_check_con_sum (values_num, values, values_names));
+
+	free (values);
+	free (values_names);
+
+	return (RET_UNKNOWN);
+}
+

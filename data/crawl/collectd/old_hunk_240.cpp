@@ -1,11 +1,6 @@
-	Py_BEGIN_ALLOW_THREADS;
-	ret = plugin_dispatch_values(&value_list);
-	Py_END_ALLOW_THREADS;
-	if (ret != 0) {
-		PyErr_SetString(PyExc_RuntimeError, "error dispatching values, read the logs");
-		return NULL;
 	}
-	free(value);
-	Py_RETURN_NONE;
-}
+	DEBUG ("interval_g = %i;", interval_g);
 
+	if (init_hostname () != 0)
+		return (-1);
+	DEBUG ("hostname_g = %s;", hostname_g);

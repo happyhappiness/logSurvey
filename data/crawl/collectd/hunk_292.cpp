@@ -1,21 +1,9 @@
- 	total_num = 0;
- 	for (i = 0; i < values_num; i++)
- 	{
--		if (!isnan (values[i]))
-+		if (isnan (values[i]))
- 		{
--			total += values[i];
--			total_num++;
-+			if (!nan_is_error_g)
-+				continue;
-+
-+			printf ("CRITICAL: Data source \"%s\" is NaN\n",
-+					values_names[i]);
-+			return (RET_CRITICAL);
+ 		Py_DECREF(list);
+ 		ret = PyObject_CallFunctionObjArgs(c->callback, v, c->data, (void *) 0); /* New reference. */
+ 		if (ret == NULL) {
+-			/* FIXME */
+-			PyErr_Print();
++			cpy_log_exception("write callback");
+ 		} else {
+ 			Py_DECREF(ret);
  		}
-+
-+		total += values[i];
-+		total_num++;
- 	}
- 
- 	if (total_num == 0)

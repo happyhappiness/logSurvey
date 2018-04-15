@@ -1,23 +1,15 @@
-  lcc_connection_t *connection;
-  lcc_identifier_t ident;
+	Py_XDECREF(n);
+}
 
-  // Pointer which is passed to lcc_flush.
-  //Either a null pointer or it points to ident
-  lcc_identifier_t *identp;
-  int status;
+static int cpy_read_callback(user_data_t *data) {
+	cpy_callback_t *c = data->data;
+	PyObject *ret;
 
-  connection = NULL;
-  status = lcc_connect(address, &connection);
-  if (status != 0)
-  {
-		fprintf (stderr, "ERROR: Connecting to daemon at %s failed: %s.\n",
-				address, strerror (errno));
-		return 1;
-	}
-
-  identp = NULL;
-  if (ident_str != NULL && *ident_str != '\0') {
-    identp = &ident;
-    status = lcc_string_to_identifier (connection, &ident, ident_str);
-    if (status != 0) {
-      fprintf (stderr, "ERROR: Creating and identifier failed: %s.\n",
+	CPY_LOCK_THREADS
+		ret = PyObject_CallFunctionObjArgs(c->callback, c->data, (void *) 0); /* New reference. */
+		if (ret == NULL) {
+			/* FIXME */
+			PyErr_Print();
+		} else {
+			Py_DECREF(ret);
+		}

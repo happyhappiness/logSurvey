@@ -1,11 +1,8 @@
-	total_num = 0;
-	for (i = 0; i < values_num; i++)
-	{
-		if (!isnan (values[i]))
-		{
-			total += values[i];
-			total_num++;
+		Py_DECREF(list);
+		ret = PyObject_CallFunctionObjArgs(c->callback, v, c->data, (void *) 0); /* New reference. */
+		if (ret == NULL) {
+			/* FIXME */
+			PyErr_Print();
+		} else {
+			Py_DECREF(ret);
 		}
-	}
-
-	if (total_num == 0)

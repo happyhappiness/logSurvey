@@ -1,14 +1,7 @@
-%%
-static int yyerror (const char *s)
-{
-	char *text;
+	message[511] = '\0';
+	va_end (ap);
 
-	if (*yytext == '\n')
-		text = "<newline>";
-	else
-		text = yytext;
+	plugin_log (level, message);
+}
 
-	fprintf (stderr, "Parse error in file `%s', line %i near `%s': %s\n",
-		c_file, yylineno, text, s);
-	return (-1);
-} /* int yyerror */
+void plugin_relief (int level, complain_t *c, const char *format, ...)

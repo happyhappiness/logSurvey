@@ -1,57 +1,23 @@
-			num_okay++;
 	}
 
-	if ((num_critical == 0) && (num_warning == 0) && (num_okay == 0))
-	{
-		printf ("WARNING: No defined values found\n");
-		return (RET_WARNING);
-	}
-	else if ((num_critical == 0) && (num_warning == 0))
-	{
-		status_str = "OKAY";
-		status_code = RET_OKAY;
-	}
-	else if (num_critical == 0)
-	{
-		status_str = "WARNING";
-		status_code = RET_WARNING;
-	}
+	if (total_num == 0)
+		average = NAN;
 	else
-	{
-		status_str = "CRITICAL";
-		status_code = RET_CRITICAL;
-	}
-
-	printf ("%s: %i critical, %i warning, %i okay", status_str,
-			num_critical, num_warning, num_okay);
-	if (values_num > 0)
-	{
-		printf (" |");
-		for (i = 0; i < values_num; i++)
-			printf (" %s=%g;;;;", values_names[i], values[i]);
-	}
-	printf ("\n");
-
-	return (status_code);
-} /* int do_check_con_none */
-
-static int do_check_con_average (int values_num,
-		double *values, char **values_names)
-{
-	int i;
-	double total;
-	int total_num;
-	double average;
-	const char *status_str = "UNKNOWN";
-	int status_code = RET_UNKNOWN;
-
-	total = 0.0;
-	total_num = 0;
+		average = total / total_num;
+	printf ("%lf average |", average);
 	for (i = 0; i < values_num; i++)
-	{
-		if (ignore_ds (values_names[i]))
-			continue;
+		printf (" %s=%lf;;;;", values_names[i], values[i]);
 
-		if (!isnan (values[i]))
-		{
-			total += values[i];
+	if (total_num == 0)
+		return (RET_WARNING);
+
+	if (isnan (average)
+			|| match_range (&range_critical_g, average))
+		return (RET_CRITICAL);
+	else if (match_range (&range_warning_g, average) != 0)
+		return (RET_WARNING);
+
+	return (RET_OKAY);
+} /* int do_check_con_average */
+
+int do_check_con_sum (int values_num, double *values, char **values_names)

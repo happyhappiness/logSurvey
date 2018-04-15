@@ -1,13 +1,8 @@
-                                                   .writer = nop_writer,
-                                               });
-    if (status != 0) {
-      fprintf(stderr,
-              "lcc_network_parse(raw_packet_data[%" PRIsz "]) = %d, want 0\n",
-              i, status);
-      ret = status;
-    }
-
-    printf("ok - lcc_network_parse(raw_packet_data[%" PRIsz "])\n", i);
-  }
-
-  return ret;
+	 if (strcmp ($1.key, $3) != 0)
+	 {
+		printf ("block_begin = %s; block_end = %s;\n", $1.key, $3);
+		yyerror("block not closed");
+		YYERROR;
+	 }
+	 free ($3); $3 = NULL;
+	 $$ = $1;

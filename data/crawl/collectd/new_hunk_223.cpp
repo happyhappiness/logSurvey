@@ -1,13 +1,23 @@
-static PyObject *cpy_register_generic(cpy_callback_t **list_head, PyObject *args, PyObject *kwds) {
-	char buf[512];
-	cpy_callback_t *c;
-	char *name = NULL;
-	PyObject *callback = NULL, *data = NULL, *mod = NULL;
-	static char *kwlist[] = {"callback", "data", "name", NULL};
-	
-	if (PyArg_ParseTupleAndKeywords(args, kwds, "O|Oet", kwlist, &callback, &data, NULL, &name) == 0) return NULL;
-	if (PyCallable_Check(callback) == 0) {
-		PyMem_Free(name);
-		PyErr_SetString(PyExc_TypeError, "callback needs a be a callable object.");
-		return NULL;
-	}
+    exit_usage (argv[0], 1);
+  }
+
+  c = NULL;
+  status = lcc_connect (address, &c);
+  if (status != 0) {
+    fprintf (stderr, "ERROR: Failed to connect to daemon at %s: %s.\n",
+        address, strerror (errno));
+    return (1);
+  }
+
+  if (strcasecmp (argv[optind], "flush") == 0)
+    status = flush (c, argc - optind, argv + optind);
+  else {
+    fprintf (stderr, "%s: invalid command: %s\n", argv[0], argv[optind]);
+    return (1);
+  }
+
+  LCC_DESTROY (c);
+
+  if (status != 0)
+    return (status);
+  return (0);

@@ -1,11 +1,10 @@
+  return 0;
+}
 
-  fh = fopen(file, "r");
-  if (fh == NULL) {
-    char errbuf[1024];
-    fprintf(stderr, "Failed to open types database `%s': %s.\n", file,
-            sstrerror(errno, errbuf, sizeof(errbuf)));
-    ERROR("Failed to open types database `%s': %s", file,
-          sstrerror(errno, errbuf, sizeof(errbuf)));
-    return -1;
-  }
+int main (void)
+{
+  RUN_TEST(simple);
+  RUN_TEST(percentile);
 
+  END_TEST;
+}

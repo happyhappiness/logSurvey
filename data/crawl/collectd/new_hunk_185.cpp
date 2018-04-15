@@ -1,8 +1,41 @@
-  CHECK_NOT_NULL (l = latency_counter_create ());
+};
+static int config_keys_num = STATIC_ARRAY_SIZE (config_keys);
 
-  for (i = 0; i < STATIC_ARRAY_SIZE (cases); i++) {
-    printf ("# case %zu: DOUBLE_TO_CDTIME_T(%g) = %"PRIu64"\n",
-        i, cases[i].val, DOUBLE_TO_CDTIME_T (cases[i].val));
-    latency_counter_add (l, DOUBLE_TO_CDTIME_T (cases[i].val));
+static ignorelist_t *ignorelist = NULL;
 
-    DBLEQ (cases[i].min, CDTIME_T_TO_DOUBLE (latency_counter_get_min (l)));
+/*
+ * Private functions
+ */
+static int irq_config (const char *key, const char *value)
+{
+	if (ignorelist == NULL)
+		ignorelist = ignorelist_create (/* invert = */ 1);
+
+	if (strcasecmp (key, "Irq") == 0)
+	{
+		ignorelist_add (ignorelist, value);
+	}
+	else if (strcasecmp (key, "IgnoreSelected") == 0)
+	{
+		int invert = 1;
+		if (IS_TRUE (value))
+			invert = 0;
+		ignorelist_set_invert (ignorelist, invert);
+	}
+	else
+	{
+		return (-1);
+	}
+
+	return (0);
+}
+
+static void irq_submit (const char *irq_name, derive_t value)
+{
+	value_t values[1];
+	value_list_t vl = VALUE_LIST_INIT;
+
+	if (ignorelist_match (ignorelist, irq_name) != 0)
+		return;
+
+	values[0].derive = value;

@@ -1,7 +1,7 @@
-			module = PyImport_ImportModule(module_name); /* New reference. */
-			if (module == NULL) {
-				ERROR("python plugin: Error importing module \"%s\".", module_name);
-				cpy_log_exception("python initialization");
-				PyErr_Print();
-			}
-			free(module_name);
+		ret = 1;
+
+	return (((ret - range->invert) == 0) ? 0 : 1);
+} /* int match_range */
+
+static void usage (const char *name)
+{

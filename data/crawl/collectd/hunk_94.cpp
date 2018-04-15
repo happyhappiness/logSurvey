@@ -1,77 +1,108 @@
- fi
- # }}}
+ 		status = parse_string (&buffer, &string);
+ 		if (status != 0)
+ 		{
+-			print_to_socket (fh, "-1 Misformatted value.\n");
+-			sfree (vl.values);
+-			return (-1);
++			cmd_error (CMD_PARSE_ERROR, err, "Misformatted value.");
++			cmd_destroy_putval (ret_putval);
++			return (CMD_PARSE_ERROR);
+ 		}
+ 		assert (string != NULL);
  
-+# --with-libjevents {{{
-+with_libjevents_cppflags=""
-+with_libjevents_ldflags=""
-+AC_ARG_WITH(libjevents, [AS_HELP_STRING([--with-libjevents@<:@=PREFIX@:>@], [Path to libjevents.])],
-+[
-+  if test "x$withval" != "xno" && test "x$withval" != "xyes"
-+  then
-+    with_libjevents_cppflags="-I$withval/include"
-+    with_libjevents_ldflags="-L$withval/lib"
-+    with_libjevents="yes"
-+  else
-+    with_libjevents="$withval"
-+  fi
-+],
-+[
-+  with_libjevents="yes"
-+])
-+if test "x$with_libjevents" = "xyes"
-+then
-+  SAVE_CPPFLAGS="$CPPFLAGS"
-+  CPPFLAGS="$CPPFLAGS $with_libjevents_cppflags"
+ 		status = parse_values (string, &vl, ds);
+ 		if (status != 0)
+ 		{
+-			print_to_socket (fh, "-1 Parsing the values string failed.\n");
+-			sfree (vl.values);
+-			return (-1);
++			cmd_error (CMD_PARSE_ERROR, err, "Parsing the values string failed.");
++			cmd_destroy_putval (ret_putval);
++			return (CMD_PARSE_ERROR);
+ 		}
+ 
+-		plugin_dispatch_values (&vl);
+-		values_submitted++;
++		tmp = (value_list_t *) realloc (ret_putval->vl,
++				(ret_putval->vl_num + 1) * sizeof(*ret_putval->vl));
++		if (tmp == NULL)
++		{
++			cmd_error (CMD_ERROR, err, "realloc failed.");
++			cmd_destroy_putval (ret_putval);
++			return (CMD_ERROR);
++		}
 +
-+  AC_CHECK_HEADERS(jevents.h, [with_libjevents="yes"], [with_libjevents="no (jevents.h not found)"])
++		ret_putval->vl = tmp;
++		ret_putval->vl_num++;
++		memcpy (&ret_putval->vl[ret_putval->vl_num - 1], &vl, sizeof (vl));
+ 	} /* while (*buffer != 0) */
+ 	/* Done parsing the options. */
+ 
+-	if (fh!=stdout)
+-		print_to_socket (fh, "0 Success: %i %s been dispatched.\n",
+-			values_submitted,
+-			(values_submitted == 1) ? "value has" : "values have");
++	return (CMD_OK);
++} /* cmd_status_t cmd_parse_putval */
+ 
+-	sfree (vl.values);
+-	return (0);
+-} /* int handle_putval */
++void cmd_destroy_putval (cmd_putval_t *putval)
++{
++	size_t i;
 +
-+  CPPFLAGS="$SAVE_CPPFLAGS"
-+fi
-+if test "x$with_libjevents" = "xyes"
-+then
-+  SAVE_CPPFLAGS="$CPPFLAGS"
-+  SAVE_LDFLAGS="$LDFLAGS"
-+  CPPFLAGS="$CPPFLAGS $with_libjevents_cppflags"
-+  LDFLAGS="$LDFLAGS $with_libjevents_ldflags"
++	if (putval == NULL)
++		return;
 +
-+  AC_CHECK_LIB(jevents, json_events, [with_libjevents="yes"], [with_libjevents="no (Can't find libjevents)"])
++	sfree (putval->identifier);
 +
-+  CPPFLAGS="$SAVE_CPPFLAGS"
-+  LDFLAGS="$SAVE_LDFLAGS"
-+fi
-+if test "x$with_libjevents" = "xyes"
-+then
-+  SAVE_CPPFLAGS="$CPPFLAGS"
-+  SAVE_LDFLAGS="$LDFLAGS"
-+  SAVE_LIBS="$LIBS"
-+  CPPFLAGS="$CPPFLAGS -fPIC"
-+  LDFLAGS="$LDFLAGS -shared"
-+  LIBS="-ljevents"
-+  AC_LINK_IFELSE([AC_LANG_SOURCE(
-+    [[
-+      #include <stdio.h>
-+      #include "jevents.h"
-+      void print_cpu(void){
-+        printf("%s", get_cpu_str());
-+      }
-+    ]]
-+  )],
-+  [with_libjevents="yes"], [with_libjevents="no (could not link to libjevents. Check jevents is compiled with -fPIC.)"])
-+  CPPFLAGS="$SAVE_CPPFLAGS"
-+  LDFLAGS="$SAVE_LDFLAGS"
-+  LIBS="$SAVE_LIBS"
-+fi
-+if test "x$with_libjevents" = "xyes"
-+then
-+  BUILD_WITH_LIBJEVENTS_CPPFLAGS="$with_libjevents_cppflags"
-+  BUILD_WITH_LIBJEVENTS_LDFLAGS="$with_libjevents_ldflags"
-+  BUILD_WITH_LIBJEVENTS_LIBS="-ljevents"
-+  AC_SUBST(BUILD_WITH_LIBJEVENTS_CPPFLAGS)
-+  AC_SUBST(BUILD_WITH_LIBJEVENTS_LDFLAGS)
-+  AC_SUBST(BUILD_WITH_LIBJEVENTS_LIBS)
-+fi
-+# }}}
++	for (i = 0; i < putval->vl_num; ++i)
++	{
++		sfree (putval->vl[i].values);
++		meta_data_destroy (putval->vl[i].meta);
++		putval->vl[i].meta = NULL;
++	}
++	sfree (putval->vl);
++	putval->vl = NULL;
++	putval->vl_num = 0;
++} /* void cmd_destroy_putval */
 +
- # --with-libprotobuf {{{
- with_libprotobuf_cppflags=""
- with_libprotobuf_ldflags=""
++cmd_status_t cmd_handle_putval (FILE *fh, char *buffer)
++{
++	cmd_error_handler_t err = { cmd_error_fh, fh };
++	cmd_t cmd;
++	size_t i;
++
++	int status;
++
++	DEBUG ("utils_cmd_putval: cmd_handle_putval (fh = %p, buffer = %s);",
++			(void *) fh, buffer);
++
++	if ((status = cmd_parse (buffer, &cmd, &err)) != CMD_OK)
++		return (status);
++	if (cmd.type != CMD_PUTVAL)
++	{
++		cmd_error (CMD_UNKNOWN_COMMAND, &err, "Unexpected command: `%s'.",
++				CMD_TO_STRING (cmd.type));
++		cmd_destroy (&cmd);
++		return (CMD_UNKNOWN_COMMAND);
++	}
++
++	for (i = 0; i < cmd.cmd.putval.vl_num; ++i)
++		plugin_dispatch_values (&cmd.cmd.putval.vl[i]);
++
++	if (fh != stdout)
++		cmd_error (CMD_OK, &err, "Success: %i %s been dispatched.",
++				(int)cmd.cmd.putval.vl_num,
++				(cmd.cmd.putval.vl_num == 1) ? "value has" : "values have");
++
++	cmd_destroy (&cmd);
++	return (CMD_OK);
++} /* int cmd_handle_putval */
+ 
+-int create_putval (char *ret, size_t ret_len, /* {{{ */
++int cmd_create_putval (char *ret, size_t ret_len, /* {{{ */
+ 	const data_set_t *ds, const value_list_t *vl)
+ {
+ 	char buffer_ident[6 * DATA_MAX_NAME_LEN];

@@ -1,11 +1,14 @@
-    PyErr_Format(PyExc_TypeError, "Dataset %s not found", notification.type);
-    return NULL;
-  }
-  if (meta != NULL && meta != Py_None && !PyDict_Check(meta)) {
-    PyErr_Format(PyExc_TypeError, "meta must be a dict");
-    return NULL;
-  }
-  cpy_build_notification_meta(&notification, meta);
+#define OK(cond) OK1(cond, #cond)
 
-  if (notification.time == 0)
-    notification.time = cdtime();
+#define EXPECT_EQ_STR(expect, actual) do { \
+  /* Evaluate 'actual' only once. */ \
+  const char *got__ = actual; \
+  if (strcmp (expect, got__) != 0) { \
+    printf ("not ok %i - %s = \"%s\", want \"%s\"\n", \
+        ++check_count__, #actual, got__, expect); \
+    return (-1); \
+  } \
+  printf ("ok %i - %s = \"%s\"\n", ++check_count__, #actual, got__); \
+} while (0)
+
+#define EXPECT_EQ_INT(expect, actual) do { \

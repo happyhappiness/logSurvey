@@ -1,7 +1,6 @@
+  return (0);
+} /* }}} int http_config */
 
-static PyObject *cpy_error(PyObject *self, PyObject *args) {
-	const char *text;
-	if (PyArg_ParseTuple(args, "s", &text) == 0) return NULL;
-	Py_BEGIN_ALLOW_THREADS
-	plugin_log(LOG_ERR, "%s", text);
-	Py_END_ALLOW_THREADS
+static int http_write (const data_set_t *ds, const value_list_t *vl, /* {{{ */
+    user_data_t __attribute__((unused)) *user_data)
+{

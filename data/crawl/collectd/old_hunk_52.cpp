@@ -1,12 +1,6 @@
-                                                   .writer = nop_writer,
-                                               });
-    if (status != 0) {
-      fprintf(stderr, "lcc_network_parse(raw_packet_data[%zu]) = %d, want 0\n",
-              i, status);
-      ret = status;
-    }
-
-    printf("ok - lcc_network_parse(raw_packet_data[%zu])\n", i);
+    PyErr_Format(PyExc_TypeError, "Dataset %s not found", notification.type);
+    return NULL;
   }
 
-  return ret;
+  if (notification.time == 0)
+    notification.time = cdtime();

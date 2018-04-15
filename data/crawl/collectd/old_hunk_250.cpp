@@ -1,11 +1,13 @@
-	}
+	return 0;
+}
 
-	if ((socket_file_g == NULL) || (value_string_g == NULL)
-			|| (hostname_g == NULL))
-	{
-		fprintf (stderr, "Missing required arguments.\n");
-		usage (argv[0]);
-	}
-
-	return (do_check ());
-} /* int main */
+static PyObject *Values_dispatch(Values *self, PyObject *args, PyObject *kwds) {
+	int i, ret;
+	const data_set_t *ds;
+	int size;
+	value_t *value;
+	value_list_t value_list = VALUE_LIST_INIT;
+	PyObject *values = self->values;
+	double time = self->data.time;
+	int interval = self->interval;
+	const char *host = self->data.host;

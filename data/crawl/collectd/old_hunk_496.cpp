@@ -1,9 +1,6 @@
+    StringCounter *sc;
+    StringAddrCounter *ssc;
 
-static void stderr_log (int severity, const char *msg)
-{
-	if (severity > log_level)
-		return;
+    if (len < sizeof(qh))
+	return 0;
 
-	fprintf (stderr, "%s\n", msg);
-	return;
-} /* void stderr_log (int, const char *) */

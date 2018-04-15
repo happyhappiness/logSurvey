@@ -1,6 +1,7 @@
-%%
-static int yyerror (const char *s)
-{
-	fprintf (stderr, "Error in line %i near `%s': %s\n", yylineno, yytext, s);
-	return (-1);
-} /* int yyerror */
+	message[511] = '\0';
+	va_end (ap);
+
+	syslog (level, message);
+}
+
+void plugin_relief (int level, complain_t *c, const char *format, ...)

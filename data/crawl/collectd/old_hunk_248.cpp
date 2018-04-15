@@ -1,6 +1,7 @@
-	exit (1);
-} /* void usage */
+	PyErr_Clear();
+}
 
-static int do_check_con_none (size_t values_num,
-		double *values, char **values_names)
-{
+static void cpy_log_exception(const char *context) {
+	int l = 0, i;
+	const char *typename = NULL, *message = NULL;
+	PyObject *type, *value, *traceback, *tn, *m, *list;

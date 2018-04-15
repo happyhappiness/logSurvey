@@ -1,7 +1,6 @@
-	message[sizeof (message) - 1] = '\0';
-	va_end (ap);
+	return (0);
+} /* int us_handle_getval */
 
-	plugin_log (level, "%s", message);
-} /* c_release */
-
-/* vim: set sw=4 ts=4 tw=78 noexpandtab : */
+static int us_handle_listval (FILE *fh, char **fields, int fields_num)
+{
+	char buffer[1024];

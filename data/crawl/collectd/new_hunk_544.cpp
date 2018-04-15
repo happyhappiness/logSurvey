@@ -1,17 +1,15 @@
-	else if (0 == strcasecmp (key, "MaxConns")) {
-		long int tmp = strtol (value, NULL, 0);
+	/* open syslog */
+	openlog (PACKAGE, LOG_CONS | LOG_PID, LOG_DAEMON);
 
-		if (tmp < 1) {
-			fprintf (stderr, "email plugin: `MaxConns' was set to invalid "
-					"value %li, will use default %i.\n",
-					tmp, MAX_CONNS);
-			max_conns = MAX_CONNS;
-		}
-		else if (tmp > MAX_CONNS_LIMIT) {
-			fprintf (stderr, "email plugin: `MaxConns' was set to invalid "
-					"value %li, will use hardcoded limit %i.\n",
-					tmp, MAX_CONNS_LIMIT);
-			max_conns = MAX_CONNS_LIMIT;
-		}
-		else {
-			max_conns = (int)tmp;
+	DBG_STARTFILE(logfile, "Debug file opened.");
+
+	/*
+	 * Read options from the config file, the environment and the command
+	 * line (in that order, with later options overwriting previous ones in
+	 * general).
+	 * Also, this will automatically load modules.
+	 */
+	if (cf_read (argc, argv, CONFIGFILE))
+	{
+		fprintf (stderr, "Error: Reading the config file failed!\n"
+				"Read the syslog for details.\n");

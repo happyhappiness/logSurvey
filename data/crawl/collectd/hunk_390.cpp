@@ -1,61 +1,73 @@
+ 		return (NULL);
+ 	}
  
- =back
+-	fprintf (stderr, "cf_read_generic (path = %s, depth = %i);", path, depth);
++	status = wordexp (path, &we, WRDE_NOCMD);
++	if (status != 0)
++	{
++		ERROR ("configfile: wordexp (%s) failed.", path);
++		return (NULL);
++	}
++
++	root = (oconfig_item_t *) malloc (sizeof (oconfig_item_t));
++	if (root == NULL)
++	{
++		ERROR ("configfile: malloc failed.");
++		return (NULL);
++	}
++	memset (root, '\0', sizeof (oconfig_item_t));
++
++	for (i = 0; i < we.we_wordc; i++)
++	{
++		oconfig_item_t *temp;
++		struct stat statbuf;
++
++		path_ptr = we.we_wordv[i];
++
++		status = stat (path_ptr, &statbuf);
++		if (status != 0)
++		{
++			char errbuf[1024];
++			ERROR ("configfile: stat (%s) failed: %s",
++					path_ptr,
++					sstrerror (errno, errbuf, sizeof (errbuf)));
++			return (NULL);
++		}
++
++		if (S_ISREG (statbuf.st_mode))
++			temp = cf_read_file (path_ptr, depth);
++		else if (S_ISDIR (statbuf.st_mode))
++			temp = cf_read_dir (path_ptr, depth);
++		else
++		{
++			ERROR ("configfile: %s is neither a file nor a "
++					"directory.", path);
++			continue;
++		}
++
++		cf_ci_append_children (root, temp);
++		sfree (temp->children);
++		sfree (temp);
++	}
++
++	wordfree (&we);
++
++	return (root);
++} /* oconfig_item_t *cf_read_generic */
++/* #endif HAVE_WORDEXP_H */
++
++#else /* if !HAVE_WORDEXP_H */
++static oconfig_item_t *cf_read_generic (const char *path, int depth)
++{
++	struct stat statbuf;
++	int status;
++
++	if (depth >= CF_MAX_DEPTH)
++	{
++		ERROR ("configfile: Not including `%s' because the maximum "
++				"nesting depth has been reached.", path);
++		return (NULL);
++	}
  
-+=head2 Plugin C<notify_email>
-+
-+The I<notify_email> plugin uses the I<ESMTP> library to send notifications to a
-+configured email address.
-+
-+I<libESMTP> is available from L<http://www.stafford.uklinux.net/libesmtp/>.
-+
-+Available configuration options:
-+
-+=over 4
-+
-+=item B<From> I<Address>
-+
-+Email address from which the emails should appear to come from.
-+
-+Default: C<root@localhost>
-+
-+=item B<Recipient> I<Address>
-+
-+Configures the email address(es) to which the notifications should be mailed.
-+May be repeated to send notifications to multiple addresses.
-+
-+At least one B<Recipient> must be present for the plugin to work correctly.
-+
-+=item B<SMTPServer> I<Hostname>
-+
-+Hostname of the SMTP server to connect to.
-+
-+Default: C<localhost>
-+
-+=item B<SMTPPort> I<Port>
-+
-+TCP port to connect to.
-+
-+Default: C<25>
-+
-+=item B<SMTPUser> I<Username>
-+
-+Username for ASMTP authentication. Optional.
-+
-+=item B<SMTPPassword> I<Password>
-+
-+Password for ASMTP authentication. Optional.
-+
-+=item B<Subject> I<Subject>
-+
-+Subject-template to use when sending emails. There must be exactly two
-+string-placeholders in the subject, given in the standard I<printf(3)> syntax,
-+i.E<nbsp>e. C<%s>. The first will be replaced with the severity, the second
-+with the hostname.
-+
-+Default: C<Collectd notify: %s@%s>
-+
-+=back
-+
- =head2 Plugin C<ntpd>
- 
- =over 4
+ 	status = stat (path, &statbuf);
+ 	if (status != 0)

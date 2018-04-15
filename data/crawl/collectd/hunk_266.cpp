@@ -1,8 +1,7 @@
-     status = flush (c, argc - optind, argv + optind);
-   else if (strcasecmp (argv[optind], "listval") == 0)
-     status = listval (c, argc - optind, argv + optind);
-+  else if (strcasecmp (argv[optind], "putval") == 0)
-+    status = putval (c, argc - optind, argv + optind);
-   else {
-     fprintf (stderr, "%s: invalid command: %s\n", argv[0], argv[optind]);
-     return (1);
+ 		if (strcmp(name, tmp->name) == 0)
+ 			break;
+ 	
++	Py_DECREF(arg);
+ 	if (tmp == NULL) {
+ 		PyErr_Format(PyExc_RuntimeError, "Unable to unregister %s callback '%s'.", desc, name);
+ 		return NULL;

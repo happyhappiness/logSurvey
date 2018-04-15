@@ -1,18 +1,9 @@
-	;
+  }
 
-%%
-static int yyerror (const char *s)
-{
-	const char *text;
-
-	if (*yytext == '\n')
-		text = "<newline>";
-	else
-		text = yytext;
-
-	fprintf (stderr, "Parse error in file `%s', line %i near `%s': %s\n",
-		c_file, yylineno, text, s);
-	return (-1);
-} /* int yyerror */
-
-static char *unquote (const char *orig)
+  if (fh == NULL) {
+    char errbuf[1024];
+    fprintf(stderr, "logfile plugin: fopen (%s) failed: %s\n", log_file,
+            sstrerror(errno, errbuf, sizeof(errbuf)));
+  } else {
+    if (print_timestamp)
+      fprintf(fh, "[%s] %s%s\n", timestamp_str, level_str, msg);

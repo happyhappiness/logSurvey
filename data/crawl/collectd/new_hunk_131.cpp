@@ -1,21 +1,17 @@
-  return ENOTSUP;
-}
-
-int plugin_flush (const char *plugin, cdtime_t timeout, const char *identifier)
-{
-  return ENOTSUP;
-}
-
-static data_source_t magic_ds[] = {{ "value", DS_TYPE_DERIVE, 0.0, NAN }};
-static data_set_t magic = { "MAGIC", 1, magic_ds };
-const data_set_t *plugin_get_ds (const char *name)
-{
-  if (strcmp (name, "MAGIC"))
-    return NULL;
-
-  return &magic;
-}
-
-void plugin_log (int level, char const *format, ...)
-{
-  char buffer[1024];
+       ci_copy->values[i].type = ci_orig->values[i].type;
+       if (ci_copy->values[i].type == OCONFIG_TYPE_STRING)
+       {
+         ci_copy->values[i].value.string = strdup (ci_orig->values[i].value.string);
+         if (ci_copy->values[i].value.string == NULL)
+         {
+           fprintf (stderr, "strdup failed.\n");
+           oconfig_free (ci_copy);
+           return (NULL);
+         }
+       }
+       else /* ci_copy->values[i].type != OCONFIG_TYPE_STRING) */
+       {
+         ci_copy->values[i].value = ci_orig->values[i].value;
+       }
+    }
+  } /* }}} if (ci_orig->values_num > 0) */

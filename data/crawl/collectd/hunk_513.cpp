@@ -1,441 +1,250 @@
-+/* Library which manipulates firewall rules.  Version 0.1. */
+ 	return (0);
+ }
+ 
+-<<<<<<< .mine
+-/* 
+- * Get and print status from apcupsd NIS server if APCMAIN is defined. 
+- * Poplate apcups_detail structure for plugin submit().
+- */
+-static int do_apc_status(char *host, int port, struct apc_detail_s *apcups_detail)
+-=======
+ /* Get and print status from apcupsd NIS server */
+ static int apc_query_server (char *host, int port,
+ 		struct apc_detail_s *apcups_detail)
+->>>>>>> .r743
+ {
+ 	int     sockfd;
+ 	int     n;
+-	char    recvline[MAXSTRING + 1];
++	char    recvline[1024];
+ 	char   *tokptr;
+ 	char   *key;
+-	float  value;
++	double  value;
 +
-+/* Architecture of firewall rules is as follows:
-+ *
-+ * Chains go INPUT, FORWARD, OUTPUT then user chains.
-+ * Each user chain starts with an ERROR node.
-+ * Every chain ends with an unconditional jump: a RETURN for user chains,
-+ * and a POLICY for built-ins.
-+ */
++	static int complain = 0;
 +
-+/* (C)1999 Paul ``Rusty'' Russell - Placed under the GNU GPL (See
-+   COPYING for details). */
+ #if APCMAIN
+ # define PRINT_VALUE(name, val) printf("  Found property: name = %s; value = %f;\n", name, val)
+ #else
+ # define PRINT_VALUE(name, val) /**/
+ #endif
+ 
+-<<<<<<< .mine
+-	/* 
+-	 * TODO: Keep the socket open, if possible.
+-	 * Can open socket in module init, but without a corresponding module
+-	 * uninit there is no place to gracefully close the socket.
+-	 */
+-=======
+ 	/* TODO: Keep the socket open, if possible */
+->>>>>>> .r743
+ 	if ((sockfd = net_open (host, NULL, port)) < 0)
+ 	{
+-		/* 
+-		 * When the integer apcConnStatus rolls over it will print out
+-		 * again, if we haven't connected by then.
+-		 */
+-		if (apcConnStatus++ == 0)
+-			syslog (LOG_ERR, "apcups plugin: Connecting to the apcupsd failed: %s",
+-				net_errmsg);
++		/* Complain once every six hours.
++		int complain_step = 21600 / atoi (COLLECTD_STEP);
 +
-+#include <assert.h>
-+#include <string.h>
-+#include <errno.h>
-+#include <stdlib.h>
-+#include <stdio.h>
-+#include <unistd.h>
-+#include <arpa/inet.h>
++		if ((complain % complain_step) == 0)
++			syslog (LOG_ERR, "apcups plugin: Connecting to the apcupsd failed.");
++		complain++;
 +
-+#ifdef DEBUG_CONNTRACK
-+#define inline
-+#endif
-+
-+#if !defined(__GLIBC__) || (__GLIBC__ < 2)
-+typedef unsigned int socklen_t;
-+#endif
-+
-+#include "libiptc/libip6tc.h"
-+
-+#define HOOK_PRE_ROUTING	NF_IP6_PRE_ROUTING
-+#define HOOK_LOCAL_IN		NF_IP6_LOCAL_IN
-+#define HOOK_FORWARD		NF_IP6_FORWARD
-+#define HOOK_LOCAL_OUT		NF_IP6_LOCAL_OUT
-+#define HOOK_POST_ROUTING	NF_IP6_POST_ROUTING
-+
-+#define STRUCT_ENTRY_TARGET	struct ip6t_entry_target
-+#define STRUCT_ENTRY		struct ip6t_entry
-+#define STRUCT_ENTRY_MATCH	struct ip6t_entry_match
-+#define STRUCT_GETINFO		struct ip6t_getinfo
-+#define STRUCT_GET_ENTRIES	struct ip6t_get_entries
-+#define STRUCT_COUNTERS		struct ip6t_counters
-+#define STRUCT_COUNTERS_INFO	struct ip6t_counters_info
-+#define STRUCT_STANDARD_TARGET	struct ip6t_standard_target
-+#define STRUCT_REPLACE		struct ip6t_replace
-+
-+#define STRUCT_TC_HANDLE	struct ip6tc_handle
-+#define TC_HANDLE_T		ip6tc_handle_t
-+
-+#define ENTRY_ITERATE		IP6T_ENTRY_ITERATE
-+#define TABLE_MAXNAMELEN	IP6T_TABLE_MAXNAMELEN
-+#define FUNCTION_MAXNAMELEN	IP6T_FUNCTION_MAXNAMELEN
-+
-+#define GET_TARGET		ip6t_get_target
-+
-+#define ERROR_TARGET		IP6T_ERROR_TARGET
-+#define NUMHOOKS		NF_IP6_NUMHOOKS
-+
-+#define IPT_CHAINLABEL		ip6t_chainlabel
-+
-+#define TC_DUMP_ENTRIES		dump_entries6
-+#define TC_IS_CHAIN		ip6tc_is_chain
-+#define TC_FIRST_CHAIN		ip6tc_first_chain
-+#define TC_NEXT_CHAIN		ip6tc_next_chain
-+#define TC_FIRST_RULE		ip6tc_first_rule
-+#define TC_NEXT_RULE		ip6tc_next_rule
-+#define TC_GET_TARGET		ip6tc_get_target
-+#define TC_BUILTIN		ip6tc_builtin
-+#define TC_GET_POLICY		ip6tc_get_policy
-+#define TC_INSERT_ENTRY		ip6tc_insert_entry
-+#define TC_REPLACE_ENTRY	ip6tc_replace_entry
-+#define TC_APPEND_ENTRY		ip6tc_append_entry
-+#define TC_DELETE_ENTRY		ip6tc_delete_entry
-+#define TC_DELETE_NUM_ENTRY	ip6tc_delete_num_entry
-+#define TC_CHECK_PACKET		ip6tc_check_packet
-+#define TC_FLUSH_ENTRIES	ip6tc_flush_entries
-+#define TC_ZERO_ENTRIES		ip6tc_zero_entries
-+#define TC_ZERO_COUNTER		ip6tc_zero_counter
-+#define TC_READ_COUNTER		ip6tc_read_counter
-+#define TC_SET_COUNTER		ip6tc_set_counter
-+#define TC_CREATE_CHAIN		ip6tc_create_chain
-+#define TC_GET_REFERENCES	ip6tc_get_references
-+#define TC_DELETE_CHAIN		ip6tc_delete_chain
-+#define TC_RENAME_CHAIN		ip6tc_rename_chain
-+#define TC_SET_POLICY		ip6tc_set_policy
-+#define TC_GET_RAW_SOCKET	ip6tc_get_raw_socket
-+#define TC_INIT			ip6tc_init
-+#define TC_FREE			ip6tc_free
-+#define TC_COMMIT		ip6tc_commit
-+#define TC_STRERROR		ip6tc_strerror
-+#define TC_NUM_RULES		ip6tc_num_rules
-+#define TC_GET_RULE		ip6tc_get_rule
-+
-+#define TC_AF			AF_INET6
-+#define TC_IPPROTO		IPPROTO_IPV6
-+
-+#define SO_SET_REPLACE		IP6T_SO_SET_REPLACE
-+#define SO_SET_ADD_COUNTERS	IP6T_SO_SET_ADD_COUNTERS
-+#define SO_GET_INFO		IP6T_SO_GET_INFO
-+#define SO_GET_ENTRIES		IP6T_SO_GET_ENTRIES
-+#define SO_GET_VERSION		IP6T_SO_GET_VERSION
-+
-+#define STANDARD_TARGET		IP6T_STANDARD_TARGET
-+#define LABEL_RETURN		IP6TC_LABEL_RETURN
-+#define LABEL_ACCEPT		IP6TC_LABEL_ACCEPT
-+#define LABEL_DROP		IP6TC_LABEL_DROP
-+#define LABEL_QUEUE		IP6TC_LABEL_QUEUE
-+
-+#define ALIGN			IP6T_ALIGN
-+#define RETURN			IP6T_RETURN
-+
-+#include "libiptc.c"
-+
-+#define BIT6(a, l) \
-+ ((ntohl(a->in6_u.u6_addr32[(l) / 32]) >> (31 - ((l) & 31))) & 1)
-+
-+int
-+ipv6_prefix_length(const struct in6_addr *a)
-+{
-+	int l, i;
-+	for (l = 0; l < 128; l++) {
-+		if (BIT6(a, l) == 0)
-+			break;
+ 		return (-1);
+-	} else apcConnStatus = 0;
 +	}
-+	for (i = l + 1; i < 128; i++) {
-+		if (BIT6(a, i) == 1)
-+			return -1;
-+	}
-+	return l;
-+}
++	complain = 0;
+ 
+ 	if (net_send (sockfd, "status", 6) < 0)
+ 	{
+-		syslog (LOG_ERR, "apcups plugin: sending to the apcupsd failed: %s",
+-			net_errmsg);
++		syslog (LOG_ERR, "apcups plugin: Writing to the socket failed.");
+ 		return (-1);
+ 	}
+ 
+-<<<<<<< .mine
+-=======
+-	net_send (sockfd, "status", 6);
+-
+->>>>>>> .r743
+-	while ((n = net_recv (sockfd, recvline, sizeof (recvline))) > 0)
++ 	/* XXX: Do we read `n' or `n-1' bytes? */
++	while ((n = net_recv (sockfd, recvline, sizeof (recvline) - 1)) > 0)
+ 	{
+-		recvline[n-1] = '\0';
++		assert (n < sizeof (recvline));
++		recvline[n] = '\0';
+ #if APCMAIN
+-		printf ("net_recv = \"%s\"\n", recvline);
++		printf ("net_recv = `%s';\n", recvline);
+ #endif /* if APCMAIN */
+ 
+ 		tokptr = strtok (recvline, ":");
+ 		while (tokptr != NULL)
+ 		{
+ 			key = tokptr;
+ 			if ((tokptr = strtok (NULL, " \t")) == NULL)
+-				continue; 
++				continue;
++			value = atof (tokptr);
++			PRINT_VALUE (key, value);
+ 
+-			if (strncmp ("LINEV", key,5) == 0) {
+-				value = atof (tokptr);
+-				PRINT_VALUE (key, value);
++			if (strcmp ("LINEV", key) == 0)
+ 				apcups_detail->linev = value;
+-			} else if (strncmp ("BATTV", key,5) == 0) {
+-				value = atof (tokptr);
+-				PRINT_VALUE (key, value);
++			else if (strcmp ("BATTV", tokptr) == 0)
+ 				apcups_detail->battv = value;
+-			} else if (strncmp ("ITEMP", key,5) == 0) {
+-				value = atof (tokptr);
+-				PRINT_VALUE (key, value);
++			else if (strcmp ("ITEMP", tokptr) == 0)
+ 				apcups_detail->itemp = value;
+-			} else if (strncmp ("LOADPCT", key,7) == 0) {
+-				value = atof (tokptr);
+-				PRINT_VALUE (key, value);
++			else if (strcmp ("LOADPCT", tokptr) == 0)
+ 				apcups_detail->loadpct = value;
+-			} else if (strncmp ("BCHARGE", key,7) == 0) {
+-				value = atof (tokptr);
+-				PRINT_VALUE (key, value);
++			else if (strcmp ("BCHARGE", tokptr) == 0)
+ 				apcups_detail->bcharge = value;
+-			} else if (strncmp ("OUTPUTV", key,7) == 0) {
+-				value = atof (tokptr);
+-				PRINT_VALUE (key, value);
++			else if (strcmp ("OUTPUTV", tokptr) == 0)
+ 				apcups_detail->outputv = value;
+-			} else if (strncmp ("LINEFREQ", key,8) == 0) {
+-				value = atof (tokptr);
+-				PRINT_VALUE (key, value);
++			else if (strcmp ("LINEFREQ", tokptr) == 0)
+ 				apcups_detail->linefreq = value;
+-			} else if (strncmp ("TIMELEFT", key,8) == 0) {
+-				value = atof (tokptr);
+-				PRINT_VALUE (key, value);
++			else if (strcmp ("TIMELEFT", tokptr) == 0)
+ 				apcups_detail->timeleft = value;
+-			} 
++			else
++			{
++				syslog (LOG_WARNING, "apcups plugin: Received unknown property from apcupsd: `%s' = %f",
++						key, value);
++			}
+ 
+ 			tokptr = strtok (NULL, ":");
+ 		} /* while (tokptr != NULL) */
+ 	}
+ 
+-<<<<<<< .mine
+-	if (n < 0) {
+-	  syslog(LOG_ERR, "apcups plugin: Error recieving data: %s",
+-		 net_errmsg);
+-	  net_errmsg = NULL;
+-	  return(-1);
+-	}
+-=======
+ 	net_close (sockfd);
+ 
+ 	if (n < 0)
+ 	{
+ 		syslog (LOG_WARNING, "apcups plugin: Error reading from socket");
+ 		return (-1);
+ 	}
+->>>>>>> .r743
+ 
+-<<<<<<< .mine
+-	/* signal that we did in fact connect. */
+-	apcups_detail->connected = 1;
+-
+-	net_close(sockfd);
+-
+-=======
+->>>>>>> .r743
+ 	return (0);
+ }
+ 
+ #ifdef APCMAIN
+-<<<<<<< .mine
+ /*
+  * This is used for testing apcups in a standalone mode.
+  * Usefull for debugging.
+  */
+-int main(int argc, char **argv)
+-=======
+ int main (int argc, char **argv)
+->>>>>>> .r743
+ {
+ 	/* we are not really going to use this */
+ 	struct apc_detail_s apcups_detail;
+ 
+-<<<<<<< .mine
+-	openlog("apcups",LOG_PID | LOG_NDELAY | LOG_LOCAL1);
++	openlog ("apcups", LOG_PID | LOG_NDELAY | LOG_LOCAL1);
+ 
+-	if (!*host || strcmp(host, "0.0.0.0") == 0)
+-=======
+ 	if (!*host || strcmp (host, "0.0.0.0") == 0)
+->>>>>>> .r743
+ 		host = "localhost";
+ 
+-<<<<<<< .mine
+-	if(do_apc_status(host, port, &apcups_detail) < 0) {
++	if(do_apc_status (host, port, &apcups_detail) < 0)
++	{
+ 		printf("apcups: Failed...\n");
+ 		return(-1);
+ 	}
+-=======
 +
-+static int
-+dump_entry(struct ip6t_entry *e, const ip6tc_handle_t handle)
-+{
-+	size_t i;
-+	char buf[40];
-+	int len;
-+	struct ip6t_entry_target *t;
-+	
-+	printf("Entry %u (%lu):\n", iptcb_entry2index(handle, e),
-+	       iptcb_entry2offset(handle, e));
-+	puts("SRC IP: ");
-+	inet_ntop(AF_INET6, &e->ipv6.src, buf, sizeof buf);
-+	puts(buf);
-+	putchar('/');
-+	len = ipv6_prefix_length(&e->ipv6.smsk);
-+	if (len != -1)
-+		printf("%d", len);
-+	else {
-+		inet_ntop(AF_INET6, &e->ipv6.smsk, buf, sizeof buf);
-+		puts(buf);
-+	}
-+	putchar('\n');
-+	
-+	puts("DST IP: ");
-+	inet_ntop(AF_INET6, &e->ipv6.dst, buf, sizeof buf);
-+	puts(buf);
-+	putchar('/');
-+	len = ipv6_prefix_length(&e->ipv6.dmsk);
-+	if (len != -1)
-+		printf("%d", len);
-+	else {
-+		inet_ntop(AF_INET6, &e->ipv6.dmsk, buf, sizeof buf);
-+		puts(buf);
-+	}
-+	putchar('\n');
-+	
-+	printf("Interface: `%s'/", e->ipv6.iniface);
-+	for (i = 0; i < IFNAMSIZ; i++)
-+		printf("%c", e->ipv6.iniface_mask[i] ? 'X' : '.');
-+	printf("to `%s'/", e->ipv6.outiface);
-+	for (i = 0; i < IFNAMSIZ; i++)
-+		printf("%c", e->ipv6.outiface_mask[i] ? 'X' : '.');
-+	printf("\nProtocol: %u\n", e->ipv6.proto);
-+	if (e->ipv6.flags & IP6T_F_TOS)
-+		printf("TOS: %u\n", e->ipv6.tos);
-+	printf("Flags: %02X\n", e->ipv6.flags);
-+	printf("Invflags: %02X\n", e->ipv6.invflags);
-+	printf("Counters: %llu packets, %llu bytes\n",
-+	       (unsigned long long)e->counters.pcnt, (unsigned long long)e->counters.bcnt);
-+	printf("Cache: %08X ", e->nfcache);
-+	if (e->nfcache & NFC_ALTERED) printf("ALTERED ");
-+	if (e->nfcache & NFC_UNKNOWN) printf("UNKNOWN ");
-+	printf("\n");
-+	
-+	IP6T_MATCH_ITERATE(e, print_match);
-+
-+	t = ip6t_get_target(e);
-+	printf("Target name: `%s' [%u]\n", t->u.user.name, t->u.target_size);
-+	if (strcmp(t->u.user.name, IP6T_STANDARD_TARGET) == 0) {
-+		int pos = *(int *)t->data;
-+		if (pos < 0)
-+			printf("verdict=%s\n",
-+			       pos == -NF_ACCEPT-1 ? "NF_ACCEPT"
-+			       : pos == -NF_DROP-1 ? "NF_DROP"
-+			       : pos == IP6T_RETURN ? "RETURN"
-+			       : "UNKNOWN");
-+		else
-+			printf("verdict=%u\n", pos);
-+	} else if (strcmp(t->u.user.name, IP6T_ERROR_TARGET) == 0)
-+		printf("error=`%s'\n", t->data);
-+
-+	printf("\n");
-+	return 0;
-+}
-+
-+static unsigned char *
-+is_same(const STRUCT_ENTRY *a, const STRUCT_ENTRY *b,
-+	unsigned char *matchmask)
-+{
-+	unsigned int i;
-+	unsigned char *mptr;
-+
-+	/* Always compare head structures: ignore mask here. */
-+	if (memcmp(&a->ipv6.src, &b->ipv6.src, sizeof(struct in6_addr))
-+	    || memcmp(&a->ipv6.dst, &b->ipv6.dst, sizeof(struct in6_addr))
-+	    || memcmp(&a->ipv6.smsk, &b->ipv6.smsk, sizeof(struct in6_addr))
-+	    || memcmp(&a->ipv6.dmsk, &b->ipv6.dmsk, sizeof(struct in6_addr))
-+	    || a->ipv6.proto != b->ipv6.proto
-+	    || a->ipv6.tos != b->ipv6.tos
-+	    || a->ipv6.flags != b->ipv6.flags
-+	    || a->ipv6.invflags != b->ipv6.invflags)
-+		return NULL;
-+
-+	for (i = 0; i < IFNAMSIZ; i++) {
-+		if (a->ipv6.iniface_mask[i] != b->ipv6.iniface_mask[i])
-+			return NULL;
-+		if ((a->ipv6.iniface[i] & a->ipv6.iniface_mask[i])
-+		    != (b->ipv6.iniface[i] & b->ipv6.iniface_mask[i]))
-+			return NULL;
-+		if (a->ipv6.outiface_mask[i] != b->ipv6.outiface_mask[i])
-+			return NULL;
-+		if ((a->ipv6.outiface[i] & a->ipv6.outiface_mask[i])
-+		    != (b->ipv6.outiface[i] & b->ipv6.outiface_mask[i]))
-+			return NULL;
-+	}
-+
-+	if (a->nfcache != b->nfcache
-+	    || a->target_offset != b->target_offset
-+	    || a->next_offset != b->next_offset)
-+		return NULL;
-+
-+	mptr = matchmask + sizeof(STRUCT_ENTRY);
-+	if (IP6T_MATCH_ITERATE(a, match_different, a->elems, b->elems, &mptr))
-+		return NULL;
-+	mptr += IP6T_ALIGN(sizeof(struct ip6t_entry_target));
-+
-+	return mptr;
-+}
-+
-+/* All zeroes == unconditional rule. */
-+static inline int
-+unconditional(const struct ip6t_ip6 *ipv6)
-+{
-+	unsigned int i;
-+
-+	for (i = 0; i < sizeof(*ipv6); i++)
-+		if (((char *)ipv6)[i])
-+			break;
-+
-+	return (i == sizeof(*ipv6));
-+}
-+
-+#ifdef IPTC_DEBUG
-+/* Do every conceivable sanity check on the handle */
-+static void
-+do_check(TC_HANDLE_T h, unsigned int line)
-+{
-+	unsigned int i, n;
-+	unsigned int user_offset; /* Offset of first user chain */
-+	int was_return;
-+
-+	assert(h->changed == 0 || h->changed == 1);
-+	if (strcmp(h->info.name, "filter") == 0) {
-+		assert(h->info.valid_hooks
-+		       == (1 << NF_IP6_LOCAL_IN
-+			   | 1 << NF_IP6_FORWARD
-+			   | 1 << NF_IP6_LOCAL_OUT));
-+
-+		/* Hooks should be first three */
-+		assert(h->info.hook_entry[NF_IP6_LOCAL_IN] == 0);
-+
-+		n = get_chain_end(h, 0);
-+		n += get_entry(h, n)->next_offset;
-+		assert(h->info.hook_entry[NF_IP6_FORWARD] == n);
-+
-+		n = get_chain_end(h, n);
-+		n += get_entry(h, n)->next_offset;
-+		assert(h->info.hook_entry[NF_IP6_LOCAL_OUT] == n);
-+
-+		user_offset = h->info.hook_entry[NF_IP6_LOCAL_OUT];
-+	} else if (strcmp(h->info.name, "nat") == 0) {
-+		assert((h->info.valid_hooks
-+			== (1 << NF_IP6_PRE_ROUTING
-+			    | 1 << NF_IP6_LOCAL_OUT
-+			    | 1 << NF_IP6_POST_ROUTING)) ||
-+		       (h->info.valid_hooks
-+			== (1 << NF_IP6_PRE_ROUTING
-+			    | 1 << NF_IP6_LOCAL_IN
-+			    | 1 << NF_IP6_LOCAL_OUT
-+			    | 1 << NF_IP6_POST_ROUTING)));
-+
-+		assert(h->info.hook_entry[NF_IP6_PRE_ROUTING] == 0);
-+
-+		n = get_chain_end(h, 0);
-+
-+		n += get_entry(h, n)->next_offset;
-+		assert(h->info.hook_entry[NF_IP6_POST_ROUTING] == n);
-+		n = get_chain_end(h, n);
-+
-+		n += get_entry(h, n)->next_offset;
-+		assert(h->info.hook_entry[NF_IP6_LOCAL_OUT] == n);
-+		user_offset = h->info.hook_entry[NF_IP6_LOCAL_OUT];
-+
-+		if (h->info.valid_hooks & (1 << NF_IP6_LOCAL_IN)) {
-+			n = get_chain_end(h, n);
-+			n += get_entry(h, n)->next_offset;
-+			assert(h->info.hook_entry[NF_IP6_LOCAL_IN] == n);
-+			user_offset = h->info.hook_entry[NF_IP6_LOCAL_IN];
-+		}
-+
-+	} else if (strcmp(h->info.name, "mangle") == 0) {
-+		/* This code is getting ugly because linux < 2.4.18-pre6 had
-+		 * two mangle hooks, linux >= 2.4.18-pre6 has five mangle hooks
-+		 * */
-+		assert((h->info.valid_hooks
-+			== (1 << NF_IP6_PRE_ROUTING
-+			    | 1 << NF_IP6_LOCAL_OUT)) ||
-+		       (h->info.valid_hooks
-+			== (1 << NF_IP6_PRE_ROUTING
-+			    | 1 << NF_IP6_LOCAL_IN
-+			    | 1 << NF_IP6_FORWARD
-+			    | 1 << NF_IP6_LOCAL_OUT
-+			    | 1 << NF_IP6_POST_ROUTING)));
-+
-+		/* Hooks should be first five */
-+		assert(h->info.hook_entry[NF_IP6_PRE_ROUTING] == 0);
-+
-+		n = get_chain_end(h, 0);
-+
-+		if (h->info.valid_hooks & (1 << NF_IP6_LOCAL_IN)) {
-+			n += get_entry(h, n)->next_offset;
-+			assert(h->info.hook_entry[NF_IP6_LOCAL_IN] == n);
-+			n = get_chain_end(h, n);
-+		}
-+
-+		if (h->info.valid_hooks & (1 << NF_IP6_FORWARD)) {
-+			n += get_entry(h, n)->next_offset;
-+			assert(h->info.hook_entry[NF_IP6_FORWARD] == n);
-+			n = get_chain_end(h, n);
-+		}
-+
-+		n += get_entry(h, n)->next_offset;
-+		assert(h->info.hook_entry[NF_IP6_LOCAL_OUT] == n);
-+		user_offset = h->info.hook_entry[NF_IP6_LOCAL_OUT];
-+
-+		if (h->info.valid_hooks & (1 << NF_IP6_POST_ROUTING)) {
-+			n = get_chain_end(h, n);
-+			n += get_entry(h, n)->next_offset;
-+			assert(h->info.hook_entry[NF_IP6_POST_ROUTING] == n);
-+			user_offset = h->info.hook_entry[NF_IP6_POST_ROUTING];
-+		}
-+	} else if (strcmp(h->info.name, "raw") == 0) {
-+		assert(h->info.valid_hooks
-+		       == (1 << NF_IP6_PRE_ROUTING
-+			   | 1 << NF_IP6_LOCAL_OUT));
-+
-+		/* Hooks should be first three */
-+		assert(h->info.hook_entry[NF_IP6_PRE_ROUTING] == 0);
-+
-+		n = get_chain_end(h, n);
-+		n += get_entry(h, n)->next_offset;
-+		assert(h->info.hook_entry[NF_IP6_LOCAL_OUT] == n);
-+
-+		user_offset = h->info.hook_entry[NF_IP6_LOCAL_OUT];
-+	} else {
-+                fprintf(stderr, "Unknown table `%s'\n", h->info.name);
-+		abort();
-+	}
-+
-+	/* User chain == end of last builtin + policy entry */
-+	user_offset = get_chain_end(h, user_offset);
-+	user_offset += get_entry(h, user_offset)->next_offset;
-+
-+	/* Overflows should be end of entry chains, and unconditional
-+           policy nodes. */
-+	for (i = 0; i < NUMHOOKS; i++) {
-+		STRUCT_ENTRY *e;
-+		STRUCT_STANDARD_TARGET *t;
-+
-+		if (!(h->info.valid_hooks & (1 << i)))
-+			continue;
-+		assert(h->info.underflow[i]
-+		       == get_chain_end(h, h->info.hook_entry[i]));
-+
-+		e = get_entry(h, get_chain_end(h, h->info.hook_entry[i]));
-+		assert(unconditional(&e->ipv6));
-+		assert(e->target_offset == sizeof(*e));
-+		t = (STRUCT_STANDARD_TARGET *)GET_TARGET(e);
-+		printf("target_size=%u, align=%u\n",
-+			t->target.u.target_size, ALIGN(sizeof(*t)));
-+		assert(t->target.u.target_size == ALIGN(sizeof(*t)));
-+		assert(e->next_offset == sizeof(*e) + ALIGN(sizeof(*t)));
-+
-+		assert(strcmp(t->target.u.user.name, STANDARD_TARGET)==0);
-+		assert(t->verdict == -NF_DROP-1 || t->verdict == -NF_ACCEPT-1);
-+
-+		/* Hooks and underflows must be valid entries */
-+		iptcb_entry2index(h, get_entry(h, h->info.hook_entry[i]));
-+		iptcb_entry2index(h, get_entry(h, h->info.underflow[i]));
-+	}
-+
-+	assert(h->info.size
-+	       >= h->info.num_entries * (sizeof(STRUCT_ENTRY)
-+					 +sizeof(STRUCT_STANDARD_TARGET)));
-+
-+	assert(h->entries.size
-+	       >= (h->new_number
-+		   * (sizeof(STRUCT_ENTRY)
-+		      + sizeof(STRUCT_STANDARD_TARGET))));
-+	assert(strcmp(h->info.name, h->entries.name) == 0);
-+
-+	i = 0; n = 0;
-+	was_return = 0;
-+
-+#if 0
-+	/* Check all the entries. */
-+	ENTRY_ITERATE(h->entries.entrytable, h->entries.size,
-+		      check_entry, &i, &n, user_offset, &was_return, h);
-+
-+	assert(i == h->new_number);
-+	assert(n == h->entries.size);
-+
-+	/* Final entry must be error node */
-+	assert(strcmp(GET_TARGET(index2entry(h, h->new_number-1))
-+		      ->u.user.name,
-+		      ERROR_TARGET) == 0);
-+#endif
-+}
-+#endif /*IPTC_DEBUG*/
+ 	apc_query_server (global_host, global_port, &apcups_detail);
+->>>>>>> .r743
+ 
+ 	return 0;
+ }
+ #else
+ static int apcups_config (char *key, char *value)
+ {
+-<<<<<<< .mine
+-  static char lhost[126];
+-  
+-  if (strcasecmp (key, "host") == 0)
+-    {
+-      lhost[0] = '\0';
+-      strcpy(lhost,key);
+-      host = lhost;
+-    }
+-  else if (strcasecmp (key, "Port") == 0)
+-    {
+-      int port_tmp = atoi (value);
+-      if(port_tmp < 1 || port_tmp > 65535) {
+-	syslog (LOG_WARNING, "apcups: `port' failed: %s",
+-		value);
+-	return (1);
+-      } else {
+-	port = port_tmp;
+-      }
+-    }
+-  else
+-    {
+-      return (-1);
+-    }
+-
+-  if (strcmp(host, "0.0.0.0") == 0)
+-	host = "localhost";
+-
+-  return(0);
+-=======
+ 	if (strcasecmp (key, "host") == 0)
+ 	{
+ 		if (global_host != NULL)

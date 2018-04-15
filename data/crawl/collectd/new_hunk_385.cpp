@@ -1,9 +1,7 @@
-  if (fh == NULL)
-  {
-    char errbuf[1024];
-    fprintf (stderr, "Failed to open types database `%s': %s.\n",
-	file, sstrerror (errno, errbuf, sizeof (errbuf)));
-    ERROR ("Failed to open types database `%s': %s",
-	file, sstrerror (errno, errbuf, sizeof (errbuf)));
-    return (-1);
-  }
+		{
+			if (parse_option (&vl, fields[i]) != 0)
+			{
+				fprintf (fh, "-1 Error parsing option `%s'\n",
+						fields[i]);
+				break;
+			}

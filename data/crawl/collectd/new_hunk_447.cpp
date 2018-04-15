@@ -1,7 +1,17 @@
-  if (strlen (n->type_instance) > 0)
-    fprintf (fh, "TypeInstance: %s\n", n->type_instance);
 
-  fprintf (fh, "\n%s\n", n->message);
+	pthread_mutex_lock (&cache_lock);
 
-  fflush (fh);
-  fclose (fh);
+	DEBUG ("vc = cache_search (%s)", name);
+	vc = cache_search (name);
+
+	if (vc == NULL)
+	{
+		DEBUG ("Did not find cache entry.");
+		fprintf (fh, "-1 No such value");
+	}
+	else
+	{
+		DEBUG ("Found cache entry.");
+		fprintf (fh, "%i", vc->values_num);
+		for (i = 0; i < vc->values_num; i++)
+		{

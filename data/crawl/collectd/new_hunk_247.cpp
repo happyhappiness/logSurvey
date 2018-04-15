@@ -1,8 +1,9 @@
-			continue;
-		}
+#endif	
+}
 
-		/* skip over the (empty) hostname and following '/' */
-		printf ("\t%s\n", id + 1);
-	}
+void cpy_log_exception(const char *context);
 
-	if (ret_ident != NULL)
+/* Python object declarations. */
+
+typedef struct {
+	PyObject_HEAD        /* No semicolon! */

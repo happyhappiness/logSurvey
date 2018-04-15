@@ -1,15 +1,14 @@
-  } while (0)
+		PyErr_SetString(PyExc_TypeError, "Cannot delete this attribute");
+		return -1;
+	}
+	new = PyString_AsString(value);
+	if (new == NULL) return -1;
+	old = ((char *) self) + (intptr_t) data;
+	sstrncpy(old, new, NOTIF_MAX_MSG_LEN);
+	return 0;
+}
 
-  status = lcc_listval (c, &ret_ident, &ret_ident_num);
-  if (status != 0)
-    BAIL_OUT (status);
-
-  for (i = 0; i < ret_ident_num; ++i) {
-    char id[1024];
-
-    status = lcc_identifier_to_string (c, id, sizeof (id), ret_ident + i);
-    if (status != 0) {
-      fprintf (stderr, "ERROR: listval: Failed to convert returned "
-          "identifier to a string.\n");
-      continue;
-    }
+static PyObject *Notification_repr(PyObject *s) {
+	PyObject *ret;
+	Notification *self = (Notification *) s;
+	

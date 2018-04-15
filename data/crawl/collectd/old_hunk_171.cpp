@@ -1,14 +1,13 @@
-	new_values = (gauge_t *)calloc (match_ds_num_g, sizeof (*new_values));
-	if (new_values == NULL)
-	{
-		fprintf (stderr, "malloc failed: %s\n", strerror (errno));
-		return (RET_UNKNOWN);
-	}
+			NULL, &plugin, NULL, &host, &time, &interval, &meta))
+		return NULL;
 
-	new_names = (char **)calloc (match_ds_num_g, sizeof (*new_names));
-	if (new_names == NULL)
-	{
-		fprintf (stderr, "malloc failed: %s\n", strerror (errno));
-		free (new_values);
-		return (RET_UNKNOWN);
+	if (type[0] == 0) {
+		PyErr_SetString(PyExc_RuntimeError, "type not set");
+		return NULL;
 	}
+	ds = plugin_get_ds(type);
+	if (ds == NULL) {
+		PyErr_Format(PyExc_TypeError, "Dataset %s not found", type);
+		return NULL;
+	}
+	if (values == NULL || (PyTuple_Check(values) == 0 && PyList_Check(values) == 0)) {

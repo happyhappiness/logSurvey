@@ -1,121 +1,195 @@
-  }
+	0,                         /* tp_alloc */
+	Values_new                 /* tp_new */
+};
 
-  return count;
-} /* count_chars */
+static char severity_doc[] = "The severity of this notification. Assign or compare to\n"
+		"NOTIF_FAILURE, NOTIF_WARNING or NOTIF_OKAY.";
 
-static int flush (const char *address, int argc, char **argv)
-{
-  lcc_connection_t *connection;
+static char message_doc[] = "Some kind of description what's going on and why this Notification was generated.";
 
-  lcc_identifier_t  ident;
-  lcc_identifier_t *identp = NULL;
+static char Notification_doc[] = "The Notification class is a wrapper around the collectd notification.\n"
+		"It can be used to notify other plugins about bad stuff happening. It works\n"
+		"similar to Values but has a severity and a message instead of interval\n"
+		"and time.\n"
+		"Notifications can be dispatched at any time and can be received with register_notification.";
 
-  char *plugin  = NULL;
-  int   timeout = -1;
+static int Notification_init(PyObject *s, PyObject *args, PyObject *kwds) {
+	Notification *self = (Notification *) s;
+	PyObject *tmp;
+	int severity = 0, ret;
+	double time = 0;
+	const char *message = "";
+	const char *type = "", *plugin_instance = "", *type_instance = "", *plugin = "", *host = "";
+	static char *kwlist[] = {"type", "message", "plugin_instance", "type_instance",
+			"plugin", "host", "time", "severity", NULL};
+	
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "|ssssssdi", kwlist,
+			&type, &message, &plugin_instance, &type_instance,
+			&plugin, &host, &time, &severity))
+		return -1;
+	
+	tmp = Py_BuildValue("sssssd", type, plugin_instance, type_instance, plugin, host, time);
+	if (tmp == NULL)
+		return -1;
+	ret = PluginDataType.tp_init(s, tmp, NULL);
+	Py_DECREF(tmp);
+	if (ret != 0)
+		return -1;
+	
+	sstrncpy(self->message, message, sizeof(self->message));
+	self->severity = severity;
+	return 0;
+}
 
-  int status;
-  int i;
+static PyObject *Notification_dispatch(Notification *self, PyObject *args, PyObject *kwds) {
+	int ret;
+	const data_set_t *ds;
+	notification_t notification;
+	double t = self->data.time;
+	int severity = self->severity;
+	const char *host = self->data.host;
+	const char *plugin = self->data.plugin;
+	const char *plugin_instance = self->data.plugin_instance;
+	const char *type = self->data.type;
+	const char *type_instance = self->data.type_instance;
+	const char *message = self->message;
+	
+	static char *kwlist[] = {"type", "message", "plugin_instance", "type_instance",
+			"plugin", "host", "time", "severity", NULL};
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "|ssssssdi", kwlist,
+			&type, &message, &plugin_instance, &type_instance,
+			&plugin, &host, &t, &severity))
+		return NULL;
 
-  assert (strcasecmp (argv[0], "flush") == 0);
+	if (type[0] == 0) {
+		PyErr_SetString(PyExc_RuntimeError, "type not set");
+		return NULL;
+	}
+	ds = plugin_get_ds(type);
+	if (ds == NULL) {
+		PyErr_Format(PyExc_TypeError, "Dataset %s not found", type);
+		return NULL;
+	}
 
-  connection = NULL;
-  status = lcc_connect (address, &connection);
-  if (status != 0) {
-    fprintf (stderr, "ERROR: Failed to connect to daemon at %s: %s.\n",
-        address, strerror (errno));
-    return (1);
-  }
+	notification.time = t;
+	notification.severity = severity;
+	sstrncpy(notification.message, message, sizeof(notification.message));
+	sstrncpy(notification.host, host, sizeof(notification.host));
+	sstrncpy(notification.plugin, plugin, sizeof(notification.plugin));
+	sstrncpy(notification.plugin_instance, plugin_instance, sizeof(notification.plugin_instance));
+	sstrncpy(notification.type, type, sizeof(notification.type));
+	sstrncpy(notification.type_instance, type_instance, sizeof(notification.type_instance));
+	notification.meta = NULL;
+	if (notification.time < 1)
+		notification.time = time(0);
+	if (notification.host[0] == 0)
+		sstrncpy(notification.host, hostname_g, sizeof(notification.host));
+	if (notification.plugin[0] == 0)
+		sstrncpy(notification.plugin, "python", sizeof(notification.plugin));
+	Py_BEGIN_ALLOW_THREADS;
+	ret = plugin_dispatch_notification(&notification);
+	Py_END_ALLOW_THREADS;
+	if (ret != 0) {
+		PyErr_SetString(PyExc_RuntimeError, "error dispatching notification, read the logs");
+		return NULL;
+	}
+	Py_RETURN_NONE;
+}
 
-  for (i = 1; i < argc; ++i) {
-    char *key, *value;
+static PyObject *Notification_new(PyTypeObject *type, PyObject *args, PyObject *kwds) {
+	Notification *self;
+	
+	self = (Notification *) PluginData_new(type, args, kwds);
+	if (self == NULL)
+		return NULL;
+	
+	self->message[0] = 0;
+	self->severity = 0;
+	return (PyObject *) self;
+}
 
-    key   = argv[i];
-    value = strchr (argv[i], (int)'=');
+static int Notification_setstring(PyObject *self, PyObject *value, void *data) {
+	char *old;
+	const char *new;
+	
+	if (value == NULL) {
+		PyErr_SetString(PyExc_TypeError, "Cannot delete this attribute");
+		return -1;
+	}
+	new = PyString_AsString(value);
+	if (new == NULL) return -1;
+	old = ((char *) self) + (int) data;
+	sstrncpy(old, new, NOTIF_MAX_MSG_LEN);
+	return 0;
+}
 
-    if (! value) {
-      fprintf (stderr, "ERROR: Invalid option ``%s''.\n", argv[i]);
-      return (-1);
-    }
+static PyObject *Notification_repr(PyObject *s) {
+	PyObject *ret;
+	Notification *self = (Notification *) s;
+	
+	ret = PyString_FromFormat("collectd.Values(type='%s%s%s%s%s%s%s%s%s%s%s',time=%lu,interval=%i)", self->data.type,
+			*self->data.type_instance ? "',type_instance='" : "", self->data.type_instance,
+			*self->data.plugin ? "',plugin='" : "", self->data.plugin,
+			*self->data.plugin_instance ? "',plugin_instance='" : "", self->data.plugin_instance,
+			*self->data.host ? "',host='" : "", self->data.host,
+			*self->message ? "',message='" : "", self->message,
+			(long unsigned) self->data.time, self->severity);
+	return ret;
+}
 
-    *value = '\0';
-    ++value;
+static PyMethodDef Notification_methods[] = {
+	{"dispatch", (PyCFunction) Notification_dispatch, METH_VARARGS | METH_KEYWORDS, dispatch_doc},
+	{NULL}
+};
 
-    if (strcasecmp (key, "timeout") == 0) {
-      char *endptr = NULL;
+static PyMemberDef Notification_members[] = {
+	{"severity", T_INT, offsetof(Notification, severity), 0, severity_doc},
+	{NULL}
+};
 
-      timeout = strtol (value, &endptr, 0);
+static PyGetSetDef Notification_getseters[] = {
+	{"message", PluginData_getstring, Notification_setstring, message_doc, (void *) offsetof(Notification, message)},
+	{NULL}
+};
 
-      if (endptr == value) {
-        fprintf (stderr, "ERROR: Failed to parse timeout as number: %s.\n",
-            value);
-        return (-1);
-      }
-      else if ((endptr != NULL) && (*endptr != '\0')) {
-        fprintf (stderr, "WARNING: Ignoring trailing garbage after timeout: "
-            "%s.\n", endptr);
-      }
-    }
-    else if (strcasecmp (key, "plugin") == 0) {
-      plugin = value;
-    }
-    else if (strcasecmp (key, "identifier") == 0) {
-      char hostname[1024];
-      char ident_str[1024] = "";
-      int  n_slashes;
-
-      n_slashes = count_chars (value, '/');
-      if (n_slashes == 1) {
-        /* The user has omitted the hostname part of the identifier
-         * (there is only one '/' in the identifier)
-         * Let's add the local hostname */
-        if (gethostname (hostname, sizeof (hostname)) != 0) {
-          fprintf (stderr, "ERROR: Failed to get local hostname: %s",
-              strerror (errno));
-          return (-1);
-        }
-        hostname[sizeof (hostname) - 1] = '\0';
-
-        snprintf (ident_str, sizeof (ident_str), "%s/%s", hostname, value);
-        ident_str[sizeof(ident_str) - 1] = '\0';
-      }
-      else {
-        strncpy (ident_str, value, sizeof (ident_str));
-        ident_str[sizeof (ident_str) - 1] = '\0';
-      }
-
-      status = lcc_string_to_identifier (connection, &ident, ident_str);
-      if (status != 0) {
-        fprintf (stderr, "ERROR: Failed to parse identifier ``%s'': %s.\n",
-            ident_str, lcc_strerror(connection));
-        LCC_DESTROY (connection);
-        return (-1);
-      }
-      identp = &ident;
-    }
-  }
-
-  status = lcc_flush (connection, plugin, identp, timeout);
-  if (status != 0) {
-    fprintf (stderr, "ERROR: Flushing failed: %s.\n",
-        lcc_strerror (connection));
-    LCC_DESTROY (connection);
-    return (-1);
-  }
-
-  LCC_DESTROY (connection);
-
-  return 0;
-} /* flush */
-
-int main (int argc, char **argv) {
-  char address[1024] = "unix:"DEFAULT_SOCK;
-
-  int status;
-
-  while (42) {
-    int c;
-
-    c = getopt (argc, argv, "s:h");
-
-    if (c == -1)
-      break;
+PyTypeObject NotificationType = {
+	PyObject_HEAD_INIT(NULL)
+	0,                         /* Always 0 */
+	"collectd.Notification",   /* tp_name */
+	sizeof(Notification),      /* tp_basicsize */
+	0,                         /* Will be filled in later */
+	0,                         /* tp_dealloc */
+	0,                         /* tp_print */
+	0,                         /* tp_getattr */
+	0,                         /* tp_setattr */
+	0,                         /* tp_compare */
+	Notification_repr,         /* tp_repr */
+	0,                         /* tp_as_number */
+	0,                         /* tp_as_sequence */
+	0,                         /* tp_as_mapping */
+	0,                         /* tp_hash */
+	0,                         /* tp_call */
+	0,                         /* tp_str */
+	0,                         /* tp_getattro */
+	0,                         /* tp_setattro */
+	0,                         /* tp_as_buffer */
+	Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE, /*tp_flags*/
+	Notification_doc,          /* tp_doc */
+	0,                         /* tp_traverse */
+	0,                         /* tp_clear */
+	0,                         /* tp_richcompare */
+	0,                         /* tp_weaklistoffset */
+	0,                         /* tp_iter */
+	0,                         /* tp_iternext */
+	Notification_methods,      /* tp_methods */
+	Notification_members,      /* tp_members */
+	Notification_getseters,    /* tp_getset */
+	0,                         /* tp_base */
+	0,                         /* tp_dict */
+	0,                         /* tp_descr_get */
+	0,                         /* tp_descr_set */
+	0,                         /* tp_dictoffset */
+	Notification_init,         /* tp_init */
+	0,                         /* tp_alloc */
+	Notification_new           /* tp_new */
+};

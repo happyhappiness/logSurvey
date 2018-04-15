@@ -1,14 +1,6 @@
-        return 1;
-}
+  return (ret);
+} /* oconfig_item_t *oconfig_parse_file */
 
-# This function is called when plugin_log () has been used.
-sub monitorus_log
+void oconfig_free (oconfig_item_t *ci)
 {
-        my $level = shift;
-        my $msg   = shift;
-
-        print "LOG: $level - $msg\n";
-        return 1;
-} # monitorus_log ()
-
-1;
+  int i;

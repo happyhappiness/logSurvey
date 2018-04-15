@@ -1,12 +1,17 @@
-#define OK(cond) OK1(cond, #cond)
-
-#define EXPECT_EQ_STR(expect, actual) do { \
-  if (strcmp (expect, actual) != 0) { \
-    printf ("not ok %i - %s = \"%s\", want \"%s\"\n", \
-        ++check_count__, #actual, actual, expect); \
-    return (-1); \
-  } \
-  printf ("ok %i - %s = \"%s\"\n", ++check_count__, #actual, actual); \
-} while (0)
-
-#define EXPECT_EQ_INT(expect, actual) do { \
+	cpy_callback_t *c = NULL;
+	user_data_t *user_data = NULL;
+	double interval = 0;
+	const char *name = NULL;
+	PyObject *callback = NULL, *data = NULL;
+	struct timespec ts;
+	static char *kwlist[] = {"callback", "interval", "data", "name", NULL};
+	
+	if (PyArg_ParseTupleAndKeywords(args, kwds, "O|dOet", kwlist, &callback, &interval, &data, NULL, &name) == 0) return NULL;
+	if (PyCallable_Check(callback) == 0) {
+		PyErr_SetString(PyExc_TypeError, "callback needs a be a callable object.");
+		return NULL;
+	}
+	cpy_build_name(buf, sizeof(buf), callback, name);
+	
+	Py_INCREF(callback);
+	Py_XINCREF(data);

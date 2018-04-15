@@ -1,35 +1,31 @@
-			num_okay++;
 	}
 
-	printf ("%i critical, %i warning, %i okay",
-			num_critical, num_warning, num_okay);
-	if (values_num > 0)
+	if (total_num == 0)
 	{
-		printf (" |");
-		for (i = 0; i < values_num; i++)
-			printf (" %s=%lf;;;;", values_names[i], values[i]);
-	}
-	printf ("\n");
-
-	if ((num_critical != 0) || (values_num == 0))
-		return (RET_CRITICAL);
-	else if (num_warning != 0)
+		printf ("WARNING: No defined values found\n");
 		return (RET_WARNING);
+	}
 
-	return (RET_OKAY);
-} /* int do_check_con_none */
-
-int do_check_con_average (int values_num, double *values, char **values_names)
-{
-	int i;
-	double total;
-	int total_num;
-	double average;
-
-	total = 0.0;
-	total_num = 0;
-	for (i = 0; i < values_num; i++)
+	if (match_range (&range_critical_g, total / total_num) != 0)
 	{
-		if (!isnan (values[i]))
-		{
-			total += values[i];
+		printf ("CRITICAL: Average = %lf\n",
+				(double) (total / total_num));
+		return (RET_CRITICAL);
+	}
+	else if (match_range (&range_warning_g, total / total_num) != 0)
+	{
+		printf ("WARNING: Average = %lf\n",
+				(double) (total / total_num));
+		return (RET_WARNING);
+	}
+	else
+	{
+		printf ("OKAY: Average = %lf\n",
+				(double) (total / total_num));
+		return (RET_OKAY);
+	}
+
+	return (RET_UNKNOWN);
+} /* int do_check_con_average */
+
+int do_check_con_sum (int values_num, double *values, char **values_names)

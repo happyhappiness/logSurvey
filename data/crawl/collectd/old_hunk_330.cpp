@@ -1,14 +1,6 @@
-		PyErr_SetString(PyExc_TypeError, "Cannot delete this attribute");
-		return -1;
-	}
-	new = PyString_AsString(value);
-	if (new == NULL) return -1;
-	old = ((char *) self) + (intptr_t) data;
-	sstrncpy(old, new, NOTIF_MAX_MSG_LEN);
-	return 0;
-}
+        CB_TYPE_SHUTDOWN));
+} /* }}} jint cjni_api_register_shutdown */
 
-static PyObject *Notification_repr(PyObject *s) {
-	PyObject *ret;
-	Notification *self = (Notification *) s;
-	
+/* List of ``native'' functions, i. e. C-functions that can be called from
+ * Java. */
+static JNINativeMethod jni_api_functions[] = /* {{{ */

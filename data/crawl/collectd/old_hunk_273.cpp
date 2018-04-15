@@ -1,8 +1,14 @@
-  }
+        return 1;
+}
 
-  return 0;
-} /* flush */
+# This function is called when plugin_log () has been used.
+sub monitorus_log
+{
+        my $level = shift;
+        my $msg   = shift;
 
-int main (int argc, char **argv) {
-  char address[1024] = "unix:"DEFAULT_SOCK;
+        print "LOG: $level - $msg\n";
+        return 1;
+} # monitorus_log ()
 
+1;

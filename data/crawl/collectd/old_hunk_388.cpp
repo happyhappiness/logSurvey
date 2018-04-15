@@ -1,6 +1,10 @@
-        CB_TYPE_SHUTDOWN));
-} /* }}} jint cjni_api_register_shutdown */
+  else if (n->severity == NOTIF_OKAY)
+    severity = "OKAY";
 
-/* List of ``native'' functions, i. e. C-functions that can be called from
- * Java. */
-static JNINativeMethod jni_api_functions[] = /* {{{ */
+  fprintf (fh, "Severity: %s\n"
+      "Time: %u\n"
+      "Message: %s\n",
+      severity, (unsigned int) n->time, n->message);
+
+  /* Print the optional fields */
+  if (strlen (n->host) > 0)

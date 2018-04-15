@@ -1,8 +1,19 @@
-  }
-  size = (size_t)PySequence_Length(values);
-  if (size != ds->ds_num) {
-    PyErr_Format(PyExc_RuntimeError,
-                 "type %s needs %" PRIsz " values, got %" PRIsz,
-                 value_list.type, ds->ds_num, size);
-    return NULL;
-  }
+	;
+
+%%
+static void yyerror(const char *s)
+{
+	const char *text;
+
+	if (yytext == NULL)
+		text = "<empty>";
+	else if (*yytext == '\n')
+		text = "<newline>";
+	else
+		text = yytext;
+
+	fprintf(stderr, "Parse error in file `%s', line %i near `%s': %s\n",
+		c_file, yylineno, text, s);
+} /* int yyerror */
+
+static char *unquote (const char *orig)

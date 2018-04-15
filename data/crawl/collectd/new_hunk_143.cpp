@@ -1,25 +1,15 @@
-	va_end (ap);
-} /* void cmd_error */
+  } while (0)
 
-cmd_status_t cmd_parsev (size_t argc, char **argv,
-		cmd_t *ret_cmd, cmd_error_handler_t *err)
+#define print_to_socket(fh, ...) \
+  do { \
+    if (fprintf (fh, __VA_ARGS__) < 0) { \
+      char errbuf[1024]; \
+      WARNING ("handle_listval: failed to write to socket #%i: %s", \
+          fileno (fh), sstrerror (errno, errbuf, sizeof (errbuf))); \
+      free_everything_and_return (-1); \
+    } \
+    fflush(fh); \
+  } while (0);
+
+int handle_listval (FILE *fh, char *buffer)
 {
-	char *command = NULL;
-
-	if ((argc < 1) || (argv == NULL) || (ret_cmd == NULL))
-	{
-		errno = EINVAL;
-		cmd_error (CMD_ERROR, err, "Missing command.");
-		return CMD_ERROR;
-	}
-
-	memset (ret_cmd, 0, sizeof (*ret_cmd));
-	command = argv[0];
-	if (strcasecmp ("PUTVAL", command) == 0)
-	{
-		ret_cmd->type = CMD_PUTVAL;
-		return cmd_parse_putval (argc - 1, argv + 1,
-				&ret_cmd->cmd.putval, err);
-	}
-	else
-	{

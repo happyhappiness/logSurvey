@@ -1,6 +1,7 @@
+		return (NULL);
+	}
 
-=back
+	fprintf (stderr, "cf_read_generic (path = %s, depth = %i);", path, depth);
 
-=head2 Plugin C<ntpd>
-
-=over 4
+	status = stat (path, &statbuf);
+	if (status != 0)

@@ -1,10 +1,13 @@
+ 	value_list_t vl = VALUE_LIST_INIT;
+ 	size_t i;
  
- #define print_to_socket(fh, ...)                                               \
-   if (fprintf(fh, __VA_ARGS__) < 0) {                                          \
--    char errbuf[1024];                                                         \
-     WARNING("handle_getthreshold: failed to write to socket #%i: %s",          \
--            fileno(fh), sstrerror(errno, errbuf, sizeof(errbuf)));             \
-+            fileno(fh), STRERRNO);                                             \
-     return -1;                                                                 \
-   }
- 
++	if ((ret_putval == NULL) || (opts == NULL))
++	{
++		errno = EINVAL;
++		cmd_error (CMD_ERROR, err, "Invalid arguments to cmd_parse_putval.");
++		return (CMD_ERROR);
++	}
++
+ 	if (argc < 2)
+ 	{
+ 		cmd_error (CMD_PARSE_ERROR, err,

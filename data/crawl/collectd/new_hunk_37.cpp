@@ -1,11 +1,6 @@
-#if COLLECT_DEBUG
-  case IPMI_LOG_DEBUG_START:
-  case IPMI_LOG_DEBUG:
-    DEBUG("ipmi plugin: %s", msg);
-    break;
-  case IPMI_LOG_DEBUG_CONT:
-  case IPMI_LOG_DEBUG_END:
-    DEBUG("%s", msg);
-    break;
-#else
-  case IPMI_LOG_DEBUG_START:
+  type = NULL;
+  type_instance = NULL;
+
+  ret_putval->raw_identifier = identifier_copy;
+  if (ret_putval->raw_identifier == NULL) {
+    cmd_error(CMD_ERROR, err, "malloc failed.");

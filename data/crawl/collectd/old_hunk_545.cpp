@@ -1,16 +1,19 @@
-		if (errsize)
-			regerr = smalloc(errsize);
-		/* get error message */
-		if (regerror(rcompile, regtemp, regerr, errsize))
-			syslog (LOG_ERR, "cannot compile regex %s: %i/%s",
-					entry, rcompile, regerr);
-		else
-			syslog (LOG_ERR, "cannot compile regex %s: %i",
-					entry, rcompile);
-		if (errsize)
-			sfree (regerr);
-		regfree (regtemp);
-		return (0);
+	 * Change directory. We do this _after_ reading the config and loading
+	 * modules to relative paths work as expected.
+	 */
+	if (change_basedir (datadir))
+	{
+		fprintf (stderr, "Error: Unable to change to directory `%s'.\n", datadir);
+		return (1);
 	}
-	DBG("regex compiled: %s - %i", entry, rcompile);
 
+	/*
+	 * fork off child
+	 */
+#if COLLECT_DAEMON
+	sigChldAction.sa_handler = SIG_IGN;
+	sigaction (SIGCHLD, &sigChldAction, NULL);
+
+	if (daemonize)
+	{
+		if ((pid = fork ()) == -1)

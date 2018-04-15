@@ -1,8 +1,7 @@
-	}
-
-	for (i = 0; i < values_num; i++)
-		if (!isnan (values[i]))
-			sum += values[i];
-
-	if (sum == 0.0)
-	{
+	CPY_LOCK_THREADS
+		if (PyImport_ImportModule("readline") == NULL) {
+			/* This interactive session will suck. */
+			PyErr_Print(); /* FIXME */
+		}
+		PyRun_InteractiveLoop(stdin, "<stdin>");
+	CPY_RELEASE_THREADS

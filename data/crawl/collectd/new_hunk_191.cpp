@@ -1,15 +1,20 @@
-  printf ("ok %i - %s evaluates to \"%s\"\n", ++check_count__, #actual, expect); \
-} while (0)
+	return (status_code);
+} /* int do_check_con_percentage */
 
-#define DBLEQ(expect, actual) do { \
-  if ((isnan (expect) && !isnan (actual)) || ((expect) != (actual))) {\
-    printf ("not ok %i - %s incorrect: expected %.15g, got %.15g\n", \
-        ++check_count__, #actual, expect, actual); \
-    return (-1); \
-  } \
-  printf ("ok %i - %s evaluates to %.15g\n", ++check_count__, #actual, expect); \
-} while (0)
+static int do_check (lcc_connection_t *connection)
+{
+	gauge_t *values;
+	char   **values_names;
+	size_t   values_num;
+	char ident_str[1024];
+	lcc_identifier_t ident;
+	size_t i;
+	int status;
 
-#define CHECK_NOT_NULL(expr) do { \
-  void *ptr_; \
-  ptr_ = (expr); \
+	snprintf (ident_str, sizeof (ident_str), "%s/%s",
+			hostname_g, value_string_g);
+	ident_str[sizeof (ident_str) - 1] = 0;
+
+	memset (&ident, 0, sizeof (ident));
+	status = lcc_string_to_identifier (connection, &ident, ident_str);
+	if (status != 0)

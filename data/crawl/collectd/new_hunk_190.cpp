@@ -1,45 +1,42 @@
-}
+	exit (1);
+} /* void usage */
 
-#if HAVE_REGEX_H
-static int ignorelist_append_regex(ignorelist_t *il, const char *re_str)
+static int do_listval (lcc_connection_t *connection)
 {
-	regex_t *re;
-	ignorelist_item_t *entry;
+	lcc_identifier_t *ret_ident = NULL;
+	size_t ret_ident_num = 0;
+
 	int status;
+	size_t i;
 
-	re = malloc (sizeof (*re));
-	if (re == NULL)
-	{
-		ERROR ("utils_ignorelist: malloc failed");
-		return (ENOMEM);
-	}
-	memset (re, 0, sizeof (*re));
-
-	status = regcomp (re, re_str, REG_EXTENDED);
-	if (status != 0)
-	{
-		char errbuf[1024] = "";
-		regerror (status, re, errbuf, sizeof (errbuf));
-		ERROR ("utils_ignorelist: regcomp failed: %s", errbuf);
-		regfree (re);
-		sfree (re);
-		return (status);
+	status = lcc_listval (connection, &ret_ident, &ret_ident_num);
+	if (status != 0) {
+		printf ("UNKNOWN: %s\n", lcc_strerror (connection));
+		if (ret_ident != NULL)
+			free (ret_ident);
+		return (RET_UNKNOWN);
 	}
 
-	entry = malloc (sizeof (*entry));
-	if (entry == NULL)
-	{
-		ERROR ("utils_ignorelist: malloc failed");
-		regfree (re);
-		sfree (re);
-		return (ENOMEM);
+	for (i = 0; i < ret_ident_num; ++i) {
+		char id[1024];
+
+		status = lcc_identifier_to_string (connection,
+				id, sizeof (id), ret_ident + i);
+		if (status != 0) {
+			printf ("ERROR: listval: Failed to convert returned "
+					"identifier to a string: %s\n",
+					lcc_strerror (connection));
+			continue;
+		}
+
+		printf ("%s\n", id);
 	}
-	memset (entry, 0, sizeof (*entry));
-	entry->rmatch = re;
 
-	ignorelist_append (il, entry);
-	return (0);
-} /* int ignorelist_append_regex */
-#endif
+	if (ret_ident != NULL)
+		free (ret_ident);
+	return (RET_OKAY);
+} /* int do_listval */
 
-static int ignorelist_append_string(ignorelist_t *il, const char *entry)
+static int do_check_con_none (size_t values_num,
+		double *values, char **values_names)
+{

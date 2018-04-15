@@ -1,8 +1,9 @@
-	 if (strcmp ($1.key, $2) != 0)
-	 {
-		printf ("block_begin = %s; block_end = %s;\n", $1.key, $2);
-		yyerror ("Block not closed..\n");
-		exit (1);
-	 }
-	 free ($2); $2 = NULL;
-	 $$ = $1;
+  }
+
+  if (fh == NULL) {
+    char errbuf[1024];
+    fprintf(stderr, "log_logstash plugin: fopen (%s) failed: %s\n", log_file,
+            sstrerror(errno, errbuf, sizeof(errbuf)));
+  } else {
+    fprintf(fh, "%s\n", buf);
+    if (do_close) {

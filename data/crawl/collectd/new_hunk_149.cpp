@@ -1,11 +1,10 @@
-		sstrncpy (vl.type_instance, type_instance, sizeof (vl.type_instance));
+ *   Florian octo Forster <octo at collectd.org>
+ */
 
-	ds = plugin_get_ds (type);
-	if (ds == NULL)
-	{
-		cmd_error (CMD_PARSE_ERROR, err, "1 Type `%s' isn't defined.", type);
-		sfree (identifier_copy);
-		return (CMD_PARSE_ERROR);
-	}
+#include "tests/macros.h"
+#include "collectd.h"
+#include "utils_avltree.h"
 
-	/* Free identifier_copy */
+static int compare_total_count = 0;
+#define RESET_COUNTS() do { compare_total_count = 0; } while (0)
+

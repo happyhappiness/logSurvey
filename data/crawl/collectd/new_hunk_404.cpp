@@ -1,7 +1,11 @@
-{
-    int status;
+	}
+	else
+	{
+		if (print_timestamp)
+			fprintf (fh, "[%s] %s\n", timestamp_str, msg);
+		else
+			fprintf (fh, "%s\n", msg);
 
-    DEBUG ("handle_pcap (udata = %p, hdr = %p, pkt = %p): hdr->caplen = %i\n",
-		    (void *) udata, (void *) hdr, (void *) pkt,
-		    hdr->caplen);
-
+		if (do_close != 0)
+			fclose (fh);
+	}

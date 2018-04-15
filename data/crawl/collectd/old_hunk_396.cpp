@@ -1,7 +1,10 @@
-{
-  int status;
+  }
 
-  printf ("domain_connection_change_handler (domain = %p, err = %i, "
-      "conn_num = %u, port_num = %u, still_connected = %i, "
-      "user_data = %p);\n",
-      (void *) domain, err, conn_num, port_num, still_connected, user_data);
+  pl->pid = 0;
+  pthread_exit ((void *) 0);
+  return (NULL);
+} /* void *exec_read_one }}} */
+
+static int exec_init (void) /* {{{ */
+{
+  struct sigaction sa;

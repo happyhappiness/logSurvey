@@ -1,26 +1,52 @@
+  }
+
+  return 0;
+#undef BAIL_OUT
+} /* flush */
+
+static int listval (lcc_connection_t *c, int argc, char **argv)
 {
-    lvm_t lvm;
-    vg_t vg;
-    int status = 0;
-    struct dm_list *vg_names;
-    struct lvm_str_list *name_list;
+  lcc_identifier_t *ret_ident     = NULL;
+  size_t            ret_ident_num = 0;
 
-    lvm = lvm_init(NULL);
-    if (!lvm) {
-    	status = lvm_errno(lvm);
-    	ERROR("volume plugin: lvm_init failed: %s", lvm_errmsg(lvm));
+  int status;
+  size_t i;
+
+  assert (strcasecmp (argv[0], "listval") == 0);
+
+  if (argc != 1) {
+    fprintf (stderr, "ERROR: listval: Does not accept any arguments.\n");
+    return (-1);
+  }
+
+#define BAIL_OUT(s) \
+  do { \
+    if (ret_ident != NULL) \
+      free (ret_ident); \
+    ret_ident_num = 0; \
+    return (s); \
+  } while (0)
+
+  status = lcc_listval (c, &ret_ident, &ret_ident_num);
+  if (status != 0)
+    BAIL_OUT (status);
+
+  for (i = 0; i < ret_ident_num; ++i) {
+    char id[1024];
+
+    status = lcc_identifier_to_string (c, id, sizeof (id), ret_ident + i);
+    if (status != 0) {
+      fprintf (stderr, "ERROR: listval: Failed to convert returned "
+          "identifier to a string.\n");
+      continue;
     }
 
-    vg_names = lvm_list_vg_names(lvm);
-    if (!vg_names) {
-    	status = lvm_errno(lvm);
-    	ERROR("volume plugin lvm_list_vg_name failed %s", lvm_errmsg(lvm));
-    }
+    printf ("%s\n", id);
+  }
+  BAIL_OUT (0);
+#undef BAIL_OUT
+} /* listval */
 
-    dm_list_iterate_items(name_list, vg_names) {
-        vg = lvm_vg_open(lvm, name_list->str, "r", 0);
-        volume_submit(name_list->str, "df_complex", "size", lvm_vg_get_size(vg));
-        volume_submit(name_list->str, "df_complex", "free", lvm_vg_get_free_size(vg));
+int main (int argc, char **argv) {
+  char address[1024] = "unix:"DEFAULT_SOCK;
 
-        lvm_vg_close(vg);
-    }

@@ -1,41 +1,68 @@
- 	loop++;
+  * Send a message over the network. The send consists of
+  * two network packets. The first is sends a short containing
+  * the length of the data packet which follows.
+- * Returns zero on success
+- * Returns non-zero on error
++ * Returns number of bytes sent
++ * Returns -1 on error
+  */
+ static int net_send(int sockfd, char *buff, int len)
+ {
+ 	int rc;
+-	short packet_size;
++	short pktsiz;
+ 
+ 	/* send short containing size of data packet */
+-	packet_size = htons ((short) len);
+-
+-	rc = write_nbytes(sockfd, &packet_size, sizeof (packet_size));
+-	if (rc != sizeof(packet_size))
+-		return (-1);
++	pktsiz = htons((short)len);
++	rc = write_nbytes(sockfd, (char *)&pktsiz, sizeof(short));
++	if (rc != sizeof(short)) {
++		net_errmsg = "net_send: write_nbytes error of length prefix\n";
++		return -1;
++	}
+ 
+ 	/* send data packet */
+-	rc = write_nbytes (sockfd, buff, len);
+-	if (rc != len)
+-		return (-1);
++	rc = write_nbytes(sockfd, buff, len);
++	if (rc != len) {
++		net_errmsg = "net_send: write_nbytes error\n";
++		return -1;
++	}
+ 
+-	return (0);
++	return rc;
  }
  
-+static int init_global_variables (void)
-+{
-+	const char *str;
 +
-+	str = global_option_get ("Hostname");
-+	if (str != NULL)
-+	{
-+		strncpy (hostname_g, str, sizeof (hostname_g));
-+	}
-+	else
-+	{
-+		if (gethostname (hostname_g, sizeof (hostname_g)) != 0)
-+		{
-+			fprintf (stderr, "`gethostname' failed and no "
-+					"hostname was configured.\n");
-+			return (-1);
-+		}
-+	}
-+	DBG ("hostname_g = %s;", hostname_g);
-+
-+	str = global_option_get ("Interval");
-+	if (str == NULL)
-+		str = COLLECTD_STEP;
-+	interval_g = atoi (str);
-+	if (interval_g <= 0)
-+	{
-+		fprintf (stderr, "Cannot set the interval to a correct value.\n"
-+				"Please check your settings.\n");
-+		return (-1);
-+	}
-+	DBG ("interval_g = %i;", interval_g);
-+
-+	return (0);
-+} /* int init_global_variables */
-+
- static int change_basedir (const char *orig_dir)
+ /* Get and print status from apcupsd NIS server */
+ static int do_pthreads_status(char *host, int port, struct apc_detail_s *apcups_detail)
  {
- 	char *dir = strdup (orig_dir);
++<<<<<<< .mine
++  int sockfd, n;
++  char recvline[MAXSTRING + 1];
++  char *tokptr;
++
++  if ((sockfd = net_open(host, NULL, port)) < 0){
++    syslog(LOG_ERR, "apcups: Cannot open connection: %s",
++	   net_errmsg);
++    net_errmsg = NULL;
++    return;
++  }
++  
++  net_send(sockfd, "status", 6);
++  
++  while ((n = net_recv(sockfd, recvline, sizeof(recvline))) > 0) {
++    recvline[n] = 0;
++#ifdef APCMAIN
++    fputs(recvline, stdout);
++#endif /* ifdef APCMAIN */
++=======
+ 	int     sockfd;
+ 	int     n;
+ 	char    recvline[MAXSTRING + 1];

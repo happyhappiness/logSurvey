@@ -1,11 +1,24 @@
+ 		PyErr_SetString(PyExc_TypeError, "Cannot delete this attribute");
+ 		return -1;
+ 	}
+-	new = PyString_AsString(value);
+-	if (new == NULL) return -1;
++	Py_INCREF(value);
++	new = cpy_unicode_or_bytes_to_string(&value);
++	if (new == NULL) {
++		Py_DECREF(value);
++		return -1;
++	}
  
-   status = lcc_getval (c, &ident,
-       &ret_values_num, &ret_values, &ret_values_names);
--  if (status != 0)
-+  if (status != 0) {
-+    fprintf (stderr, "ERROR: %s\n", lcc_strerror (c));
-     BAIL_OUT (-1);
-+  }
+ 	if (plugin_get_ds(new) == NULL) {
+ 		PyErr_Format(PyExc_TypeError, "Dataset %s not found", new);
++		Py_DECREF(value);
+ 		return -1;
+ 	}
  
-   for (i = 0; i < ret_values_num; ++i)
-     printf ("%s=%e\n", ret_values_names[i], ret_values[i]);
+ 	old = ((char *) self) + (intptr_t) data;
+ 	sstrncpy(old, new, DATA_MAX_NAME_LEN);
++	Py_DECREF(value);
+ 	return 0;
+ }
+ 

@@ -1,8 +1,8 @@
-      cmd_handle_flush(fhout, buffer);
-    } else {
-      if (fprintf(fhout, "-1 Unknown command: %s\n", fields[0]) < 0) {
-        WARNING("unixsock plugin: failed to write to socket #%i: %s",
-                fileno(fhout), STRERRNO);
-        break;
-      }
-    }
+  }
+
+  if (fh == NULL) {
+    fprintf(stderr, "log_logstash plugin: fopen (%s) failed: %s\n", log_file,
+            STRERRNO);
+  } else {
+    fprintf(fh, "%s\n", buf);
+    if (do_close) {

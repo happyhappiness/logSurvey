@@ -1,10 +1,9 @@
-		if ((pid = fork ()) == -1)
-		{
-			/* error */
-			char errbuf[1024];
-			fprintf (stderr, "fork: %s",
-					sstrerror (errno, errbuf,
-						sizeof (errbuf)));
-			return (1);
-		}
-		else if (pid != 0)
+handle_udp(const struct udphdr *udp, int len, struct in_addr sip, struct in_addr dip)
+{
+    char buf[PCAP_SNAPLEN];
+    fprintf (stderr, "handle_udp (udp = %p, len = %i)\n",
+		    (void *) udp, len);
+    if (ntohs (udp->uh_dport) != 53)
+	return 0;
+    memcpy(buf, udp + 1, len - sizeof(*udp));
+    if (0 == handle_dns(buf, len - sizeof(*udp), sip, dip))

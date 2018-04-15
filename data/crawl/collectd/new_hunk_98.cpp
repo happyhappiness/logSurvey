@@ -1,20 +1,17 @@
-#endif
+static int cpy_shutdown(void) {
+	PyObject *ret;
 
-#include "collectd/lcc_features.h"
-#include "collectd/network_parse.h" /* for lcc_network_parse_options_t */
-#include "collectd/server.h"
+	if (!state) {
+		printf("================================================================\n");
+		printf("collectd shutdown while running an interactive session. This will\n");
+		printf("probably leave your terminal in a mess.\n");
+		printf("Run the command \"reset\" to get it back into a usable state.\n");
+		printf("You can press Ctrl+D in the interactive session to\n");
+		printf("close collectd and avoid this problem in the future.\n");
+		printf("================================================================\n");
+	}
 
-#include <errno.h>
-#include <net/if.h>
-#include <netdb.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
+	CPY_LOCK_THREADS
 
-#include <stdio.h>
-#define DEBUG(...) printf(__VA_ARGS__)
-
-static _Bool is_multicast(struct addrinfo const *ai) {
-  if (ai->ai_family == AF_INET) {
-    struct sockaddr_in *addr = (struct sockaddr_in *)ai->ai_addr;
+	for (cpy_callback_t *c = cpy_shutdown_callbacks; c; c = c->next) {
+		ret = PyObject_CallFunctionObjArgs(c->callback, c->data, (void *) 0); /* New reference. */

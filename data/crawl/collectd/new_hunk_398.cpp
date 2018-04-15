@@ -1,8 +1,7 @@
-		{
-			fprintf (stderr, "rrdtool: `CacheTimeout' must "
-					"be greater than 0.\n");
-			ERROR ("rrdtool: `CacheTimeout' must "
-					"be greater than 0.\n");
-			return (1);
-		}
-		cache_timeout = tmp;
+	my $vl   = shift;
+
+	if (scalar (@$ds) != scalar (@{$vl->{'values'}})) {
+		plugin_log (LOG_WARNING,
+			"DS number does not match values length");
+		return;
+	}

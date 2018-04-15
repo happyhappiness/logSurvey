@@ -1,25 +1,14 @@
-  return 0;
-}
+#define OK(cond) OK1(cond, #cond)
 
-static int cpy_build_meta(PyObject *meta, cpy_build_meta_handler_t *meta_func,
-                          void *m) {
-  int s;
-  PyObject *l;
+#define EXPECT_EQ_STR(expect, actual) do { \
+  /* Evaluate 'actual' only once. */ \
+  const char *got__ = actual; \
+  if (strcmp (expect, got__) != 0) { \
+    printf ("not ok %i - %s = \"%s\", want \"%s\"\n", \
+        ++check_count__, #actual, got__, expect); \
+    return (-1); \
+  } \
+  printf ("ok %i - %s = \"%s\"\n", ++check_count__, #actual, got__); \
+} while (0)
 
-  if ((meta == NULL) || (meta == Py_None))
-    return -1;
-
-  l = PyDict_Items(meta); /* New reference. */
-  if (!l) {
-    cpy_log_exception("building meta data");
-    return -1;
-  }
-  s = PyList_Size(l);
-  if (s <= 0) {
-    Py_XDECREF(l);
-    return -1;
-  }
-
-  for (int i = 0; i < s; ++i) {
-    const char *string, *keystring;
-    PyObject *key, *value, *item, *tmp;
+#define EXPECT_EQ_INT(expect, actual) do { \

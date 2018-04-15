@@ -1,6 +1,7 @@
-
-AC_FUNC_STRERROR_R
-
-AC_CHECK_FUNCS(getpwnam_r getgrnam_r setgroups regcomp regerror regexec regfree)
-
-socket_needs_socket="no"
+	if (fh == NULL)
+	{
+			char errbuf[1024];
+			fprintf (stderr, "stderr plugin: fopen (%s) failed: %s\n",
+					(log_file == NULL) ? "<null>" : log_file,
+					sstrerror (errno, errbuf, sizeof (errbuf)));
+	}

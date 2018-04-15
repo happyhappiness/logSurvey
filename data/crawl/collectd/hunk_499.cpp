@@ -1,20 +1,8 @@
- 
- 	plugin_log (level, message);
- }
-+
-+const data_set_t *plugin_get_ds (const char *name)
-+{
-+	data_set_t *ds;
-+	llentry_t *le;
-+
-+	le = llist_search (list_data_set, name);
-+	if (le == NULL)
-+	{
-+		DEBUG ("No such dataset registered: %s", name);
-+		return (NULL);
-+	}
-+
-+	ds = (data_set_t *) le->value;
-+
-+	return (ds);
-+} /* data_set_t *plugin_get_ds */
+     int offset = ip->ip_hl << 2;
+     AgentAddr *clt;
+     AgentAddr *srv;
++    fprintf (stderr, "handle_ip (ip = %p, len = %i)\n",
++		    (void *) ip, len);
+     if (ignore_addr.s_addr)
+ 	if (ip->ip_src.s_addr == ignore_addr.s_addr)
+ 	    return 0;

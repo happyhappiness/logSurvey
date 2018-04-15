@@ -1,8 +1,12 @@
-#define print_to_socket(fh, ...)                                               \
-  do {                                                                         \
-    if (fprintf(fh, __VA_ARGS__) < 0) {                                        \
-      WARNING("handle_listval: failed to write to socket #%i: %s", fileno(fh), \
-              STRERRNO);                                                       \
-      free_everything_and_return(CMD_ERROR);                                   \
-    }                                                                          \
-    fflush(fh);                                                                \
+
+#define END_TEST exit ((fail_count__ == 0) ? 0 : 1);
+
+#define LOG(result, text) \
+  printf ("%s %i - %s\n", result ? "ok" : "not ok", ++check_count__, text)
+
+#define OK1(cond, text) do { \
+  _Bool result = (cond); \
+  LOG (result, text); \
+  if (!result) { return -1; } \
+} while (0)
+#define OK(cond) OK1(cond, #cond)

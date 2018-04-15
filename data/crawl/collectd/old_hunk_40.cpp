@@ -1,35 +1,35 @@
-  char *text;
-  if (PyArg_ParseTuple(args, "et", NULL, &text) == 0)
-    return NULL;
-  Py_BEGIN_ALLOW_THREADS plugin_log(LOG_ERR, "%s", text);
-  Py_END_ALLOW_THREADS PyMem_Free(text);
-  Py_RETURN_NONE;
-}
+#endif
 
-static PyObject *cpy_warning(PyObject *self, PyObject *args) {
-  char *text;
-  if (PyArg_ParseTuple(args, "et", NULL, &text) == 0)
-    return NULL;
-  Py_BEGIN_ALLOW_THREADS plugin_log(LOG_WARNING, "%s", text);
-  Py_END_ALLOW_THREADS PyMem_Free(text);
-  Py_RETURN_NONE;
-}
+#include "collectd/lcc_features.h"
+#include "collectd/server.h"
 
-static PyObject *cpy_notice(PyObject *self, PyObject *args) {
-  char *text;
-  if (PyArg_ParseTuple(args, "et", NULL, &text) == 0)
-    return NULL;
-  Py_BEGIN_ALLOW_THREADS plugin_log(LOG_NOTICE, "%s", text);
-  Py_END_ALLOW_THREADS PyMem_Free(text);
-  Py_RETURN_NONE;
-}
+#include <arpa/inet.h>
+#include <endian.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <math.h>
+#include <net/if.h>
+#include <netdb.h>
+#include <pthread.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
 
-static PyObject *cpy_info(PyObject *self, PyObject *args) {
-  char *text;
-  if (PyArg_ParseTuple(args, "et", NULL, &text) == 0)
-    return NULL;
-  Py_BEGIN_ALLOW_THREADS plugin_log(LOG_INFO, "%s", text);
-  Py_END_ALLOW_THREADS PyMem_Free(text);
-  Py_RETURN_NONE;
-}
+#define GCRYPT_NO_DEPRECATED
+#include <gcrypt.h>
 
+#include <stdio.h>
+#define DEBUG(...) printf(__VA_ARGS__)
+
+GCRY_THREAD_OPTION_PTHREAD_IMPL;
+
+/* forward declaration because parse_sign_sha256()/parse_encrypt_aes256() and
+ * network_parse() need to call each other. */
+static int network_parse(void *data, size_t data_size, lcc_security_level_t sl,
+                         lcc_network_parse_options_t const *opts);
+
+static _Bool is_multicast(struct addrinfo const *ai) {
+  if (ai->ai_family == AF_INET) {
+    struct sockaddr_in *addr = (struct sockaddr_in *)ai->ai_addr;

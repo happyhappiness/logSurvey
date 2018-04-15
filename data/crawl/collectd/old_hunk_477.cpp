@@ -1,25 +1,24 @@
-	}
-	else if (strcasecmp ("StepSize", key) == 0)
+	double  *values;
+	char   **values_names;
+	int      values_num;
+	int i;
+
+	if (get_values (&values_num, &values, &values_names) != 0)
 	{
-		int tmp = atoi (value);
-		if (tmp <= 0)
-		{
-			fprintf (stderr, "rrdtool: `StepSize' must "
-					"be greater than 0.\n");
-			return (1);
-		}
-		stepsize = tmp;
+		fputs ("ERROR: Cannot get values from daemon\n", stdout);
+		return (RET_CRITICAL);
 	}
-	else if (strcasecmp ("HeartBeat", key) == 0)
-	{
-		int tmp = atoi (value);
-		if (tmp <= 0)
-		{
-			fprintf (stderr, "rrdtool: `HeartBeat' must "
-					"be greater than 0.\n");
-			return (1);
-		}
-		heartbeat = tmp;
-	}
-	else if (strcasecmp ("RRARows", key) == 0)
-	{
+
+	for (i = 0; i < values_num; i++)
+		printf ("%s=%lf\n", values_names[i], values[i]);
+
+	if (consolitation_g == CON_NONE)
+		return (do_check_con_none (values_num, values, values_names));
+	else if (consolitation_g == CON_AVERAGE)
+		return (do_check_con_average (values_num, values, values_names));
+	else if (consolitation_g == CON_SUM)
+		return (do_check_con_sum (values_num, values, values_names));
+
+	return (RET_UNKNOWN);
+}
+

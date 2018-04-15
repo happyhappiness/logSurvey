@@ -1,13 +1,20 @@
+ #include "utils_cache.h"
+ #include "utils_parse_option.h"
  
-   fh = fopen(file, "r");
-   if (fh == NULL) {
--    char errbuf[1024];
-     fprintf(stderr, "Failed to open types database `%s': %s.\n", file,
--            sstrerror(errno, errbuf, sizeof(errbuf)));
--    ERROR("Failed to open types database `%s': %s", file,
--          sstrerror(errno, errbuf, sizeof(errbuf)));
-+            STRERRNO);
-+    ERROR("Failed to open types database `%s': %s", file, STRERRNO);
-     return -1;
-   }
- 
++cmd_status_t cmd_parse_listval (size_t argc, char **argv,
++    cmd_listval_t *ret_listval __attribute__((unused)),
++    cmd_error_handler_t *err)
++{
++  if (argc != 0)
++  {
++    cmd_error (CMD_PARSE_ERROR, err,
++	"Garbage after end of command: `%s'.", argv[0]);
++    return (CMD_PARSE_ERROR);
++  }
++
++  return (CMD_OK);
++} /* cmd_status_t cmd_parse_listval */
++
+ #define free_everything_and_return(status) do { \
+     for (size_t j = 0; j < number; j++) { \
+       sfree(names[j]); \

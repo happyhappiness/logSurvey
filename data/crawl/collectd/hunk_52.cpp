@@ -1,15 +1,11 @@
-                                                    .writer = nop_writer,
-                                                });
-     if (status != 0) {
--      fprintf(stderr, "lcc_network_parse(raw_packet_data[%zu]) = %d, want 0\n",
-+      fprintf(stderr,
-+              "lcc_network_parse(raw_packet_data[%" PRIsz "]) = %d, want 0\n",
-               i, status);
-       ret = status;
-     }
- 
--    printf("ok - lcc_network_parse(raw_packet_data[%zu])\n", i);
-+    printf("ok - lcc_network_parse(raw_packet_data[%" PRIsz "])\n", i);
+     PyErr_Format(PyExc_TypeError, "Dataset %s not found", notification.type);
+     return NULL;
    }
++  if (meta != NULL && meta != Py_None && !PyDict_Check(meta)) {
++    PyErr_Format(PyExc_TypeError, "meta must be a dict");
++    return NULL;
++  }
++  cpy_build_notification_meta(&notification, meta);
  
-   return ret;
+   if (notification.time == 0)
+     notification.time = cdtime();

@@ -1,10 +1,5 @@
-  else if (n->severity == NOTIF_OKAY)
-    severity = "OKAY";
+	message[511] = '\0';
+	va_end (ap);
 
-  fprintf (fh, "Severity: %s\n"
-      "Time: %u\n"
-      "Message: %s\n",
-      severity, (unsigned int) n->time, n->message);
-
-  /* Print the optional fields */
-  if (strlen (n->host) > 0)
+	syslog (level, message);
+}

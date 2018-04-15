@@ -1,59 +1,40 @@
- 		return (1);
+ 	return cpy_string_to_unicode_or_bytes(buf);
+ }
  
- 	return (0);
--} /* int parse_option */
-+} /* int set_option */
+-static PyObject *cpy_flush(cpy_callback_t **list_head, PyObject *args, PyObject *kwds) {
++static PyObject *float_or_none(float number) {
++	if (isnan(number)) {
++		Py_RETURN_NONE;
++	}
++	return PyFloat_FromDouble(number);
++}
 +
-+/*
-+ * public API
-+ */
- 
--int handle_putval (FILE *fh, char *buffer)
-+cmd_status_t cmd_parse_putval (char *buffer,
-+		cmd_putval_t *ret_putval, cmd_error_handler_t *err)
- {
--	char *command;
- 	char *identifier;
- 	char *hostname;
- 	char *plugin;
- 	char *plugin_instance;
- 	char *type;
- 	char *type_instance;
- 	int   status;
--	int   values_submitted;
- 
- 	char *identifier_copy;
- 
- 	const data_set_t *ds;
- 	value_list_t vl = VALUE_LIST_INIT;
- 	vl.values = NULL;
- 
--	DEBUG ("utils_cmd_putval: handle_putval (fh = %p, buffer = %s);",
--			(void *) fh, buffer);
--
--	command = NULL;
--	status = parse_string (&buffer, &command);
--	if (status != 0)
--	{
--		print_to_socket (fh, "-1 Cannot parse command.\n");
--		return (-1);
--	}
--	assert (command != NULL);
--
--	if (strcasecmp ("PUTVAL", command) != 0)
--	{
--		print_to_socket (fh, "-1 Unexpected command: `%s'.\n", command);
--		return (-1);
--	}
--
- 	identifier = NULL;
- 	status = parse_string (&buffer, &identifier);
- 	if (status != 0)
- 	{
--		print_to_socket (fh, "-1 Cannot parse identifier.\n");
--		return (-1);
-+		cmd_error (CMD_PARSE_ERROR, err, "Cannot parse identifier.");
-+		return (CMD_PARSE_ERROR);
- 	}
- 	assert (identifier != NULL);
- 
++static PyObject *cpy_get_dataset(PyObject *self, PyObject *args) {
++	int i;
++	char *name;
++	const data_set_t *ds;
++	PyObject *list, *tuple;
++
++	if (PyArg_ParseTuple(args, "et", NULL, &name) == 0) return NULL;
++	ds = plugin_get_ds(name);
++	PyMem_Free(name);
++	if (ds == NULL) {
++		PyErr_Format(PyExc_TypeError, "Dataset %s not found", name);
++		return NULL;
++	}
++	list = PyList_New(ds->ds_num); /* New reference. */
++	for (i = 0; i < ds->ds_num; ++i) {
++		tuple = PyTuple_New(4);
++		PyTuple_SET_ITEM(tuple, 0, cpy_string_to_unicode_or_bytes(ds->ds[i].name));
++		PyTuple_SET_ITEM(tuple, 1, cpy_string_to_unicode_or_bytes(DS_TYPE_TO_STRING(ds->ds[i].type)));
++		PyTuple_SET_ITEM(tuple, 2, float_or_none(ds->ds[i].min));
++		PyTuple_SET_ITEM(tuple, 3, float_or_none(ds->ds[i].max));
++		PyList_SET_ITEM(list, i, tuple);
++	}
++	return list;
++}
++
++static PyObject *cpy_flush(PyObject *self, PyObject *args, PyObject *kwds) {
+ 	int timeout = -1;
+ 	char *plugin = NULL, *identifier = NULL;
+ 	static char *kwlist[] = {"plugin", "timeout", "identifier", NULL};

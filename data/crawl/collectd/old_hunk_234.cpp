@@ -1,7 +1,11 @@
-			}
-		} else {
-			free(value);
-			PyErr_Format(PyExc_RuntimeError, "unknown data type %d for %s", ds->ds->type, type);
-			return NULL;
+	total_num = 0;
+	for (i = 0; i < values_num; i++)
+	{
+		if (!isnan (values[i]))
+		{
+			total += values[i];
+			total_num++;
 		}
-		if (PyErr_Occurred() != NULL) {
+	}
+
+	if (total_num == 0)

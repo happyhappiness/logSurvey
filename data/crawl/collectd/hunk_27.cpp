@@ -1,9 +1,10 @@
- 
-     if ((pid = fork()) == -1) {
-       /* error */
--      char errbuf[1024];
--      fprintf(stderr, "fork: %s", sstrerror(errno, errbuf, sizeof(errbuf)));
-+      fprintf(stderr, "fork: %s", STRERRNO);
-       return 1;
-     } else if (pid != 0) {
-       /* parent */
+ #define print_to_socket(fh, ...)                                               \
+   do {                                                                         \
+     if (fprintf(fh, __VA_ARGS__) < 0) {                                        \
+-      char errbuf[1024];                                                       \
+       WARNING("handle_putnotif: failed to write to socket #%i: %s",            \
+-              fileno(fh), sstrerror(errno, errbuf, sizeof(errbuf)));           \
++              fileno(fh), STRERRNO);                                           \
+       return -1;                                                               \
+     }                                                                          \
+     fflush(fh);                                                                \

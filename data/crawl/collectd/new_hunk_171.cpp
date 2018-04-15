@@ -1,14 +1,20 @@
-	new_values = (gauge_t *)calloc (match_ds_num_g, sizeof (*new_values));
-	if (new_values == NULL)
-	{
-		fprintf (stderr, "calloc failed: %s\n", strerror (errno));
-		return (RET_UNKNOWN);
-	}
+			NULL, &plugin, NULL, &host, &time, &interval, &meta))
+		return NULL;
 
-	new_names = (char **)calloc (match_ds_num_g, sizeof (*new_names));
-	if (new_names == NULL)
-	{
-		fprintf (stderr, "calloc failed: %s\n", strerror (errno));
-		free (new_values);
-		return (RET_UNKNOWN);
+	sstrncpy(value_list.host, host ? host : self->data.host, sizeof(value_list.host));
+	sstrncpy(value_list.plugin, plugin ? plugin : self->data.plugin, sizeof(value_list.plugin));
+	sstrncpy(value_list.plugin_instance, plugin_instance ? plugin_instance : self->data.plugin_instance, sizeof(value_list.plugin_instance));
+	sstrncpy(value_list.type, type ? type : self->data.type, sizeof(value_list.type));
+	sstrncpy(value_list.type_instance, type_instance ? type_instance : self->data.type_instance, sizeof(value_list.type_instance));
+	FreeAll();
+	if (value_list.type[0] == 0) {
+		PyErr_SetString(PyExc_RuntimeError, "type not set");
+		FreeAll();
+		return NULL;
 	}
+	ds = plugin_get_ds(value_list.type);
+	if (ds == NULL) {
+		PyErr_Format(PyExc_TypeError, "Dataset %s not found", value_list.type);
+		return NULL;
+	}
+	if (values == NULL || (PyTuple_Check(values) == 0 && PyList_Check(values) == 0)) {

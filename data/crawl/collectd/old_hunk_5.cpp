@@ -1,7 +1,12 @@
-  }
-  size = (size_t)PySequence_Length(values);
-  if (size != ds->ds_num) {
-    PyErr_Format(PyExc_RuntimeError, "type %s needs %zu values, got %zu",
-                 value_list.type, ds->ds_num, size);
-    return NULL;
-  }
+
+  return 0;
+}
+
+int main(void) {
+  int ret = 0;
+
+  printf("libcollectdclient/server_test.c\n");
+
+  int status;
+  if ((status = test_network_parse())) {
+    ret = status;

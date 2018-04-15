@@ -1,10 +1,9 @@
+    return (1);
+  }
 
-static int init_global_variables (void)
-{
-	char const *str;
-
-	interval_g = cf_get_default_interval ();
-	assert (interval_g > 0);
-	DEBUG ("interval_g = %.3f;", CDTIME_T_TO_DOUBLE (interval_g));
-
-	str = global_option_get ("Timeout");
+  if (strcasecmp (argv[optind], "getval") == 0)
+    status = getval (c, argc - optind, argv + optind);
+  else if (strcasecmp (argv[optind], "flush") == 0)
+    status = flush (c, argc - optind, argv + optind);
+  else {
+    fprintf (stderr, "%s: invalid command: %s\n", argv[0], argv[optind]);

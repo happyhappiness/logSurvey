@@ -1,6 +1,6 @@
-	value_list_t vl = VALUE_LIST_INIT;
-	size_t i;
+  printf ("ok %i - %s evaluates to \"%s\"\n", ++check_count__, #actual, expect); \
+} while (0)
 
-	if (argc < 2)
-	{
-		cmd_error (CMD_PARSE_ERROR, err,
+#define DBLEQ(expect, actual) do { \
+  if ((isnan (expect) && !isnan (actual)) || ((expect) != (actual))) {\
+    printf ("not ok %i - %s incorrect: expected %.15g, got %.15g\n", \

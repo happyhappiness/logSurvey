@@ -1,13 +1,14 @@
- #if COLLECT_DEBUG
-   case IPMI_LOG_DEBUG_START:
-   case IPMI_LOG_DEBUG:
--    fprintf(stderr, "ipmi plugin: %s\n", msg);
-+    DEBUG("ipmi plugin: %s", msg);
-     break;
-   case IPMI_LOG_DEBUG_CONT:
-   case IPMI_LOG_DEBUG_END:
--    fprintf(stderr, "%s\n", msg);
-+    DEBUG("%s", msg);
-     break;
- #else
-   case IPMI_LOG_DEBUG_START:
+   type = NULL;
+   type_instance = NULL;
+ 
+-  vl.values_len = ds->ds_num;
+-  vl.values = malloc(vl.values_len * sizeof(*vl.values));
+-  if (vl.values == NULL) {
+-    cmd_error(CMD_ERROR, err, "malloc failed.");
+-    sfree(identifier_copy);
+-    return (CMD_ERROR);
+-  }
+-
+   ret_putval->raw_identifier = identifier_copy;
+   if (ret_putval->raw_identifier == NULL) {
+     cmd_error(CMD_ERROR, err, "malloc failed.");

@@ -1,7 +1,6 @@
-	struct timespec ts;
-	static char *kwlist[] = {"callback", "interval", "data", "name", NULL};
-	
-	if (PyArg_ParseTupleAndKeywords(args, kwds, "O|dOet", kwlist, &callback, &interval, &data, NULL, &name) == 0) return NULL;
-	if (PyCallable_Check(callback) == 0) {
-		PyErr_SetString(PyExc_TypeError, "callback needs a be a callable object.");
-		return NULL;
+        metric_name, timestamp, value);
+    send_buffer_fill += status;
+
+    if ((sizeof (send_buffer) - send_buffer_fill) < 128)
+    {
+            http_flush_buffer();

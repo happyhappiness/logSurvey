@@ -1,6 +1,7 @@
-	sigChldAction.sa_handler = SIG_IGN;
-	sigaction (SIGCHLD, &sigChldAction, NULL);
+		return (1);
+	}
 
-	if (daemonize)
-	{
-		if ((pid = fork ()) == -1)
+	fprintf (fh, "%i\n", (int) getpid ());
+	fclose(fh);
+
+	return (0);

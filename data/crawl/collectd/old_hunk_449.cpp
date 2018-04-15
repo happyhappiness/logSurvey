@@ -1,8 +1,6 @@
-	my $vl   = shift;
+	return (0);
+}
 
-	if (scalar (@$ds) != scalar (@{$vl->{'values'}})) {
-		plugin_log (LOG_WARNING,
-			"DS number does not match values length");
-		return;
-	}
-
+void plugin_complain (int level, complain_t *c, const char *format, ...)
+{
+	char message[512];

@@ -1,171 +1,201 @@
-+/*
-+ * /usr/share/doc/collectd/examples/myplugin.c
-+ *
-+ * A plugin template for collectd.
-+ *
-+ * Written by Sebastian Harl <sh@tokkee.org>
-+ *
-+ * This is free software; you can redistribute it and/or modify it under
-+ * the terms of the GNU General Public License as published by the Free
-+ * Software Foundation; only version 2 of the License is applicable.
-+ */
-+
-+/*
-+ * Notes:
-+ * - plugins are executed in parallel, thus, thread-safe
-+ *   functions need to be used
-+ * - each of the functions below (except module_register)
-+ *   is optional
-+ */
-+
-+#include <stdio.h>
-+#include <stdlib.h>
-+
-+#include <string.h>
-+
-+#ifndef __USE_ISOC99 /* required for NAN */
-+# define DISABLE_ISOC99 1
-+# define __USE_ISOC99 1
-+#endif /* !defined(__USE_ISOC99) */
-+#include <math.h>
-+#if DISABLE_ISOC99
-+# undef DISABLE_ISOC99
-+# undef __USE_ISOC99
-+#endif /* DISABLE_ISOC99 */
-+
-+#include <collectd/collectd.h>
-+#include <collectd/common.h>
-+#include <collectd/plugin.h>
-+
-+/*
-+ * data source definition:
-+ * - name of the data source
-+ * - type of the data source (DS_TYPE_GAUGE, DS_TYPE_COUNTER)
-+ * - minimum allowed value
-+ * - maximum allowed value
-+ */
-+static data_source_t dsrc[1] =
-+{
-+	{ "my_ds", DS_TYPE_GAUGE, 0, NAN }
-+};
-+
-+/*
-+ * data set definition:
-+ * - name of the data set
-+ * - number of data sources
-+ * - list of data sources
-+ */
-+static data_set_t ds =
-+{
-+	"myplugin", STATIC_ARRAY_SIZE (dsrc), dsrc
-+};
-+
-+/*
-+ * This function is called once upon startup to initialize the plugin.
-+ */
-+static int my_init (void)
-+{
-+	/* open sockets, initialize data structures, ... */
-+
-+	/* A return value != 0 indicates an error and causes the plugin to be
-+	   disabled. */
-+    return 0;
-+} /* static int my_init (void) */
-+
-+/*
-+ * This function is called in regular intervalls to collect the data.
-+ */
-+static int my_read (void)
-+{
-+	value_t values[1]; /* the size of this list should equal the number of
-+						  data sources */
-+	value_list_t vl = VALUE_LIST_INIT;
-+
-+	/* do the magic to read the data */
-+	values[0].gauge = random ();
-+
-+	vl.values     = values;
-+	vl.values_len = 1;
-+	vl.time       = time (NULL);
-+	strcpy (vl.host, hostname_g);
-+	strcpy (vl.plugin, "myplugin");
-+	/* optionally set vl.plugin_instance and vl.type_instance to reasonable
-+	 * values (default: "") */
-+
-+	/* dispatch the values to collectd which passes them on to all registered
-+	 * write functions - the first argument is used to lookup the data set
-+	 * definition */
-+	plugin_dispatch_values ("myplugin", &vl);
-+
-+	/* A return value != 0 indicates an error and the plugin will be skipped
-+	 * for an increasing amount of time. */
-+    return 0;
-+} /* static int my_read (void) */
-+
-+/*
-+ * This function is called after values have been dispatched to collectd.
-+ */
-+static int my_write (const data_set_t *ds, const value_list_t *vl)
-+{
-+	char name[1024] = "";
-+	int i = 0;
-+
-+	if (ds->ds_num != vl->values_len) {
-+		plugin_log (LOG_WARNING, "DS number does not match values length");
-+		return -1;
-+	}
-+
-+	/* get the default base filename for the output file - depending on the
-+	 * provided values this will be something like
-+	 * <host>/<plugin>[-<plugin_type>]/<instance>[-<instance_type>] */
-+	if (0 != format_name (name, 1024, vl->host, vl->plugin,
-+			vl->plugin_instance, ds->type, vl->type_instance))
-+		return -1;
-+
-+	for (i = 0; i < ds->ds_num; ++i) {
-+		/* do the magic to output the data */
-+		printf ("%s (%s) at %i: ", name,
-+				(ds->ds->type == DS_TYPE_GAUGE) ? "GAUGE" : "COUNTER",
-+				(int)vl->time);
-+
-+		if (ds->ds->type == DS_TYPE_GAUGE)
-+			printf ("%f\n", vl->values[i].gauge);
-+		else
-+			printf ("%lld\n", vl->values[i].counter);
-+	}
-+	return 0;
-+} /* static int my_write (data_set_t *, value_list_t *) */
-+
-+/*
-+ * This function is called when plugin_log () has been used.
-+ */
-+static void my_log (int severity, const char *msg)
-+{
-+	printf ("LOG: %i - %s\n", severity, msg);
-+	return;
-+} /* static void my_log (int, const char *) */
-+
-+/*
-+ * This function is called before shutting down collectd.
-+ */
-+static int my_shutdown (void)
-+{
-+	/* close sockets, free data structures, ... */
-+	return 0;
-+} /* static int my_shutdown (void) */
-+
-+/*
-+ * This function is called after loading the plugin to register it with
-+ * collectd.
-+ */
-+void module_register (void)
-+{
-+	plugin_register_log ("myplugin", my_log);
-+	plugin_register_data_set (&ds);
-+	plugin_register_read ("myplugin", my_read);
-+	plugin_register_init ("myplugin", my_init);
-+	plugin_register_write ("myplugin", my_write);
-+	plugin_register_shutdown ("myplugin", my_shutdown);
-+    return;
-+} /* void module_register (void) */
-+
+-#include "compat.h"
+-#include "libconfig.h"
+-#include "libconfig_private.h"
+-#include "conf_section.h"
+-
+-#ifdef HAVE_STDIO_H
+-#include <stdio.h>
+-#endif
+-
+-#ifdef HAVE_STRING_H
+-#include <string.h>
+-#endif
+-
+-int lc_process_conf_section(const char *appname, const char *configfile) {
+-	LC_FILE *configfp = NULL;
+-	const char *local_lc_errfile;
+-	char linebuf[LC_LINEBUF_LEN] = {0}, *linebuf_ptr = NULL;
+-	char qualifbuf[LC_LINEBUF_LEN] = {0};
+-	char *cmd = NULL, *value = NULL, *sep = NULL, *cmdend = NULL;
+-	char *currsection = NULL;
+-	char *fgetsret = NULL;
+-	int lcpvret = -1;
+-	int invalid_section = 1, ignore_section = 0;
+-	int local_lc_errline;
+-	int retval = 0;
+-	lc_err_t save_lc_errno = LC_ERR_NONE;
+-
+-	local_lc_errfile = configfile;
+-	local_lc_errline = 0;
+-
+-	if (appname == NULL || configfile == NULL) {
+-		lc_errfile = local_lc_errfile;
+-		lc_errline = local_lc_errline;
+-		lc_errno = LC_ERR_INVDATA;
+-		return(-1);
+-	}
+-
+-	configfp = lc_fopen(configfile, "r");
+-
+-	if (configfp == NULL) {
+-		lc_errfile = local_lc_errfile;
+-		lc_errline = local_lc_errline;
+-		lc_errno = LC_ERR_CANTOPEN;
+-		return(-1);
+-	}
+-
+-	while (1) {
+-		fgetsret = lc_fgets(linebuf, sizeof(linebuf) - 1, configfp);
+-		if (fgetsret == NULL) {
+-			break;
+-		}
+-		if (lc_feof(configfp)) {
+-			break;
+-		}
+-
+-		local_lc_errline++;
+-
+-		/* Remove trailing crap (but not spaces). */
+-		linebuf_ptr = &linebuf[strlen(linebuf) - 1];
+-		while (*linebuf_ptr < ' ' && linebuf_ptr >= linebuf) {
+-			*linebuf_ptr = '\0';
+-			linebuf_ptr--;
+-		}
+-
+-		/* Handle section header. */
+-		if (linebuf[0] == '[' && linebuf[strlen(linebuf) - 1] == ']') {
+-			linebuf[strlen(linebuf) - 1] = '\0';
+-			linebuf_ptr = &linebuf[1];
+-
+-			/* If a section was open, close it. */
+-			if (currsection != NULL) {
+-				lcpvret = lc_process_var(currsection, NULL, NULL, LC_FLAGS_SECTIONEND);
+-				if (lcpvret < 0) {
+-#ifdef DEBUG
+-					fprintf(stderr, "Invalid section terminating: \"%s\"\n", currsection);
+-#endif
+-				}
+-				free(currsection);
+-			}
+-
+-			/* Open new section. */
+-			currsection = strdup(linebuf_ptr);
+-			lcpvret = lc_process_var(currsection, NULL, NULL, LC_FLAGS_SECTIONSTART);
+-			if (lcpvret < 0) {
+-#ifdef DEBUG
+-				fprintf(stderr, "Invalid section: \"%s\"\n", currsection);
+-#endif
+-				invalid_section = 1;
+-				lc_errfile = local_lc_errfile;
+-				lc_errline = local_lc_errline;
+-				lc_errno = LC_ERR_INVSECTION;
+-				retval = -1;
+-			} else {
+-				invalid_section = 0;
+-				ignore_section = 0;
+-			}
+-
+-			if (lcpvret == LC_CBRET_IGNORESECTION) {
+-				ignore_section = 1;
+-			}
+-			continue;
+-		}
+-
+-		/* Remove leading spaces. */
+-		linebuf_ptr = &linebuf[0];
+-		while (*linebuf_ptr == ' ') {
+-			linebuf_ptr++;
+-		}
+-
+-		/* Drop comments and blank lines. */
+-		if (*linebuf_ptr == ';' || *linebuf_ptr == '\0') {
+-			continue;
+-		}
+-
+-		/* Don't handle things for a section that doesn't exist. */
+-		if (invalid_section == 1) {
+-#ifdef DEBUG
+-			fprintf(stderr, "Ignoring line (because invalid section): %s\n", linebuf);
+-#endif
+-			continue;
+-		}
+-
+-		/* Don't process commands if this section is specifically ignored. */
+-		if (ignore_section == 1) {
+-#ifdef DEBUG
+-			fprintf(stderr, "Ignoring line (because ignored section): %s\n", linebuf);
+-#endif
+-			continue;
+-		}
+-
+-		/* Find the command and the data in the line. */
+-		cmdend = sep = strpbrk(linebuf_ptr, "=");
+-		if (sep == NULL) {
+-#ifdef DEBUG
+-			fprintf(stderr, "Invalid line: \"%s\"\n", linebuf);
+-#endif
+-			continue;
+-		}
+-
+-		/* Delete space at the end of the command. */
+-		cmdend--; /* It currently derefs to the seperator.. */
+-		while (*cmdend <= ' ') {
+-			*cmdend = '\0';
+-			cmdend--;
+-		}
+-
+-		cmd = linebuf_ptr;
+-
+-		/* Delete the seperator char and any leading space. */
+-		*sep = '\0';
+-		sep++;
+-		while (*sep == ' ' || *sep == '\t') {
+-			sep++;
+-		}
+-		value = sep;
+-
+-		/* Create the fully qualified variable name. */
+-		if (currsection == NULL) {
+-			strncpy(qualifbuf, cmd, sizeof(qualifbuf) - 1);
+-		} else {
+-			snprintf(qualifbuf, sizeof(qualifbuf) - 1, "%s.%s", currsection, cmd);
+-		}
+-
+-		/* Call the parent and tell them we have data. */
+-		save_lc_errno = lc_errno;
+-		lc_errno = LC_ERR_NONE;
+-		lcpvret = lc_process_var(qualifbuf, NULL, value, LC_FLAGS_VAR);
+-		if (lcpvret < 0) {
+-			if (lc_errno == LC_ERR_NONE) {
+-#ifdef DEBUG
+-				fprintf(stderr, "Invalid command: \"%s\"\n", cmd);
+-#endif
+-				lc_errno = LC_ERR_INVCMD;
+-			} else {
+-#ifdef DEBUG
+-				fprintf(stderr, "Error processing command (command was valid, but an error occured, errno was set)\n");
+-#endif
+-			}
+-			lc_errfile = local_lc_errfile;
+-			lc_errline = local_lc_errline;
+-			retval = -1;
+-		} else {
+-			lc_errno = save_lc_errno;
+-		}
+-	}
+-
+-	/* Close any open section, and clean-up. */
+-	if (currsection != NULL) {
+-		lcpvret = lc_process_var(currsection, NULL, NULL, LC_FLAGS_SECTIONEND);
+-		if (lcpvret < 0) {
+-#ifdef DEBUG
+-			fprintf(stderr, "Invalid section terminating: \"%s\"\n", currsection);
+-#endif
+-		}
+-		free(currsection);
+-	}
+-
+-	lc_fclose(configfp);
+-
+-	return(retval);
+-}

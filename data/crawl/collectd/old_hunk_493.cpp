@@ -1,7 +1,12 @@
-	if (fh == NULL)
-	{
-			char errbuf[1024];
-			fprintf (stderr, "stderr plugin: fopen (%s) failed: %s\n",
-					(log_file == NULL) ? "<null>" : log_file,
-					sstrerror (errno, errbuf, sizeof (errbuf)));
-	}
+    }
+
+    memset(&fp, '\0', sizeof(fp));
+    x = pcap_compile(pcap, &fp, bpf_program_str, 1, 0);
+    if (x < 0) {
+	fprintf(stderr, "pcap_compile failed\n");
+	exit(1);
+    }
+    x = pcap_setfilter(pcap, &fp);
+    if (x < 0) {
+	fprintf(stderr, "pcap_setfilter failed\n");
+	exit(1);

@@ -1,14 +1,8 @@
-     }
+ 	}
  
-     memset(&fp, '\0', sizeof(fp));
--    x = pcap_compile(pcap, &fp, bpf_program_str, 1, 0);
-+    x = pcap_compile(pcap_obj, &fp, bpf_program_str, 1, 0);
-     if (x < 0) {
- 	fprintf(stderr, "pcap_compile failed\n");
- 	exit(1);
-     }
--    x = pcap_setfilter(pcap, &fp);
-+    x = pcap_setfilter(pcap_obj, &fp);
-     if (x < 0) {
- 	fprintf(stderr, "pcap_setfilter failed\n");
- 	exit(1);
+ 	if (i >= cf_cb->keys_num)
+-		fprintf (stderr, "Plugin `%s' did not register for value `%s'.\n", type, key);
++		syslog (LOG_WARNING, "Plugin `%s' did not register for value `%s'.\n", type, key);
+ 
+ 	free (key);
+ 	free (value);

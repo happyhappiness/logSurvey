@@ -1,20 +1,49 @@
-			NULL, &plugin, NULL, &host, &time, &interval, &meta))
-		return NULL;
+  char ident_str[1024] = "";
+  int timeout = -1;
+  char hostname[1024];
 
-	sstrncpy(value_list.host, host ? host : self->data.host, sizeof(value_list.host));
-	sstrncpy(value_list.plugin, plugin ? plugin : self->data.plugin, sizeof(value_list.plugin));
-	sstrncpy(value_list.plugin_instance, plugin_instance ? plugin_instance : self->data.plugin_instance, sizeof(value_list.plugin_instance));
-	sstrncpy(value_list.type, type ? type : self->data.type, sizeof(value_list.type));
-	sstrncpy(value_list.type_instance, type_instance ? type_instance : self->data.type_instance, sizeof(value_list.type_instance));
-	FreeAll();
-	if (value_list.type[0] == 0) {
-		PyErr_SetString(PyExc_RuntimeError, "type not set");
-		FreeAll();
-		return NULL;
-	}
-	ds = plugin_get_ds(value_list.type);
-	if (ds == NULL) {
-		PyErr_Format(PyExc_TypeError, "Dataset %s not found", value_list.type);
-		return NULL;
-	}
-	if (values == NULL || (PyTuple_Check(values) == 0 && PyList_Check(values) == 0)) {
+  while (42) {
+    int c;
+
+    c = getopt (argc, argv, "s:p:i:ht:");
+
+    if (c == -1)
+      break;
+
+    switch (c) {
+      case 's':
+        snprintf (address, sizeof (address), "unix:%s", optarg);
+        address[sizeof (address) - 1] = '\0';
+        break;
+      case 'p':
+        plugin = optarg;
+        break;
+      case 'i':
+        if (charoccurences (optarg, '/') == 1) {
+          /* The user has omitted the hostname part of the identifier
+           * (there is only one '/' in the identifier)
+           * Let's add the local hostname */
+          if (gethostname (hostname, sizeof (hostname)) != 0) {
+            fprintf (stderr, "Could not get local hostname: %s", strerror (errno));
+            return 1;
+          }
+          /* Make sure hostname is zero-terminated */
+          hostname[sizeof (hostname) - 1] = '\0';
+          snprintf (ident_str, sizeof (ident_str), "%s/%s", hostname, optarg);
+          /* Make sure ident_str is zero terminated */
+          ident_str[sizeof(ident_str) - 1] = '\0';
+        } else {
+          strncpy (ident_str, optarg, sizeof (ident_str));
+          /* Make sure identifier is zero terminated */
+          ident_str[sizeof (ident_str) - 1] = '\0';
+        }
+        break;
+      case 't':
+        timeout = atoi (optarg);
+        break;
+      case 'h':
+        exit_usage (argv[0], 0);
+        break;
+      default:
+        exit_usage (argv[0], 1);
+    }

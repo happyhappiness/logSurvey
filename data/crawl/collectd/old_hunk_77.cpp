@@ -1,8 +1,8 @@
+		return (CMD_ERROR);
+	}
 
-    if ((pid = fork()) == -1) {
-      /* error */
-      char errbuf[1024];
-      fprintf(stderr, "fork: %s", sstrerror(errno, errbuf, sizeof(errbuf)));
-      return 1;
-    } else if (pid != 0) {
-      /* parent */
+	ret_putval->identifier = identifier_copy;
+	if (ret_putval->identifier == NULL)
+	{
+		cmd_error (CMD_ERROR, err, "malloc failed.");
+		cmd_destroy_putval (ret_putval);

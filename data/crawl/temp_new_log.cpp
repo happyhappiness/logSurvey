@@ -1,2 +1,1 @@
-logprintf (LOG_VERBOSE, _("Failed to unlink symlink `%s': %s\n"),
-		   file, strerror (errno));
+fprintf (stderr, "Option `%s' is not valid in this mode!\n", shortvar);

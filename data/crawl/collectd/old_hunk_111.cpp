@@ -1,6 +1,13 @@
-    sstrncpy(notification.plugin, "python", sizeof(notification.plugin));
-  Py_BEGIN_ALLOW_THREADS;
-  ret = plugin_dispatch_notification(&notification);
-  Py_END_ALLOW_THREADS;
-  if (ret != 0) {
-    PyErr_SetString(PyExc_RuntimeError,
+{
+  oconfig_item_t *ci_copy;
+
+  ci_copy = malloc (sizeof (*ci_copy));
+  if (ci_copy == NULL)
+  {
+    fprintf (stderr, "malloc failed.\n");
+    return (NULL);
+  }
+  memset (ci_copy, 0, sizeof (*ci_copy));
+  ci_copy->values = NULL;
+  ci_copy->parent = NULL;
+  ci_copy->children = NULL;

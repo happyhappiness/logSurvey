@@ -1,13 +1,6 @@
-    exit_usage (argv[0], 1);
-  }
+	return 0;
+}
 
-  if (strcasecmp (argv[optind], "flush") == 0)
-    status = flush (address, argc - optind, argv + optind);
-  else {
-    fprintf (stderr, "%s: invalid command: %s\n", argv[0], argv[optind]);
-    return (1);
-  }
-
-  if (status != 0)
-    return (status);
-  return (0);
+static void cpy_log_callback(int severity, const char *message, user_data_t *data) {
+	cpy_callback_t * c = data->data;
+	PyObject *ret;

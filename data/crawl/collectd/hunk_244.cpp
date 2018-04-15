@@ -1,13 +1,14 @@
- {
- 	if (strcasecmp (key, "Irq") == 0)
+ 	else
  	{
--		unsigned int *temp;
--		unsigned int irq;
--		char *endptr;
-+		char **temp;
+ 		if (print_timestamp)
+-			fprintf (fh, "[%s] %s%s\n", timestamp_str,
+-					print_level ? level_str : "",
+-					msg);
++			fprintf (fh, "[%s] %s%s\n", timestamp_str, level_str, msg);
+ 		else
+-			fprintf (fh, "%s%s\n", print_level ? level_str : "",
+-						msg);
++			fprintf (fh, "%s%s\n", level_str, msg);
  
--		temp = (unsigned int *) realloc (irq_list, (irq_list_num + 1) * sizeof (unsigned int *));
-+		temp = realloc (irq_list, (irq_list_num + 1) * sizeof (*irq_list));
- 		if (temp == NULL)
- 		{
- 			fprintf (stderr, "irq plugin: Cannot allocate more memory.\n");
+ 		if (do_close != 0)
+ 			fclose (fh);

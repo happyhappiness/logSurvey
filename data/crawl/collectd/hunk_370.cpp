@@ -1,6 +1,6 @@
 +/**
-+ * collectd - src/utils_cms_getthreshold.c
-+ * Copyright (C) 2008,2009  Florian octo Forster
++ * collectd - src/owfs.c
++ * Copyright (C) 2008  Florian octo Forster
 + *
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms of the GNU General Public License as published by the
@@ -15,164 +15,292 @@
 + * with this program; if not, write to the Free Software Foundation, Inc.,
 + * 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
 + *
-+ * Author:
-+ *   Florian octo Forster <octo at verplant.org>
++ * Authors:
++ *   Florian octo Forster <octo at noris.net>
 + **/
 +
 +#include "collectd.h"
 +#include "common.h"
 +#include "plugin.h"
++#include "utils_ignorelist.h"
 +
-+#include "utils_threshold.h"
-+#include "utils_parse_option.h" /* for `parse_string' */
-+#include "utils_cmd_getthreshold.h"
++#include <owcapi.h>
 +
-+#define print_to_socket(fh, ...) \
-+  if (fprintf (fh, __VA_ARGS__) < 0) { \
-+    char errbuf[1024]; \
-+    WARNING ("handle_getthreshold: failed to write to socket #%i: %s", \
-+        fileno (fh), sstrerror (errno, errbuf, sizeof (errbuf))); \
-+    return -1; \
++#define OW_FAMILY_MAX_FEATURES 2
++struct ow_family_features_s
++{
++  char *family;
++  struct
++  {
++    char filename[DATA_MAX_NAME_LEN];
++    char type[DATA_MAX_NAME_LEN];
++    char type_instance[DATA_MAX_NAME_LEN];
++  } features[OW_FAMILY_MAX_FEATURES];
++  size_t features_num;
++};
++typedef struct ow_family_features_s ow_family_features_t;
++
++/* see http://owfs.sourceforge.net/ow_table.html for a list of families */
++static ow_family_features_t ow_family_features[] =
++{
++  {
++    /* family = */ "10",
++    {
++      {
++        /* filename = */ "temperature",
++        /* type = */ "temperature",
++        /* type_instance = */ ""
++      }
++    },
++    /* features_num = */ 1
++  }
++};
++static int ow_family_features_num = STATIC_ARRAY_SIZE (ow_family_features);
++
++static char *device_g = NULL;
++
++static const char *config_keys[] =
++{
++  "Alias",
++  "Device",
++  "IgnoreSelected",
++  "Sensor",
++};
++static int config_keys_num = STATIC_ARRAY_SIZE (config_keys);
++
++static ignorelist_t *sensor_list;
++
++static int cow_load_config (const char *key, const char *value)
++{
++  if (sensor_list == NULL)
++    sensor_list = ignorelist_create (1);
++
++  if (strcasecmp (key, "Sensor") == 0)
++  {
++    if (ignorelist_add (sensor_list, value))
++    {
++      ERROR ("sensors plugin: "
++          "Cannot add value to ignorelist.");
++      return (1);
++    }
++  }
++  else if (strcasecmp (key, "IgnoreSelected") == 0)
++  {
++    ignorelist_set_invert (sensor_list, 1);
++    if ((strcasecmp (value, "True") == 0)
++        || (strcasecmp (value, "Yes") == 0)
++        || (strcasecmp (value, "On") == 0))
++      ignorelist_set_invert (sensor_list, 0);
++  }
++  else if (strcasecmp (key, "Device") == 0)
++  {
++    char *temp;
++    temp = strdup (value);
++    if (temp == NULL)
++    {
++      ERROR ("onewire plugin: strdup failed.");
++      return (1);
++    }
++    sfree (device_g);
++    device_g = temp;
++  }
++  else if (strcasecmp (key, "Alias") == 0)
++  {
++    /* azogtodo alias-list */
++  }
++  else
++  {
++    return (-1);
 +  }
 +
-+int handle_getthreshold (FILE *fh, char *buffer)
++  return (0);
++}
++
++static int cow_init (void)
 +{
-+  char *command;
-+  char *identifier;
-+  char *identifier_copy;
++  int status;
 +
-+  char *host;
-+  char *plugin;
-+  char *plugin_instance;
-+  char *type;
-+  char *type_instance;
++  if (device_g == NULL)
++  {
++    ERROR ("onewire plugin: cow_init: No device configured.");
++    return (-1);
++  }
 +
-+  value_list_t vl;
-+  threshold_t threshold;
++  status = (int) OW_init (device_g);
++  if (status != 0)
++  {
++    ERROR ("onewire plugin: OW_init(%s) failed: %i.", device_g, status);
++    return (1);
++  }
 +
-+  int   status;
++  return (0);
++} /* int cow_init */
++
++static int cow_read_values (const char *path, const char *name,
++    const ow_family_features_t *family_info)
++{
++  value_t values[1];
++  value_list_t vl = VALUE_LIST_INIT;
++  int success = 0;
 +  size_t i;
 +
-+  if ((fh == NULL) || (buffer == NULL))
-+    return (-1);
-+
-+  DEBUG ("utils_cmd_getthreshold: handle_getthreshold (fh = %p, buffer = %s);",
-+      (void *) fh, buffer);
-+
-+  command = NULL;
-+  status = parse_string (&buffer, &command);
-+  if (status != 0)
++  if (sensor_list != NULL)
 +  {
-+    print_to_socket (fh, "-1 Cannot parse command.\n");
-+    return (-1);
-+  }
-+  assert (command != NULL);
-+
-+  if (strcasecmp ("GETTHRESHOLD", command) != 0)
-+  {
-+    print_to_socket (fh, "-1 Unexpected command: `%s'.\n", command);
-+    return (-1);
++    DEBUG ("onewire plugin: Checking ignorelist for `%s'", name);
++    if (ignorelist_match (sensor_list, name) != 0)
++      return 0;
 +  }
 +
-+  identifier = NULL;
-+  status = parse_string (&buffer, &identifier);
-+  if (status != 0)
++  vl.values = values;
++  vl.values_len = 1;
++  vl.time = time (NULL);
++
++  sstrncpy (vl.host, hostname_g, sizeof (vl.host));
++  sstrncpy (vl.plugin, "onewire", sizeof (vl.plugin));
++  sstrncpy (vl.plugin_instance, name, sizeof (vl.plugin_instance));
++
++  for (i = 0; i < family_info->features_num; i++)
 +  {
-+    print_to_socket (fh, "-1 Cannot parse identifier.\n");
++    char *buffer;
++    size_t buffer_size;
++    int status;
++
++    char file[4096];
++    char *endptr;
++
++    snprintf (file, sizeof (file), "%s/%s",
++        path, family_info->features[i].filename);
++    file[sizeof (file) - 1] = 0;
++
++    buffer = NULL;
++    buffer_size = 0;
++    status = OW_get (file, &buffer, &buffer_size);
++    if (status < 0)
++    {
++      ERROR ("onewire plugin: OW_get (%s/%s) failed. status = %#x;",
++          path, family_info->features[i].filename, status);
++      return (-1);
++    }
++
++    endptr = NULL;
++    values[0].gauge = strtod (buffer, &endptr);
++    if (endptr == NULL)
++    {
++      ERROR ("onewire plugin: Buffer is not a number: %s", buffer);
++      status = -1;
++      continue;
++    }
++
++    sstrncpy (vl.type, family_info->features[i].type, sizeof (vl.type));
++    sstrncpy (vl.type_instance, family_info->features[i].type_instance,
++        sizeof (vl.type_instance));
++
++    plugin_dispatch_values (&vl);
++    success++;
++
++    free (buffer);
++  } /* for (i = 0; i < features_num; i++) */
++
++  return ((success > 0) ? 0 : -1);
++} /* int cow_read_values */
++
++static int cow_read_bus (const char *path)
++{
++  char *buffer;
++  size_t buffer_size;
++  int status;
++
++  char *buffer_ptr;
++  char *dummy;
++  char *saveptr;
++  char subpath[4096];
++  char family_dummy[3]; /* a family only has 2 digits */
++
++  status = OW_get (path, &buffer, &buffer_size);
++  if (status < 0)
++  {
++    ERROR ("onewire plugin: OW_get (%s) failed. status = %#x;",
++        path, status);
 +    return (-1);
 +  }
-+  assert (identifier != NULL);
 +
-+  if (*buffer != 0)
++  dummy = buffer;
++  saveptr = NULL;
++  while ((buffer_ptr = strtok_r (dummy, ",/", &saveptr)) != NULL)
 +  {
-+    print_to_socket (fh, "-1 Garbage after end of command: %s\n", buffer);
-+    return (-1);
-+  }
++    int i;
 +
-+  /* parse_identifier() modifies its first argument,
-+   * returning pointers into it */
-+  identifier_copy = sstrdup (identifier);
++    dummy = NULL;
 +
-+  status = parse_identifier (identifier_copy, &host,
-+      &plugin, &plugin_instance,
-+      &type, &type_instance);
-+  if (status != 0)
++    snprintf (subpath, sizeof (subpath), "%s/%s", path, buffer_ptr);
++    subpath[sizeof (subpath) - 1] = 0;
++
++    for (i = 0; i < ow_family_features_num; i++)
++    {
++      snprintf (family_dummy, sizeof (family_dummy), "%s%s", ow_family_features[i].family, ".");
++      if (strncmp (family_dummy, buffer_ptr, strlen (family_dummy)) != 0)
++        continue;
++
++      cow_read_values (subpath, buffer_ptr + 3, ow_family_features + i);
++    }
++  } /* while (strtok_r) */
++
++  free (buffer);
++  return (0);
++} /* int cow_read_bus */
++
++static int cow_read (void)
++{
++  char *buffer;
++  size_t buffer_size;
++  int status;
++
++  char *buffer_ptr;
++  char *dummy;
++  char *saveptr;
++
++  status = OW_get ("/uncached/", &buffer, &buffer_size);
++  if (status < 0)
 +  {
-+    DEBUG ("handle_getthreshold: Cannot parse identifier `%s'.", identifier);
-+    print_to_socket (fh, "-1 Cannot parse identifier `%s'.\n", identifier);
-+    sfree (identifier_copy);
-+    return (-1);
-+  }
-+
-+  memset (&vl, 0, sizeof (vl));
-+  sstrncpy (vl.host, host, sizeof (vl.host));
-+  sstrncpy (vl.plugin, plugin, sizeof (vl.plugin));
-+  if (plugin_instance != NULL)
-+    sstrncpy (vl.plugin_instance, plugin_instance, sizeof (vl.plugin_instance));
-+  sstrncpy (vl.type, type, sizeof (vl.type));
-+  if (type_instance != NULL)
-+    sstrncpy (vl.type_instance, type_instance, sizeof (vl.type_instance));
-+  sfree (identifier_copy);
-+
-+  memset (&threshold, 0, sizeof (threshold));
-+  status = ut_search_threshold (&vl, &threshold);
-+  if (status == ENOENT)
-+  {
-+    print_to_socket (fh, "-1 No threshold found for identifier %s\n",
-+        identifier);
-+    return (0);
-+  }
-+  else if (status != 0)
-+  {
-+    print_to_socket (fh, "-1 Error while looking up threshold: %i\n",
++    ERROR ("onewire plugin: OW_get (\"/\") failed. status = %#x;",
 +        status);
 +    return (-1);
 +  }
 +
-+  /* Lets count the number of lines we'll return. */
-+  i = 0;
-+  if (threshold.host[0] != 0)            i++;
-+  if (threshold.plugin[0] != 0)          i++;
-+  if (threshold.plugin_instance[0] != 0) i++;
-+  if (threshold.type[0] != 0)            i++;
-+  if (threshold.type_instance[0] != 0)   i++;
-+  if (threshold.data_source[0] != 0)     i++;
-+  if (!isnan (threshold.warning_min))    i++;
-+  if (!isnan (threshold.warning_max))    i++;
-+  if (!isnan (threshold.failure_min))    i++;
-+  if (!isnan (threshold.failure_max))    i++;
-+  if (threshold.hysteresis > 0.0)        i++;
-+  if (threshold.hits > 1)                i++;
++  printf ("-- 8< --\n");
 +
-+  /* Print the response */
-+  print_to_socket (fh, "%zu Threshold found\n", i);
++  dummy = buffer;
++  saveptr = NULL;
++  while ((buffer_ptr = strtok_r (dummy, ",/", &saveptr)) != NULL)
++  {
++    dummy = NULL;
++    if (strncmp ("bus", buffer_ptr, strlen ("bus")) == 0)
++    {
++      cow_read_bus (buffer_ptr);
++    }
++  } /* while (strtok_r) */
 +
-+  if (threshold.host[0] != 0)
-+    print_to_socket (fh, "Host: %s\n", threshold.host)
-+  if (threshold.plugin[0] != 0)
-+    print_to_socket (fh, "Plugin: %s\n", threshold.plugin)
-+  if (threshold.plugin_instance[0] != 0)
-+    print_to_socket (fh, "Plugin Instance: %s\n", threshold.plugin_instance)
-+  if (threshold.type[0] != 0)
-+    print_to_socket (fh, "Type: %s\n", threshold.type)
-+  if (threshold.type_instance[0] != 0)
-+    print_to_socket (fh, "Type Instance: %s\n", threshold.type_instance)
-+  if (threshold.data_source[0] != 0)
-+    print_to_socket (fh, "Data Source: %s\n", threshold.data_source)
-+  if (!isnan (threshold.warning_min))
-+    print_to_socket (fh, "Warning Min: %g\n", threshold.warning_min)
-+  if (!isnan (threshold.warning_max))
-+    print_to_socket (fh, "Warning Max: %g\n", threshold.warning_max)
-+  if (!isnan (threshold.failure_min))
-+    print_to_socket (fh, "Failure Min: %g\n", threshold.failure_min)
-+  if (!isnan (threshold.failure_max))
-+    print_to_socket (fh, "Failure Max: %g\n", threshold.failure_max)
-+  if (threshold.hysteresis > 0.0)
-+    print_to_socket (fh, "Hysteresis: %g\n", threshold.hysteresis)
-+  if (threshold.hits > 1)
-+    print_to_socket (fh, "Hits: %i\n", threshold.hits)
++  printf ("-- >8 --\n");
++
++  free (buffer);
 +
 +  return (0);
-+} /* int handle_getthreshold */
++} /* int cow_read */
 +
-+/* vim: set sw=2 sts=2 ts=8 et : */
++static int cow_shutdown (void)
++{
++  OW_finish ();
++  ignorelist_free (sensor_list);
++  return (0);
++} /* int cow_shutdown */
++
++void module_register (void)
++{
++  plugin_register_init ("onewire", cow_init);
++  plugin_register_read ("onewire", cow_read);
++  plugin_register_shutdown ("onewire", cow_shutdown);
++  plugin_register_config ("onewire", cow_load_config,
++    config_keys, config_keys_num);
++}
++
++/* vim: set sw=2 sts=2 ts=8 et fdm=marker cindent : */

@@ -1,16 +1,7 @@
-	PyType_Ready(&ValuesType);
-	sys = PyImport_ImportModule("sys"); /* New reference. */
-	if (sys == NULL) {
-		ERROR("python module: Unable to import \"sys\" module.");
-		/* Just print the default python exception text to stderr. */
-		PyErr_Print();
-		return 1;
-	}
-	sys_path = PyObject_GetAttrString(sys, "path"); /* New reference. */
-	Py_DECREF(sys);
-	if (sys_path == NULL) {
-		ERROR("python module: Unable to read \"sys.path\".");
-		PyErr_Print();
-		return 1;
-	}
-	module = Py_InitModule("collectd", cpy_methods); /* Borrowed reference. */
+	vsnprintf (message, sizeof (message), format, ap);
+	message[sizeof (message) - 1] = '\0';
+
+	plugin_log (level, message);
+	return 1;
+} /* vcomplain */
+

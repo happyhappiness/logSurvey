@@ -1,8 +1,8 @@
-	PyType_Ready(&PluginDataType);
-	ValuesType.tp_base = &PluginDataType;
-	PyType_Ready(&ValuesType);
-	NotificationType.tp_base = &PluginDataType;
-	PyType_Ready(&NotificationType);
-	sys = PyImport_ImportModule("sys"); /* New reference. */
-	if (sys == NULL) {
-		cpy_log_exception("python initialization");
+		{
+			fprintf (stderr, "rrdtool: `CacheTimeout' must "
+					"be greater than 0.\n");
+			ERROR ("rrdtool: `CacheTimeout' must "
+					"be greater than 0.\n");
+			return (1);
+		}
+		cache_timeout = tmp;

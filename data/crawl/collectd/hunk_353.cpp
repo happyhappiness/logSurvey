@@ -1,8 +1,8 @@
- 	for (c = cpy_init_callbacks; c; c = c->next) {
- 		ret = PyObject_CallFunctionObjArgs(c->callback, c->data, (void *) 0); /* New reference. */
- 		if (ret == NULL)
--			PyErr_Print(); /* FIXME */
-+			cpy_log_exception("init callback");
- 		else
- 			Py_DECREF(ret);
+ 		XSRETURN_EMPTY;
  	}
+ 
+-	plugin_log (SvIV (ST (0)), SvPV_nolen (ST (1)));
++	plugin_log (SvIV (ST (0)), "%s", SvPV_nolen (ST (1)));
+ 	XSRETURN_YES;
+ } /* static XS (Collectd_plugin_log) */
+ 

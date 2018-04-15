@@ -1,8 +1,8 @@
-#define print_to_socket(fh, ...)                                               \
-  do {                                                                         \
-    if (fprintf(fh, __VA_ARGS__) < 0) {                                        \
-      WARNING("cmd_handle_getval: failed to write to socket #%i: %s",          \
-              fileno(fh), STRERRNO);                                           \
-      return -1;                                                               \
-    }                                                                          \
-    fflush(fh);                                                                \
+      cmd_handle_flush(fhout, buffer);
+    } else {
+      if (fprintf(fhout, "-1 Unknown command: %s\n", fields[0]) < 0) {
+        WARNING("unixsock plugin: failed to write to socket #%i: %s",
+                fileno(fhout), STRERRNO);
+        break;
+      }
+    }

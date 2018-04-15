@@ -1,10 +1,25 @@
-					return (RET_UNKNOWN);
-				}
-				match_ds_g = tmp;
-				match_ds_g[match_ds_num_g] = strdup (optarg);
-				if (match_ds_g[match_ds_num_g] == NULL)
-				{
-					fprintf (stderr, "strdup failed: %s\n",
-							strerror (errno));
-					return (RET_UNKNOWN);
-				}
+	}
+	else if (strcasecmp ("StepSize", key) == 0)
+	{
+		int tmp = atoi (value);
+		if (tmp <= 0)
+		{
+			fprintf (stderr, "rrdtool: `StepSize' must "
+					"be greater than 0.\n");
+			return (1);
+		}
+		stepsize = tmp;
+	}
+	else if (strcasecmp ("HeartBeat", key) == 0)
+	{
+		int tmp = atoi (value);
+		if (tmp <= 0)
+		{
+			fprintf (stderr, "rrdtool: `HeartBeat' must "
+					"be greater than 0.\n");
+			return (1);
+		}
+		heartbeat = tmp;
+	}
+	else if (strcasecmp ("RRARows", key) == 0)
+	{

@@ -1,27 +1,26 @@
-	 * This will make sure that SIGINT won't kill collectd but
-	 * still interrupt syscalls like sleep and pause. */
+{
+    lvm_t lvm;
+    vg_t vg;
+    int status = 0;
+    struct dm_list *vg_names;
+    struct lvm_str_list *name_list;
 
-	if (PyImport_ImportModule("readline") == NULL) {
-		/* This interactive session will suck. */
-		cpy_log_exception("interactive session init");
-	}
-	cur_sig = PyOS_setsig(SIGINT, python_sigint_handler);
-	PyOS_AfterFork();
-	PyEval_InitThreads();
-	close(*(int *) pipefd);
-	PyRun_InteractiveLoop(stdin, "<stdin>");
-	PyOS_setsig(SIGINT, cur_sig);
-	PyErr_Print();
-	state = PyEval_SaveThread();
-	NOTICE("python: Interactive interpreter exited, stopping collectd ...");
-	pthread_kill(main_thread, SIGINT);
-	return NULL;
-}
+    lvm = lvm_init(NULL);
+    if (!lvm) {
+    	status = lvm_errno(lvm);
+    	ERROR("volume plugin: lvm_init failed: %s", lvm_errmsg(lvm));
+    }
 
-static int cpy_init(void) {
-	PyObject *ret;
-	int pipefd[2];
-	char buf;
-	static pthread_t thread;
+    vg_names = lvm_list_vg_names(lvm);
+    if (!vg_names) {
+    	status = lvm_errno(lvm);
+    	ERROR("volume plugin lvm_list_vg_name failed %s", lvm_errmsg(lvm));
+    }
 
-	if (!Py_IsInitialized()) {
+    dm_list_iterate_items(name_list, vg_names) {
+        vg = lvm_vg_open(lvm, name_list->str, "r", 0);
+        volume_submit(name_list->str, "df_complex", "size", lvm_vg_get_size(vg));
+        volume_submit(name_list->str, "df_complex", "free", lvm_vg_get_free_size(vg));
+
+        lvm_vg_close(vg);
+    }

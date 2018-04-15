@@ -1,115 +1,61 @@
-+#
-+# collectd - mon.itor.us collectd plugin
-+# Copyright (C) 2009  Jeff Green
-+#
-+# This program is free software; you can redistribute it and/or modify it
-+# under the terms of the GNU General Public License as published by the
-+# Free Software Foundation; only version 2 of the License is applicable.
-+#
-+# This program is distributed in the hope that it will be useful, but
-+# WITHOUT ANY WARRANTY; without even the implied warranty of
-+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-+# General Public License for more details.
-+#
-+# You should have received a copy of the GNU General Public License along
-+# with this program; if not, write to the Free Software Foundation, Inc.,
-+# 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
-+#
-+# Authors:
-+#   Jeff Green <jeff at kikisoso.org>
-+#
+ 
+ =back
+ 
++=head2 Plugin C<notify_email>
 +
-+package Collectd::Plugin::Monitorus;
++The I<notify_email> plugin uses the I<ESMTP> library to send notifications to a
++configured email address.
 +
-+use strict;
-+use warnings;
++I<libESMTP> is available from L<http://www.stafford.uklinux.net/libesmtp/>.
 +
-+use Collectd qw( :all );
-+use LWP;
-+use threads::shared;
++Available configuration options:
 +
-+use constant NUM_OF_INTERVALS => 90;
++=over 4
 +
-+my $intervalcnt :shared;
-+$intervalcnt=NUM_OF_INTERVALS;
-+my $prev_value :shared;
-+$prev_value=0;
++=item B<From> I<Address>
 +
-+plugin_register (TYPE_READ, "monitorus", "monitorus_read");
-+plugin_register (TYPE_LOG, "monitorus", "monitorus_log");
++Email address from which the emails should appear to come from.
 +
-+sub monitorus_read
-+{
-+        my $vl = { plugin => 'monitorus' };
++Default: C<root@localhost>
 +
-+        # Only retrieve a value occasionally in order to not overload mon.itor.us
-+        if (++$intervalcnt<NUM_OF_INTERVALS) { # e.g. 180 * 10 secs / 60 seconds/min = 30 minutes
-+                $vl->{'values'} = [ $prev_value ];
-+                plugin_dispatch_values ('gauge', $vl);
-+                return 1;
-+        }
++=item B<Recipient> I<Address>
 +
-+        $intervalcnt=0;
++Configures the email address(es) to which the notifications should be mailed.
++May be repeated to send notifications to multiple addresses.
 +
-+        my $site = 'http://mon.itor.us';
-+        my $username = 'me@example.org';
-+        my $target = $site.'/user/api/'.$username.'/secretpassword';
++At least one B<Recipient> must be present for the plugin to work correctly.
 +
-+        my $ua = LWP::UserAgent->new;
-+        my $req = HTTP::Request->new(GET => "$target");
-+        $req->header('Accept' => 'text/html');          #Accept HTML Page
++=item B<SMTPServer> I<Hostname>
 +
-+        my $key;
-+        my $res = $ua->get($target);
-+        if ($res->is_success) {# Success....all content of page has been received
-+                $res->content() =~ m/\[CDATA\[(.*)\]\]/;
-+                $key = $1;
-+        } else {
-+                INFO("monitorus: Error in retrieving login page.");
-+        }
++Hostname of the SMTP server to connect to.
 +
-+        $target = $site.'/test/api/'.$key.'/testNames';
-+        my $testid;
-+        $res = $ua->get($target);
-+        if ($res->is_success) {# Success....all content of page has been received
-+                $res->content() =~ m/<test id='(.*)'><!\[CDATA\[sitetest_http\]\]/;
-+                $testid = $1;
-+        } else {
-+                INFO("monitorus: Error in retrieving testNames page.");
-+        }
++Default: C<localhost>
 +
-+        #$target = $site.'/test/api/'.$key.'/testinfo/'.$testid.'/-240';
-+        #$target = $site.'/test/api/'.$key.'/test/'.$testid.'/27/5/2009/1/3/-240';
-+        $target = $site.'/test/api/'.$key.'/testsLastValues/1/3';
++=item B<SMTPPort> I<Port>
 +
-+        my $result;
-+        my $value;
-+        $res = $ua->get($target);
-+        if ($res->is_success) {# Success....all content of page has been received
-+                $res->content() =~ m/\<\/row\>\s*(\<row\>.*?sitetest_http.*?\<\/row\>)/s;
-+                $result = $1;
-+                $result =~ s/\<cell\>.*?CDATA.*?\<\/cell\>//g;
-+                $result =~ m|\<cell\>([0-9]*)\<\/cell\>|;
-+                $value = $1;
-+        } else {
-+                INFO("monitorus: Error in retrieving testsLastValues page.");
-+        }
++TCP port to connect to.
 +
-+        $prev_value = $value;
-+        $vl->{'values'} = [ $value ];
-+        plugin_dispatch_values ('gauge', $vl);
++Default: C<25>
 +
-+        return 1;
-+}
++=item B<SMTPUser> I<Username>
 +
-+# This function is called when plugin_log () has been used.
-+sub monitorus_log
-+{
-+        my $level = shift;
-+        my $msg   = shift;
++Username for ASMTP authentication. Optional.
 +
-+        print "LOG: $level - $msg\n";
-+        return 1;
-+} # monitorus_log ()
++=item B<SMTPPassword> I<Password>
 +
-+1;
++Password for ASMTP authentication. Optional.
++
++=item B<Subject> I<Subject>
++
++Subject-template to use when sending emails. There must be exactly two
++string-placeholders in the subject, given in the standard I<printf(3)> syntax,
++i.E<nbsp>e. C<%s>. The first will be replaced with the severity, the second
++with the hostname.
++
++Default: C<Collectd notify: %s@%s>
++
++=back
++
+ =head2 Plugin C<ntpd>
+ 
+ =over 4

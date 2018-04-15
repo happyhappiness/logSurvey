@@ -1,7 +1,8 @@
-				else if (strcasecmp (optarg, "percentage") == 0)
-					consolitation_g = CON_PERCENTAGE;
-				else
-					usage (argv[0]);
-				break;
-			case 'd':
-			{
+		XSRETURN_EMPTY;
+	}
+
+	log_debug ("Collectd::plugin_log: level = %i, message = \"%s\"",
+			SvIV (ST (0)), SvPV_nolen (ST (1)));
+	plugin_log (SvIV (ST (0)), SvPV_nolen (ST (1)));
+	XSRETURN_YES;
+} /* static XS (Collectd_plugin_log) */

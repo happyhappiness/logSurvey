@@ -1,11 +1,8 @@
 
-  return 0;
-}
-#endif
+#define print_to_socket(fh, ...)                                               \
+  if (fprintf(fh, __VA_ARGS__) < 0) {                                          \
+    WARNING("handle_getthreshold: failed to write to socket #%i: %s",          \
+            fileno(fh), STRERRNO);                                             \
+    return -1;                                                                 \
+  }
 
-int main(void) {
-  int ret = 0;
-
-  int status;
-  if ((status = test_network_parse())) {
-    ret = status;

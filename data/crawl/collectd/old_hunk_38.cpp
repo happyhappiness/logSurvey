@@ -1,36 +1,33 @@
-  ERROR("ipmi plugin: %s failed: %s", func, errbuf);
-} /* void c_ipmi_error */
+    /* else: cmd_parse_option did not find an option; treat this as a
+     * value list. */
 
-/*
- * Sensor handlers
- */
-/* Prototype for sensor_list_remove, so sensor_read_handler can call it. */
-static int sensor_list_remove(ipmi_sensor_t *sensor);
+    status = parse_values(argv[i], &vl, ds);
+    if (status != 0) {
+      cmd_error(CMD_PARSE_ERROR, err, "Parsing the values string failed.");
+      result = CMD_PARSE_ERROR;
+      break;
+    }
 
-static void sensor_read_handler(ipmi_sensor_t *sensor, int err,
-                                enum ipmi_value_present_e value_present,
-                                unsigned int __attribute__((unused)) raw_value,
-                                double value,
-                                ipmi_states_t __attribute__((unused)) * states,
-                                void *user_data) {
-  value_list_t vl = VALUE_LIST_INIT;
+    tmp = (value_list_t *)realloc(ret_putval->vl, (ret_putval->vl_num + 1) *
+                                                      sizeof(*ret_putval->vl));
+    if (tmp == NULL) {
+      cmd_error(CMD_ERROR, err, "realloc failed.");
+      cmd_destroy_putval(ret_putval);
+      result = CMD_ERROR;
+      break;
+    }
 
-  c_ipmi_sensor_list_t *list_item = (c_ipmi_sensor_list_t *)user_data;
+    ret_putval->vl = tmp;
+    ret_putval->vl_num++;
+    memcpy(&ret_putval->vl[ret_putval->vl_num - 1], &vl, sizeof(vl));
+  } /* while (*buffer != 0) */
+  /* Done parsing the options. */
 
-  if (err != 0) {
-    if ((err & 0xff) == IPMI_NOT_PRESENT_CC) {
-      if (list_item->sensor_not_present == 0) {
-        list_item->sensor_not_present = 1;
+  if (result != CMD_OK) {
+    if (ret_putval->vl_num == 0)
+      sfree(vl.values);
+    cmd_destroy_putval(ret_putval);
+  }
 
-        INFO("ipmi plugin: sensor_read_handler: sensor %s "
-             "not present.",
-             list_item->sensor_name);
-
-        if (c_ipmi_notify_notpresent) {
-          notification_t n = {
-              NOTIF_WARNING, cdtime(), "", "", "ipmi", "", "", "", NULL};
-
-          sstrncpy(n.host, hostname_g, sizeof(n.host));
-          sstrncpy(n.type_instance, list_item->sensor_name,
-                   sizeof(n.type_instance));
-          sstrncpy(n.type, list_item->sensor_type, sizeof(n.type));
+  return (result);
+} /* cmd_status_t cmd_parse_putval */

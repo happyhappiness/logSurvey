@@ -1,35 +1,31 @@
-	return cpy_register_generic(&cpy_init_callbacks, args, kwds);
-}
+		free (values);
+		return (-1);
+	}
 
-static PyObject *cpy_register_shutdown(PyObject *self, PyObject *args, PyObject *kwds) {
-	return cpy_register_generic(&cpy_shutdown_callbacks, args, kwds);
-}
+	i = 0;
+	while (fgets (buffer, sizeof (buffer), fh_in) != NULL)
+	{
+		char *key;
+		char *value;
 
-static PyObject *cpy_Error(PyObject *self, PyObject *args) {
-	const char *text;
-	if (PyArg_ParseTuple(args, "s", &text) == 0) return NULL;
-	plugin_log(LOG_ERR, "%s", text);
-	Py_RETURN_NONE;
-}
+		key = buffer;
 
-static PyObject *cpy_Warning(PyObject *self, PyObject *args) {
-	const char *text;
-	if (PyArg_ParseTuple(args, "s", &text) == 0) return NULL;
-	plugin_log(LOG_WARNING, "%s", text);
-	Py_RETURN_NONE;
-}
+		value = strchr (key, '=');
+		if (value == NULL)
+			continue;
+		*value = '\0'; value++;
 
-static PyObject *cpy_Notice(PyObject *self, PyObject *args) {
-	const char *text;
-	if (PyArg_ParseTuple(args, "s", &text) == 0) return NULL;
-	plugin_log(LOG_NOTICE, "%s", text);
-	Py_RETURN_NONE;
-}
+		if (ignore_ds (key) != 0)
+			continue;
 
-static PyObject *cpy_Info(PyObject *self, PyObject *args) {
-	const char *text;
-	if (PyArg_ParseTuple(args, "s", &text) == 0) return NULL;
-	plugin_log(LOG_INFO, "%s", text);
-	Py_RETURN_NONE;
-}
+		values_names[i] = strdup (key);
+		values[i] = atof (value);
 
+		i++;
+		if (i >= values_num)
+			break;
+	}
+	values_num = i;
+
+	fclose (fh_in); fh_in = NULL; fd = -1;
+	fclose (fh_out); fh_out = NULL;

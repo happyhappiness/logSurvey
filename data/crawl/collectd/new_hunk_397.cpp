@@ -1,7 +1,6 @@
-  status = thread_init (&os_handler);
-  if (status != 0)
-  {
-    ERROR ("ipmi plugin: thread_init failed.\n");
-    return ((void *) -1);
-  }
+	}
+} /* void plugin_log */
 
+const data_set_t *plugin_get_ds (const char *name)
+{
+	data_set_t *ds;

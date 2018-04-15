@@ -1,14 +1,6 @@
-	{
-		const char *error = lt_dlerror ();
-
-		ERROR ("lt_dlopen failed: %s", error);
-		fprintf (stderr, "lt_dlopen failed: %s\n", error);
-		return (1);
+		}
+		rrarows = tmp;
 	}
-
-	if ((reg_handle = (void (*) (void)) lt_dlsym (dlh, "module_register")) == NULL)
+	else if (strcasecmp ("XFF", key) == 0)
 	{
-		WARNING ("Couldn't find symbol ``module_register'' in ``%s'': %s\n",
-				file, lt_dlerror ());
-		lt_dlclose (dlh);
-		return (-1);
+		double tmp = atof (value);

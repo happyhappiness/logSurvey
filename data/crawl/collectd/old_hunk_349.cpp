@@ -1,7 +1,7 @@
-				CPY_RETURN_FROM_THREADS 0;
-			}
-			if (PyErr_Occurred() != NULL) {
-				PyErr_Print();
-				CPY_RETURN_FROM_THREADS 0;
-			}
-		}
+
+	if ((socket_file_g == NULL) || (value_string_g == NULL)
+			|| (hostname_g == NULL))
+		usage (argv[0]);
+
+	return (do_check ());
+} /* int main */

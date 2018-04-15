@@ -23,564 +23,413 @@
  *   Florian octo Forster <octo at collectd.org>
  **/
 
-#if HAVE_CONFIG_H
-#include "config.h"
-#endif
-
-#if !defined(__GNUC__) || !__GNUC__
-#define __attribute__(x) /**/
-#endif
-
 #include "collectd/lcc_features.h"
-#include "collectd/network_parse.h"
+
+#include "collectd/network_buffer.h"
 
 #include <errno.h>
-#include <math.h>
-#include <pthread.h>
-
-#define GCRYPT_NO_DEPRECATED
-#include <gcrypt.h>
-
 #include <stdio.h>
-#define DEBUG(...) printf(__VA_ARGS__)
+#include <stdlib.h>
+#include <string.h>
 
-GCRY_THREAD_OPTION_PTHREAD_IMPL;
+#include "server.c" /* sic */
 
-/* forward declaration because parse_sign_sha256()/parse_encrypt_aes256() and
- * network_parse() need to call each other. */
-static int network_parse(void *data, size_t data_size, lcc_security_level_t sl,
-                         lcc_network_parse_options_t const *opts);
+char *raw_packet_data[] = {
+    "0000000e6c6f63616c686f7374000008000c1513676ac3a6e0970009000c00000002800000"
+    "000002000973776170000004000973776170000005000966726565000006000f0001010000"
+    "0080ff610f420008000c1513676ac3a8fc120004000c737761705f696f0000050007696e00"
+    "0006000f00010200000000000000000008000c1513676ac3a9077d000500086f7574000006"
+    "000f00010200000000000000000008000c1513676ac3bd2a8c0002000e696e746572666163"
+    "65000003000965746830000004000e69665f6f637465747300000500050000060018000202"
+    "02000000000000000000000000000000000008000c1513676ac3bd5a970004000e69665f65"
+    "72726f7273000006001800020202000000000000000000000000000000000008000c151367"
+    "6ac3bd7fea000300076c6f000004000e69665f6f6374657473000006001800020202000000"
+    "000009e79c000000000009e79c0008000c1513676ac3bdaae60003000a776c616e30000006"
+    "001800020202000000001009fa5400000000011cf6670008000c1513676ac3bdb0e0000400"
+    "0e69665f6572726f7273000006001800020202000000000000000000000000000000000008"
+    "000c1513676ac3bd3d6d0003000965746830000004000f69665f7061636b65747300000600"
+    "1800020202000000000000000000000000000000000008000c1513676ac3bdae290003000a"
+    "776c616e300000060018000202020000000000032f8f00000000000205e50008000c151367"
+    "6ac3bdbb7b0003000c646f636b657230000006001800020202000000000000000000000000"
+    "000000000008000c1513676ac3bda0db000300076c6f000004000e69665f6572726f727300"
+    "0006001800020202000000000000000000000000000000000008000c1513676ac3bdbde800"
+    "03000c646f636b657230000006001800020202000000000000000000000000000000000008"
+    "000c1513676ac3bd8d8e000300076c6f000004000f69665f7061636b657473000006001800"
+    "0202020000000000000c9c0000000000000c9c0008000c1513676ac3bdb90b0003000c646f"
+    "636b657230000004000e69665f6f6374657473000006001800020202000000000000000000"
+    "000000000000000008000c1513676ac469b10f0002000e70726f6365737365730000030005"
+    "000004000d70735f7374617465000005000c7a6f6d62696573000006000f00010100000000"
+    "000000000008000c1513676ac469a4a30005000d736c656570696e67000006000f00010100"
+    "00000000006e400008000c1513676ac469c6320005000b706167696e67000006000f000101"
+    "00000000000000000008000c1513676ac469f06e0005000c626c6f636b6564000006000f00"
+    "010100000000000000000008000c1513676ac4698af40005000c72756e6e696e6700000600"
+    "0f00010100000000000000000008000c1513676ac469bbe10005000c73746f707065640000"
+    "06000f00010100000000000000000008000c1513676ac46b8e710004000e666f726b5f7261"
+    "74650000050005000006000f0001020000000000001bcf0008000c1513676d437f12960002"
+    "00086370750000030006300000040008637075000005000b73797374656d000006000f0001"
+    "0200000000000021870008000c1513676d437f36020005000969646c65000006000f000102"
+    "000000000005847a0008000c1513676d437f979b0005000977616974000006000f00010200"
+    "000000000005210008000c1513676d43802ff60005000c736f6674697271000006000f0001"
+    "02000000000000001f0008000c1513676d43803b3a0005000a737465616c000006000f0001"
+    "020000000000000000",
+    "0000000e6c6f63616c686f7374000008000c1513676d4380551f0009000c00000002800000"
+    "00000200086370750000030006310000040008637075000005000975736572000006000f00"
+    "01020000000000007cad0008000c1513676d43805dbe000500096e696365000006000f0001"
+    "0200000000000001de0008000c1513676d4380697d0005000b73797374656d000006000f00"
+    "01020000000000001ce80008000c1513676d438072bd0005000969646c65000006000f0001"
+    "02000000000005931c0008000c1513676d43807c430005000977616974000006000f000102"
+    "000000000000094b0008000c1513676d43808cee0005000c736f6674697271000006000f00"
+    "010200000000000000120008000c1513676d4380843a0005000e696e746572727570740000"
+    "06000f00010200000000000000000008000c1513676d438096230005000a737465616c0000"
+    "06000f00010200000000000000000008000c1513676d4380aa9c0003000632000005000975"
+    "736572000006000f00010200000000000089580008000c1513676d4380b29f000500096e69"
+    "6365000006000f00010200000000000003610008000c1513676d4380c44c0005000969646c"
+    "65000006000f000102000000000005873d0008000c1513676d4380bc0f0005000b73797374"
+    "656d000006000f000102000000000000201d0008000c1513676d4380cea400050009776169"
+    "74000006000f00010200000000000005810008000c1513676d4380d7370005000e696e7465"
+    "7272757074000006000f00010200000000000000000008000c1513676d4380ea830005000a"
+    "737465616c000006000f00010200000000000000000008000c1513676d437eef6200030006"
+    "3000000500096e696365000006000f00010200000000000003920008000c1513676d4380e0"
+    "260003000632000005000c736f6674697271000006000f0001020000000000000016000800"
+    "0c1513676d438101410003000633000005000975736572000006000f000102000000000000"
+    "7d8a0008000c1513676d438109f5000500096e696365000006000f00010200000000000004"
+    "350008000c1513676d4380244b0003000630000005000e696e74657272757074000006000f"
+    "00010200000000000000000008000c1513676d438122070003000633000005000969646c65"
+    "000006000f0001020000000000058eb60008000c1513676d43812e83000500097761697400"
+    "0006000f0001020000000000000ca80008000c1513676d438141480005000c736f66746972"
+    "71000006000f000102000000000000001e0008000c1513676d43814a5d0005000a73746561"
+    "6c000006000f00010200000000000000000008000c1513676d4381149e0005000b73797374"
+    "656d000006000f0001020000000000001b9a0008000c1513676d437ea86000030006300000"
+    "05000975736572000006000f00010200000000000089a80008000c1513676d438138190003"
+    "000633000005000e696e74657272757074000006000f00010200000000000000000008000c"
+    "1513676d438a9ca00002000e696e74657266616365000003000965746830000004000e6966"
+    "5f6f6374657473000005000500000600180002020200000000000000000000000000000000"
+    "0008000c1513676d438aea760004000f69665f7061636b6574730000060018000202020000"
+    "00000000000000000000000000000008000c1513676d438b214d0004000e69665f6572726f"
+    "727300000600180002020200000000000000000000000000000000",
+    "0000000e6c6f63616c686f7374000008000c1513676d438aac590009000c00000002800000"
+    "000002000764660000030009726f6f74000004000f64665f636f6d706c6578000005000966"
+    "726565000006000f0001010000004c077e57420008000c1513676d438b6ada0005000d7265"
+    "736572766564000006000f00010100000000338116420008000c1513676d438b7a17000200"
+    "0e696e7465726661636500000300076c6f000004000e69665f6f6374657473000005000500"
+    "0006001800020202000000000009ecf5000000000009ecf50008000c1513676d438b757800"
+    "02000764660000030009726f6f74000004000f64665f636f6d706c65780000050009757365"
+    "64000006000f000101000000e0a41b26420008000c1513676d438b8ed20002000e696e7465"
+    "726661636500000300076c6f000004000e69665f6572726f72730000050005000006001800"
+    "020202000000000000000000000000000000000008000c1513676d438b86bf0004000f6966"
+    "5f7061636b6574730000060018000202020000000000000c9d0000000000000c9d0008000c"
+    "1513676d438bb3e60003000a776c616e300000060018000202020000000000032fab000000"
+    "00000205ed0008000c1513676d438bd62e0003000c646f636b657230000004000e69665f6f"
+    "6374657473000006001800020202000000000000000000000000000000000008000c151367"
+    "6d438bbc8f0003000a776c616e30000004000e69665f6572726f7273000006001800020202"
+    "000000000000000000000000000000000008000c1513676d438bdf030003000c646f636b65"
+    "7230000004000f69665f7061636b6574730000060018000202020000000000000000000000"
+    "00000000000008000c1513676d438baaf10003000a776c616e30000004000e69665f6f6374"
+    "65747300000600180002020200000000100a042300000000011cfa460008000c1513676d43"
+    "8c5f100002000764660000030009626f6f74000004000f64665f636f6d706c657800000500"
+    "0966726565000006000f0001010000000010e198410008000c1513676d438c689c0005000d"
+    "7265736572766564000006000f00010100000000804c68410008000c1513676d438c70ce00"
+    "05000975736564000006000f0001010000000020ea9e410008000c1513676d438be7bc0002"
+    "000e696e74657266616365000003000c646f636b657230000004000e69665f6572726f7273"
+    "0000050005000006001800020202000000000000000000000000000000000008000c151367"
+    "6d43beca8c0002000c656e74726f70790000030005000004000c656e74726f707900000600"
+    "0f0001010000000000088f400008000c1513676d43bf1d13000200096c6f61640000040009"
+    "6c6f6164000006002100030101019a9999999999a93f666666666666d63f5c8fc2f5285cdf"
+    "3f0008000c1513676d43c02b85000200096469736b00000300087364610000040010646973"
+    "6b5f6f63746574730000060018000202020000000075887800000000005b6f3c000008000c"
+    "1513676d43c06d1f0004000d6469736b5f6f7073000006001800020202000000000003cbbd"
+    "000000000001c0510008000c1513676d43c08b6a0004000e6469736b5f74696d6500000600"
+    "1800020202000000000000003f00000000000001720008000c1513676d43c0a5fb00040010"
+    "6469736b5f6d65726765640000060018000202020000000000001285000000000000f80100"
+    "08000c1513676d43c0c8b4000300097364613100000400106469736b5f6f63746574730000"
+    "060018000202020000000001107c000000000000003c00",
+    "0000000e6c6f63616c686f7374000008000c1513676d43c0d00a0009000c00000002800000"
+    "00000200096469736b000003000973646131000004000d6469736b5f6f7073000006001800"
+    "020202000000000000029b00000000000000080008000c1513676d43c0d7b20004000e6469"
+    "736b5f74696d650000060018000202020000000000000004000000000000000f0008000c15"
+    "13676d43c0df73000400106469736b5f6d6572676564000006001800020202000000000000"
+    "0fb400000000000000010008000c1513676d43c0f87c000300097364613200000400106469"
+    "736b5f6f637465747300000600180002020200000000000008000000000000000000000800"
+    "0c1513676d43c1003e0004000d6469736b5f6f707300000600180002020200000000000000"
+    "0200000000000000000008000c1513676d43c107bf000400106469736b5f6d657267656400"
+    "0006001800020202000000000000000000000000000000000008000c1513676d43c12fa400"
+    "03000973646135000004000d6469736b5f6f7073000006001800020202000000000003c867"
+    "000000000001aef20008000c1513676d43c13d5e000400106469736b5f6d65726765640000"
+    "0600180002020200000000000002d1000000000000f8000008000c1513676d43c136a90004"
+    "000e6469736b5f74696d65000006001800020202000000000000003f000000000000011c00"
+    "08000c1513676d43c1740500030009646d2d3000000400106469736b5f6f63746574730000"
+    "060018000202020000000074596400000000005b6f00000008000c1513676d43c179c70004"
+    "000d6469736b5f6f7073000006001800020202000000000003cae4000000000002b0f30008"
+    "000c1513676d43c18abe000400106469736b5f6d6572676564000006001800020202000000"
+    "000000000000000000000000000008000c1513676d43c181b90004000e6469736b5f74696d"
+    "650000060018000202020000000000000040000000000000013e0008000c1513676d43c1a9"
+    "5e00030009646d2d3100000400106469736b5f6f6374657473000006001800020202000000"
+    "00000e000000000000000000000008000c1513676d43c1b7ea0004000e6469736b5f74696d"
+    "65000006001800020202000000000000000200000000000000000008000c1513676d43c1b0"
+    "3e0004000d6469736b5f6f707300000600180002020200000000000000e000000000000000"
+    "000008000c1513676d43c1c00d000400106469736b5f6d6572676564000006001800020202"
+    "000000000000000000000000000000000008000c1513676d43c12818000300097364613500"
+    "000400106469736b5f6f637465747300000600180002020200000000746c6400000000005b"
+    "6f00000008000c1513676d43d320a80002000c62617474657279000003000630000004000b"
+    "636861726765000006000f0001018fc2f5285c2f58400008000c1513676d43d36fd6000400"
+    "0c63757272656e74000006000f00010100000000000000800008000c1513676d43d3cdb600"
+    "04000c766f6c74616765000006000f000101736891ed7cbf28400008000c1513676d43d59d"
+    "d60002000869727100000300050000040008697271000005000630000006000f0001020000"
+    "0000000000110008000c1513676d43d5d2cf0005000631000006000f000102000000000000"
+    "00100008000c1513676d43d5fe820005000638000006000f00010200000000000000010008"
+    "000c1513676d43d635440005000639000006000f00010200000000000035210008000c1513"
+    "676d43d66265000500073132000006000f0001020000000000000790",
+    "0000000e6c6f63616c686f7374000008000c1513676d43d68e940009000c00000002800000"
+    "0000020008697271000004000869727100000500073136000006000f000102000000000000"
+    "00210008000c1513676d43d69be20002000a7573657273000004000a757365727300000500"
+    "05000006000f00010100000000000010400008000c1513676d43d6aa5d0002000869727100"
+    "0004000869727100000500073233000006000f00010200000000000000250008000c151367"
+    "6d43d6c7dc000500073431000006000f000102000000000000ff7d0008000c1513676d43d6"
+    "e23d000500073432000006000f00010200000000000008070008000c1513676d43d9aa3a00"
+    "0500073437000006000f0001020000000000079a260008000c1513676d43d9cca900050007"
+    "3438000006000f00010200000000000000c70008000c1513676d43d9ea5d00050007343900"
+    "0006000f00010200000000000004c20008000c1513676d43da050e00050007353000000600"
+    "0f000102000000000000001c0008000c1513676d43da1efa000500084e4d49000006000f00"
+    "010200000000000000000008000c1513676d43da3c82000500084c4f43000006000f000102"
+    "000000000018d3080008000c1513676d43da544e00050008535055000006000f0001020000"
+    "0000000000000008000c1513676d43da6cca00050008504d49000006000f00010200000000"
+    "000000000008000c1513676d43da885400050008495749000006000f000102000000000000"
+    "a9da0008000c1513676d43daa23a00050008525452000006000f0001020000000000000003"
+    "0008000c1513676d43dabaed00050008524553000006000f00010200000000000ac8360008"
+    "000c1513676d43dad4150005000843414c000006000f000102000000000000191f0008000c"
+    "1513676d43daeef300050008544c42000006000f000102000000000003dbdc0008000c1513"
+    "676d43db11410005000854524d000006000f00010200000000000000000008000c1513676d"
+    "43db292c00050008544852000006000f00010200000000000000000008000c1513676d43db"
+    "411d000500084d4345000006000f00010200000000000000000008000c1513676d43db5b59"
+    "000500084d4350000006000f000102000000000000003c0008000c1513676d43db68010005"
+    "0008455252000006000f00010200000000000000000008000c1513676d43db758a00050008"
+    "4d4953000006000f00010200000000000000000008000c1513676d43dd2e800002000b6d65"
+    "6d6f7279000004000b6d656d6f7279000005000975736564000006000f00010100000000fe"
+    "bbe0410008000c1513676d43dd3f4b0005000d6275666665726564000006000f0001010000"
+    "000070fbc8410008000c1513676d43dd48700005000b636163686564000006000f00010100"
+    "000000c008df410008000c1513676d43dd51c60005000966726565000006000f0001010000"
+    "0080481d05420008000c1513676d43dec7e300020009737761700000040009737761700000"
+    "05000975736564000006000f00010100000000000000000008000c1513676d43ded4490005"
+    "000966726565000006000f00010100000080ff610f420008000c1513676d43dedcfd000500"
+    "0b636163686564000006000f00010100000000000000000008000c1513676d43d715e30002"
+    "0008697271000004000869727100000500073434000006000f0001020000000000031b6100"
+    "08000c1513676d43d73116000500073435000006000f00010200000000000000180008000c"
+    "1513676d43ee00150002000973776170000004000c737761705f696f0000050007696e0000"
+    "06000f0001020000000000000000",
+};
 
-static int init_gcrypt() {
-  /* http://lists.gnupg.org/pipermail/gcrypt-devel/2003-August/000458.html
-   * Because you can't know in a library whether another library has
-   * already initialized the library */
-  if (gcry_control(GCRYCTL_ANY_INITIALIZATION_P))
-    return (0);
-
-/* http://www.gnupg.org/documentation/manuals/gcrypt/Multi_002dThreading.html
- * To ensure thread-safety, it's important to set GCRYCTL_SET_THREAD_CBS
- * *before* initalizing Libgcrypt with gcry_check_version(), which itself must
- * be called before any other gcry_* function. GCRYCTL_ANY_INITIALIZATION_P
- * above doesn't count, as it doesn't implicitly initalize Libgcrypt.
- *
- * tl;dr: keep all these gry_* statements in this exact order please. */
-#if GCRYPT_VERSION_NUMBER < 0x010600
-  if (gcry_control(GCRYCTL_SET_THREAD_CBS, &gcry_threads_pthread)) {
+static int decode_string(char const *in, uint8_t *out, size_t *out_size) {
+  size_t in_size = strlen(in);
+  if (*out_size < (in_size / 2))
     return -1;
-  }
-#endif
+  *out_size = in_size / 2;
 
-  gcry_check_version(NULL);
-
-  if (gcry_control(GCRYCTL_INIT_SECMEM, 32768)) {
-    return -1;
-  }
-
-  gcry_control(GCRYCTL_INITIALIZATION_FINISHED);
-  return 0;
-}
-
-typedef struct {
-  uint8_t *data;
-  size_t len;
-} buffer_t;
-
-static int buffer_next(buffer_t *b, void *out, size_t n) {
-  if (b->len < n) {
-    return -1;
-  }
-  memmove(out, b->data, n);
-
-  b->data += n;
-  b->len -= n;
-
-  return 0;
-}
-
-static int buffer_uint16(buffer_t *b, uint16_t *out) {
-  uint16_t tmp;
-  if (buffer_next(b, &tmp, sizeof(tmp)) != 0)
-    return -1;
-
-  *out = be16toh(tmp);
-  return 0;
-}
-
-#define TYPE_HOST 0x0000
-#define TYPE_TIME 0x0001
-#define TYPE_TIME_HR 0x0008
-#define TYPE_PLUGIN 0x0002
-#define TYPE_PLUGIN_INSTANCE 0x0003
-#define TYPE_TYPE 0x0004
-#define TYPE_TYPE_INSTANCE 0x0005
-#define TYPE_VALUES 0x0006
-#define TYPE_INTERVAL 0x0007
-#define TYPE_INTERVAL_HR 0x0009
-#define TYPE_SIGN_SHA256 0x0200
-#define TYPE_ENCR_AES256 0x0210
-
-static int parse_int(void *payload, size_t payload_size, uint64_t *out) {
-  uint64_t tmp;
-
-  if (payload_size != sizeof(tmp))
-    return EINVAL;
-
-  memmove(&tmp, payload, sizeof(tmp));
-  *out = be64toh(tmp);
-  return 0;
-}
-
-static int parse_string(void *payload, size_t payload_size, char *out,
-                        size_t out_size) {
-  char *in = payload;
-
-  if ((payload_size < 1) || (in[payload_size - 1] != 0) ||
-      (payload_size > out_size))
-    return EINVAL;
-
-  strncpy(out, in, out_size);
-  return 0;
-}
-
-static int parse_identifier(uint16_t type, void *payload, size_t payload_size,
-                            lcc_value_list_t *state) {
-  char buf[LCC_NAME_LEN];
-
-  if (parse_string(payload, payload_size, buf, sizeof(buf)) != 0)
-    return EINVAL;
-
-  switch (type) {
-  case TYPE_HOST:
-    memmove(state->identifier.host, buf, LCC_NAME_LEN);
-    break;
-  case TYPE_PLUGIN:
-    memmove(state->identifier.plugin, buf, LCC_NAME_LEN);
-    break;
-  case TYPE_PLUGIN_INSTANCE:
-    memmove(state->identifier.plugin_instance, buf, LCC_NAME_LEN);
-    break;
-  case TYPE_TYPE:
-    memmove(state->identifier.type, buf, LCC_NAME_LEN);
-    break;
-  case TYPE_TYPE_INSTANCE:
-    memmove(state->identifier.type_instance, buf, LCC_NAME_LEN);
-    break;
-  default:
-    return EINVAL;
+  for (size_t i = 0; i < *out_size; i++) {
+    char tmp[] = {in[2 * i], in[2 * i + 1], 0};
+    out[i] = (uint8_t)strtoul(tmp, NULL, 16);
   }
 
   return 0;
 }
 
-static int parse_time(uint16_t type, void *payload, size_t payload_size,
-                      lcc_value_list_t *state) {
-  uint64_t tmp = 0;
-  if (parse_int(payload, payload_size, &tmp))
-    return EINVAL;
-
-  double t = (double)tmp;
-  switch (type) {
-  case TYPE_INTERVAL:
-    state->interval = t;
-    break;
-  case TYPE_INTERVAL_HR:
-    state->interval = t / 1073741824.0;
-    break;
-  case TYPE_TIME:
-    state->time = t;
-    break;
-  case TYPE_TIME_HR:
-    state->time = t / 1073741824.0;
-    break;
-  default:
+static int nop_writer(lcc_value_list_t const *vl) {
+  if (!strlen(vl->identifier.host) || !strlen(vl->identifier.plugin) ||
+      !strlen(vl->identifier.type)) {
     return EINVAL;
   }
-
   return 0;
 }
 
-static double ntohd(double val) /* {{{ */
-{
-  static int config = 0;
+static int test_network_parse() {
+  int ret = 0;
 
-  union {
-    uint8_t byte[8];
-    double floating;
-  } in = {
-      .floating = val,
-  };
-  union {
-    uint8_t byte[8];
-    double floating;
-  } out = {
-      .byte = {0},
-  };
-
-  if (config == 0) {
-    double d = 8.642135e130;
-    uint8_t b[8];
-
-    memcpy(b, &d, sizeof(b));
-
-    if ((b[0] == 0x2f) && (b[1] == 0x25) && (b[2] == 0xc0) && (b[3] == 0xc7) &&
-        (b[4] == 0x43) && (b[5] == 0x2b) && (b[6] == 0x1f) && (b[7] == 0x5b))
-      config = 1; /* need nothing */
-    else if ((b[7] == 0x2f) && (b[6] == 0x25) && (b[5] == 0xc0) &&
-             (b[4] == 0xc7) && (b[3] == 0x43) && (b[2] == 0x2b) &&
-             (b[1] == 0x1f) && (b[0] == 0x5b))
-      config = 2; /* endian flip */
-    else if ((b[4] == 0x2f) && (b[5] == 0x25) && (b[6] == 0xc0) &&
-             (b[7] == 0xc7) && (b[0] == 0x43) && (b[1] == 0x2b) &&
-             (b[2] == 0x1f) && (b[3] == 0x5b))
-      config = 3; /* int swap */
-    else
-      config = 4;
-  }
-
-  if (memcmp((char[]){0, 0, 0, 0, 0, 0, 0xf8, 0x7f}, in.byte, 8) == 0) {
-    return NAN;
-  } else if (config == 1) {
-    return val;
-  } else if (config == 2) {
-    in.floating = val;
-    out.byte[0] = in.byte[7];
-    out.byte[1] = in.byte[6];
-    out.byte[2] = in.byte[5];
-    out.byte[3] = in.byte[4];
-    out.byte[4] = in.byte[3];
-    out.byte[5] = in.byte[2];
-    out.byte[6] = in.byte[1];
-    out.byte[7] = in.byte[0];
-    return (out.floating);
-  } else if (config == 3) {
-    in.floating = val;
-    out.byte[0] = in.byte[4];
-    out.byte[1] = in.byte[5];
-    out.byte[2] = in.byte[6];
-    out.byte[3] = in.byte[7];
-    out.byte[4] = in.byte[0];
-    out.byte[5] = in.byte[1];
-    out.byte[6] = in.byte[2];
-    out.byte[7] = in.byte[3];
-    return out.floating;
-  } else {
-    /* If in doubt, just copy the value back to the caller. */
-    return val;
-  }
-} /* }}} double ntohd */
-
-static int parse_values(void *payload, size_t payload_size,
-                        lcc_value_list_t *state) {
-  buffer_t *b = &(buffer_t){
-      .data = payload, .len = payload_size,
-  };
-
-  uint16_t n;
-  if (buffer_uint16(b, &n))
-    return EINVAL;
-
-  if (((size_t)n * 9) != b->len)
-    return EINVAL;
-
-  state->values_len = (size_t)n;
-  state->values = calloc(sizeof(*state->values), state->values_len);
-  state->values_types = calloc(sizeof(*state->values_types), state->values_len);
-  if ((state->values == NULL) || (state->values_types == NULL)) {
-    free(state->values);
-    free(state->values_types);
-    return ENOMEM;
-  }
-
-  for (uint16_t i = 0; i < n; i++) {
-    uint8_t tmp;
-    if (buffer_next(b, &tmp, sizeof(tmp)))
-      return EINVAL;
-    state->values_types[i] = (int)tmp;
-  }
-
-  for (uint16_t i = 0; i < n; i++) {
-    uint64_t tmp;
-    if (buffer_next(b, &tmp, sizeof(tmp)))
-      return EINVAL;
-
-    if (state->values_types[i] == LCC_TYPE_GAUGE) {
-      union {
-        uint64_t i;
-        double d;
-      } conv = {.i = tmp};
-      state->values[i].gauge = ntohd(conv.d);
-      continue;
+  for (size_t i = 0; i < sizeof(raw_packet_data) / sizeof(raw_packet_data[0]);
+       i++) {
+    uint8_t buffer[LCC_NETWORK_BUFFER_SIZE_DEFAULT];
+    size_t buffer_size = sizeof(buffer);
+    if (decode_string(raw_packet_data[i], buffer, &buffer_size)) {
+      fprintf(
+          stderr,
+          "lcc_network_parse(raw_packet_data[%zu]): decoding string failed\n",
+          i);
+      return -1;
     }
 
-    tmp = be64toh(tmp);
-    switch (state->values_types[i]) {
-    case LCC_TYPE_COUNTER:
-      state->values[i].counter = (counter_t)tmp;
-      break;
-    case LCC_TYPE_DERIVE:
-      state->values[i].derive = (derive_t)tmp;
-      break;
-    case LCC_TYPE_ABSOLUTE:
-      state->values[i].absolute = (absolute_t)tmp;
-      break;
-    default:
-      return EINVAL;
+    int status = lcc_network_parse(buffer, buffer_size, nop_writer);
+    if (status != 0) {
+      fprintf(stderr, "lcc_network_parse(raw_packet_data[%zu]) = %d, want 0\n",
+              i, status);
+      ret = status;
+    }
+
+    printf("ok - lcc_network_parse(raw_packet_data[%zu])\n", i);
+  }
+
+  return ret;
+}
+
+static int test_parse_time() {
+  int ret = 0;
+
+  struct {
+    uint64_t in;
+    double want;
+  } cases[] = {
+      {1439980823, 1439980823.0},
+      {1439981005, 1439981005.0},
+      {1439981150, 1439981150.0},
+  };
+
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    lcc_value_list_t vl = LCC_VALUE_LIST_INIT;
+
+    uint64_t be = htobe64(cases[i].in);
+    int status = parse_time(TYPE_TIME, &be, sizeof(be), &vl);
+    if ((status != 0) || (vl.time != cases[i].want)) {
+      fprintf(stderr, "parse_time(%" PRIu64 ") = (%.0f, %d), want (%.0f, 0)\n",
+              cases[i].in, vl.time, status, cases[i].want);
+      ret = -1;
     }
   }
 
-  return 0;
-}
-
-static int verify_sha256(void *payload, size_t payload_size,
-                         char const *username, char const *password,
-                         uint8_t hash_provided[32]) {
-  gcry_md_hd_t hd = NULL;
-
-  gcry_error_t err = gcry_md_open(&hd, GCRY_MD_SHA256, GCRY_MD_FLAG_HMAC);
-  if (err != 0) {
-    /* TODO(octo): use gcry_strerror(err) to create an error string. */
-    return -1;
-  }
-
-  err = gcry_md_setkey(hd, password, strlen(password));
-  if (err != 0) {
-    gcry_md_close(hd);
-    return -1;
-  }
-
-  gcry_md_write(hd, username, strlen(username));
-  gcry_md_write(hd, payload, payload_size);
-
-  unsigned char *hash_calculated = gcry_md_read(hd, GCRY_MD_SHA256);
-  if (!hash_calculated) {
-    gcry_md_close(hd);
-    return -1;
-  }
-
-  int ret = memcmp(hash_provided, hash_calculated, 32);
-
-  gcry_md_close(hd);
-  hash_calculated = NULL;
-
-  return !!ret;
-}
-
-static int parse_sign_sha256(void *signature, size_t signature_len,
-                             void *payload, size_t payload_size,
-                             lcc_network_parse_options_t const *opts) {
-  if (opts->password_lookup == NULL) {
-    /* TODO(octo): print warning */
-    return network_parse(payload, payload_size, NONE, opts);
-  }
-
-  buffer_t *b = &(buffer_t){
-      .data = signature, .len = signature_len,
+  struct {
+    uint64_t in;
+    double want;
+  } cases_hr[] = {
+      {1546167635576736987, 1439980823.152453627},
+      {1546167831554815222, 1439981005.671262017},
+      {1546167986577716567, 1439981150.047589622},
   };
 
-  uint8_t hash[32];
-  if (buffer_next(b, hash, sizeof(hash)))
-    return EINVAL;
+  for (size_t i = 0; i < sizeof(cases_hr) / sizeof(cases_hr[0]); i++) {
+    lcc_value_list_t vl = LCC_VALUE_LIST_INIT;
 
-  char username[b->len + 1];
-  memset(username, 0, sizeof(username));
-  if (buffer_next(b, username, sizeof(username) - 1)) {
-    return EINVAL;
-  }
-
-  char const *password = opts->password_lookup(username);
-  if (!password)
-    return network_parse(payload, payload_size, NONE, opts);
-
-  int status = verify_sha256(payload, payload_size, username, password, hash);
-  if (status != 0)
-    return status;
-
-  return network_parse(payload, payload_size, SIGN, opts);
-}
-
-static int decrypt_aes256(buffer_t *b, void *iv, size_t iv_size,
-                          char const *password) {
-  gcry_cipher_hd_t cipher = NULL;
-
-  if (gcry_cipher_open(&cipher, GCRY_CIPHER_AES256, GCRY_CIPHER_MODE_OFB,
-                       /* flags = */ 0))
-    return -1;
-
-  uint8_t pwhash[32] = {0};
-  gcry_md_hash_buffer(GCRY_MD_SHA256, pwhash, password, strlen(password));
-
-  fprintf(stderr, "sizeof(iv) = %zu\n", sizeof(iv));
-  if (gcry_cipher_setkey(cipher, pwhash, sizeof(pwhash)) ||
-      gcry_cipher_setiv(cipher, iv, iv_size) ||
-      gcry_cipher_decrypt(cipher, b->data, b->len, /* in = */ NULL,
-                          /* in_size = */ 0)) {
-    gcry_cipher_close(cipher);
-    return -1;
-  }
-
-  gcry_cipher_close(cipher);
-  return 0;
-}
-
-static int parse_encrypt_aes256(void *data, size_t data_size,
-                                lcc_network_parse_options_t const *opts) {
-  if (opts->password_lookup == NULL) {
-    /* TODO(octo): print warning */
-    return ENOENT;
-  }
-
-  buffer_t *b = &(buffer_t){
-      .data = data, .len = data_size,
-  };
-
-  uint16_t username_len;
-  if (buffer_uint16(b, &username_len))
-    return EINVAL;
-  if ((size_t)username_len > data_size)
-    return ENOMEM;
-  char username[((size_t)username_len) + 1];
-  memset(username, 0, sizeof(username));
-  if (buffer_next(b, username, sizeof(username)))
-    return EINVAL;
-
-  char const *password = opts->password_lookup(username);
-  if (!password)
-    return ENOENT;
-
-  uint8_t iv[16];
-  if (buffer_next(b, iv, sizeof(iv)))
-    return EINVAL;
-
-  int status = decrypt_aes256(b, iv, sizeof(iv), password);
-  if (status != 0)
-    return status;
-
-  uint8_t hash_provided[20];
-  if (buffer_next(b, hash_provided, sizeof(hash_provided))) {
-    return -1;
-  }
-
-  uint8_t hash_calculated[20];
-  gcry_md_hash_buffer(GCRY_MD_SHA1, hash_calculated, b->data, b->len);
-
-  if (memcmp(hash_provided, hash_calculated, sizeof(hash_provided)) != 0) {
-    return -1;
-  }
-
-  return network_parse(b->data, b->len, ENCRYPT, opts);
-}
-
-static int network_parse(void *data, size_t data_size, lcc_security_level_t sl,
-                         lcc_network_parse_options_t const *opts) {
-  buffer_t *b = &(buffer_t){
-      .data = data, .len = data_size,
-  };
-
-  lcc_value_list_t state = {0};
-
-  while (b->len > 0) {
-    uint16_t type = 0, sz = 0;
-    if (buffer_uint16(b, &type) || buffer_uint16(b, &sz)) {
-      DEBUG("lcc_network_parse(): reading type and/or length failed.\n");
-      return EINVAL;
+    uint64_t be = htobe64(cases_hr[i].in);
+    int status = parse_time(TYPE_TIME_HR, &be, sizeof(be), &vl);
+    if ((status != 0) || (vl.time != cases_hr[i].want)) {
+      fprintf(stderr, "parse_time(%" PRIu64 ") = (%.9f, %d), want (%.9f, 0)\n",
+              cases_hr[i].in, vl.time, status, cases_hr[i].want);
+      ret = -1;
     }
+  }
 
-    if ((sz < 5) || (((size_t)sz - 4) > b->len)) {
-      DEBUG("lcc_network_parse(): invalid 'sz' field: sz = %" PRIu16
-            ", b->len = %zu\n",
-            sz, b->len);
-      return EINVAL;
-    }
-    sz -= 4;
+  return ret;
+}
 
-    uint8_t payload[sz];
-    if (buffer_next(b, payload, sizeof(payload)))
-      return EINVAL;
+static int test_parse_string() {
+  int ret = 0;
 
-    switch (type) {
-    case TYPE_HOST:
-    case TYPE_PLUGIN:
-    case TYPE_PLUGIN_INSTANCE:
-    case TYPE_TYPE:
-    case TYPE_TYPE_INSTANCE: {
-      if (parse_identifier(type, payload, sizeof(payload), &state)) {
-        DEBUG("lcc_network_parse(): parse_identifier failed.\n");
-        return EINVAL;
+  struct {
+    uint8_t *in;
+    size_t in_len;
+    char *want;
+  } cases[] = {
+      {(uint8_t[]){0}, 1, ""},
+      {(uint8_t[]){'t', 'e', 's', 't', 0}, 5, "test"},
+      {(uint8_t[]){'t', 'e', 's', 't'}, 4, NULL}, // null byte missing
+      {(uint8_t[]){'t', 'e', 's', 't', 'x', 0}, 6,
+       NULL}, // output buffer too small
+  };
+
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    char got[5] = {0};
+
+    int status = parse_string(cases[i].in, cases[i].in_len, got, sizeof(got));
+    if (cases[i].want == NULL) {
+      if (status == 0) {
+        fprintf(stderr, "parse_string() = (\"%s\", 0), want error\n", got);
+        ret = -1;
       }
-      break;
-    }
-
-    case TYPE_INTERVAL:
-    case TYPE_INTERVAL_HR:
-    case TYPE_TIME:
-    case TYPE_TIME_HR: {
-      if (parse_time(type, payload, sizeof(payload), &state)) {
-        DEBUG("lcc_network_parse(): parse_time failed.\n");
-        return EINVAL;
-      }
-      break;
-    }
-
-    case TYPE_VALUES: {
-      lcc_value_list_t vl = state;
-      if (parse_values(payload, sizeof(payload), &vl)) {
-        DEBUG("lcc_network_parse(): parse_values failed.\n");
-        return EINVAL;
-      }
-
-      /* TODO(octo): skip if current_security_level < required_security_level */
-
-      int status = opts->writer(&vl);
-
-      free(vl.values);
-      free(vl.values_types);
-
-      if (status != 0)
-        return status;
-      break;
-    }
-
-    case TYPE_SIGN_SHA256: {
-      int status =
-          parse_sign_sha256(payload, sizeof(payload), b->data, b->len, opts);
+    } else /* if cases[i].want != NULL */ {
       if (status != 0) {
-        DEBUG("lcc_network_parse(): parse_sign_sha256() = %d\n", status);
-        return -1;
+        fprintf(stderr, "parse_string() = %d, want 0\n", status);
+        ret = -1;
+      } else if (strcmp(got, cases[i].want) != 0) {
+        fprintf(stderr, "parse_string() = (\"%s\", 0), want (\"%s\", 0)\n", got,
+                cases[i].want);
+        ret = -1;
       }
-      /* parse_sign_sha256, if successful, consumes all remaining data. */
-      b->data = NULL;
-      b->len = 0;
-      break;
-    }
-
-    case TYPE_ENCR_AES256: {
-      int status = parse_encrypt_aes256(payload, sizeof(payload), opts);
-      if (status != 0) {
-        DEBUG("lcc_network_parse(): parse_encrypt_aes256() = %d\n", status);
-        return -1;
-      }
-      break;
-    }
-
-    default: {
-      DEBUG("lcc_network_parse(): ignoring unknown type %" PRIu16 "\n", type);
-      return EINVAL;
-    }
     }
   }
 
-  return 0;
+  return ret;
 }
 
-int lcc_network_parse(void *data, size_t data_size,
-                      lcc_network_parse_options_t opts) {
-  if (opts.password_lookup) {
-    int status;
-    if ((status = init_gcrypt())) {
-      return status;
+static int test_parse_values() {
+  int ret = 0;
+
+  uint8_t testcase[] = {
+      // 0, 6,                          // pkg type
+      // 0, 33,                         // pkg len
+      0, 3,                         // num values
+      1, 2, 1,                      // gauge, derive, gauge
+      0, 0, 0, 0, 0, 0, 0x45, 0x40, // 42.0
+      0, 0, 0, 0, 0, 0, 0x7a, 0x69, // 31337
+      0, 0, 0, 0, 0, 0, 0xf8, 0x7f, // NaN
+  };
+
+  lcc_value_list_t vl = LCC_VALUE_LIST_INIT;
+  int status = parse_values(testcase, sizeof(testcase), &vl);
+  if (status != 0) {
+    fprintf(stderr, "parse_values() = %d, want 0\n", status);
+    return -1;
+  }
+
+  if (vl.values_len != 3) {
+    fprintf(stderr, "parse_values(): vl.values_len = %zu, want 3\n",
+            vl.values_len);
+    return -1;
+  }
+
+  int want_types[] = {LCC_TYPE_GAUGE, LCC_TYPE_DERIVE, LCC_TYPE_GAUGE};
+  for (size_t i = 0; i < sizeof(want_types) / sizeof(want_types[0]); i++) {
+    if (vl.values_types[i] != want_types[i]) {
+      fprintf(stderr, "parse_values(): vl.values_types[%zu] = %d, want %d\n", i,
+              vl.values_types[i], want_types[i]);
+      ret = -1;
     }
   }
 
-  return network_parse(data, data_size, NONE, &opts);
+  if (vl.values[0].gauge != 42.0) {
+    fprintf(stderr, "parse_values(): vl.values[0] = %g, want 42\n",
+            vl.values[0].gauge);
+    ret = -1;
+  }
+  if (vl.values[1].derive != 31337) {
+    fprintf(stderr, "parse_values(): vl.values[1] = %" PRIu64 ", want 31337\n",
+            vl.values[1].derive);
+    ret = -1;
+  }
+  if (!isnan(vl.values[2].gauge)) {
+    fprintf(stderr, "parse_values(): vl.values[2] = %g, want NaN\n",
+            vl.values[2].gauge);
+    ret = -1;
+  }
+
+  free(vl.values);
+  free(vl.values_types);
+
+  return ret;
+}
+
+int main(void) {
+  int ret = 0;
+
+  printf("libcollectdclient/server_test.c\n");
+
+  int status;
+  if ((status = test_network_parse())) {
+    ret = status;
+  }
+  if ((status = test_parse_time())) {
+    ret = status;
+  }
+  if ((status = test_parse_string())) {
+    ret = status;
+  }
+  if ((status = test_parse_values())) {
+    ret = status;
+  }
+
+  return ret;
 }

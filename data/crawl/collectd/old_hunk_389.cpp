@@ -1,6 +1,8 @@
-  return (ret);
-} /* oconfig_item_t *oconfig_parse_file */
+  if (strlen (n->type_instance) > 0)
+    fprintf (fh, "TypeInstance: %s\n", n->type_instance);
 
-void oconfig_free (oconfig_item_t *ci)
-{
-  int i;
+  /* Newline signalling end of data */
+  fprintf (fh, "\n");
+
+  fflush (fh);
+  fclose (fh);

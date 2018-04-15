@@ -1,10 +1,26 @@
-    uint8_t buffer[LCC_NETWORK_BUFFER_SIZE_DEFAULT];
-    size_t buffer_size = sizeof(buffer);
-    if (decode_string(raw_packet_data[i], buffer, &buffer_size)) {
-      fprintf(
-          stderr,
-          "lcc_network_parse(raw_packet_data[%zu]): decoding string failed\n",
-          i);
-      return -1;
-    }
+  return 0;
+}
 
+static meta_data_t *cpy_build_meta(PyObject *meta) {
+  int s;
+  meta_data_t *m = NULL;
+  PyObject *l;
+
+  if ((meta == NULL) || (meta == Py_None))
+    return NULL;
+
+  l = PyDict_Items(meta); /* New reference. */
+  if (!l) {
+    cpy_log_exception("building meta data");
+    return NULL;
+  }
+  s = PyList_Size(l);
+  if (s <= 0) {
+    Py_XDECREF(l);
+    return NULL;
+  }
+
+  m = meta_data_create();
+  for (int i = 0; i < s; ++i) {
+    const char *string, *keystring;
+    PyObject *key, *value, *item, *tmp;

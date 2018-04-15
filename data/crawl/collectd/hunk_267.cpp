@@ -1,23 +1,34 @@
-   return count;
- } /* count_chars */
+ 	char buf[512];
+ 	const char *name;
  
-+static int array_grow (void **array, int *array_len, size_t elem_size)
-+{
-+  void *tmp;
-+
-+  assert ((array != NULL) && (array_len != NULL));
-+
-+  tmp = realloc (*array, (*array_len + 1) * elem_size);
-+  if (tmp == NULL) {
-+    fprintf (stderr, "ERROR: Failed to allocate memory.\n");
-+    return (-1);
-+  }
-+
-+  *array = tmp;
-+  ++(*array_len);
-+  return (0);
-+} /* array_grow */
-+
- static int parse_identifier (lcc_connection_t *c,
-     const char *value, lcc_identifier_t *ident)
- {
+-	if (PyUnicode_Check(arg)) {
+-		arg = PyUnicode_AsEncodedString(arg, NULL, NULL);
+-		if (arg == NULL)
+-			return NULL;
+-		name = PyString_AsString(arg);
+-		Py_DECREF(arg);
+-	} else if (PyString_Check(arg)) {
+-		name = PyString_AsString(arg);
+-	} else {
++	Py_INCREF(arg);
++	name = cpy_unicode_or_bytes_to_string(&arg);
++	if (name == NULL) {
++		PyErr_Clear();
+ 		if (!PyCallable_Check(arg)) {
+ 			PyErr_SetString(PyExc_TypeError, "This function needs a string or a callable object as its only parameter.");
++			Py_DECREF(&arg);
+ 			return NULL;
+ 		}
+ 		cpy_build_name(buf, sizeof(buf), arg, NULL);
+ 		name = buf;
+ 	}
+-	if (unreg(name) == 0)
++	if (unreg(name) == 0) {
++		Py_DECREF(&arg);
+ 		Py_RETURN_NONE;
++	}
+ 	PyErr_Format(PyExc_RuntimeError, "Unable to unregister %s callback '%s'.", desc, name);
++	Py_DECREF(&arg);
+ 	return NULL;
+ }
+ 

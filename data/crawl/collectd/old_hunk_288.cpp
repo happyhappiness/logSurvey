@@ -1,8 +1,7 @@
-  return 0;
-}
-
-void usage (const char *name) {
-  fprintf (stderr, "Usage: %s [options]\n"
-      "\n"
-      "Valid options are:\n"
-      "  -h, --help               Display this help message.\n"
+		PyErr_SetString(PyExc_TypeError, "callback needs a be a callable object.");
+		return NULL;
+	}
+	cpy_build_name(buf, sizeof(buf), callback, name);
+	
+	Py_INCREF(callback);
+	Py_XINCREF(data);

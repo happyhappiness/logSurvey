@@ -1,8 +1,11 @@
- 	char *value_str = strchr (time_str, ':');
- 	if (value_str == NULL)
- 	{
--		fprintf (fh, "-1 No time found.");
-+		fprintf (fh, "-1 No time found.\n");
- 		return (-1);
- 	}
- 	*value_str = '\0'; value_str++;
+ 		if ((pid = fork ()) == -1)
+ 		{
+ 			/* error */
+-			fprintf (stderr, "fork: %s", strerror (errno));
++			char errbuf[1024];
++			fprintf (stderr, "fork: %s",
++					sstrerror (errno, errbuf,
++						sizeof (errbuf)));
+ 			return (1);
+ 		}
+ 		else if (pid != 0)

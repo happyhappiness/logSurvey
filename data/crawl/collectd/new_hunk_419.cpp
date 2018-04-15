@@ -1,10 +1,15 @@
-					return (RET_UNKNOWN);
-				}
-				match_ds_g = tmp;
-				match_ds_g[match_ds_num_g] = cn_strdup (optarg);
-				if (match_ds_g[match_ds_num_g] == NULL)
-				{
-					fprintf (stderr, "cn_strdup failed: %s\n",
-							strerror (errno));
-					return (RET_UNKNOWN);
-				}
+	}
+	else if (strcasecmp ("StepSize", key) == 0)
+	{
+		stepsize = atoi (value);
+		if (stepsize < 0)
+			stepsize = 0;
+	}
+	else if (strcasecmp ("HeartBeat", key) == 0)
+	{
+		heartbeat = atoi (value);
+		if (heartbeat < 0)
+			heartbeat = 0;
+	}
+	else if (strcasecmp ("RRARows", key) == 0)
+	{

@@ -1,7 +1,6 @@
-    return (1);
-  }
+	Py_RETURN_NONE;
+}
 
-  if (strcasecmp (argv[optind], "flush") == 0)
-    status = flush (c, argc - optind, argv + optind);
-  else {
-    fprintf (stderr, "%s: invalid command: %s\n", argv[0], argv[optind]);
+static PyObject *Values_repr(PyObject *s) {
+	PyObject *ret, *valuestring = NULL;
+	Values *self = (Values *) s;

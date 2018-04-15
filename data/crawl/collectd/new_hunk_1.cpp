@@ -1,9 +1,9 @@
-    uint8_t buffer[LCC_NETWORK_BUFFER_SIZE_DEFAULT];
-    size_t buffer_size = sizeof(buffer);
-    if (decode_string(raw_packet_data[i], buffer, &buffer_size)) {
-      fprintf(stderr, "lcc_network_parse(raw_packet_data[%" PRIsz "]):"
-                      " decoding string failed\n",
-              i);
-      return -1;
-    }
-
+	}
+	| block_begin block_end
+	{
+	 if (strcmp($1.key, $2) != 0)
+	 {
+		printf("block_begin = %s; block_end = %s;\n", $1.key, $2);
+		yyerror("block not closed");
+		YYERROR;
+	 }

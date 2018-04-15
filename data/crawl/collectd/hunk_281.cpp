@@ -1,24 +1,24 @@
-     exit_usage (argv[0], 1);
-   }
+ 	return 0;
+ }
  
-+  c = NULL;
-+  status = lcc_connect (address, &c);
-+  if (status != 0) {
-+    fprintf (stderr, "ERROR: Failed to connect to daemon at %s: %s.\n",
-+        address, strerror (errno));
-+    return (1);
-+  }
++static int cpy_notification_callback(const notification_t *notification, user_data_t *data) {
++	cpy_callback_t *c = data->data;
++	PyObject *ret, *n;
 +
-   if (strcasecmp (argv[optind], "flush") == 0)
--    status = flush (address, argc - optind, argv + optind);
-+    status = flush (c, argc - optind, argv + optind);
-   else {
-     fprintf (stderr, "%s: invalid command: %s\n", argv[0], argv[optind]);
-     return (1);
-   }
- 
-+  LCC_DESTROY (c);
++	CPY_LOCK_THREADS
++		n = PyObject_CallFunction((PyObject *) &NotificationType, "ssssssdi", notification->type, notification->message,
++				notification->plugin_instance, notification->type_instance, notification->plugin,
++				notification->host, (double) notification->time, notification->severity);
++		ret = PyObject_CallFunctionObjArgs(c->callback, n, c->data, (void *) 0); /* New reference. */
++		if (ret == NULL) {
++			cpy_log_exception("notification callback");
++		} else {
++			Py_DECREF(ret);
++		}
++	CPY_RELEASE_THREADS
++	return 0;
++}
 +
-   if (status != 0)
-     return (status);
-   return (0);
+ static void cpy_log_callback(int severity, const char *message, user_data_t *data) {
+ 	cpy_callback_t * c = data->data;
+ 	PyObject *ret;

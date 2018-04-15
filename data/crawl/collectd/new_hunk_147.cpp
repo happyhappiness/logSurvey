@@ -1,12 +1,10 @@
-			&type, &type_instance);
-	if (status != 0)
-	{
-		DEBUG ("cmd_handle_putval: Cannot parse identifier `%s'.",
-				identifier);
-		cmd_error (CMD_PARSE_ERROR, err, "Cannot parse identifier `%s'.",
-				identifier);
-		sfree (identifier_copy);
-		return (CMD_PARSE_ERROR);
-	}
+ *   Florian octo Forster <octo at collectd.org>
+ */
 
-	if ((strlen (hostname) >= sizeof (vl.host))
+#include "tests/macros.h"
+#include "common.h"
+
+DEF_TEST(sstrncpy)
+{
+  char buffer[16] = "";
+  char *ptr = &buffer[4];

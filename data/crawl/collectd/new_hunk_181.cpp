@@ -1,19 +1,35 @@
-  printf ("ok %i - %s = %"PRIu64"\n", ++check_count__, #actual, got__); \
-} while (0)
-
-#define EXPECT_EQ_DOUBLE(expect, actual) do { \
-  double want__ = (double) expect; \
-  double got__  = (double) actual; \
-  if (isnan (want__) && !isnan (got__)) { \
-    printf ("not ok %i - %s = %.15g, want %.15g\n", \
-        ++check_count__, #actual, got__, want__); \
-    return (-1); \
-  } else if (!isnan (want__) && (((want__-got__) < -DBL_PRECISION) || ((want__-got__) > DBL_PRECISION))) { \
-    printf ("not ok %i - %s = %.15g, want %.15g\n", \
-        ++check_count__, #actual, got__, want__); \
-    return (-1); \
-  } \
-  printf ("ok %i - %s = %.15g\n", ++check_count__, #actual, got__); \
-} while (0)
-
-#define CHECK_NOT_NULL(expr) do { \
+	value = malloc(size * sizeof(*value));
+	for (i = 0; i < size; ++i) {
+		PyObject *item, *num;
+		item = PySequence_Fast_GET_ITEM(values, i); /* Borrowed reference. */
+		if (ds->ds->type == DS_TYPE_COUNTER) {
+			num = PyNumber_Long(item); /* New reference. */
+			if (num != NULL) {
+				value[i].counter = PyLong_AsUnsignedLongLong(num);
+				Py_XDECREF(num);
+			}
+		} else if (ds->ds->type == DS_TYPE_GAUGE) {
+			num = PyNumber_Float(item); /* New reference. */
+			if (num != NULL) {
+				value[i].gauge = PyFloat_AsDouble(num);
+				Py_XDECREF(num);
+			}
+		} else if (ds->ds->type == DS_TYPE_DERIVE) {
+			/* This might overflow without raising an exception.
+			 * Not much we can do about it */
+			num = PyNumber_Long(item); /* New reference. */
+			if (num != NULL) {
+				value[i].derive = PyLong_AsLongLong(num);
+				Py_XDECREF(num);
+			}
+		} else if (ds->ds->type == DS_TYPE_ABSOLUTE) {
+			/* This might overflow without raising an exception.
+			 * Not much we can do about it */
+			num = PyNumber_Long(item); /* New reference. */
+			if (num != NULL) {
+				value[i].absolute = PyLong_AsUnsignedLongLong(num);
+				Py_XDECREF(num);
+			}
+		} else {
+			free(value);
+			PyErr_Format(PyExc_RuntimeError, "unknown data type %d for %s", ds->ds->type, type);

@@ -1,18 +1,13 @@
-	}
-	DEBUG ("interval_g = %i;", interval_g);
-
-	str = global_option_get ("Timeout");
-	if (str == NULL)
-		str = "10";
-	timeout_g = atoi (str);
-	if (timeout_g <= 0)
-	{
-		fprintf (stderr, "Cannot set the timeout to a correct value.\n"
-				"Please check your settings.\n");
-		return (-1);
-	}
-	DEBUG ("timeout_g = %i;", timeout_g);
-
-	if (init_hostname () != 0)
-		return (-1);
-	DEBUG ("hostname_g = %s;", hostname_g);
+				ERROR("python plugin: Unable to convert \"%s\" to "
+				      "a python object.", dir);
+				free(dir);
+				cpy_log_exception("python initialization");
+				continue;
+			}
+			if (PyList_Append(sys_path, dir_object) != 0) {
+				ERROR("python plugin: Unable to append \"%s\" to "
+				      "python module path.", dir);
+				cpy_log_exception("python initialization");
+			}
+			Py_DECREF(dir_object);
+			free(dir);

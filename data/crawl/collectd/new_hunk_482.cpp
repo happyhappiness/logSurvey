@@ -1,8 +1,20 @@
-		if (i != ds->ds_num)
+		syslog (LOG_WARNING, "apcups plugin: Error reading from socket");
+		return (-1);
+	}
+
+	return (0);
+}
+
+static int apcups_config (const char *key, const char *value)
+{
+	if (strcasecmp (key, "host") == 0)
+	{
+		if (conf_host != NULL)
 		{
-			sfree (value_ptr);
-			fprintf (fh, "-1 Number of values incorrect: Got %i, "
-					"expected %i.", i, ds->ds_num);
-			return (-1);
+			free (conf_host);
+			conf_host = NULL;
 		}
-	} /* done parsing the value-list */
+		if ((conf_host = strdup (value)) == NULL)
+			return (1);
+	}
+	else if (strcasecmp (key, "Port") == 0)

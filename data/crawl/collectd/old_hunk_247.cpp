@@ -1,7 +1,7 @@
-			continue;
-		}
+#endif	
+}
 
-		printf ("%s\n", id);
-	}
+ /* Python object declarations. */
 
-	if (ret_ident != NULL)
+typedef struct {
+	PyObject_HEAD        /* No semicolon! */

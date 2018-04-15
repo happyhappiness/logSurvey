@@ -1,20 +1,15 @@
-		syslog (LOG_WARNING, "apcups plugin: Error reading from socket");
-		return (-1);
-	}
-
-	return (0);
+	return (NULL);
 }
 
-static int apcups_config (const char *key, const char *value)
-{
-	if (strcasecmp (key, "host") == 0)
-	{
-		if (conf_host != NULL)
-		{
-			free (conf_host);
-			conf_host = NULL;
-		}
-		if ((conf_host = strdup (value)) == NULL)
-			return (1);
-	}
-	else if (strcasecmp (key, "Port") == 0)
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+ * Functions for the actual parsing                                    *
+ * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+/*
+ * `cf_callback_mode'
+ *   Chose the `operating_mode'
+ *
+ * Mode `value'
+ */
+int cf_callback_mode (const char *shortvar, const char *var,
+		const char *arguments, const char *value, lc_flags_t flags,

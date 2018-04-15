@@ -1,11 +1,6 @@
+#include "utils_cache.h"
+#include "utils_parse_option.h"
 
-  fh = fopen(file, "r");
-  if (fh == NULL) {
-    char errbuf[1024];
-    fprintf(stderr, "Failed to open types database `%s': %s.\n", file,
-            sstrerror(errno, errbuf, sizeof(errbuf)));
-    ERROR("Failed to open types database `%s': %s", file,
-          sstrerror(errno, errbuf, sizeof(errbuf)));
-    return -1;
-  }
-
+#define free_everything_and_return(status) do { \
+    for (size_t j = 0; j < number; j++) { \
+      sfree(names[j]); \

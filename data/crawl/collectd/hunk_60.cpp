@@ -1,10 +1,13 @@
- 	 if (strcmp ($1.key, $3) != 0)
- 	 {
- 		printf ("block_begin = %s; block_end = %s;\n", $1.key, $3);
--	 	yyerror ("Block not closed..\n");
--		exit (1);
-+		yyerror("block not closed");
-+		YYERROR;
- 	 }
- 	 free ($3); $3 = NULL;
- 	 $$ = $1;
+ 
+ static _Bool loop = 1;
+ 
+-__attribute__((noreturn))
+-static void exit_usage (int exit_status) /* {{{ */
++__attribute__((noreturn)) static void exit_usage(int exit_status) /* {{{ */
+ {
+-  fprintf ((exit_status == EXIT_FAILURE) ? stderr : stdout,
++  fprintf(
++      (exit_status == EXIT_FAILURE) ? stderr : stdout,
+       "collectd-tg -- collectd traffic generator\n"
+       "\n"
+       "  Usage: collectd-ng [OPTION]\n"

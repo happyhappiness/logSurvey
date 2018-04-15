@@ -1,8 +1,12 @@
-    sstrncpy(notification.plugin, "python", sizeof(notification.plugin));
-  Py_BEGIN_ALLOW_THREADS;
-  ret = plugin_dispatch_notification(&notification);
-  if (notification.meta)
-    plugin_notification_meta_free(notification.meta);
-  Py_END_ALLOW_THREADS;
-  if (ret != 0) {
-    PyErr_SetString(PyExc_RuntimeError,
+{
+  oconfig_item_t *ci_copy;
+
+  ci_copy = calloc (1, sizeof (*ci_copy));
+  if (ci_copy == NULL)
+  {
+    fprintf (stderr, "calloc failed.\n");
+    return (NULL);
+  }
+  ci_copy->values = NULL;
+  ci_copy->parent = NULL;
+  ci_copy->children = NULL;

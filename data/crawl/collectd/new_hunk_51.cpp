@@ -1,9 +1,25 @@
-    uint8_t buffer[LCC_NETWORK_BUFFER_SIZE_DEFAULT];
-    size_t buffer_size = sizeof(buffer);
-    if (decode_string(raw_packet_data[i], buffer, &buffer_size)) {
-      fprintf(stderr, "lcc_network_parse(raw_packet_data[%" PRIsz "]):"
-                      " decoding string failed\n",
-              i);
-      return -1;
-    }
+  return 0;
+}
 
+static int cpy_build_meta(PyObject *meta, cpy_build_meta_handler_t *meta_func,
+                          void *m) {
+  int s;
+  PyObject *l;
+
+  if ((meta == NULL) || (meta == Py_None))
+    return -1;
+
+  l = PyDict_Items(meta); /* New reference. */
+  if (!l) {
+    cpy_log_exception("building meta data");
+    return -1;
+  }
+  s = PyList_Size(l);
+  if (s <= 0) {
+    Py_XDECREF(l);
+    return -1;
+  }
+
+  for (int i = 0; i < s; ++i) {
+    const char *string, *keystring;
+    PyObject *key, *value, *item, *tmp;

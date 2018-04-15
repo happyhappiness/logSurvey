@@ -1,6 +1,12 @@
-  printf ("ok %i - %s evaluates to \"%s\"\n", ++check_count__, #actual, expect); \
-} while (0)
+		return (RET_UNKNOWN);
+	}
 
-#define DBLEQ(expect, actual) do { \
-  if ((isnan (expect) && !isnan (actual)) || ((expect) != (actual))) {\
-    printf ("not ok %i - %s incorrect: expected %.15g, got %.15g\n", \
+	for (i = 0; i < ret_ident_num; ++i) {
+		char id[1024];
+
+		if ((hostname_g != NULL) && (strcasecmp (hostname_g, ret_ident[i].host)))
+			continue;
+
+		status = lcc_identifier_to_string (connection,
+				id, sizeof (id), ret_ident + i);
+		if (status != 0) {

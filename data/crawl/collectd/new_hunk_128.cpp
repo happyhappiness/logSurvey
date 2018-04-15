@@ -1,7 +1,7 @@
-			if (parse_identifier (opt_value,
-						&id->host, &id->plugin, &id->plugin_instance,
-						&id->type, &id->type_instance,
-						opts->identifier_default_host) != 0)
-			{
-				cmd_error (CMD_PARSE_ERROR, err,
-						"Invalid identifier `%s'.", opt_value);
+#define OK1(cond, text) do { \
+  _Bool result = (cond); \
+  printf ("%s %i - %s\n", result ? "ok" : "not ok", ++check_count__, text); \
+  if (!result) { return -1; } \
+} while (0)
+#define OK(cond) OK1(cond, #cond)
+

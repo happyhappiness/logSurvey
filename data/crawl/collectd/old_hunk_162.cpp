@@ -1,7 +1,28 @@
+
+static int init_global_variables (void)
 {
-  int status;
+	const char *str;
 
-  LCC_DEBUG ("send:    --> %s\n", command);
+	str = global_option_get ("Interval");
+	if (str == NULL)
+	{
+		interval_g = TIME_T_TO_CDTIME_T (10);
+	}
+	else
+	{
+		double tmp;
 
-  status = fprintf (c->fh, "%s\r\n", command);
-  if (status < 0)
+		tmp = atof (str);
+		if (tmp <= 0.0)
+		{
+			fprintf (stderr, "Cannot set the interval to a "
+					"correct value.\n"
+					"Please check your settings.\n");
+			return (-1);
+		}
+
+		interval_g = DOUBLE_TO_CDTIME_T (tmp);
+	}
+	DEBUG ("interval_g = %.3f;", CDTIME_T_TO_DOUBLE (interval_g));
+
+	str = global_option_get ("Timeout");

@@ -1,7 +1,18 @@
-  }
-  size = (size_t)PySequence_Length(values);
-  if (size != ds->ds_num) {
-    PyErr_Format(PyExc_RuntimeError, "type %s needs %zu values, got %zu",
-                 value_list.type, ds->ds_num, size);
-    return NULL;
-  }
+	;
+
+%%
+static int yyerror (const char *s)
+{
+	const char *text;
+
+	if (*yytext == '\n')
+		text = "<newline>";
+	else
+		text = yytext;
+
+	fprintf (stderr, "Parse error in file `%s', line %i near `%s': %s\n",
+		c_file, yylineno, text, s);
+	return (-1);
+} /* int yyerror */
+
+static char *unquote (const char *orig)

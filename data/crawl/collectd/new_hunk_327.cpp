@@ -1,6 +1,9 @@
-			if (module == NULL) {
-				ERROR("python plugin: Error importing module \"%s\".", module_name);
-				cpy_log_exception("importing module");
-			}
-			free(module_name);
-			Py_XDECREF(module);
+  if (fh == NULL)
+  {
+    char errbuf[1024];
+    fprintf (stderr, "Failed to open types database `%s': %s.\n",
+	file, sstrerror (errno, errbuf, sizeof (errbuf)));
+    ERROR ("Failed to open types database `%s': %s",
+	file, sstrerror (errno, errbuf, sizeof (errbuf)));
+    return (-1);
+  }

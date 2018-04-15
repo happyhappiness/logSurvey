@@ -1,7 +1,7 @@
+		if (temp == NULL)
 		{
-			if (parse_option (&vl, fields[i]) != 0)
-			{
-				fprintf (fh, "-1 Error parsing option `%s'\n",
-						fields[i]);
-				break;
-			}
+			fprintf (stderr, "irq plugin: Cannot allocate more memory.\n");
+			ERROR ("irq plugin: Cannot allocate more memory.");
+			return (1);
+		}
+		irq_list = temp;

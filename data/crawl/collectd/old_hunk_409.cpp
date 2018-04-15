@@ -1,6 +1,6 @@
-	return (status_code);
-} /* int do_check_con_sum */
+		const char *error = lt_dlerror ();
 
-static int do_check (void)
-{
-	lcc_connection_t *connection;
+		ERROR ("lt_dlopen failed: %s", error);
+		return (1);
+	}
+

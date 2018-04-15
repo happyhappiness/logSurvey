@@ -1,6 +1,7 @@
-		{
-			fprintf (stderr, "rrdtool: `CacheTimeout' must "
-					"be greater than 0.\n");
-			return (1);
-		}
-		cache_timeout = tmp;
+	my $vl   = shift;
+
+	if (scalar (@$ds) != scalar (@{$vl->{'values'}})) {
+		Collectd::plugin_log (Collectd::LOG_WARNING,
+			"DS number does not match values length");
+		return;
+	}

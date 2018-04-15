@@ -1,12 +1,19 @@
-} while (0)
+		}
+		irq_list = temp;
 
-#define DBLEQ(expect, actual) do { \
-  if ((isnan (expect) && !isnan (actual)) || ((expect) != (actual))) {\
-    printf ("not ok %i - %s incorrect: expected %.15g, got %.15g\n", \
-        ++check_count__, #actual, expect, actual); \
-    return (-1); \
-  } \
-  printf ("ok %i - %s evaluates to %.15g\n", ++check_count__, #actual, expect); \
-} while (0)
+		/* Clear errno, because we need it to see if an error occured. */
+		errno = 0;
 
-#define CHECK_NOT_NULL(expr) do { \
+		irq = strtol(value, &endptr, 10);
+		if ((endptr == value) || (errno != 0))
+		{
+			fprintf (stderr, "irq plugin: Irq value is not a "
+					"number: `%s'\n", value);
+			ERROR ("irq plugin: Irq value is not a "
+					"number: `%s'", value);
+			return (1);
+		}
+		irq_list[irq_list_num] = irq;
+		irq_list_num++;
+	}
+	else if (strcasecmp (key, "IgnoreSelected") == 0)

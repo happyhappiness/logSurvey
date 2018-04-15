@@ -1,26 +1,12 @@
-  return 0;
-}
+#define OK(cond) OK1(cond, #cond)
 
-static meta_data_t *cpy_build_meta(PyObject *meta) {
-  int s;
-  meta_data_t *m = NULL;
-  PyObject *l;
+#define EXPECT_EQ_STR(expect, actual) do { \
+  if (strcmp (expect, actual) != 0) { \
+    printf ("not ok %i - %s = \"%s\", want \"%s\"\n", \
+        ++check_count__, #actual, actual, expect); \
+    return (-1); \
+  } \
+  printf ("ok %i - %s = \"%s\"\n", ++check_count__, #actual, actual); \
+} while (0)
 
-  if ((meta == NULL) || (meta == Py_None))
-    return NULL;
-
-  l = PyDict_Items(meta); /* New reference. */
-  if (!l) {
-    cpy_log_exception("building meta data");
-    return NULL;
-  }
-  s = PyList_Size(l);
-  if (s <= 0) {
-    Py_XDECREF(l);
-    return NULL;
-  }
-
-  m = meta_data_create();
-  for (int i = 0; i < s; ++i) {
-    const char *string, *keystring;
-    PyObject *key, *value, *item, *tmp;
+#define EXPECT_EQ_INT(expect, actual) do { \

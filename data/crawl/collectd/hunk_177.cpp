@@ -1,28 +1,32 @@
-   sstrncpy (vl.host, hostname_g, sizeof (vl.host));
-   sstrncpy (vl.plugin, "gps", sizeof (vl.plugin));
-   sstrncpy (vl.type, type, sizeof (vl.type));
--  sstrncpy (vl.type_instance, "gps", sizeof (vl.type_instance));
-+  sstrncpy (vl.type_instance, type_instance, sizeof (vl.type_instance));
+ 			NULL, &plugin, NULL, &host, &time, &severity))
+ 		return -1;
+ 	
+-	if (type[0] != 0 && plugin_get_ds(type) == NULL) {
++	if (type && plugin_get_ds(type) == NULL) {
+ 		PyErr_Format(PyExc_TypeError, "Dataset %s not found", type);
++		FreeAll();
++		PyMem_Free(message);
+ 		return -1;
+ 	}
  
-   plugin_dispatch_values (&vl);
+-	sstrncpy(self->data.host, host, sizeof(self->data.host));
+-	sstrncpy(self->data.plugin, plugin, sizeof(self->data.plugin));
+-	sstrncpy(self->data.plugin_instance, plugin_instance, sizeof(self->data.plugin_instance));
+-	sstrncpy(self->data.type, type, sizeof(self->data.type));
+-	sstrncpy(self->data.type_instance, type_instance, sizeof(self->data.type_instance));
++	sstrncpy(self->data.host, host ? host : "", sizeof(self->data.host));
++	sstrncpy(self->data.plugin, plugin ? plugin : "", sizeof(self->data.plugin));
++	sstrncpy(self->data.plugin_instance, plugin_instance ? plugin_instance : "", sizeof(self->data.plugin_instance));
++	sstrncpy(self->data.type, type ? type : "", sizeof(self->data.type));
++	sstrncpy(self->data.type_instance, type_instance ? type_instance : "", sizeof(self->data.type_instance));
++	sstrncpy(self->message, message ? message : "", sizeof(self->message));
+ 	self->data.time = time;
+-
+-	sstrncpy(self->message, message, sizeof(self->message));
+ 	self->severity = severity;
++
++	FreeAll();
++	PyMem_Free(message);
+ 	return 0;
  }
  
- 
- /**
-- * Read the data and submit.
-+ * Read the data and submit by piece.
-  */
- static int gps_collectd_read ()
- {
-   pthread_mutex_lock (&data_mutex);
--  gps_collectd_submit("gps_hdop", (gauge_t) gps_data_read.hdop);
--  gps_collectd_submit("gps_vdop", (gauge_t) gps_data_read.vdop);
--  gps_collectd_submit("gps_sat", (gauge_t) gps_data_read.satellites);
--  printf ("gps: hdop=%1.3f, vdop=%1.3f, sat=%02d.\n", 
-+  gps_collectd_submit("dilution_of_precision", (gauge_t) gps_data_read.hdop, "horizontal");
-+  gps_collectd_submit("dilution_of_precision", (gauge_t) gps_data_read.vdop, "vertical");
-+  gps_collectd_submit("satellites", (gauge_t) gps_data_read.satellites, "gps");
-+  DEBUG ("gps: hdop=%1.3f, vdop=%1.3f, sat=%02d.\n", 
-     gps_data_read.hdop,
-     gps_data_read.vdop,
-     gps_data_read.satellites

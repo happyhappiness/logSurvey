@@ -1,7 +1,11 @@
-	CPY_LOCK_THREADS
-		list = PyList_New(value_list->values_len); /* New reference. */
-		if (list == NULL) {
-			cpy_log_exception("write callback");
-			CPY_RETURN_FROM_THREADS 0;
-		}
-		for (i = 0; i < value_list->values_len; ++i) {
+				else if (strcasecmp (optarg, "percentage") == 0)
+					consolitation_g = CON_PERCENTAGE;
+				else
+				{
+					fprintf (stderr, "Unknown consolidation function `%s'.\n",
+							optarg);
+					usage (argv[0]);
+				}
+				break;
+			case 'd':
+			{

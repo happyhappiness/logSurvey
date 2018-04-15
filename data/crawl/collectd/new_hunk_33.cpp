@@ -1,8 +1,10 @@
-#define print_to_socket(fh, ...)                                               \
-  do {                                                                         \
-    if (fprintf(fh, __VA_ARGS__) < 0) {                                        \
-      WARNING("cmd_handle_getval: failed to write to socket #%i: %s",          \
-              fileno(fh), STRERRNO);                                           \
-      return -1;                                                               \
-    }                                                                          \
-    fflush(fh);                                                                \
+  char *text;
+  if (PyArg_ParseTuple(args, "et", NULL, &text) == 0)
+    return NULL;
+  Py_BEGIN_ALLOW_THREADS
+  plugin_log(LOG_DEBUG, "%s", text);
+  Py_END_ALLOW_THREADS
+  PyMem_Free(text);
+#endif
+  Py_RETURN_NONE;
+}

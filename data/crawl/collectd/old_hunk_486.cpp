@@ -1,6 +1,8 @@
-		XSRETURN_EMPTY;
-} /* static XS (Collectd_plugin_dispatch_values) */
+	else if (0 == strcasecmp (key, "MaxConns")) {
+		long int tmp = strtol (value, NULL, 0);
 
-/*
- * Collectd::bootstrap ().
- */
+		if (INT_MAX < tmp) {
+			max_conns = INT_MAX;
+		}
+		else {
+			max_conns = (int)tmp;

@@ -1,7 +1,6 @@
-	if (vl.values == NULL)
-	{
-		sfree (value_ptr);
-		fprintf (fh, "-1 malloc failed.");
-		return (-1);
-	}
-	DEBUG ("value_ptr = 0x%p; vl.values = 0x%p;", (void *) value_ptr, (void *) vl.values);
+	return (0);
+}
+
+#ifdef HAVE_LIBKSTAT
+int get_kstat (kstat_t **ksp_ptr, char *module, int instance, char *name)
+{

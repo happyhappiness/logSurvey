@@ -1,12 +1,9 @@
-
-  return 0;
-}
-
-int main(void) {
-  int ret = 0;
-
-  printf("libcollectdclient/server_test.c\n");
-
-  int status;
-  if ((status = test_network_parse())) {
-    ret = status;
+      cmd_handle_flush(fhout, buffer);
+    } else {
+      if (fprintf(fhout, "-1 Unknown command: %s\n", fields[0]) < 0) {
+        char errbuf[1024];
+        WARNING("unixsock plugin: failed to write to socket #%i: %s",
+                fileno(fhout), sstrerror(errno, errbuf, sizeof(errbuf)));
+        break;
+      }
+    }

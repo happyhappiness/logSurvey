@@ -1,11 +1,7 @@
+	CHECK(handle);
 
-		fields_num = strsplit (buffer_copy, fields,
-				sizeof (fields) / sizeof (fields[0]));
-
-		if (fields_num < 1)
-		{
-			close (fd);
-			break;
-		}
-
-		if (strcasecmp (fields[0], "getval") == 0)
+	printf("libiptc v%s. %u bytes.\n",
+	       IPTABLES_VERSION, handle->entries->size);
+	printf("Table `%s'\n", handle->info.name);
+	printf("Hooks: pre/in/fwd/out/post = %u/%u/%u/%u/%u\n",
+	       handle->info.hook_entry[HOOK_PRE_ROUTING],

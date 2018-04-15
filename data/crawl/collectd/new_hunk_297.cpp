@@ -1,7 +1,28 @@
-
-	printf ("%s: %g sum |", status_str, total);
-	for (i = 0; i < values_num; i++)
-		printf (" %s=%f;;;;", values_names[i], values[i]);
-	printf ("\n");
-
-	return (status_code);
+		oconfig_item_t *item = ci->children + i;
+		
+		if (strcasecmp(item->key, "Interactive") == 0) {
+			if (item->values_num != 1 || item->values[0].type != OCONFIG_TYPE_BOOLEAN)
+				continue;
+			do_interactive = item->values[0].value.boolean;
+		} else if (strcasecmp(item->key, "LogTraces") == 0) {
+			if (item->values_num != 1 || item->values[0].type != OCONFIG_TYPE_BOOLEAN)
+				continue;
+			if (!item->values[0].value.boolean) {
+				Py_XDECREF(cpy_format_exception);
+				cpy_format_exception = NULL;
+				continue;
+			}
+			if (cpy_format_exception)
+				continue;
+			tb = PyImport_ImportModule("traceback"); /* New reference. */
+			if (tb == NULL) {
+				cpy_log_exception("python initialization");
+				continue;
+			}
+			cpy_format_exception = PyObject_GetAttrString(tb, "format_exception"); /* New reference. */
+			Py_DECREF(tb);
+			if (cpy_format_exception == NULL)
+				cpy_log_exception("python initialization");
+		} else if (strcasecmp(item->key, "ModulePath") == 0) {
+			char *dir = NULL;
+			PyObject *dir_object;

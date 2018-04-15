@@ -1,8 +1,30 @@
 
-#define print_to_socket(fh, ...)                                               \
-  if (fprintf(fh, __VA_ARGS__) < 0) {                                          \
-    WARNING("handle_getthreshold: failed to write to socket #%i: %s",          \
-            fileno(fh), STRERRNO);                                             \
-    return -1;                                                                 \
-  }
+	const data_set_t *ds;
+	value_list_t vl = VALUE_LIST_INIT;
+	size_t i;
 
+	if (argc < 2)
+	{
+		cmd_error (CMD_PARSE_ERROR, err,
+				"Missing identifier and/or value-list.");
+		return (CMD_PARSE_ERROR);
+	}
+
+	identifier = argv[0];
+
+	/* parse_identifier() modifies its first argument, returning pointers into
+	 * it; retain the old value for later. */
+	identifier_copy = sstrdup (identifier);
+
+	status = parse_identifier (identifier, &hostname,
+			&plugin, &plugin_instance,
+			&type, &type_instance);
+	if (status != 0)
+	{
+		DEBUG ("cmd_handle_putval: Cannot parse identifier `%s'.",
+				identifier_copy);
+		cmd_error (CMD_PARSE_ERROR, err, "Cannot parse identifier `%s'.",
+				identifier_copy);
+		sfree (identifier_copy);
+		return (CMD_PARSE_ERROR);
+	}

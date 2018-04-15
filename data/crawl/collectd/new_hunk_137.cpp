@@ -1,39 +1,7 @@
-      char errbuf[1024]; \
-      WARNING ("handle_listval: failed to write to socket #%i: %s", \
-          fileno (fh), sstrerror (errno, errbuf, sizeof (errbuf))); \
-      free_everything_and_return (CMD_ERROR); \
-    } \
-    fflush(fh); \
-  } while (0)
-
-cmd_status_t cmd_handle_listval (FILE *fh, char *buffer)
+ */
+static void exit_usage (int status)
 {
-  cmd_error_handler_t err = { cmd_error_fh, fh };
-  cmd_status_t status;
-  cmd_t cmd;
+	printf ("Usage: "PACKAGE_NAME" [OPTIONS]\n\n"
 
-  char **names = NULL;
-  cdtime_t *times = NULL;
-  size_t number = 0;
-
-  DEBUG ("utils_cmd_listval: handle_listval (fh = %p, buffer = %s);",
-      (void *) fh, buffer);
-
-  if ((status = cmd_parse (buffer, &cmd, &err)) != CMD_OK)
-    return (status);
-  if (cmd.type != CMD_LISTVAL)
-  {
-    cmd_error (CMD_UNKNOWN_COMMAND, &err,
-	"Unexpected command: `%s'.", CMD_TO_STRING (cmd.type));
-    free_everything_and_return (CMD_UNKNOWN_COMMAND);
-  }
-
-  status = uc_get_names (&names, &times, &number);
-  if (status != 0)
-  {
-    DEBUG ("command listval: uc_get_names failed with status %i", status);
-    cmd_error (CMD_ERROR, &err, "uc_get_names failed.");
-    free_everything_and_return (CMD_ERROR);
-  }
-
-  print_to_socket (fh, "%i Value%s found\n",
+			"Available options:\n"
+			"  General:\n"

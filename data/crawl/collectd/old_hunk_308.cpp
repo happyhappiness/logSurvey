@@ -1,13 +1,11 @@
-	return 0;
-}
 
-static PyObject *Values_dispatch(Values *self, PyObject *args, PyObject *kwds) {
-	int i, ret;
-	const data_set_t *ds;
-	int size;
-	value_t *value;
-	value_list_t value_list = VALUE_LIST_INIT;
-	PyObject *values = self->values;
-	double time = self->data.time;
-	int interval = self->interval;
-	const char *host = self->data.host;
+		fields_num = strsplit (buffer_copy, fields,
+				sizeof (fields) / sizeof (fields[0]));
+
+		if (fields_num < 1)
+		{
+			close (fd);
+			break;
+		}
+
+		if (strcasecmp (fields[0], "getval") == 0)

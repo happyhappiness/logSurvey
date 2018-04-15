@@ -1,18 +1,12 @@
- 		else if (ds->ds[i].type == DS_TYPE_GAUGE)
- 			vl.values[i].gauge = atof (value_ptr[i]);
- 	} /* for (i = 2 .. fields_num) */
--	sfree (value_ptr);
  
- 	plugin_dispatch_values (type, &vl);
+ 	default:
+ 	    fprintf (stderr, "unsupported data link type %d\n",
+-		    pcap_datalink(pcap));
++		    pcap_datalink(pcap_obj));
+ 	    status = 0;
+ 	    break;
+-    } /* switch (pcap_datalink(pcap)) */
++    } /* switch (pcap_datalink(pcap_obj)) */
  
-+	DEBUG ("value_ptr = 0x%p; vl.values = 0x%p;", (void *) value_ptr, (void *) vl.values);
-+
-+	sfree (value_ptr);
- 	sfree (vl.values); 
- 
-+	fprintf (fh, "0 Success\n");
-+	fflush (fh);
-+
- 	return (0);
- } /* int us_handle_putval */
- 
+     if (0 == status)
+ 	return;

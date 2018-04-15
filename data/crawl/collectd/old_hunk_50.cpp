@@ -1,7 +1,8 @@
-  uint8_t pwhash[32] = {0};
-  gcry_md_hash_buffer(GCRY_MD_SHA256, pwhash, password, strlen(password));
 
-  fprintf(stderr, "sizeof(iv) = %zu\n", sizeof(iv));
-  if (gcry_cipher_setkey(cipher, pwhash, sizeof(pwhash)) ||
-      gcry_cipher_setiv(cipher, iv, iv_size) ||
-      gcry_cipher_decrypt(cipher, b->data, b->len, /* in = */ NULL,
+  if (fh == NULL) {
+    char errbuf[1024];
+    fprintf(stderr, "logfile plugin: fopen (%s) failed: %s\n",
+            (log_file == NULL) ? DEFAULT_LOGFILE : log_file,
+            sstrerror(errno, errbuf, sizeof(errbuf)));
+  } else {
+    if (print_timestamp)

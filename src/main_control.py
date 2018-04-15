@@ -9,7 +9,7 @@ import statistic
 
 # repos name squid, git, collectd, make, tar, wget
 if __name__ == "__main__":
-    my_util.set_user_repos(repos_name='wget')
+    my_util.set_user_repos(repos_name='collectd')
     fetch_hunk.fetch_patch()
     gumtree=Gumtree()
     fetch_log.fetch_hunk(gumtree)

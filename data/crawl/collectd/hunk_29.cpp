@@ -1,10 +1,13 @@
-   }
- 
-   if (fh == NULL) {
--    char errbuf[1024];
-     fprintf(stderr, "log_logstash plugin: fopen (%s) failed: %s\n", log_file,
--            sstrerror(errno, errbuf, sizeof(errbuf)));
-+            STRERRNO);
-   } else {
-     fprintf(fh, "%s\n", buf);
-     if (do_close) {
+ #if COLLECT_DEBUG
+   case IPMI_LOG_DEBUG_START:
+   case IPMI_LOG_DEBUG:
+-    fprintf(stderr, "ipmi plugin: %s\n", msg);
++    DEBUG("ipmi plugin: %s", msg);
+     break;
+   case IPMI_LOG_DEBUG_CONT:
+   case IPMI_LOG_DEBUG_END:
+-    fprintf(stderr, "%s\n", msg);
++    DEBUG("%s", msg);
+     break;
+ #else
+   case IPMI_LOG_DEBUG_START:

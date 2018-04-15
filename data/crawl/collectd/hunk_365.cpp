@@ -1,336 +1,309 @@
-+#include <Python.h>
-+#include <structmember.h>
+ }
+ 
+ 
++/**********************************************************************
++ * Chain index (cache utility) functions
++ **********************************************************************
++ * The chain index is an array with pointers into the chain list, with
++ * CHAIN_INDEX_BUCKET_LEN spacing.  This facilitates the ability to
++ * speedup chain list searching, by find a more optimal starting
++ * points when searching the linked list.
++ *
++ * The starting point can be found fast by using a binary search of
++ * the chain index. Thus, reducing the previous search complexity of
++ * O(n) to O(log(n/k) + k) where k is CHAIN_INDEX_BUCKET_LEN.
++ *
++ * A nice property of the chain index, is that the "bucket" list
++ * length is max CHAIN_INDEX_BUCKET_LEN (when just build, inserts will
++ * change this). Oppose to hashing, where the "bucket" list length can
++ * vary a lot.
++ */
++#ifndef CHAIN_INDEX_BUCKET_LEN
++#define CHAIN_INDEX_BUCKET_LEN 40
++#endif
 +
-+#include "collectd.h"
-+#include "common.h"
++/* Another nice property of the chain index is that inserting/creating
++ * chains in chain list don't change the correctness of the chain
++ * index, it only causes longer lists in the buckets.
++ *
++ * To mitigate the performance penalty of longer bucket lists and the
++ * penalty of rebuilding, the chain index is rebuild only when
++ * CHAIN_INDEX_INSERT_MAX chains has been added.
++ */
++#ifndef CHAIN_INDEX_INSERT_MAX
++#define CHAIN_INDEX_INSERT_MAX 355
++#endif
 +
-+typedef struct cpy_callback_s {
-+	char *name;
-+	PyObject *callback;
-+	struct cpy_callback_s *next;
-+} cpy_callback_t;
++static inline unsigned int iptcc_is_builtin(struct chain_head *c);
 +
-+/* This is our global thread state. Python saves some stuff in thread-local
-+ * storage. So if we allow the interpreter to run in the background
-+ * (the scriptwriters might have created some threads from python), we have
-+ * to save the state so we can resume it later from a different thread.
 +
-+ * Technically the Global Interpreter Lock (GIL) and thread states can be
-+ * manipulated independently. But to keep stuff from getting too complex
-+ * we'll just use PyEval_SaveTread and PyEval_RestoreThreas which takes
-+ * care of the thread states as well as the GIL. */
++/* Use binary search in the chain index array, to find a chain_head
++ * pointer closest to the place of the searched name element.
++ *
++ * Notes that, binary search (obviously) requires that the chain list
++ * is sorted by name.
++ */
++static struct list_head *
++iptcc_bsearch_chain_index(const char *name, unsigned int *idx, TC_HANDLE_T handle)
++{
++	unsigned int pos, end;
++	int res;
 +
-+static PyThreadState *state;
++	struct list_head *list_pos;
++	list_pos=&handle->chains;
 +
-+static cpy_callback_t *cpy_config_callbacks;
++	/* Check for empty array, e.g. no user defined chains */
++	if (handle->chain_index_sz == 0) {
++		debug("WARNING: handle->chain_index_sz == 0\n");
++		return list_pos;
++	}
 +
-+typedef struct {
-+	PyObject_HEAD      /* No semicolon! */
-+	PyObject *parent;
-+	PyObject *key;
-+	PyObject *values;
-+	PyObject *children;
-+} Config;
++	/* Init */
++	end = handle->chain_index_sz;
++	pos = end / 2;
 +
-+static void Config_dealloc(PyObject *s) {
-+	Config *self = (Config *) s;
-+	
-+	Py_XDECREF(self->parent);
-+	Py_XDECREF(self->key);
-+	Py_XDECREF(self->values);
-+	Py_XDECREF(self->children);
-+	self->ob_type->tp_free(s);
++	debug("bsearch Find chain:%s (pos:%d end:%d)\n", name, pos, end);
++
++	/* Loop */
++ loop:
++	if (!handle->chain_index[pos]) {
++		fprintf(stderr, "ERROR: NULL pointer chain_index[%d]\n", pos);
++		return &handle->chains; /* Be safe, return orig start pos */
++	}
++
++	res = strcmp(name, handle->chain_index[pos]->name);
++	list_pos = &handle->chain_index[pos]->list;
++	*idx = pos;
++
++	debug("bsearch Index[%d] name:%s res:%d ",
++	      pos, handle->chain_index[pos]->name, res);
++
++	if (res == 0) { /* Found element, by direct hit */
++		debug("[found] Direct hit pos:%d end:%d\n", pos, end);
++		return list_pos;
++	} else if (res < 0) { /* Too far, jump back */
++		end = pos;
++		pos = pos / 2;
++
++		/* Exit case: First element of array */
++		if (end == 0) {
++			debug("[found] Reached first array elem (end%d)\n",end);
++			return list_pos;
++		}
++		debug("jump back to pos:%d (end:%d)\n", pos, end);
++		goto loop;
++	} else if (res > 0 ){ /* Not far enough, jump forward */
++
++		/* Exit case: Last element of array */
++		if (pos == handle->chain_index_sz-1) {
++			debug("[found] Last array elem (end:%d)\n", end);
++			return list_pos;
++		}
++
++		/* Exit case: Next index less, thus elem in this list section */
++		res = strcmp(name, handle->chain_index[pos+1]->name);
++		if (res < 0) {
++			debug("[found] closest list (end:%d)\n", end);
++			return list_pos;
++		}
++
++		pos = (pos+end)/2;
++		debug("jump forward to pos:%d (end:%d)\n", pos, end);
++		goto loop;
++	}
++
++	return list_pos;
 +}
 +
-+static PyObject *Config_new(PyTypeObject *type, PyObject *args, PyObject *kwds) {
-+	Config *self;
-+	
-+	self = (Config *) type->tp_alloc(type, 0);
-+	if (self == NULL)
-+		return NULL;
-+	
-+	self->parent = NULL;
-+	self->key = NULL;
-+	self->values = NULL;
-+	self->children = NULL;
-+	return (PyObject *) self;
++#ifdef DEBUG
++/* Trivial linear search of chain index. Function used for verifying
++   the output of bsearch function */
++static struct list_head *
++iptcc_linearly_search_chain_index(const char *name, TC_HANDLE_T handle)
++{
++	unsigned int i=0;
++	int res=0;
++
++	struct list_head *list_pos;
++	list_pos = &handle->chains;
++
++	if (handle->chain_index_sz)
++		list_pos = &handle->chain_index[0]->list;
++
++	/* Linearly walk of chain index array */
++
++	for (i=0; i < handle->chain_index_sz; i++) {
++		if (handle->chain_index[i]) {
++			res = strcmp(handle->chain_index[i]->name, name);
++			if (res > 0)
++				break; // One step too far
++			list_pos = &handle->chain_index[i]->list;
++			if (res == 0)
++				break; // Direct hit
++		}
++	}
++
++	return list_pos;
++}
++#endif
++
++static int iptcc_chain_index_alloc(TC_HANDLE_T h)
++{
++	unsigned int list_length = CHAIN_INDEX_BUCKET_LEN;
++	unsigned int array_elems;
++	unsigned int array_mem;
++
++	/* Allocate memory for the chain index array */
++	array_elems = (h->num_chains / list_length) +
++                      (h->num_chains % list_length ? 1 : 0);
++	array_mem   = sizeof(h->chain_index) * array_elems;
++
++	debug("Alloc Chain index, elems:%d mem:%d bytes\n",
++	      array_elems, array_mem);
++
++	h->chain_index = malloc(array_mem);
++	if (!h->chain_index) {
++		h->chain_index_sz = 0;
++		return -ENOMEM;
++	}
++	memset(h->chain_index, 0, array_mem);
++	h->chain_index_sz = array_elems;
++
++	return 1;
 +}
 +
-+static int Config_init(PyObject *s, PyObject *args, PyObject *kwds) {
-+	PyObject *key = NULL, *parent = NULL, *values = NULL, *children = NULL, *tmp;
-+	Config *self = (Config *) s;
-+	static char *kwlist[] = {"key", "parent", "values", "children", NULL};
-+	
-+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "S|OOO", kwlist,
-+			&key, &parent, &values, &children))
-+		return -1;
-+	
-+	if (values == NULL) {
-+		values = PyTuple_New(0);
-+		PyErr_Clear();
-+	}
-+	if (children == NULL) {
-+		children = PyTuple_New(0);
-+		PyErr_Clear();
-+	}
-+	tmp = self->key;
-+	Py_INCREF(key);
-+	self->key = key;
-+	Py_XDECREF(tmp);
-+	if (parent != NULL) {
-+		tmp = self->parent;
-+		Py_INCREF(parent);
-+		self->parent = parent;
-+		Py_XDECREF(tmp);
-+	}
-+	if (values != NULL) {
-+		tmp = self->values;
-+		Py_INCREF(values);
-+		self->values = values;
-+		Py_XDECREF(tmp);
-+	}
-+	if (children != NULL) {
-+		tmp = self->children;
-+		Py_INCREF(children);
-+		self->children = children;
-+		Py_XDECREF(tmp);
-+	}
-+	return 0;
++static void iptcc_chain_index_free(TC_HANDLE_T h)
++{
++	h->chain_index_sz = 0;
++	free(h->chain_index);
 +}
 +
-+static PyMemberDef Config_members[] = {
-+    {"Parent", T_OBJECT, offsetof(Config, parent), 0, "Parent node"},
-+    {"Key", T_OBJECT_EX, offsetof(Config, key), 0, "Keyword of this node"},
-+    {"Values", T_OBJECT_EX, offsetof(Config, values), 0, "Values after the key"},
-+    {"Children", T_OBJECT_EX, offsetof(Config, children), 0, "Childnodes of this node"},
-+    {NULL}
-+};
 +
-+static PyTypeObject ConfigType = {
-+    PyObject_HEAD_INIT(NULL)
-+    0,                         /* Always 0 */
-+    "collectd.Config",         /* tp_name */
-+    sizeof(Config),            /* tp_basicsize */
-+    0,                         /* Will be filled in later */
-+    Config_dealloc,            /* tp_dealloc */
-+    0,                         /* tp_print */
-+    0,                         /* tp_getattr */
-+    0,                         /* tp_setattr */
-+    0,                         /* tp_compare */
-+    0,                         /* tp_repr */
-+    0,                         /* tp_as_number */
-+    0,                         /* tp_as_sequence */
-+    0,                         /* tp_as_mapping */
-+    0,                         /* tp_hash */
-+    0,                         /* tp_call */
-+    0,                         /* tp_str */
-+    0,                         /* tp_getattro */
-+    0,                         /* tp_setattro */
-+    0,                         /* tp_as_buffer */
-+    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE, /*tp_flags*/
-+    "Cool help text later",    /* tp_doc */
-+    0,		               /* tp_traverse */
-+    0,		               /* tp_clear */
-+    0,		               /* tp_richcompare */
-+    0,		               /* tp_weaklistoffset */
-+    0,		               /* tp_iter */
-+    0,		               /* tp_iternext */
-+    0,                         /* tp_methods */
-+    Config_members,            /* tp_members */
-+    0,                         /* tp_getset */
-+    0,                         /* tp_base */
-+    0,                         /* tp_dict */
-+    0,                         /* tp_descr_get */
-+    0,                         /* tp_descr_set */
-+    0,                         /* tp_dictoffset */
-+    Config_init,               /* tp_init */
-+    0,                         /* tp_alloc */
-+    Config_new                 /* tp_new */
-+};
++#ifdef DEBUG
++static void iptcc_chain_index_dump(TC_HANDLE_T h)
++{
++	unsigned int i = 0;
 +
-+static PyObject *cpy_register_config(PyObject *self, PyObject *args) {
-+	cpy_callback_t *c;
-+	const char *name = NULL;
-+	PyObject *callback = NULL;
-+	
-+	if (PyArg_ParseTuple(args, "O|z", &callback, &name) == 0) return NULL;
-+	if (PyCallable_Check(callback) == 0) {
-+		PyErr_SetString(PyExc_TypeError, "callback needs a be a callable object.");
++	/* Dump: contents of chain index array */
++	for (i=0; i < h->chain_index_sz; i++) {
++		if (h->chain_index[i]) {
++			fprintf(stderr, "Chain index[%d].name: %s\n",
++				i, h->chain_index[i]->name);
++		}
++	}
++}
++#endif
++
++/* Build the chain index */
++static int iptcc_chain_index_build(TC_HANDLE_T h)
++{
++	unsigned int list_length = CHAIN_INDEX_BUCKET_LEN;
++	unsigned int chains = 0;
++	unsigned int cindex = 0;
++	struct chain_head *c;
++
++	/* Build up the chain index array here */
++	debug("Building chain index\n");
++
++	debug("Number of user defined chains:%d bucket_sz:%d array_sz:%d\n",
++		h->num_chains, list_length, h->chain_index_sz);
++
++	if (h->chain_index_sz == 0)
 +		return 0;
++
++	list_for_each_entry(c, &h->chains, list) {
++
++		/* Issue: The index array needs to start after the
++		 * builtin chains, as they are not sorted */
++		if (!iptcc_is_builtin(c)) {
++			cindex=chains / list_length;
++
++			/* Safe guard, break out on array limit, this
++			 * is useful if chains are added and array is
++			 * rebuild, without realloc of memory. */
++			if (cindex >= h->chain_index_sz)
++				break;
++
++			if ((chains % list_length)== 0) {
++				debug("\nIndex[%d] Chains:", cindex);
++				h->chain_index[cindex] = c;
++			}
++			chains++;
++		}
++		debug("%s, ", c->name);
 +	}
-+	if (name == NULL) {
-+		PyObject *mod;
-+		
-+		mod = PyObject_GetAttrString(callback, "__module__");
-+		if (mod != NULL) name = PyString_AsString(mod);
-+		if (name == NULL) {
-+			PyErr_SetString(PyExc_ValueError, "No module name specified and "
-+				"callback function does not have a \"__module__\" attribute.");
++	debug("\n");
++
++	return 1;
++}
++
++static int iptcc_chain_index_rebuild(TC_HANDLE_T h)
++{
++	debug("REBUILD chain index array\n");
++	iptcc_chain_index_free(h);
++	if ((iptcc_chain_index_alloc(h)) < 0)
++		return -ENOMEM;
++	iptcc_chain_index_build(h);
++	return 1;
++}
++
++/* Delete chain (pointer) from index array.  Removing an element from
++ * the chain list only affects the chain index array, if the chain
++ * index points-to/uses that list pointer.
++ *
++ * There are different strategies, the simple and safe is to rebuild
++ * the chain index every time.  The more advanced is to update the
++ * array index to point to the next element, but that requires some
++ * house keeping and boundry checks.  The advanced is implemented, as
++ * the simple approach behaves badly when all chains are deleted
++ * because list_for_each processing will always hit the first chain
++ * index, thus causing a rebuild for every chain.
++ */
++static int iptcc_chain_index_delete_chain(struct chain_head *c, TC_HANDLE_T h)
++{
++	struct list_head *index_ptr, *index_ptr2, *next;
++	struct chain_head *c2;
++	unsigned int idx, idx2;
++
++	index_ptr = iptcc_bsearch_chain_index(c->name, &idx, h);
++
++	debug("Del chain[%s] c->list:%p index_ptr:%p\n",
++	      c->name, &c->list, index_ptr);
++
++	/* Save the next pointer */
++	next = c->list.next;
++	list_del(&c->list);
++
++	if (index_ptr == &c->list) { /* Chain used as index ptr */
++
++		/* See if its possible to avoid a rebuild, by shifting
++		 * to next pointer.  Its possible if the next pointer
++		 * is located in the same index bucket.
++		 */
++		c2         = list_entry(next, struct chain_head, list);
++		index_ptr2 = iptcc_bsearch_chain_index(c2->name, &idx2, h);
++		if (idx != idx2) {
++			/* Rebuild needed */
++			return iptcc_chain_index_rebuild(h);
++		} else {
++			/* Avoiding rebuild */
++			debug("Update cindex[%d] with next ptr name:[%s]\n",
++			      idx, c2->name);
++			h->chain_index[idx]=c2;
 +			return 0;
 +		}
 +	}
-+	c = malloc(sizeof(*c));
-+	c->name = strdup(name);
-+	c->callback = callback;
-+	c->next = cpy_config_callbacks;
-+	cpy_config_callbacks = c;
-+	return Py_None;
-+}
-+
-+static PyMethodDef cpy_methods[] = {
-+	{"register_config", cpy_register_config, METH_VARARGS, "foo"},
-+	{0, 0, 0, 0}
-+};
-+
-+static int cpy_shutdown(void) {
-+	/* This can happen if the module was loaded but not configured. */
-+	if (state != NULL)
-+		PyEval_RestoreThread(state);
-+	Py_Finalize();
 +	return 0;
 +}
 +
-+static int cpy_init(void) {
-+	PyEval_InitThreads();
-+	/* Now it's finally OK to use python threads. */
-+	return 0;
-+}
 +
-+static PyObject *cpy_oconfig_to_pyconfig(oconfig_item_t *ci, PyObject *parent) {
-+	int i;
-+	PyObject *item, *values, *children, *tmp;
-+	
-+	if (parent == NULL)
-+		parent = Py_None;
-+	
-+	values = PyTuple_New(ci->values_num); /* New reference. */
-+	for (i = 0; i < ci->values_num; ++i) {
-+		if (ci->values[i].type == OCONFIG_TYPE_STRING) {
-+			PyTuple_SET_ITEM(values, i, PyString_FromString(ci->values[i].value.string));
-+		} else if (ci->values[i].type == OCONFIG_TYPE_NUMBER) {
-+			PyTuple_SET_ITEM(values, i, PyFloat_FromDouble(ci->values[i].value.number));
-+		} else if (ci->values[i].type == OCONFIG_TYPE_BOOLEAN) {
-+			PyTuple_SET_ITEM(values, i, PyBool_FromLong(ci->values[i].value.boolean));
-+		}
-+	}
-+	
-+	item = PyObject_CallFunction((PyObject *) &ConfigType, "sONO", ci->key, parent, values, Py_None);
-+	if (item == NULL)
-+		return NULL;
-+	children = PyTuple_New(ci->children_num); /* New reference. */
-+	for (i = 0; i < ci->children_num; ++i) {
-+			PyTuple_SET_ITEM(children, i, cpy_oconfig_to_pyconfig(ci->children + i, item));
-+	}
-+	tmp = ((Config *) item)->children;
-+	((Config *) item)->children = children;
-+	Py_XDECREF(tmp);
-+	return item;
-+}
-+
-+static int cpy_config(oconfig_item_t *ci) {
-+	int i;
-+	PyObject *sys;
-+	PyObject *sys_path;
-+	PyObject *module;
-+	
-+	/* Ok in theory we shouldn't do initialization at this point
-+	 * but we have to. In order to give python scripts a chance
-+	 * to register a config callback we need to be able to execute
-+	 * python code during the config callback so we have to start
-+	 * the interpreter here. */
-+	/* Do *not* use the python "thread" module at this point! */
-+	Py_Initialize();
-+	
-+	PyType_Ready(&ConfigType);
-+	sys = PyImport_ImportModule("sys"); /* New reference. */
-+	if (sys == NULL) {
-+		ERROR("python module: Unable to import \"sys\" module.");
-+		/* Just print the default python exception text to stderr. */
-+		PyErr_Print();
-+		return 1;
-+	}
-+	sys_path = PyObject_GetAttrString(sys, "path"); /* New reference. */
-+	Py_DECREF(sys);
-+	if (sys_path == NULL) {
-+		ERROR("python module: Unable to read \"sys.path\".");
-+		PyErr_Print();
-+		return 1;
-+	}
-+	module = Py_InitModule("collectd", cpy_methods); /* Borrowed reference. */
-+	PyModule_AddObject(module, "Config", (PyObject *) &ConfigType); /* Steals a reference. */
-+	for (i = 0; i < ci->children_num; ++i) {
-+		oconfig_item_t *item = ci->children + i;
-+		
-+		if (strcasecmp(item->key, "ModulePath") == 0) {
-+			char *dir = NULL;
-+			PyObject *dir_object;
-+			
-+			if (cf_util_get_string(item, &dir) != 0) 
-+				continue;
-+			dir_object = PyString_FromString(dir); /* New reference. */
-+			if (dir_object == NULL) {
-+				ERROR("python plugin: Unable to convert \"%s\" to "
-+				      "a python object.", dir);
-+				free(dir);
-+				PyErr_Print();
-+				continue;
-+			}
-+			if (PyList_Append(sys_path, dir_object) != 0) {
-+				ERROR("python plugin: Unable to append \"%s\" to "
-+				      "python module path.", dir);
-+				PyErr_Print();
-+			}
-+			Py_DECREF(dir_object);
-+			free(dir);
-+		} else if (strcasecmp(item->key, "Import") == 0) {
-+			char *module_name = NULL;
-+			PyObject *module;
-+			
-+			if (cf_util_get_string(item, &module_name) != 0) 
-+				continue;
-+			module = PyImport_ImportModule(module_name); /* New reference. */
-+			if (module == NULL) {
-+				ERROR("python plugin: Error importing module \"%s\".", module_name);
-+				PyErr_Print();
-+			}
-+			free(module_name);
-+			Py_XDECREF(module);
-+		} else if (strcasecmp(item->key, "Module") == 0) {
-+			char *name = NULL;
-+			cpy_callback_t *c;
-+			PyObject *ret;
-+			
-+			if (cf_util_get_string(item, &name) != 0)
-+				continue;
-+			for (c = cpy_config_callbacks; c; c = c->next) {
-+				if (strcasecmp(c->name, name) == 0)
-+					break;
-+			}
-+			if (c == NULL) {
-+				WARNING("python plugin: Found a configuration for the \"%s\" plugin, "
-+					"but the plugin isn't loaded or didn't register "
-+					"a configuration callback.", name);
-+				free(name);
-+				continue;
-+			}
-+			free(name);
-+			ret = PyObject_CallFunction(c->callback, "N",
-+					cpy_oconfig_to_pyconfig(item, NULL)); /* New reference. */
-+			if (ret == NULL)
-+				PyErr_Print();
-+			else
-+				Py_DECREF(ret);
-+		} else {
-+			WARNING("python plugin: Ignoring unknown config key \"%s\".", item->key);
-+		}
-+	}
-+	Py_DECREF(sys_path);
-+	return 0;
-+}
-+
-+void module_register(void) {
-+	plugin_register_complex_config("python", cpy_config);
-+	plugin_register_init("python", cpy_init);
-+//	plugin_register_read("netapp", cna_read);
-+	plugin_register_shutdown("netapp", cpy_shutdown);
-+}
+ /**********************************************************************
+  * iptc cache utility functions (iptcc_*)
+  **********************************************************************/
+ 
+ /* Is the given chain builtin (1) or user-defined (0) */
+-static unsigned int iptcc_is_builtin(struct chain_head *c)
++static inline unsigned int iptcc_is_builtin(struct chain_head *c)
+ {
+ 	return (c->hooknum ? 1 : 0);
+ }

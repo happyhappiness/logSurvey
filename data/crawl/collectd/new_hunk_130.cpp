@@ -1,13 +1,15 @@
-	value_list_t vl = VALUE_LIST_INIT;
-	size_t i;
+  printf ("ok %i - %s evaluates to \"%s\"\n", ++check_count__, #actual, expect); \
+} while (0)
 
-	if ((ret_putval == NULL) || (opts == NULL))
-	{
-		errno = EINVAL;
-		cmd_error (CMD_ERROR, err, "Invalid arguments to cmd_parse_putval.");
-		return (CMD_ERROR);
-	}
+#define EXPECT_INTEQ(expect, actual) do { \
+  if ((expect) != (actual)) {\
+    printf ("not ok %i - %s incorrect: expected %d, got %d\n", \
+        ++check_count__, #actual, expect, actual); \
+    return (-1); \
+  } \
+  printf ("ok %i - %s evaluates to %d\n", ++check_count__, #actual, expect); \
+} while (0)
 
-	if (argc < 2)
-	{
-		cmd_error (CMD_PARSE_ERROR, err,
+#define DBLEQ(expect, actual) do { \
+  if ((isnan (expect) && !isnan (actual)) || ((expect) != (actual))) {\
+    printf ("not ok %i - %s incorrect: expected %.15g, got %.15g\n", \

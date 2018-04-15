@@ -1,8 +1,11 @@
-  }
-  size = (size_t)PySequence_Length(values);
-  if (size != ds->ds_num) {
-    PyErr_Format(PyExc_RuntimeError,
-                 "type %s needs %" PRIsz " values, got %" PRIsz,
-                 value_list.type, ds->ds_num, size);
-    return NULL;
-  }
+
+  return 0;
+}
+#endif
+
+int main(void) {
+  int ret = 0;
+
+  int status;
+  if ((status = test_network_parse())) {
+    ret = status;

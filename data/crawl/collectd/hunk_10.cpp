@@ -1,10 +1,13 @@
- 	 if (strcmp ($1.key, $3) != 0)
- 	 {
- 		printf ("block_begin = %s; block_end = %s;\n", $1.key, $3);
--	 	yyerror ("Block not closed..\n");
--		exit (1);
-+		yyerror("block not closed");
-+		YYERROR;
- 	 }
- 	 free ($3); $3 = NULL;
- 	 $$ = $1;
+ 
+   fh = fopen(file, "r");
+   if (fh == NULL) {
+-    char errbuf[1024];
+     fprintf(stderr, "Failed to open types database `%s': %s.\n", file,
+-            sstrerror(errno, errbuf, sizeof(errbuf)));
+-    ERROR("Failed to open types database `%s': %s", file,
+-          sstrerror(errno, errbuf, sizeof(errbuf)));
++            STRERRNO);
++    ERROR("Failed to open types database `%s': %s", file, STRERRNO);
+     return -1;
+   }
+ 

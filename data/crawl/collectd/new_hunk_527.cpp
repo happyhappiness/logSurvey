@@ -1,7 +1,7 @@
-	 * Change directory. We do this _after_ reading the config and loading
-	 * modules to relative paths work as expected.
-	 */
-	if ((datadir = global_option_get ("BaseDir")) != NULL)
-	{
-		fprintf (stderr, "Don't have a datadir to use. This should not happen. Ever.");
-		return (1);
+
+		/* The `%.*s' is needed because there is no null-byte behind
+		 * the name. */
+		fprintf(log, ",%.*s", (int) (tmp - name), name);
+	}
+	fprintf(log, "\n");
+	fclose(log);

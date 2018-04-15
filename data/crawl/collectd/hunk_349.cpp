@@ -1,8 +1,10 @@
- 				CPY_RETURN_FROM_THREADS 0;
- 			}
- 			if (PyErr_Occurred() != NULL) {
--				PyErr_Print();
-+				cpy_log_exception("value building for write callback");
- 				CPY_RETURN_FROM_THREADS 0;
- 			}
- 		}
+ 
+ 	if ((socket_file_g == NULL) || (value_string_g == NULL)
+ 			|| (hostname_g == NULL))
++	{
++		fprintf (stderr, "Missing required arguments.\n");
+ 		usage (argv[0]);
++	}
+ 
+ 	return (do_check ());
+ } /* int main */

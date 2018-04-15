@@ -1,21 +1,35 @@
-			NULL, &plugin, NULL, &host, &time, &interval, &meta))
-		return -1;
-	
-	if (type && plugin_get_ds(type) == NULL) {
-		PyErr_Format(PyExc_TypeError, "Dataset %s not found", type);
-		FreeAll();
-		return -1;
-	}
+}
 
-	sstrncpy(self->data.host, host ? host : "", sizeof(self->data.host));
-	sstrncpy(self->data.plugin, plugin ? plugin : "", sizeof(self->data.plugin));
-	sstrncpy(self->data.plugin_instance, plugin_instance ? plugin_instance : "", sizeof(self->data.plugin_instance));
-	sstrncpy(self->data.type, type ? type : "", sizeof(self->data.type));
-	sstrncpy(self->data.type_instance, type_instance ? type_instance : "", sizeof(self->data.type_instance));
-	self->data.time = time;
+static void exit_usage (const char *name, int status) {
+  fprintf ((status == 0) ? stdout : stderr,
+      "Usage: %s [options]\n\n"
 
-	FreeAll();
+      "Available options:\n"
+      "  -s             Path to collectd's UNIX socket.\n"
+      "                 Default: /var/run/collectd-unixsock\n"
+      "  -p <plugin>    Plugin to be flushed.\n"
+      "  -i <id>        Flush data identified by <id> only (see below).\n"
+      "  -t <seconds>   Flush values older than this value only.\n"
 
-	if (values == NULL) {
-		values = PyList_New(0);
-		PyErr_Clear();
+      "\n  -h             Display this help and exit.\n"
+
+      "\nIdentfiers:\n\n"
+
+      "An identifier (as accepted by the -i option) has the following\n"
+      "format:\n\n"
+
+      "  [<hostname>/]<plugin>[-<plugin_instance>]/<type>[-<type_instance>]\n\n"
+
+      "Hostname defaults to the local hostname if omitted (e.g., uptime/uptime).\n"
+      "No error is returned if the specified identifier does not exist.\n"
+
+      "\nExample:\n\n"
+
+      "  collectd-flush -p rrdtool -i somehost/cpu-0/cpu-wait\n\n"
+
+      "Flushes all CPU wait RRD values of the first CPU of the local host.\n"
+      "I.e., writes all pending RRD updates of that data-source to disk.\n"
+      , name);
+  exit (status);
+}
+

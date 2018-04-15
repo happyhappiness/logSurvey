@@ -1,32 +1,13 @@
-	va_end (ap);
-} /* void cmd_error */
+  } while (0)
 
-cmd_status_t cmd_parse (char *buffer,
-		cmd_t *ret_cmd, cmd_error_handler_t *err)
+#define print_to_socket(fh, ...) \
+  if (fprintf (fh, __VA_ARGS__) < 0) { \
+    char errbuf[1024]; \
+    WARNING ("handle_listval: failed to write to socket #%i: %s", \
+	fileno (fh), sstrerror (errno, errbuf, sizeof (errbuf))); \
+    free_everything_and_return (-1); \
+  } \
+  fflush(fh);
+
+int handle_listval (FILE *fh, char *buffer)
 {
-	char *command = NULL;
-	int status;
-
-	if ((buffer == NULL) || (ret_cmd == NULL))
-	{
-		errno = EINVAL;
-		cmd_error (CMD_ERROR, err, "Invalid arguments to cmd_parse.");
-		return CMD_ERROR;
-	}
-
-	if ((status = parse_string (&buffer, &command)) != 0)
-	{
-		cmd_error (CMD_PARSE_ERROR, err,
-				"Failed to extract command from `%s'.", buffer);
-		return (CMD_PARSE_ERROR);
-	}
-	assert (command != NULL);
-
-	memset (ret_cmd, 0, sizeof (*ret_cmd));
-	if (strcasecmp ("PUTVAL", command) == 0)
-	{
-		ret_cmd->type = CMD_PUTVAL;
-		return cmd_parse_putval (buffer, &ret_cmd->cmd.putval, err);
-	}
-	else
-	{

@@ -1,12 +1,10 @@
-}
+		return (-1);
+
+	value_ptr = (char **) calloc (ds->ds_num, sizeof (char *));
+	/* FIXME: Send some response */
+	if (value_ptr == NULL)
+		return (-1);
 
 
-/**********************************************************************
- * iptc cache utility functions (iptcc_*)
- **********************************************************************/
-
-/* Is the given chain builtin (1) or user-defined (0) */
-static unsigned int iptcc_is_builtin(struct chain_head *c)
-{
-	return (c->hooknum ? 1 : 0);
-}
+	{ /* parse the value-list. It's colon-separated. */
+		char *dummy;

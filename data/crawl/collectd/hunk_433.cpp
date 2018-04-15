@@ -1,21 +1,18 @@
-   if (strlen (n->type_instance) > 0)
-     fprintf (fh, "TypeInstance: %s\n", n->type_instance);
+ 		else if (ds->ds[i].type == DS_TYPE_GAUGE)
+ 			vl.values[i].gauge = atof (value_ptr[i]);
+ 	} /* for (i = 2 .. fields_num) */
+-	sfree (value_ptr);
  
-+  for (meta = n->meta; meta != NULL; meta = meta->next)
-+  {
-+    if (meta->type == NM_TYPE_STRING)
-+      fprintf (fh, "%s: %s\n", meta->name, meta->value_string);
-+    else if (meta->type == NM_TYPE_SIGNED_INT)
-+      fprintf (fh, "%s: %lli\n", meta->name, meta->value_signed_int);
-+    else if (meta->type == NM_TYPE_UNSIGNED_INT)
-+      fprintf (fh, "%s: %llu\n", meta->name, meta->value_unsigned_int);
-+    else if (meta->type == NM_TYPE_DOUBLE)
-+      fprintf (fh, "%s: %e\n", meta->name, meta->value_double);
-+    else if (meta->type == NM_TYPE_BOOLEAN)
-+      fprintf (fh, "%s: %s\n", meta->name,
-+	  meta->value_boolean ? "true" : "false");
-+  }
+ 	plugin_dispatch_values (type, &vl);
+ 
++	DEBUG ("value_ptr = 0x%p; vl.values = 0x%p;", (void *) value_ptr, (void *) vl.values);
 +
-   fprintf (fh, "\n%s\n", n->message);
++	sfree (value_ptr);
+ 	sfree (vl.values); 
  
-   fflush (fh);
++	fprintf (fh, "0 Success\n");
++	fflush (fh);
++
+ 	return (0);
+ } /* int us_handle_putval */
+ 

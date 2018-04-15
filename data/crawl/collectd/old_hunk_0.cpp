@@ -1,7 +1,9 @@
-  uint8_t pwhash[32] = {0};
-  gcry_md_hash_buffer(GCRY_MD_SHA256, pwhash, password, strlen(password));
-
-  fprintf(stderr, "sizeof(iv) = %zu\n", sizeof(iv));
-  if (gcry_cipher_setkey(cipher, pwhash, sizeof(pwhash)) ||
-      gcry_cipher_setiv(cipher, iv, iv_size) ||
-      gcry_cipher_decrypt(cipher, b->data, b->len, /* in = */ NULL,
+block:
+	block_begin statement_list block_end
+	{
+	 if (strcmp ($1.key, $3) != 0)
+	 {
+		printf ("block_begin = %s; block_end = %s;\n", $1.key, $3);
+		yyerror("block not closed");
+		YYERROR;
+	 }

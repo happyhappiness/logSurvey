@@ -1,21 +1,8 @@
- 	}
- 
- 	for (i = 0; i < values_num; i++)
--		if (!isnan (values[i]))
--			sum += values[i];
-+	{
-+		if (isnan (values[i]))
-+		{
-+			if (!nan_is_error_g)
-+				continue;
-+
-+			printf ("CRITICAL: Data source \"%s\" is NaN\n",
-+					values_names[i]);
-+			return (RET_CRITICAL);
-+		}
-+
-+		sum += values[i];
-+	}
- 
- 	if (sum == 0.0)
- 	{
+ 	CPY_LOCK_THREADS
+ 		if (PyImport_ImportModule("readline") == NULL) {
+ 			/* This interactive session will suck. */
+-			PyErr_Print(); /* FIXME */
++			cpy_log_exception("interactive session init");
+ 		}
+ 		PyRun_InteractiveLoop(stdin, "<stdin>");
+ 	CPY_RELEASE_THREADS

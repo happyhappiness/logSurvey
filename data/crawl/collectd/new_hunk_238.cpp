@@ -1,12 +1,7 @@
-	if (!meta)
-		return NULL;
 
-	l = PyDict_Items(meta); /* New reference. */
-	if (!l) {
-		cpy_log_exception("building meta data");
-		return NULL;
-	}
-	m = meta_data_create();
-	s = PyList_Size(l);
-	for (i = 0; i < s; ++i) {
-		const char *string, *keystring;
+	printf ("%s: %g average |", status_str, average);
+	for (i = 0; i < values_num; i++)
+		printf (" %s=%f;;;;", values_names[i], values[i]);
+	printf ("\n");
+
+	return (status_code);

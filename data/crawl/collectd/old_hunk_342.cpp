@@ -1,6 +1,6 @@
-	Py_RETURN_NONE;
-}
-
-static PyMethodDef cpy_methods[] = {
-	{"debug", cpy_debug, METH_VARARGS, "This is an unhelpful text."},
-	{"info", cpy_info, METH_VARARGS, "This is an unhelpful text."},
+		{
+			fprintf (stderr, "rrdtool: `RRARows' must "
+					"be greater than 0.\n");
+			return (1);
+		}
+		rrarows = tmp;

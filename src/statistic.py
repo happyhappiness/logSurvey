@@ -189,7 +189,7 @@ def get_statistic(file_name='data/analyze/statistic.csv'):
     wait_counter = get_wait_time()
     writer.writerow(['wait counter'])
     writer.writerow([wait_counter])
-    get_reason_for_consistence(writer)
+    # get_reason_for_consistence(writer)
 
 
     writer_file.close()

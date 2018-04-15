@@ -1,10 +1,10 @@
-   vsnprintf(buf, sizeof(buf), format, ap);
-   buf[sizeof(buf) - 1] = '\0';
-   if (fprintf(fh, "%i %s\n", code, buf) < 0) {
--    char errbuf[1024];
-     WARNING("utils_cmds: failed to write to file-handle #%i: %s", fileno(fh),
--            sstrerror(errno, errbuf, sizeof(errbuf)));
-+            STRERRNO);
-     return;
-   }
- 
+ #define print_to_socket(fh, ...)                                               \
+   do {                                                                         \
+     if (fprintf(fh, __VA_ARGS__) < 0) {                                        \
+-      char errbuf[1024];                                                       \
+       WARNING("handle_listval: failed to write to socket #%i: %s", fileno(fh), \
+-              sstrerror(errno, errbuf, sizeof(errbuf)));                       \
++              STRERRNO);                                                       \
+       free_everything_and_return(CMD_ERROR);                                   \
+     }                                                                          \
+     fflush(fh);                                                                \

@@ -1,9 +1,6 @@
-#include "utils_cmd_flush.h"
+  CHECK_NOT_NULL (l = latency_counter_create ());
 
-cmd_status_t cmd_parse_flush (size_t argc, char **argv,
-		cmd_flush_t *ret_flush, cmd_error_handler_t *err)
-{
-	if (ret_flush == NULL)
-	{
-		errno = EINVAL;
-		cmd_error (CMD_ERROR, err, "Invalid arguments to cmd_parse_flush.");
+  for (i = 0; i < STATIC_ARRAY_SIZE (cases); i++) {
+    latency_counter_add (l, DOUBLE_TO_CDTIME_T (cases[i].val));
+
+    DBLEQ (cases[i].min, CDTIME_T_TO_DOUBLE (latency_counter_get_min (l)));

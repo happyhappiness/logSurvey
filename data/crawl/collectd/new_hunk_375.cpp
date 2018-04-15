@@ -1,51 +1,21 @@
-    user_data_t __attribute__((unused)) *user_data)
-{
-  char         metric_name[512];
-  int          metric_prefix_len;
-  char         value[512];
-  char         timestamp[512];
+  if (strlen (n->type_instance) > 0)
+    fprintf (fh, "TypeInstance: %s\n", n->type_instance);
 
-  char csv_buffer[10240];
-
-  int status;
-  int offset = 0;
-  int i;
-
-  if (0 != strcmp (ds->type, vl->type)) {
-    ERROR ("http plugin: DS type does not match value list type");
-    return -1;
+  for (meta = n->meta; meta != NULL; meta = meta->next)
+  {
+    if (meta->type == NM_TYPE_STRING)
+      fprintf (fh, "%s: %s\n", meta->name, meta->value_string);
+    else if (meta->type == NM_TYPE_SIGNED_INT)
+      fprintf (fh, "%s: %lli\n", meta->name, meta->value_signed_int);
+    else if (meta->type == NM_TYPE_UNSIGNED_INT)
+      fprintf (fh, "%s: %llu\n", meta->name, meta->value_unsigned_int);
+    else if (meta->type == NM_TYPE_DOUBLE)
+      fprintf (fh, "%s: %e\n", meta->name, meta->value_double);
+    else if (meta->type == NM_TYPE_BOOLEAN)
+      fprintf (fh, "%s: %s\n", meta->name,
+	  meta->value_boolean ? "true" : "false");
   }
 
-  metric_prefix_len = value_list_to_metric_name (metric_name, 
-      sizeof (metric_name), ds, vl);
-    
-  if (metric_prefix_len == -1)
-    return (-1);
+  fprintf (fh, "\n%s\n", n->message);
 
-  DEBUG ("http plugin: http_write: metric_name = %s;", metric_name);
-
-  if (value_list_to_timestamp (timestamp, sizeof (timestamp), ds, vl) != 0)
-    return (-1);
-
-  for (i = 0; i < ds->ds_num; i++) 
-  {
-
-    if (value_list_to_string (value, sizeof (value), ds, vl, i) != 0)
-      return (-1);
-
-    ssnprintf(metric_name + metric_prefix_len, sizeof (metric_name) - metric_prefix_len,
-        ",%s", ds->ds[i].name); 
-
-    escape_string (metric_name, sizeof (metric_name));
-
-    status = ssnprintf (csv_buffer + offset, sizeof (csv_buffer) - offset,
-        "\"%s\",%s,%s\n",
-        metric_name, timestamp, value);
-    offset += status;
-
-  } /* for */
-
-  printf(csv_buffer);
-
-  curl_easy_setopt (curl, CURLOPT_POSTFIELDS, csv_buffer);
-  status = curl_easy_perform (curl);
+  fflush (fh);

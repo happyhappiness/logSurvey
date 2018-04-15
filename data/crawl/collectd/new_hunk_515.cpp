@@ -1,11 +1,11 @@
-	return (0);
-} /* int rrd_write */
+	float itemp;
+	float battv;
+	float linefreq;
+};
 
-static int rrd_config (const char *key, const char *value)
-{
-	if (strcasecmp ("CacheTimeout", key) == 0)
-	{
-		int tmp = atoi (value);
-		if (tmp < 0)
-		{
-			fprintf (stderr, "rrdtool: `CacheTimeout' must "
+#define BIG_BUF 4096
+
+/*
+ * Read nbytes from the network.
+ * It is possible that the total bytes require in several
+ * read requests

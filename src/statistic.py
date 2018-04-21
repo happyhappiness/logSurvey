@@ -176,6 +176,66 @@ def get_reason_for_consistence(file_writer):
     for reason in my_util.REASON_FOR_CONSISTENCE:
         file_writer.writerow([reason] + reason_dict[reason])
 
+
+def count_log_commit(repos_name="tar"):
+    """
+    @ param repos name to analyze\n
+    @ return nothing\n
+    @ involve just statistics how many commits as well as records in patch record file\n
+    """
+    my_util.set_user_repos(repos_name=repos_name)
+    read_file = file(my_util.LOG_RECORD_FILE, 'rb')
+    records = csv.reader(read_file)
+    counter = 0
+    log_commits = set()
+    for record in islice(records, 1, None):
+        counter += 1
+        log_commits.add(record[0])
+    print "repos is: %s, log commits are %d, log revisions are %d" %(repos_name, len(log_commits), counter)
+    
+    read_file.close()
+
+def count_group_size(repos_name, group_sizes):
+    """
+    @ param repos name to analyze and historical group sizes\n
+    @ return updated group sizes\n
+    @ involve average group size for similar log revisions and the histogram of group size\n
+    """
+    my_util.set_user_repos(repos_name=repos_name)
+    read_file = file(my_util.CLUSTER_RECORD_FILE, 'rb')
+    records = csv.reader(read_file)
+    group_counter = -1
+    curr_group_size = 0
+    total_group_size = 0
+    pre_cluster = 0
+    for record in islice(records, 1, None):
+        if json.loads(record[my_util.EDIT_FEATURE_INDEX]) == [0]:
+            continue
+        curr_cluster = record[-1]
+        # new cluster
+        if curr_cluster != pre_cluster:
+            # do not record group whose size is 1 and end searching
+            if curr_group_size == 1:
+                break
+            
+            # record old counter and begin new cluster
+            group_counter += 1
+            total_group_size += curr_group_size
+            if curr_group_size != 0:
+                group_sizes.append(curr_group_size)
+            curr_group_size = 1
+        else:
+            curr_group_size += 1
+
+        pre_cluster = curr_cluster
+
+    print "repos is: %s, group size is: %d, group counter is: %d, average group size is: %f"\
+                 %(repos_name, total_group_size, group_counter, float(total_group_size)/group_counter)
+    
+    read_file.close()
+
+    return group_sizes
+
 def get_statistic(file_name='data/analyze/statistic.csv'):
     """
     @ param nothing\n
@@ -189,7 +249,7 @@ def get_statistic(file_name='data/analyze/statistic.csv'):
     wait_counter = get_wait_time()
     writer.writerow(['wait counter'])
     writer.writerow([wait_counter])
-    # get_reason_for_consistence(writer)
+    get_reason_for_consistence(writer)
 
 
     writer_file.close()
@@ -198,5 +258,15 @@ def get_statistic(file_name='data/analyze/statistic.csv'):
 main function
 """
 if __name__ == "__main__":
-    my_util.set_user_repos(repos_name='tar')
-    get_statistic(file_name = 'data/analyze/statistic.csv')
+    # my_util.set_user_repos(repos_name='tar')
+    # get_statistic(file_name = 'data/analyze/statistic.csv')
+    reposes = ['git', 'squid', 'make', 'collectd','tar','wget']
+    for repos in reposes:
+        # count_log_commit(repos)
+        my_util.set_user_repos(repos_name=repos)
+        get_statistic()
+
+    # group_sizes = []
+    # for repos in reposes:
+    #     group_sizes = count_group_size(repos, group_sizes)
+    # print group_sizes
